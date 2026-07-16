@@ -1,0 +1,517 @@
+//! Album page: header (artwork, star, rating) + track list with play,
+//! queue and playlist actions.
+
+use std::path::PathBuf;
+
+use gpui::{Context, Entity, IntoElement, Render, Window, div, img, prelude::*, px};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::popover::Popover;
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use subsonic::{AlbumWithSongs, AnnotationTarget, Song, SubsonicClient};
+
+use crate::services::{artwork, runtime};
+use crate::state::player::PlayerState;
+use crate::state::playlists::PlaylistsState;
+use crate::state::session::Session;
+use crate::ui::format_duration;
+
+const ART_SIZE: u32 = 600;
+
+pub struct AlbumDetailView {
+    session: Entity<Session>,
+    player: Entity<PlayerState>,
+    playlists: Entity<PlaylistsState>,
+    album_id: String,
+    album: Option<AlbumWithSongs>,
+    art_path: Option<PathBuf>,
+    error: Option<String>,
+    /// Transient status line (e.g. "share link copied").
+    notice: Option<String>,
+}
+
+impl AlbumDetailView {
+    pub fn new(
+        session: Entity<Session>,
+        player: Entity<PlayerState>,
+        playlists: Entity<PlaylistsState>,
+        album_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Highlight the playing track as it changes.
+        cx.observe(&player.clone(), |_, _, cx| cx.notify()).detach();
+        let mut this = Self {
+            session,
+            player,
+            playlists,
+            album_id,
+            album: None,
+            art_path: None,
+            error: None,
+            notice: None,
+        };
+        this.load(cx);
+        this
+    }
+
+    /// Create a public share for the album and copy the URL to the clipboard.
+    fn share_album(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        let id = self.album_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .create_share(&[&id], None)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(share) => {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(share.url.clone()));
+                        view.notice = Some(format!("Share link copied: {}", share.url));
+                    }
+                    Err(e) => {
+                        if let Some(subsonic::Error::Api { .. }) =
+                            e.downcast_ref::<subsonic::Error>()
+                        {
+                            view.notice = Some("Sharing is disabled on this server".into());
+                        } else {
+                            view.error = Some(format!("{e:#}"));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
+        self.session.read(cx).client.clone()
+    }
+
+    fn load(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        let id = self.album_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client.get_album(&id).await.map_err(anyhow::Error::from)
+            })
+            .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(album) => {
+                        if let Some(cover) = album.album.cover_art.clone() {
+                            view.fetch_art(cover, cx);
+                        }
+                        view.album = Some(album);
+                    }
+                    Err(e) => view.error = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn fetch_art(&self, cover_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Ok(path) = artwork::fetch(client, cover_id, ART_SIZE).await {
+                let _ = this.update(cx, |view, cx| {
+                    view.art_path = Some(path);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn play_from(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(album) = &self.album else { return };
+        let songs = album.song.clone();
+        self.player.update(cx, |player, cx| {
+            player.play_queue(songs, index, cx);
+        });
+    }
+
+    /// Toggle star on the album (optimistic local update).
+    fn toggle_album_star(&mut self, cx: &mut Context<Self>) {
+        let Some(album) = &mut self.album else { return };
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        let id = album.album.id.clone();
+        let starred = album.album.starred.is_some();
+        album.album.starred = if starred { None } else { Some(String::new()) };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                if starred {
+                    client.unstar(AnnotationTarget::Album, &id).await
+                } else {
+                    client.star(AnnotationTarget::Album, &id).await
+                }
+                .map_err(anyhow::Error::from)
+            })
+            .await;
+            if let Err(e) = result {
+                let _ = this.update(cx, |view, cx| {
+                    view.error = Some(format!("{e:#}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Toggle star on one track (optimistic local update).
+    fn toggle_song_star(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(album) = &mut self.album else { return };
+        let Some(song) = album.song.get_mut(index) else {
+            return;
+        };
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        let id = song.id.clone();
+        let starred = song.starred.is_some();
+        song.starred = if starred { None } else { Some(String::new()) };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                if starred {
+                    client.unstar(AnnotationTarget::Song, &id).await
+                } else {
+                    client.star(AnnotationTarget::Song, &id).await
+                }
+                .map_err(anyhow::Error::from)
+            })
+            .await;
+            if let Err(e) = result {
+                let _ = this.update(cx, |view, cx| {
+                    view.error = Some(format!("{e:#}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Rate the album 1-5; clicking the current rating clears it.
+    fn rate_album(&mut self, rating: u8, cx: &mut Context<Self>) {
+        let Some(album) = &mut self.album else { return };
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        let id = album.album.id.clone();
+        let new = if album.album.user_rating == Some(rating) {
+            0
+        } else {
+            rating
+        };
+        album.album.user_rating = if new == 0 { None } else { Some(new) };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .set_rating(&id, new)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            if let Err(e) = result {
+                let _ = this.update(cx, |view, cx| {
+                    view.error = Some(format!("{e:#}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Per-track "add to playlist" popover.
+    fn playlist_popover(&self, index: usize, song: &Song, _cx: &Context<Self>) -> impl IntoElement {
+        let playlists = self.playlists.clone();
+        let song_id = song.id.clone();
+        Popover::new(("addpl", index))
+            .trigger(
+                Button::new(("addpl-btn", index))
+                    .ghost()
+                    .xsmall()
+                    .label("⊕"),
+            )
+            .content(move |state, _window, cx| {
+                let entries: Vec<(String, String)> = playlists
+                    .read(cx)
+                    .playlists
+                    .iter()
+                    .map(|p| (p.id.clone(), p.name.clone()))
+                    .collect();
+                let playlists = playlists.clone();
+                let song_id = song_id.clone();
+                let mut menu = v_flex().gap_0p5().min_w(px(180.));
+                if entries.is_empty() {
+                    menu = menu.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No playlists yet"),
+                    );
+                }
+                for (i, (pl_id, pl_name)) in entries.into_iter().enumerate() {
+                    let playlists = playlists.clone();
+                    let song_id = song_id.clone();
+                    menu = menu.child(
+                        div()
+                            .id(("pl-opt", i))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().muted))
+                            .on_click(cx.listener(move |state, _, window, cx| {
+                                playlists.update(cx, |p, cx| {
+                                    p.add_song(pl_id.clone(), song_id.clone(), cx);
+                                });
+                                state.dismiss(window, cx);
+                            }))
+                            .child(pl_name),
+                    );
+                }
+                let _ = state;
+                menu
+            })
+    }
+}
+
+impl Render for AlbumDetailView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
+
+        let (album_starred, album_rating) = self
+            .album
+            .as_ref()
+            .map(|a| (a.album.starred.is_some(), a.album.user_rating.unwrap_or(0)))
+            .unwrap_or((false, 0));
+
+        let header =
+            {
+                let (name, artist, meta) = match &self.album {
+                    Some(a) => {
+                        let songs = a.album.song_count.unwrap_or(a.song.len() as u32);
+                        let dur = a
+                            .album
+                            .duration
+                            .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
+                            .unwrap_or_default();
+                        let year = a.album.year.map(|y| format!("{y} · ")).unwrap_or_default();
+                        (
+                            a.album.name.clone(),
+                            a.album.artist.clone().unwrap_or_default(),
+                            format!("{year}{songs} tracks · {dur}"),
+                        )
+                    }
+                    None => ("…".into(), String::new(), String::new()),
+                };
+
+                let rating_stars = h_flex().gap_0p5().children((1..=5u8).map(|r| {
+                    div()
+                        .id(("rate", r as usize))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.rate_album(r, cx)))
+                        .child(
+                            Icon::new(if r <= album_rating {
+                                IconName::Star
+                            } else {
+                                IconName::StarOff
+                            })
+                            .small()
+                            .text_color(if r <= album_rating {
+                                cx.theme().accent
+                            } else {
+                                cx.theme().muted_foreground
+                            }),
+                        )
+                }));
+
+                h_flex()
+                    .gap_4()
+                    .items_end()
+                    .child(
+                        div()
+                            .size(px(180.))
+                            .rounded_md()
+                            .bg(cx.theme().muted)
+                            .overflow_hidden()
+                            .when_some(self.art_path.clone(), |this, path| {
+                                this.child(img(path).size(px(180.)).rounded_md())
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_xl().child(name))
+                                    .child(
+                                        Button::new("album-star")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(Icon::new(if album_starred {
+                                                IconName::Star
+                                            } else {
+                                                IconName::StarOff
+                                            }))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_album_star(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("album-share")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Share")
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.share_album(cx)),
+                                            ),
+                                    ),
+                            )
+                            .child(div().child(artist))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(meta),
+                            )
+                            .child(rating_stars),
+                    )
+            };
+
+        let rows: Vec<_> = self
+            .album
+            .clone()
+            .iter()
+            .flat_map(|a| a.song.iter())
+            .enumerate()
+            .map(|(i, song)| {
+                let is_playing = playing_id.as_deref() == Some(song.id.as_str());
+                let starred = song.starred.is_some();
+                let track_no = song.track.map(|t| t.to_string()).unwrap_or_default();
+                let dur = song
+                    .duration
+                    .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
+                    .unwrap_or_default();
+                let song_next = song.clone();
+                let song_enq = song.clone();
+                h_flex()
+                    .id(("track", i))
+                    .group("trow")
+                    .px_2()
+                    .py_1()
+                    .gap_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .when(is_playing, |s| {
+                        s.bg(cx.theme().muted)
+                            .border_l_2()
+                            .border_color(cx.theme().accent)
+                            .text_color(cx.theme().accent)
+                    })
+                    .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
+                    .child(
+                        div()
+                            .w(px(28.))
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(track_no),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(song.title.clone()),
+                    )
+                    // Hover actions: play-next, enqueue, star, add-to-playlist.
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .opacity(0.25)
+                            .group_hover("trow", |s| s.opacity(1.))
+                            .child(
+                                Button::new(("t-next", i))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("⏵+")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.player.update(cx, |p, cx| {
+                                            p.play_next(vec![song_next.clone()], cx)
+                                        });
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                            .child(
+                                Button::new(("t-enq", i))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("+")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.player.update(cx, |p, cx| {
+                                            p.enqueue(vec![song_enq.clone()], cx)
+                                        });
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                            .child(
+                                Button::new(("t-star", i))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(if starred {
+                                        IconName::Star
+                                    } else {
+                                        IconName::StarOff
+                                    }))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_song_star(i, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            )
+                            .child(self.playlist_popover(i, song, cx)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(dur),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .id("album-detail-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .p_4()
+            .gap_4()
+            .child(header)
+            .when_some(self.notice.clone(), |this, n| {
+                this.child(div().text_color(cx.theme().accent).text_sm().child(n))
+            })
+            .when_some(self.error.clone(), |this, e| {
+                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
+            })
+            .child(v_flex().gap_0p5().children(rows))
+    }
+}

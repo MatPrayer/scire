@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = ["crates/subsonic", "crates/playback", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# UI
+# runtime_shaders: compile Metal shaders at runtime — avoids needing the
+# `metal` CLI (absent with Command Line Tools-only installs).
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+gpui-component = "0.5.1"
+gpui-component-assets = "0.5.1"
+
+# Audio
+rodio = "0.22.2"
+stream-download = { version = "0.24.1", features = ["reqwest", "temp-storage"] }
+
+# HTTP / async
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Utilities
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+md-5 = "0.10"
+rand = "0.9"
+thiserror = "2"
+anyhow = "1"
+directories = "6"
+keyring = "4"
+souvlaki = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Dev
+wiremock = "0.6"
+
+# Local crates
+subsonic = { path = "crates/subsonic" }
+playback = { path = "crates/playback" }
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.dev.package."*"]
+# gpui is heavy; optimize deps so the dev binary stays usable
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+[profile.release.build-override]
+opt-level = 0
+codegen-units = 16
