@@ -31,23 +31,34 @@ fn cache_cap_bytes() -> u64 {
     CACHE_CAP_BYTES.load(Ordering::Relaxed)
 }
 
-/// Fetch cover art for `cover_id` at `size` px, returning a cached file path.
-pub async fn fetch(client: SubsonicClient, cover_id: String, size: u32) -> Result<PathBuf> {
+/// Synchronous cache lookup (in-memory index, then disk). Never touches the
+/// network. Returns the cached file path if the art was already downloaded,
+/// so callers can render it on the first frame instead of waiting on a task.
+pub fn cached(cover_id: &str, size: u32) -> Option<PathBuf> {
     let cache_key = format!("{cover_id}-{size}");
-
-    // 1. In-memory hit (no FS access).
     if let Some(path) = mem_cache().lock().unwrap().get(&cache_key).cloned() {
-        return Ok(path);
+        return Some(path);
     }
-
-    let dir = config::artwork_cache_dir()?;
-    let path = dir.join(format!("{}-{size}.img", sanitize(&cover_id)));
-
-    // 2. Disk hit: populate in-memory cache and return.
+    let dir = config::artwork_cache_dir().ok()?;
+    let path = dir.join(format!("{}-{size}.img", sanitize(cover_id)));
     if path.exists() {
         mem_cache().lock().unwrap().insert(cache_key, path.clone());
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Fetch cover art for `cover_id` at `size` px, returning a cached file path.
+pub async fn fetch(client: SubsonicClient, cover_id: String, size: u32) -> Result<PathBuf> {
+    // 1 + 2. In-memory / disk hit (no network).
+    if let Some(path) = cached(&cover_id, size) {
         return Ok(path);
     }
+
+    let cache_key = format!("{cover_id}-{size}");
+    let dir = config::artwork_cache_dir()?;
+    let path = dir.join(format!("{}-{size}.img", sanitize(&cover_id)));
 
     // 3. Network fetch.
     let path2 = path.clone();

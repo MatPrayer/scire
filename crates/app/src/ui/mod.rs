@@ -3,7 +3,6 @@ pub mod albums;
 pub mod artists;
 pub mod favorites;
 pub mod fullscreen_player;
-pub mod icons;
 pub mod login;
 pub mod player_bar;
 pub mod playlist_detail;
@@ -11,7 +10,7 @@ pub mod queue_panel;
 pub mod radio;
 pub mod recent;
 pub mod root;
-pub mod search;
+pub mod search_bar;
 pub mod settings;
 pub mod sidebar;
 
@@ -42,6 +41,49 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Extra track-row fields selected in settings, joined for display next to
+/// the song title. `include_album` is false on album pages where the album
+/// name is redundant.
+pub fn track_extras(
+    song: &subsonic::Song,
+    prefs: &crate::config::TrackInfo,
+    include_album: bool,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if prefs.artist
+        && let Some(a) = &song.artist
+    {
+        parts.push(a.clone());
+    }
+    if prefs.album
+        && include_album
+        && let Some(a) = &song.album
+    {
+        parts.push(a.clone());
+    }
+    if prefs.year
+        && let Some(y) = song.year
+    {
+        parts.push(y.to_string());
+    }
+    if prefs.genre
+        && let Some(g) = &song.genre
+    {
+        parts.push(g.clone());
+    }
+    if prefs.bitrate
+        && let Some(b) = song.bit_rate
+    {
+        parts.push(format!("{b} kbps"));
+    }
+    if prefs.plays
+        && let Some(p) = song.play_count
+    {
+        parts.push(format!("{p} plays"));
+    }
+    parts.join(" · ")
+}
+
 /// Apply the theme preference. `System` follows the OS appearance.
 pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
     let mode = match pref {
@@ -57,7 +99,9 @@ pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
 
 pub fn apply_custom_theme_from_settings(cx: &mut App) {
     let path = settings_theme_path();
-    let Some(path) = path else { return; };
+    let Some(path) = path else {
+        return;
+    };
     let Ok(file) = ImportedThemesFile::load_from_path(&path) else {
         return;
     };
@@ -77,7 +121,11 @@ pub fn apply_custom_theme_from_settings(cx: &mut App) {
 
 fn imported_theme_colors(theme: &ImportedThemeDefinition) -> ThemeConfigColors {
     let mut colors = ThemeConfigColors::default();
-    let set = |value: &Option<String>| value.as_ref().map(|value| SharedString::from(value.clone()));
+    let set = |value: &Option<String>| {
+        value
+            .as_ref()
+            .map(|value| SharedString::from(value.clone()))
+    };
     colors.background = set(&theme.background);
     colors.foreground = set(&theme.foreground);
     colors.border = set(&theme.border);
@@ -135,5 +183,5 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
     } else {
         window.request_decorations(WindowDecorations::Server);
     }
-    window.set_window_title("Navidrome");
+    window.set_window_title("Scirè");
 }

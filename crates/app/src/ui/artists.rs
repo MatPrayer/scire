@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
 use gpui_component::{ActiveTheme as _, StyledExt, h_flex, v_flex};
-use subsonic::{Album, ArtistIndex, ArtistWithAlbums, SubsonicClient};
+use subsonic::{Album, ArtistIndex, ArtistInfo2, ArtistWithAlbums, SubsonicClient};
 
-use crate::services::{artwork, runtime, spotify};
+use crate::services::{artwork, runtime};
 use crate::state::session::Session;
 
 const ART_SIZE: u32 = 320;
@@ -41,14 +41,42 @@ impl ArtistsView {
         let Some(client) = self.session.read(cx).client.clone() else {
             return;
         };
-        let library_id = self.session.read(cx).library_id.clone();
+        let libraries = self.session.read(cx).library_query_ids();
         self.loading = true;
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
-                client
-                    .get_artists(library_id.as_ref())
-                    .await
-                    .map_err(anyhow::Error::from)
+                // One request per selected library; merge the index buckets
+                // and dedupe artists that live in several libraries.
+                let mut merged: Vec<subsonic::ArtistIndex> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for lib in &libraries {
+                    let index = client
+                        .get_artists(lib.as_ref())
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                    for bucket in index {
+                        let artists: Vec<_> = bucket
+                            .artist
+                            .into_iter()
+                            .filter(|a| seen.insert(a.id.clone()))
+                            .collect();
+                        if artists.is_empty() {
+                            continue;
+                        }
+                        match merged.iter_mut().find(|b| b.name == bucket.name) {
+                            Some(existing) => existing.artist.extend(artists),
+                            None => merged.push(subsonic::ArtistIndex {
+                                name: bucket.name,
+                                artist: artists,
+                            }),
+                        }
+                    }
+                }
+                merged.sort_by(|a, b| a.name.cmp(&b.name));
+                for bucket in &mut merged {
+                    bucket.artist.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                Ok::<_, anyhow::Error>(merged)
             })
             .await;
             let _ = this.update(cx, |view, cx| {
@@ -129,7 +157,11 @@ pub struct ArtistDetailView {
     artist_image_path: Option<PathBuf>,
     error: Option<String>,
     top_track: Option<String>,
-    artist_info: Option<spotify::ArtistInfoSummary>,
+    /// Biography + image URLs from getArtistInfo2 (Navidrome's agents).
+    info: Option<ArtistInfo2>,
+    /// An artist-image fetch has started; stops info2's fallback from
+    /// racing/overwriting the primary coverArt fetch.
+    image_requested: bool,
 }
 
 pub enum ArtistDetailEvent {
@@ -148,7 +180,8 @@ impl ArtistDetailView {
             artist_image_path: None,
             error: None,
             top_track: None,
-            artist_info: None,
+            info: None,
+            image_requested: false,
         };
         this.load(cx);
         this
@@ -173,19 +206,16 @@ impl ArtistDetailView {
                     Ok(artist) => {
                         let artist_id = artist.artist.id.clone();
                         let first_album_id = artist.album.first().map(|album| album.id.clone());
-                        if let Some(image) = artist.artist.artist_image_url.clone() {
-                            view.fetch_artist_image(Some(image), cx);
-                        } else if let Some(cover) = artist.artist.cover_art.clone() {
-                            view.fetch_artist_image(Some(cover), cx);
-                        }
                         for album in &artist.album {
                             view.fetch_art(album.id.clone(), album.cover_art.clone(), cx);
                         }
+                        let cover = artist.artist.cover_art.clone();
                         view.artist = Some(artist);
+                        view.fetch_artist_image(cover, cx);
                         if let Some(album_id) = first_album_id {
                             view.fetch_top_track(album_id, cx);
                         }
-                        view.fetch_navidrome_info(&artist_id, cx);
+                        view.fetch_artist_info(&artist_id, cx);
                     }
                     Err(e) => view.error = Some(format!("{e:#}")),
                 }
@@ -195,8 +225,13 @@ impl ArtistDetailView {
         .detach();
     }
 
-    fn fetch_art(&self, album_id: String, cover_art: Option<String>, cx: &mut Context<Self>) {
+    fn fetch_art(&mut self, album_id: String, cover_art: Option<String>, cx: &mut Context<Self>) {
         let Some(cover_id) = cover_art else { return };
+        // Synchronous cache hit: render instantly on restart, no task.
+        if let Some(path) = artwork::cached(&cover_id, ART_SIZE) {
+            self.art_paths.insert(album_id, path);
+            return;
+        }
         let Some(client) = self.client(cx) else {
             return;
         };
@@ -211,14 +246,21 @@ impl ArtistDetailView {
         .detach();
     }
 
-    fn fetch_artist_image(&self, source: Option<String>, cx: &mut Context<Self>) {
+    fn fetch_artist_image(&mut self, source: Option<String>, cx: &mut Context<Self>) {
         let Some(source) = source else {
             return;
         };
         let Some(client) = self.client(cx) else {
             return;
         };
+        self.image_requested = true;
         let is_remote = source.starts_with("http://") || source.starts_with("https://");
+        // Synchronous cache hit: no empty-frame flash on revisit.
+        if !is_remote && let Some(path) = artwork::cached(&source, ART_SIZE) {
+            self.artist_image_path = Some(path);
+            cx.notify();
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 if is_remote {
@@ -244,7 +286,10 @@ impl ArtistDetailView {
         };
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
-                client.get_album(&album_id).await.map_err(anyhow::Error::from)
+                client
+                    .get_album(&album_id)
+                    .await
+                    .map_err(anyhow::Error::from)
             })
             .await;
             let _ = this.update(cx, |view, cx| {
@@ -260,23 +305,35 @@ impl ArtistDetailView {
         .detach();
     }
 
-    fn fetch_navidrome_info(&self, artist_id: &str, cx: &mut Context<Self>) {
+    /// Biography and artist image from Navidrome (getArtistInfo2). Falls back
+    /// to the artist's own image fields when info2 has no usable image.
+    fn fetch_artist_info(&self, artist_id: &str, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
         let artist_id = artist_id.to_string();
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
-                spotify::fetch_artist_info(&client, &artist_id)
+                client
+                    .get_artist_info2(&artist_id)
                     .await
                     .map_err(anyhow::Error::from)
             })
             .await;
             let _ = this.update(cx, |view, cx| {
-                if let Ok(Some(info)) = result {
-                    view.artist_info = Some(info);
-                    cx.notify();
+                let info = result.unwrap_or_default();
+                // The primary image (artist coverArt) started in load();
+                // info2 URLs are only a fallback for artists without one.
+                if !view.image_requested {
+                    let image = info.image_url().map(str::to_string).or_else(|| {
+                        view.artist
+                            .as_ref()
+                            .and_then(|a| a.artist.artist_image_url.clone())
+                    });
+                    view.fetch_artist_image(image, cx);
                 }
+                view.info = Some(info);
+                cx.notify();
             });
         })
         .detach();
@@ -291,35 +348,31 @@ impl Render for ArtistDetailView {
             .map(|a| a.artist.name.clone())
             .unwrap_or_else(|| "…".into());
         let bio = self
-            .artist
+            .info
             .as_ref()
-            .and_then(|a| a.artist.biography.as_deref())
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().to_string())
+            .and_then(|i| i.biography.as_deref())
+            .map(strip_html)
+            .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "No biography is available for this artist yet.".into());
         let top_track = self
             .top_track
             .clone()
             .unwrap_or_else(|| "No track preview available yet.".into());
-        let navidrome_name = self
-            .artist_info
-            .as_ref()
-            .map(|info| info.name.clone())
-            .unwrap_or_default();
-        let navidrome_desc = self.artist_info.as_ref().and_then(|info| {
-            let genres = info.genres.join(", ");
-            if genres.is_empty() {
-                None
-            } else {
-                Some(format!("Genres: {genres}"))
-            }
+        let genres = self.artist.as_ref().map(|a| {
+            let mut seen = std::collections::HashSet::new();
+            a.album
+                .iter()
+                .filter_map(|album| album.genre.as_deref())
+                .map(str::trim)
+                .filter(|g| !g.is_empty() && seen.insert(g.to_lowercase()))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         });
-        let fallback_art = self
-            .artist
-            .as_ref()
-            .and_then(|a| a.album.first())
-            .and_then(|album| self.art_paths.get(&album.id).cloned());
-        let hero_art = self.artist_image_path.clone().or(fallback_art);
+        let genres_line = genres
+            .filter(|g| !g.is_empty())
+            .map(|g| format!("Genres: {g}"));
+        let hero_art = self.artist_image_path.clone();
 
         let mut album_cards: Vec<gpui::AnyElement> = Vec::new();
         let mut single_cards: Vec<gpui::AnyElement> = Vec::new();
@@ -427,20 +480,12 @@ impl Render for ArtistDetailView {
                                             .child("Bio"),
                                     )
                                     .child(div().text_sm().child(bio))
-                                    .when_some(navidrome_desc.clone(), |this, desc| {
+                                    .when_some(genres_line, |this, desc| {
                                         this.child(
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(desc),
-                                        )
-                                    })
-                                    .when(!navidrome_name.is_empty(), |this| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!("Navidrome: {navidrome_name}")),
                                         )
                                     })
                                     .child(
@@ -461,6 +506,28 @@ impl Render for ArtistDetailView {
     }
 }
 
+/// Strip HTML tags and decode the handful of entities Last.fm bios use
+/// (Navidrome forwards agent bios verbatim, tags included).
+fn strip_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .trim()
+        .to_string()
+}
+
 fn is_single_or_ep(album: &Album) -> bool {
     let name = album.name.to_lowercase();
     let song_count = album.song_count.unwrap_or_default();
@@ -470,9 +537,15 @@ fn is_single_or_ep(album: &Album) -> bool {
 async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
     let dir = crate::config::artwork_cache_dir()?;
     let path = dir.join(format!("{}-{}.img", sanitize_name(url), ART_SIZE));
+    if path.exists() {
+        return Ok(path);
+    }
     std::fs::create_dir_all(&dir)?;
     let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
-    std::fs::write(&path, &bytes)?;
+    // Temp file + rename so a partial download never poisons the cache.
+    let tmp = path.with_extension("part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(path)
 }
 

@@ -1,6 +1,7 @@
 //! Left navigation rail: library switcher + sections + playlists.
 
 use gpui::{App, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 /// Top-level nav sections shown in the sidebar.
@@ -9,7 +10,6 @@ pub enum NavSection {
     Albums,
     Artists,
     Favorites,
-    Search,
     Recent,
     Radio,
     Settings,
@@ -21,8 +21,12 @@ pub enum SidebarAction {
     Select(NavSection),
     OpenPlaylist(String),
     NewPlaylist,
-    /// Select a music library (None = all).
-    SetLibrary(Option<String>),
+    /// Toggle one music library in the selection.
+    ToggleLibrary(String),
+    /// Reset the selection to all libraries.
+    AllLibraries,
+    /// Collapse/expand the library switcher.
+    ToggleLibrarySection,
 }
 
 pub struct SidebarModel {
@@ -31,7 +35,10 @@ pub struct SidebarModel {
     pub playlists: Vec<(String, String)>, // (id, name)
     /// Available libraries (id, name); switcher shown only when > 1.
     pub libraries: Vec<(String, String)>,
-    pub active_library: Option<String>,
+    /// Selected library ids; empty = all libraries.
+    pub selected_libraries: Vec<String>,
+    /// Library switcher folded away (header stays clickable).
+    pub libraries_collapsed: bool,
 }
 
 fn section_label(text: &'static str, cx: &App) -> impl IntoElement {
@@ -72,33 +79,84 @@ pub fn render_sidebar(
     };
 
     // Library switcher (only when the user can access more than one).
+    // Checkboxes so several libraries can be browsed at once; checking
+    // none (or all) means "all libraries". The section header folds it away.
     let mut library_switcher = v_flex().gap_0p5();
     let show_libraries = model.libraries.len() > 1;
     if show_libraries {
-        library_switcher = library_switcher.child(section_label("Library", cx));
-        let lib_item = |id: Option<String>, name: String, key: usize| {
+        // Header: label + chevron, click to collapse/expand.
+        {
             let on_action = on_action.clone();
-            let is_active = model.active_library == id;
-            div()
-                .id(("lib", key))
-                .px_3()
-                .py_1()
-                .rounded_lg()
-                .cursor_pointer()
-                .text_sm()
-                .truncate()
-                .when(is_active, |s| s.bg(cx.theme().muted))
-                .when(!is_active, |s| s.text_color(cx.theme().muted_foreground))
-                .hover(|s| s.bg(cx.theme().muted))
-                .on_click(move |_, window, cx| {
-                    on_action(SidebarAction::SetLibrary(id.clone()), window, cx)
-                })
-                .child(name)
-        };
-        library_switcher = library_switcher.child(lib_item(None, "All libraries".into(), 0));
-        for (i, (id, name)) in model.libraries.iter().enumerate() {
-            library_switcher =
-                library_switcher.child(lib_item(Some(id.clone()), name.clone(), i + 1));
+            library_switcher = library_switcher.child(
+                h_flex()
+                    .id("lib-header")
+                    .px_3()
+                    .pt_3()
+                    .pb_1()
+                    .gap_1()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .on_click(move |_, window, cx| {
+                        on_action(SidebarAction::ToggleLibrarySection, window, cx)
+                    })
+                    .child("Libraries")
+                    .child(
+                        Icon::new(if model.libraries_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .xsmall(),
+                    ),
+            );
+        }
+        if !model.libraries_collapsed {
+            // Quiet rows: unlabeled checkbox + muted text (Checkbox's own
+            // label renders in full foreground — too loud for the sidebar).
+            // The action is wired to BOTH the checkbox and the row: the
+            // checkbox prevents default on mouse-down, which suppresses the
+            // row's click handler, so each click fires exactly once.
+            let lib_row =
+                |key: SharedString, label: String, checked: bool, action: SidebarAction| {
+                    let on_row = on_action.clone();
+                    let on_check = on_action.clone();
+                    let row_action = action.clone();
+                    h_flex()
+                        .id(key.clone())
+                        .px_3()
+                        .py_0p5()
+                        .gap_2()
+                        .items_center()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .hover(|s| s.bg(cx.theme().muted))
+                        .on_click(move |_, window, cx| on_row(row_action.clone(), window, cx))
+                        .child(
+                            Checkbox::new(key).checked(checked).xsmall().on_click(
+                                move |_, window, cx| on_check(action.clone(), window, cx),
+                            ),
+                        )
+                        .child(div().truncate().child(label))
+                };
+            library_switcher = library_switcher.child(lib_row(
+                "lib-all".into(),
+                "All libraries".into(),
+                model.selected_libraries.is_empty(),
+                SidebarAction::AllLibraries,
+            ));
+            for (id, name) in model.libraries.iter() {
+                let checked = model.selected_libraries.contains(id);
+                library_switcher = library_switcher.child(lib_row(
+                    SharedString::from(format!("lib-{id}")),
+                    name.clone(),
+                    checked,
+                    SidebarAction::ToggleLibrary(id.clone()),
+                ));
+            }
         }
     }
 
@@ -139,7 +197,6 @@ pub fn render_sidebar(
         .border_color(cx.theme().border)
         .bg(cx.theme().sidebar)
         .when(show_libraries, |this| this.child(library_switcher))
-        .child(nav_item("Search", IconName::Search, NavSection::Search))
         .child(nav_item(
             "Recent",
             IconName::GalleryVerticalEnd,

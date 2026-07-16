@@ -3,15 +3,17 @@
 use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+};
 use subsonic::{PlaylistWithSongs, SubsonicClient};
 
+use crate::assets::{app_icon, icons};
 use crate::services::runtime;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
-use crate::ui::format_duration;
-use crate::ui::icons::TransportIcon;
+use crate::ui::{format_duration, track_extras};
 
 pub enum PlaylistDetailEvent {
     /// Playlist was deleted — navigate away.
@@ -115,6 +117,13 @@ impl PlaylistDetailView {
         self.player
             .update(cx, |p, cx| p.play_queue(songs, index, cx));
     }
+
+    fn play_shuffled(&mut self, cx: &mut Context<Self>) {
+        let Some(pl) = &self.playlist else { return };
+        let songs = pl.songs.clone();
+        self.player
+            .update(cx, |p, cx| p.play_queue_shuffled(songs, cx));
+    }
 }
 
 impl Render for PlaylistDetailView {
@@ -171,10 +180,19 @@ impl Render for PlaylistDetailView {
                 Button::new("play-all")
                     .primary()
                     .xsmall()
+                    .icon(app_icon(icons::PLAY))
                     .label("Play")
-                    .icon(Icon::new(TransportIcon::Play))
                     .disabled(count == 0)
                     .on_click(cx.listener(|this, _, _, cx| this.play_from(0, cx))),
+            )
+            .child(
+                Button::new("shuffle-all")
+                    .ghost()
+                    .xsmall()
+                    .icon(app_icon(icons::SHUFFLE))
+                    .label("Shuffle")
+                    .disabled(count == 0)
+                    .on_click(cx.listener(|this, _, _, cx| this.play_shuffled(cx))),
             )
             .child(
                 Button::new("delete")
@@ -189,6 +207,8 @@ impl Render for PlaylistDetailView {
                     })),
             );
 
+        let info_prefs = self.session.read(cx).settings.track_info.clone();
+
         let rows: Vec<_> = self
             .playlist
             .iter()
@@ -196,6 +216,7 @@ impl Render for PlaylistDetailView {
             .enumerate()
             .map(|(i, song)| {
                 let is_playing = playing_id.as_deref() == Some(song.id.as_str());
+                let extras = track_extras(song, &info_prefs, true);
                 let dur = song
                     .duration
                     .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
@@ -211,8 +232,8 @@ impl Render for PlaylistDetailView {
                     .when(is_playing, |s| {
                         s.bg(cx.theme().muted)
                             .border_l_2()
-                            .border_color(cx.theme().accent)
-                            .text_color(cx.theme().accent)
+                            .border_color(cx.theme().primary)
+                            .text_color(cx.theme().primary)
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -229,13 +250,16 @@ impl Render for PlaylistDetailView {
                             .truncate()
                             .child(song.title.clone()),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child(song.artist.clone().unwrap_or_default()),
-                    )
+                    .when(!extras.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .max_w(px(360.))
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .truncate()
+                                .child(extras),
+                        )
+                    })
                     .child(
                         div()
                             .text_sm()
@@ -246,7 +270,7 @@ impl Render for PlaylistDetailView {
                         Button::new(("pl-rm", i))
                             .ghost()
                             .xsmall()
-                            .label("✕")
+                            .icon(Icon::new(IconName::Close))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.playlists.update(cx, |state, cx| {
                                     state.remove_songs(

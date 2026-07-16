@@ -1,23 +1,127 @@
-//! Album grid with cover art, pagination, and All / New tabs.
+//! Album grid with cover art, pagination, and sort/filter tabs.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
-use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
+use gpui::{
+    Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle, Window, div, img, prelude::*,
+    px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use subsonic::{Album, AlbumListType, SubsonicClient};
 
+use crate::assets::{app_icon, icons};
+use crate::config::AlbumSort;
 use crate::services::{artwork, runtime};
+use crate::state::player::PlayerState;
 use crate::state::session::Session;
 
 const PAGE_SIZE: u32 = 100;
-const ART_SIZE: u32 = 300;
+/// Load the next page when scrolled within this many pixels of the bottom.
+const LOAD_AHEAD_PX: f32 = 600.;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AlbumTab {
-    All,
-    New,
+/// All selectable filters, in display order.
+const TABS: &[AlbumSort] = &[
+    AlbumSort::All,
+    AlbumSort::New,
+    AlbumSort::Recent,
+    AlbumSort::Frequent,
+    AlbumSort::Random,
+    AlbumSort::Starred,
+];
+
+fn tab_label(sort: AlbumSort) -> &'static str {
+    match sort {
+        AlbumSort::All => "All",
+        AlbumSort::New => "New",
+        AlbumSort::Recent => "Recent",
+        AlbumSort::Frequent => "Frequent",
+        AlbumSort::Random => "Random",
+        AlbumSort::Starred => "Starred",
+    }
+}
+
+fn tab_list_type(sort: AlbumSort) -> AlbumListType {
+    match sort {
+        AlbumSort::All => AlbumListType::AlphabeticalByName,
+        AlbumSort::New => AlbumListType::Newest,
+        AlbumSort::Recent => AlbumListType::Recent,
+        AlbumSort::Frequent => AlbumListType::Frequent,
+        AlbumSort::Random => AlbumListType::Random,
+        AlbumSort::Starred => AlbumListType::Starred,
+    }
+}
+
+#[derive(Default)]
+struct TabState {
+    /// Emitted albums, in final display order.
+    albums: Vec<Album>,
+    /// Per-library fetched-but-not-yet-emitted albums (server order).
+    /// Held back until a globally-ordered merge can emit them safely.
+    buffers: Vec<VecDeque<Album>>,
+    /// How many albums each library has contributed to `albums` (fair
+    /// interleave tie-break when the sort key can't decide).
+    lib_emitted: Vec<usize>,
+    loading: bool,
+    exhausted: bool,
+    /// Pages fetched so far; each page requests PAGE_SIZE per selected
+    /// library, so per-library offsets stay aligned across the merge.
+    page: u32,
+    /// Per-library exhaustion, indexed like the selection at fetch time.
+    lib_exhausted: Vec<bool>,
+}
+
+/// Display order between two albums for a tab (mirrors the server's order
+/// for the corresponding getAlbumList2 type, so the per-library sorted
+/// streams can be merge-sorted client-side).
+fn album_cmp(tab: AlbumSort, a: &Album, b: &Album) -> Ordering {
+    match tab {
+        AlbumSort::All => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        AlbumSort::New => b.created.cmp(&a.created),
+        AlbumSort::Frequent => b.play_count.cmp(&a.play_count),
+        AlbumSort::Starred => b.starred.cmp(&a.starred),
+        // No client-visible key; keep each library's order and let the
+        // fair-interleave tie-break weave the streams together.
+        AlbumSort::Recent | AlbumSort::Random => Ordering::Equal,
+    }
+}
+
+/// Pop every album that can already be emitted in globally-correct order.
+/// An album is only safe to emit while all non-exhausted libraries still
+/// have buffered items — otherwise an unfetched item could sort earlier.
+fn merge_ready(state: &mut TabState, tab: AlbumSort) -> Vec<Album> {
+    let mut out = Vec::new();
+    loop {
+        let blocked = state
+            .buffers
+            .iter()
+            .enumerate()
+            .any(|(i, b)| b.is_empty() && !state.lib_exhausted[i]);
+        if blocked {
+            break;
+        }
+        let mut best: Option<usize> = None;
+        for (i, buf) in state.buffers.iter().enumerate() {
+            let Some(head) = buf.front() else { continue };
+            let better = match best {
+                None => true,
+                Some(j) => match album_cmp(tab, head, state.buffers[j].front().unwrap()) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => state.lib_emitted[i] < state.lib_emitted[j],
+                },
+            };
+            if better {
+                best = Some(i);
+            }
+        }
+        let Some(i) = best else { break };
+        state.lib_emitted[i] += 1;
+        out.push(state.buffers[i].pop_front().unwrap());
+    }
+    out
 }
 
 pub enum AlbumsEvent {
@@ -26,36 +130,39 @@ pub enum AlbumsEvent {
 
 pub struct AlbumsView {
     session: Entity<Session>,
-    /// Albums for each tab, loaded independently.
-    all_albums: Vec<Album>,
-    new_albums: Vec<Album>,
+    player: Entity<PlayerState>,
+    /// Albums for each filter tab, loaded independently and lazily.
+    tabs: HashMap<AlbumSort, TabState>,
     art_paths: HashMap<String, PathBuf>,
-    active_tab: AlbumTab,
-    loading_all: bool,
-    loading_new: bool,
-    exhausted_all: bool,
-    exhausted_new: bool,
+    active_tab: AlbumSort,
+    /// Resolution thumbnails are currently fetched at; tracked so a cover-size
+    /// change can drop stale art and refetch at the new resolution.
+    art_px: u32,
+    scroll: ScrollHandle,
     error: Option<String>,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
 
 impl AlbumsView {
-    pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<Session>,
+        player: Entity<PlayerState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let active_tab = session.read(cx).settings.album_sort;
+        let art_px = session.read(cx).settings.cover_size.art_px();
         let mut this = Self {
             session,
-            all_albums: Vec::new(),
-            new_albums: Vec::new(),
+            player,
+            tabs: HashMap::new(),
             art_paths: HashMap::new(),
-            active_tab: AlbumTab::All,
-            loading_all: false,
-            loading_new: false,
-            exhausted_all: false,
-            exhausted_new: false,
+            active_tab,
+            art_px,
+            scroll: ScrollHandle::new(),
             error: None,
         };
-        this.load_more_all(cx);
-        this.load_more_new(cx);
+        this.load_more(active_tab, cx);
         this
     }
 
@@ -63,75 +170,93 @@ impl AlbumsView {
         self.session.read(cx).client.clone()
     }
 
-    fn load_more_all(&mut self, cx: &mut Context<Self>) {
-        if self.loading_all || self.exhausted_all {
-            return;
+    fn select_tab(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
+        self.active_tab = tab;
+        if self.tabs.get(&tab).is_none_or(|t| t.albums.is_empty()) {
+            self.load_more(tab, cx);
         }
-        self.load_tab(
-            AlbumListType::AlphabeticalByName,
-            self.all_albums.len() as u32,
-            cx,
-        );
+        self.session.update(cx, |session, _| {
+            session.settings.album_sort = tab;
+            session.persist_settings();
+        });
+        cx.notify();
     }
 
-    fn load_more_new(&mut self, cx: &mut Context<Self>) {
-        if self.loading_new || self.exhausted_new {
-            return;
-        }
-        self.load_tab(AlbumListType::Newest, self.new_albums.len() as u32, cx);
-    }
-
-    fn load_tab(&mut self, list_type: AlbumListType, offset: u32, cx: &mut Context<Self>) {
+    fn load_more(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
-        let library_id = self.session.read(cx).library_id.clone();
-        self.error = None;
-        match list_type {
-            AlbumListType::AlphabeticalByName => self.loading_all = true,
-            AlbumListType::Newest => self.loading_new = true,
-            _ => {}
+        let libraries = self.session.read(cx).library_query_ids();
+        let state = self.tabs.entry(tab).or_default();
+        if state.loading || state.exhausted {
+            return;
         }
+        if state.lib_exhausted.len() != libraries.len() {
+            state.lib_exhausted = vec![false; libraries.len()];
+            state.buffers = vec![VecDeque::new(); libraries.len()];
+            state.lib_emitted = vec![0; libraries.len()];
+        }
+        let offset = state.page * PAGE_SIZE;
+        let pending: Vec<(usize, Option<String>)> = libraries
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !state.lib_exhausted[*i])
+            .collect();
+        state.loading = true;
+        self.error = None;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            // One page per selected library at the same offset, merged in
+            // selection order (the API takes one musicFolderId per request).
             let result = runtime::spawn_io(async move {
-                client
-                    .get_album_list2(list_type, PAGE_SIZE, offset, library_id.as_ref())
-                    .await
-                    .map_err(anyhow::Error::from)
+                let mut batches = Vec::with_capacity(pending.len());
+                for (lib_index, lib) in pending {
+                    let batch = client
+                        .get_album_list2(tab_list_type(tab), PAGE_SIZE, offset, lib.as_ref())
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                    batches.push((lib_index, batch));
+                }
+                Ok::<_, anyhow::Error>(batches)
             })
             .await;
 
             let _ = this.update(cx, |view, cx| {
-                match list_type {
-                    AlbumListType::AlphabeticalByName => {
-                        view.loading_all = false;
-                        match result {
-                            Ok(batch) => {
-                                view.exhausted_all = batch.len() < PAGE_SIZE as usize;
-                                for album in &batch {
-                                    view.fetch_art(album, cx);
-                                }
-                                view.all_albums.extend(batch);
+                let mut new_albums = Vec::new();
+                let state = view.tabs.entry(tab).or_default();
+                state.loading = false;
+                match result {
+                    Ok(batches) => {
+                        state.page += 1;
+                        for (lib_index, batch) in batches {
+                            if batch.len() < PAGE_SIZE as usize
+                                && let Some(flag) = state.lib_exhausted.get_mut(lib_index)
+                            {
+                                *flag = true;
                             }
-                            Err(e) => view.error = Some(format!("{e:#}")),
-                        }
-                    }
-                    AlbumListType::Newest => {
-                        view.loading_new = false;
-                        match result {
-                            Ok(batch) => {
-                                view.exhausted_new = batch.len() < PAGE_SIZE as usize;
-                                for album in &batch {
-                                    view.fetch_art(album, cx);
-                                }
-                                view.new_albums.extend(batch);
+                            if tab == AlbumSort::Random {
+                                // No order to preserve — shuffle the combined
+                                // page below instead of buffering.
+                                new_albums.extend(batch);
+                            } else {
+                                state.buffers[lib_index].extend(batch);
                             }
-                            Err(e) => view.error = Some(format!("{e:#}")),
                         }
+                        if tab == AlbumSort::Random {
+                            use rand::seq::SliceRandom;
+                            new_albums.shuffle(&mut rand::rng());
+                        } else {
+                            new_albums = merge_ready(state, tab);
+                        }
+                        state.exhausted = state.lib_exhausted.iter().all(|&e| e)
+                            && state.buffers.iter().all(|b| b.is_empty());
+                        state.albums.extend(new_albums.iter().cloned());
                     }
-                    _ => {}
+                    Err(e) => view.error = Some(format!("{e:#}")),
+                }
+                for album in &new_albums {
+                    view.fetch_art(album, cx);
                 }
                 cx.notify();
             });
@@ -139,19 +264,72 @@ impl AlbumsView {
         .detach();
     }
 
-    fn fetch_art(&self, album: &Album, cx: &mut Context<Self>) {
-        let Some(cover_id) = album.cover_art.clone() else {
+    /// Load the next page when the grid is scrolled near its bottom.
+    fn maybe_load_more_on_scroll(&mut self, cx: &mut Context<Self>) {
+        let scrolled = -self.scroll.offset().y;
+        let max = self.scroll.max_offset().height;
+        if max - scrolled < px(LOAD_AHEAD_PX) {
+            self.load_more(self.active_tab, cx);
+        }
+    }
+
+    /// Fetch the album's songs and start playing them.
+    fn play_album(&mut self, album_id: String, shuffle: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.client(cx) else {
             return;
         };
+        let player = self.player.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .get_album(&album_id)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            match result {
+                Ok(album) => {
+                    let _ = player.update(cx, |p, cx| {
+                        if shuffle {
+                            p.play_queue_shuffled(album.song, cx);
+                        } else {
+                            p.play_queue(album.song, 0, cx);
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.error = Some(format!("{e:#}"));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn fetch_art(&mut self, album: &Album, cx: &mut Context<Self>) {
         if self.art_paths.contains_key(&album.id) {
             return;
         }
+        let Some(cover_id) = album.cover_art.clone() else {
+            return;
+        };
+        // Synchronous cache hit: show it immediately, no async round-trip.
+        // This is what makes covers appear instantly on app restart instead
+        // of blanking then popping in one task at a time.
+        if let Some(path) = artwork::cached(&cover_id, self.art_px) {
+            self.art_paths.insert(album.id.clone(), path);
+            return;
+        }
+        // Miss: download in the background.
         let Some(client) = self.client(cx) else {
             return;
         };
         let album_id = album.id.clone();
+        let art_px = self.art_px;
         cx.spawn(async move |this, cx| {
-            if let Ok(path) = artwork::fetch(client, cover_id, ART_SIZE).await {
+            if let Ok(path) = artwork::fetch(client, cover_id, art_px).await {
                 let _ = this.update(cx, |view, cx| {
                     view.art_paths.insert(album_id, path);
                     cx.notify();
@@ -161,8 +339,29 @@ impl AlbumsView {
         .detach();
     }
 
-    fn render_card(&self, album: &Album, cx: &Context<Self>) -> impl IntoElement + use<> {
+    /// Drop cached thumbnail paths and refetch the active tab's art at the
+    /// current `art_px` (called when the cover-size setting changes).
+    fn refetch_art(&mut self, cx: &mut Context<Self>) {
+        self.art_paths.clear();
+        let albums: Vec<Album> = self
+            .tabs
+            .get(&self.active_tab)
+            .map(|t| t.albums.clone())
+            .unwrap_or_default();
+        for album in &albums {
+            self.fetch_art(album, cx);
+        }
+    }
+
+    fn render_card(
+        &self,
+        index: usize,
+        album: &Album,
+        tile: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement + use<> {
         let id = album.id.clone();
+        let play_id = album.id.clone();
         let art = self.art_paths.get(&album.id).cloned();
         let name = album.name.clone();
         let artist = album.artist.clone().unwrap_or_default();
@@ -170,7 +369,8 @@ impl AlbumsView {
 
         v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
-            .w(px(172.))
+            .group("acard")
+            .w(px(tile + 12.))
             .p_1p5()
             .gap_1p5()
             .rounded_lg()
@@ -181,14 +381,33 @@ impl AlbumsView {
             }))
             .child(
                 div()
-                    .size(px(160.))
+                    .size(px(tile))
                     .rounded_lg()
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
+                    .relative()
                     .when_some(art, |this, path| {
-                        this.child(img(path).size(px(160.)).rounded_lg())
-                    }),
+                        this.child(img(path).size(px(tile)).rounded_lg())
+                    })
+                    // Hover play button over the artwork.
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_2()
+                            .right_2()
+                            .opacity(0.)
+                            .group_hover("acard", |s| s.opacity(1.))
+                            .child(
+                                Button::new(("card-play", index))
+                                    .primary()
+                                    .icon(app_icon(icons::PLAY))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.play_album(play_id.clone(), false, cx);
+                                        cx.stop_propagation();
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 v_flex()
@@ -215,49 +434,56 @@ impl AlbumsView {
 
 impl Render for AlbumsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab = self.active_tab;
+        let active = self.active_tab;
 
-        let tab_btn = |label: &'static str, t: AlbumTab| {
-            let active = tab == t;
-            Button::new(label)
+        // Pick up cover-size changes: refetch art at the new resolution.
+        let cover = self.session.read(cx).settings.cover_size;
+        let tile = cover.px();
+        if cover.art_px() != self.art_px {
+            self.art_px = cover.art_px();
+            self.refetch_art(cx);
+        }
+
+        let tabs = h_flex().gap_1().children(TABS.iter().map(|&tab| {
+            Button::new(tab_label(tab))
                 .ghost()
                 .xsmall()
-                .label(label)
-                .when(active, |b: Button| b.primary())
-        };
+                .label(tab_label(tab))
+                .when(active == tab, |b: Button| b.primary())
+                .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
+        }));
 
-        let tabs = h_flex()
-            .gap_1()
-            .child(
-                tab_btn("All", AlbumTab::All).on_click(cx.listener(|this, _, _, cx| {
-                    this.active_tab = AlbumTab::All;
-                    cx.notify();
-                })),
-            )
-            .child(
-                tab_btn("New", AlbumTab::New).on_click(cx.listener(|this, _, _, cx| {
-                    this.active_tab = AlbumTab::New;
-                    if this.new_albums.is_empty() {
-                        this.load_more_new(cx);
-                    }
-                    cx.notify();
-                })),
-            );
+        // If the loaded content doesn't fill the viewport (no scrollbar yet),
+        // keep fetching until it does or the list is exhausted.
+        let needs_fill = self
+            .tabs
+            .get(&active)
+            .is_some_and(|t| !t.loading && !t.exhausted && !t.albums.is_empty())
+            && self.scroll.max_offset().height <= px(0.);
+        if needs_fill {
+            self.load_more(active, cx);
+        }
 
-        let (albums, loading, exhausted) = match tab {
-            AlbumTab::All => (&self.all_albums, self.loading_all, self.exhausted_all),
-            AlbumTab::New => (&self.new_albums, self.loading_new, self.exhausted_new),
-        };
+        let (albums, loading) = self
+            .tabs
+            .get(&active)
+            .map(|t| (&t.albums[..], t.loading))
+            .unwrap_or((&[], false));
 
         let cards: Vec<_> = albums
             .iter()
-            .map(|album| self.render_card(album, cx).into_any_element())
+            .enumerate()
+            .map(|(i, album)| self.render_card(i, album, tile, cx).into_any_element())
             .collect();
 
         v_flex()
             .id("albums-scroll")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.maybe_load_more_on_scroll(cx);
+            }))
             .p_4()
             .gap_3()
             .child(
@@ -271,17 +497,14 @@ impl Render for AlbumsView {
                 this.child(div().text_color(cx.theme().danger).text_sm().child(e))
             })
             .child(h_flex().flex_wrap().gap_4().children(cards))
-            .when(!exhausted, |this| {
+            // Loading indicator while the next page streams in.
+            .when(loading, |this| {
                 this.child(
-                    h_flex().justify_center().child(
-                        Button::new("load-more")
-                            .ghost()
-                            .label("Load more")
-                            .loading(loading)
-                            .on_click(cx.listener(|view, _, _, cx| match view.active_tab {
-                                AlbumTab::All => view.load_more_all(cx),
-                                AlbumTab::New => view.load_more_new(cx),
-                            })),
+                    h_flex().justify_center().py_2().child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Loading…"),
                     ),
                 )
             })

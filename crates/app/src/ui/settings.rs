@@ -2,11 +2,10 @@
 
 use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputState};
 use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
 
-use crate::config::{SpotifyApiConfig, ThemePref};
+use crate::config::{CoverSize, DefaultPage, ThemePref};
 use crate::services::artwork;
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
@@ -25,41 +24,34 @@ const BITRATES: &[(&str, Option<u32>)] = &[
     ("320k", Some(320)),
 ];
 const CACHE_SIZES_MB: &[u32] = &[64, 128, 256, 512, 1024];
+const PAGES: &[(&str, DefaultPage)] = &[
+    ("Albums", DefaultPage::Albums),
+    ("Artists", DefaultPage::Artists),
+    ("Favorites", DefaultPage::Favorites),
+    ("Recent", DefaultPage::Recent),
+    ("Radio", DefaultPage::Radio),
+];
+const COVER_SIZES: &[(&str, CoverSize)] = &[
+    ("Small", CoverSize::Small),
+    ("Medium", CoverSize::Medium),
+    ("Large", CoverSize::Large),
+    ("Extra large", CoverSize::ExtraLarge),
+];
 
 pub struct SettingsView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
-    spotify_client_id: Entity<InputState>,
-    spotify_client_secret: Entity<InputState>,
 }
 
 impl SettingsView {
     pub fn new(
         session: Entity<Session>,
         player: Entity<PlayerState>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
-        let spotify_client_id = cx.new(|cx| InputState::new(window, cx));
-        let spotify_client_secret = cx.new(|cx| InputState::new(window, cx).masked(true));
-        let this = Self {
-            session: session.clone(),
-            player,
-            spotify_client_id: spotify_client_id.clone(),
-            spotify_client_secret: spotify_client_secret.clone(),
-        };
-        let initial_id = session.read(cx).settings.spotify.client_id.clone();
-        let initial_secret = session.read(cx).settings.spotify.client_secret.clone();
-        if let Some(value) = initial_id {
-            spotify_client_id.update(cx, |input, cx| input.set_value(value, window, cx));
-        }
-        if let Some(value) = initial_secret {
-            spotify_client_secret.update(cx, |input, cx| {
-                input.set_value(value, window, cx)
-            });
-        }
-        this
+        Self { session, player }
     }
 
     fn persist(&self, cx: &Context<Self>) {
@@ -96,14 +88,16 @@ impl SettingsView {
     }
 
     fn set_client_titlebar(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.client_titlebar = enabled);
+        self.session
+            .update(cx, |s, _| s.settings.client_titlebar = enabled);
         self.persist(cx);
         apply_window_chrome(enabled, window, cx);
         cx.notify();
     }
 
     fn set_scrobble(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.scrobble_enabled = enabled);
+        self.session
+            .update(cx, |s, _| s.settings.scrobble_enabled = enabled);
         self.player
             .update(cx, |p, cx| p.set_scrobble_enabled(enabled, cx));
         self.persist(cx);
@@ -111,7 +105,8 @@ impl SettingsView {
     }
 
     fn set_default_shuffle(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.default_shuffle = enabled);
+        self.session
+            .update(cx, |s, _| s.settings.default_shuffle = enabled);
         let scrobble = self.session.read(cx).settings.scrobble_enabled;
         self.player.update(cx, |p, cx| {
             p.apply_playback_settings(scrobble, enabled, p.queue.repeat, cx);
@@ -121,7 +116,8 @@ impl SettingsView {
     }
 
     fn set_default_repeat(&mut self, mode: RepeatMode, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.default_repeat = mode);
+        self.session
+            .update(cx, |s, _| s.settings.default_repeat = mode);
         let scrobble = self.session.read(cx).settings.scrobble_enabled;
         let shuffle = self.session.read(cx).settings.default_shuffle;
         self.player.update(cx, |p, cx| {
@@ -132,21 +128,41 @@ impl SettingsView {
     }
 
     fn set_cache_cap(&mut self, mb: u32, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.artwork_cache_mb = mb);
+        self.session
+            .update(cx, |s, _| s.settings.artwork_cache_mb = mb);
         artwork::set_cache_cap_mb(mb);
         self.persist(cx);
         cx.notify();
     }
 
-    fn set_spotify_config(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        let client_id = self.spotify_client_id.read(cx).value().trim().to_string();
-        let client_secret = self.spotify_client_secret.read(cx).value().to_string();
+    fn set_default_page(&mut self, page: DefaultPage, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.default_page = page);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_cover_size(&mut self, size: CoverSize, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| s.settings.cover_size = size);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_waveform(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.waveform_seekbar = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn toggle_track_info(
+        &mut self,
+        toggle: fn(&mut crate::config::TrackInfo) -> &mut bool,
+        cx: &mut Context<Self>,
+    ) {
         self.session.update(cx, |s, _| {
-            s.settings.spotify = SpotifyApiConfig {
-                enabled,
-                client_id: (!client_id.is_empty()).then_some(client_id),
-                client_secret: (!client_secret.is_empty()).then_some(client_secret),
-            };
+            let flag = toggle(&mut s.settings.track_info);
+            *flag = !*flag;
         });
         self.persist(cx);
         cx.notify();
@@ -169,7 +185,6 @@ impl Render for SettingsView {
             default_shuffle,
             default_repeat,
             artwork_cache_mb,
-            spotify_config,
             account,
         ) = {
             let s = &self.session.read(cx).settings;
@@ -182,12 +197,30 @@ impl Render for SettingsView {
                 s.default_shuffle,
                 s.default_repeat,
                 s.artwork_cache_mb,
-                s.spotify.clone(),
                 s.server
                     .as_ref()
                     .map(|srv| (srv.url.clone(), srv.username.clone())),
             )
         };
+        let (default_page, cover_size, track_info, waveform) = {
+            let s = &self.session.read(cx).settings;
+            (
+                s.default_page,
+                s.cover_size,
+                s.track_info.clone(),
+                s.waveform_seekbar,
+            )
+        };
+
+        type InfoField = fn(&mut crate::config::TrackInfo) -> &mut bool;
+        let info_fields: &[(&'static str, bool, InfoField)] = &[
+            ("Artist", track_info.artist, |t| &mut t.artist),
+            ("Album", track_info.album, |t| &mut t.album),
+            ("Year", track_info.year, |t| &mut t.year),
+            ("Genre", track_info.genre, |t| &mut t.genre),
+            ("Bitrate", track_info.bitrate, |t| &mut t.bitrate),
+            ("Play count", track_info.plays, |t| &mut t.plays),
+        ];
 
         let theme_btn = |label: &'static str, pref: ThemePref, active: bool| {
             Button::new(label)
@@ -327,6 +360,24 @@ impl Render for SettingsView {
                                             .on_click(cx.listener(|this, &checked, _, cx| {
                                                 this.set_default_shuffle(checked, cx);
                                             })),
+                                    )
+                                    .child(
+                                        Switch::new("waveform-seekbar")
+                                            .checked(waveform)
+                                            .label("Waveform progress bar")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_waveform(checked, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                "The waveform seek bar downloads each track a \
+                                                 second time to decode it, so it uses extra \
+                                                 bandwidth.",
+                                            ),
                                     ),
                             )
                             .child(
@@ -357,6 +408,86 @@ impl Render for SettingsView {
                                                 default_repeat == RepeatMode::One,
                                             )),
                                     ),
+                            ),
+                    )
+                    // Browsing
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .p_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().sidebar)
+                            .child(div().text_sm().font_medium().child("Browsing"))
+                            .child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("Open at startup"),
+                                    )
+                                    .child(h_flex().gap_2().flex_wrap().children(
+                                        PAGES.iter().map(|&(label, page)| {
+                                            Button::new(label)
+                                                .label(label)
+                                                .when(default_page == page, |b| b.primary())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.set_default_page(page, cx)
+                                                }))
+                                                .into_any_element()
+                                        }),
+                                    )),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                "Album cover size — albums per row adapt to the \
+                                                 window width.",
+                                            ),
+                                    )
+                                    .child(h_flex().gap_2().flex_wrap().children(
+                                        COVER_SIZES.iter().map(|&(label, size)| {
+                                            Button::new(label)
+                                                .label(label)
+                                                .when(cover_size == size, |b| b.primary())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.set_cover_size(size, cx)
+                                                }))
+                                                .into_any_element()
+                                        }),
+                                    )),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                "Track info shown next to song titles in album \
+                                                 and playlist views.",
+                                            ),
+                                    )
+                                    .child(h_flex().gap_2().flex_wrap().children(
+                                        info_fields.iter().map(|&(label, active, field)| {
+                                            Button::new(label)
+                                                .label(label)
+                                                .when(active, |b| b.primary())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_track_info(field, cx)
+                                                }))
+                                                .into_any_element()
+                                        }),
+                                    )),
                             ),
                     )
                     // Streaming
@@ -401,10 +532,12 @@ impl Render for SettingsView {
                                             .text_color(cx.theme().muted_foreground)
                                             .child("Max bitrate"),
                                     )
-                                    .child(h_flex().gap_2().children(BITRATES.iter().map(|item| {
-                                        let active = bitrate == item.1;
-                                        bitrate_btn(item, active).into_any_element()
-                                    }))),
+                                    .child(h_flex().gap_2().children(BITRATES.iter().map(
+                                        |item| {
+                                            let active = bitrate == item.1;
+                                            bitrate_btn(item, active).into_any_element()
+                                        },
+                                    ))),
                             ),
                     )
                     // Storage
@@ -426,64 +559,11 @@ impl Render for SettingsView {
                                             .text_color(cx.theme().muted_foreground)
                                             .child("Artwork cache limit"),
                                     )
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .flex_wrap()
-                                            .children(CACHE_SIZES_MB.iter().map(|&mb| {
-                                                cache_btn(mb, artwork_cache_mb == mb)
-                                                    .into_any_element()
-                                            })),
-                                    ),
-                            ),
-                    )
-                    // Spotify
-                    .child(
-                        v_flex()
-                            .gap_3()
-                            .p_4()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().sidebar)
-                            .child(div().text_sm().font_medium().child("Spotify API"))
-                            .child(
-                                Switch::new("spotify-enabled")
-                                    .checked(spotify_config.enabled)
-                                    .label("Enable Spotify artist enrichment")
-                                    .on_click(cx.listener(|this, &checked, _, cx| {
-                                        this.set_spotify_config(checked, cx);
-                                    })),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Client ID"),
-                                    )
-                                    .child(div().w_full().child(Input::new(&self.spotify_client_id))),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Client secret"),
-                                    )
-                                    .child(div().w_full().child(Input::new(&self.spotify_client_secret))),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "Store credentials here to enrich artist pages with Spotify metadata.",
-                                    ),
+                                    .child(h_flex().gap_2().flex_wrap().children(
+                                        CACHE_SIZES_MB.iter().map(|&mb| {
+                                            cache_btn(mb, artwork_cache_mb == mb).into_any_element()
+                                        }),
+                                    )),
                             ),
                     )
                     // Account
@@ -504,7 +584,9 @@ impl Render for SettingsView {
                                             v_flex()
                                                 .gap_1()
                                                 .min_w_0()
-                                                .child(div().text_sm().font_medium().child("Account"))
+                                                .child(
+                                                    div().text_sm().font_medium().child("Account"),
+                                                )
                                                 .child(div().text_sm().child(user))
                                                 .child(
                                                     div()

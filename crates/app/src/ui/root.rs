@@ -2,16 +2,17 @@
 //! (sidebar | content | optional queue panel / player bar).
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render, Window, div,
-    prelude::*,
+    Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
+    NavigationDirection, Render, Window, div, prelude::*, px,
 };
 use gpui_component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
 
+use crate::config::DefaultPage;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::radio::RadioState;
 use crate::state::session::{ConnectionStatus, Session};
-use crate::ui::album_detail::AlbumDetailView;
+use crate::ui::album_detail::{AlbumDetailEvent, AlbumDetailView};
 use crate::ui::albums::{AlbumsEvent, AlbumsView};
 use crate::ui::artists::{ArtistDetailEvent, ArtistDetailView, ArtistsEvent, ArtistsView};
 use crate::ui::favorites::{FavoritesEvent, FavoritesView};
@@ -22,7 +23,7 @@ use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
 use crate::ui::queue_panel::QueuePanel;
 use crate::ui::radio::RadioView;
 use crate::ui::recent::RecentView;
-use crate::ui::search::{SearchEvent, SearchView};
+use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 use crate::ui::settings::SettingsView;
 use crate::ui::sidebar::{NavSection, SidebarAction, SidebarModel, render_sidebar};
 
@@ -40,7 +41,6 @@ enum Content {
     ArtistDetail(Entity<ArtistDetailView>),
     AlbumDetail(Entity<AlbumDetailView>),
     Favorites(Entity<FavoritesView>),
-    Search(Entity<SearchView>),
     Playlist(Entity<PlaylistDetailView>),
     Radio(Entity<RadioView>),
     Settings(Entity<SettingsView>),
@@ -56,6 +56,7 @@ pub struct RootView {
     player_bar: Entity<PlayerBar>,
     queue_panel: Entity<QueuePanel>,
     fullscreen: Entity<FullscreenPlayer>,
+    search_bar: Entity<SearchBar>,
     content: Option<Content>,
     section: Option<NavSection>,
     active_playlist: Option<String>,
@@ -66,8 +67,10 @@ pub struct RootView {
     show_queue: bool,
     show_fullscreen: bool,
     was_connected: bool,
-    /// Selected library at last render, to rebuild views on change.
-    last_library: Option<String>,
+    /// Library selection at last render, to rebuild views on change.
+    last_libraries: Vec<String>,
+    /// Sidebar library switcher folded away.
+    libraries_collapsed: bool,
     focus_handle: FocusHandle,
 }
 
@@ -84,6 +87,13 @@ impl RootView {
         let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), cx));
         let radio = crate::state::radio::init(session.clone(), cx);
         let fullscreen = cx.new(|cx| FullscreenPlayer::new(player.clone(), session.clone(), cx));
+        let search_bar = cx.new(|cx| SearchBar::new(session.clone(), player.clone(), window, cx));
+
+        cx.subscribe(&search_bar, |this: &mut Self, _, event, cx| match event {
+            SearchBarEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
+            SearchBarEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+        })
+        .detach();
 
         cx.subscribe(&player_bar, |this: &mut Self, _, event, cx| {
             match event {
@@ -110,19 +120,26 @@ impl RootView {
         // content views and keep the player's API client fresh.
         cx.observe(&session, |this: &mut Self, session, cx| {
             let connected = session.read(cx).status == ConnectionStatus::Connected;
-            let library = session.read(cx).library_id.clone();
+            let libraries = session.read(cx).library_ids.clone();
             if connected != this.was_connected {
                 this.was_connected = connected;
                 let client = session.read(cx).client.clone();
                 this.player.update(cx, |p, _| p.set_client(client));
                 this.content = None;
                 if connected {
-                    this.last_library = library;
-                    this.navigate(NavSection::Albums, None, cx);
+                    this.last_libraries = libraries;
+                    let start = match session.read(cx).settings.default_page {
+                        DefaultPage::Albums => NavSection::Albums,
+                        DefaultPage::Artists => NavSection::Artists,
+                        DefaultPage::Favorites => NavSection::Favorites,
+                        DefaultPage::Recent => NavSection::Recent,
+                        DefaultPage::Radio => NavSection::Radio,
+                    };
+                    this.navigate(start, None, cx);
                 }
-            } else if connected && library != this.last_library {
-                // Library changed: rebuild the current catalog view.
-                this.last_library = library;
+            } else if connected && libraries != this.last_libraries {
+                // Library selection changed: rebuild the current catalog view.
+                this.last_libraries = libraries;
                 if let Some(section) = this.section {
                     this.navigate(section, None, cx);
                 }
@@ -140,6 +157,7 @@ impl RootView {
             player_bar,
             queue_panel,
             fullscreen,
+            search_bar,
             content: None,
             section: None,
             active_playlist: None,
@@ -150,7 +168,8 @@ impl RootView {
             show_queue: false,
             show_fullscreen: false,
             was_connected: false,
-            last_library: None,
+            last_libraries: Vec::new(),
+            libraries_collapsed: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -166,7 +185,8 @@ impl RootView {
         self.active_playlist = None;
         self.content = Some(match section {
             NavSection::Albums => {
-                let view = cx.new(|cx| AlbumsView::new(self.session.clone(), cx));
+                let view =
+                    cx.new(|cx| AlbumsView::new(self.session.clone(), self.player.clone(), cx));
                 cx.subscribe(&view, |this: &mut Self, _, event, cx| {
                     let AlbumsEvent::OpenAlbum(id) = event;
                     this.open_album(id.clone(), cx);
@@ -192,20 +212,6 @@ impl RootView {
                 })
                 .detach();
                 Content::Favorites(view)
-            }
-            NavSection::Search => {
-                let Some(window) = window else {
-                    return; // search needs a window for input focus
-                };
-                let view = cx.new(|cx| {
-                    SearchView::new(self.session.clone(), self.player.clone(), window, cx)
-                });
-                cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
-                    SearchEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
-                    SearchEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
-                })
-                .detach();
-                Content::Search(view)
             }
             NavSection::Recent => Content::Recent(
                 cx.new(|cx| RecentView::new(self.player.clone(), self.session.clone(), cx)),
@@ -290,6 +296,11 @@ impl RootView {
                 cx,
             )
         });
+        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+            let AlbumDetailEvent::OpenArtist(id) = event;
+            this.open_artist(id.clone(), cx);
+        })
+        .detach();
         self.content = Some(Content::AlbumDetail(view));
         cx.notify();
     }
@@ -359,7 +370,7 @@ impl Render for RootView {
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Navidrome"),
+                                .child("Scirè"),
                         ),
                     )
                 })
@@ -373,7 +384,6 @@ impl Render for RootView {
             Some(Content::ArtistDetail(v)) => v.clone().into_any_element(),
             Some(Content::AlbumDetail(v)) => v.clone().into_any_element(),
             Some(Content::Favorites(v)) => v.clone().into_any_element(),
-            Some(Content::Search(v)) => v.clone().into_any_element(),
             Some(Content::Playlist(v)) => v.clone().into_any_element(),
             Some(Content::Radio(v)) => v.clone().into_any_element(),
             Some(Content::Settings(v)) => v.clone().into_any_element(),
@@ -398,7 +408,8 @@ impl Render for RootView {
                 .iter()
                 .map(|f| (f.id(), f.name.clone().unwrap_or_else(|| f.id())))
                 .collect(),
-            active_library: self.session.read(cx).library_id.clone(),
+            selected_libraries: self.session.read(cx).library_ids.clone(),
+            libraries_collapsed: self.libraries_collapsed,
         };
 
         let this = cx.entity();
@@ -413,6 +424,15 @@ impl Render for RootView {
             .text_color(cx.theme().foreground)
             // Keyboard navigation: track focus so on_key_down fires.
             .track_focus(&self.focus_handle)
+            // Mouse back/forward buttons mirror the [ and ] history keys.
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, window, cx| this.nav_back(window, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, window, cx| this.nav_forward(window, cx)),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let focused = window.focused(cx);
                 let is_text_input = focused.is_some_and(|focus| focus != this.focus_handle);
@@ -446,7 +466,14 @@ impl Render for RootView {
                             this.show_fullscreen = false;
                             cx.notify();
                             cx.stop_propagation();
+                        } else if this.search_bar.read(cx).is_open() {
+                            this.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
+                            cx.stop_propagation();
                         }
+                    }
+                    "/" if !is_text_input => {
+                        this.search_bar.update(cx, |sb, cx| sb.focus(window, cx));
+                        cx.stop_propagation();
                     }
                     "[" => {
                         this.nav_back(window, cx);
@@ -465,7 +492,7 @@ impl Render for RootView {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Navidrome"),
+                            .child("Scirè"),
                     ),
                 )
             })
@@ -488,14 +515,37 @@ impl Render for RootView {
                                         p.create("New Playlist".into(), Vec::new(), cx);
                                     });
                                 }
-                                SidebarAction::SetLibrary(id) => {
-                                    root.session.update(cx, |s, cx| s.set_library(id, cx));
+                                SidebarAction::ToggleLibrary(id) => {
+                                    root.session.update(cx, |s, cx| s.toggle_library(id, cx));
+                                }
+                                SidebarAction::AllLibraries => {
+                                    root.session.update(cx, |s, cx| s.select_all_libraries(cx));
+                                }
+                                SidebarAction::ToggleLibrarySection => {
+                                    root.libraries_collapsed = !root.libraries_collapsed;
+                                    cx.notify();
                                 }
                             });
                         },
                         cx,
                     ))
-                    .child(div().flex_1().min_w_0().h_full().child(content))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(content)
+                            // Global search, overlaid top right so it sits on
+                            // the same row as each page's filter tabs.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(14.))
+                                    .right(px(16.))
+                                    .child(self.search_bar.clone()),
+                            ),
+                    )
                     .when(self.show_queue, |this| this.child(self.queue_panel.clone())),
             )
             .child(self.player_bar.clone())

@@ -63,6 +63,11 @@ impl RecentView {
             .collect();
 
         for cover_id in covers {
+            // Synchronous cache hit: render instantly on restart, no task.
+            if let Some(path) = artwork::cached(&cover_id, ART_SIZE) {
+                self.art_paths.insert(cover_id, path);
+                continue;
+            }
             self.fetching.insert(cover_id.clone());
             let client = client.clone();
             let cid = cover_id.clone();

@@ -17,8 +17,8 @@ impl MediaKeys {
     /// Create OS media controls and forward key presses to `tx`.
     pub fn new(tx: mpsc::UnboundedSender<MediaControlEvent>) -> Self {
         let config = PlatformConfig {
-            display_name: "Navidrome Rusty Client",
-            dbus_name: "navidrome_rusty_client",
+            display_name: "Scirè",
+            dbus_name: "scire",
             // Windows needs a window handle; macOS/Linux ignore it.
             hwnd: None,
         };

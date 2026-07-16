@@ -8,6 +8,7 @@
 
 mod engine;
 mod source;
+pub mod waveform;
 
 use std::time::Duration;
 

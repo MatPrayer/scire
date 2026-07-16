@@ -3,19 +3,24 @@
 
 use std::path::PathBuf;
 
-use gpui::{Context, Entity, IntoElement, Render, Window, div, img, prelude::*, px};
+use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::popover::Popover;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use subsonic::{AlbumWithSongs, AnnotationTarget, Song, SubsonicClient};
 
+use crate::assets::{app_icon, icons};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
-use crate::ui::format_duration;
+use crate::ui::{format_duration, track_extras};
 
 const ART_SIZE: u32 = 600;
+
+pub enum AlbumDetailEvent {
+    OpenArtist(String),
+}
 
 pub struct AlbumDetailView {
     session: Entity<Session>,
@@ -28,6 +33,8 @@ pub struct AlbumDetailView {
     /// Transient status line (e.g. "share link copied").
     notice: Option<String>,
 }
+
+impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
 
 impl AlbumDetailView {
     pub fn new(
@@ -142,6 +149,14 @@ impl AlbumDetailView {
         });
     }
 
+    fn play_shuffled(&mut self, cx: &mut Context<Self>) {
+        let Some(album) = &self.album else { return };
+        let songs = album.song.clone();
+        self.player.update(cx, |player, cx| {
+            player.play_queue_shuffled(songs, cx);
+        });
+    }
+
     /// Toggle star on the album (optimistic local update).
     fn toggle_album_star(&mut self, cx: &mut Context<Self>) {
         let Some(album) = &mut self.album else { return };
@@ -246,7 +261,7 @@ impl AlbumDetailView {
                 Button::new(("addpl-btn", index))
                     .ghost()
                     .xsmall()
-                    .label("⊕"),
+                    .icon(app_icon(icons::LIST_PLUS)),
             )
             .content(move |state, _window, cx| {
                 let entries: Vec<(String, String)> = playlists
@@ -302,100 +317,141 @@ impl Render for AlbumDetailView {
             .map(|a| (a.album.starred.is_some(), a.album.user_rating.unwrap_or(0)))
             .unwrap_or((false, 0));
 
-        let header =
-            {
-                let (name, artist, meta) = match &self.album {
-                    Some(a) => {
-                        let songs = a.album.song_count.unwrap_or(a.song.len() as u32);
-                        let dur = a
-                            .album
-                            .duration
-                            .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
-                            .unwrap_or_default();
-                        let year = a.album.year.map(|y| format!("{y} · ")).unwrap_or_default();
-                        (
-                            a.album.name.clone(),
-                            a.album.artist.clone().unwrap_or_default(),
-                            format!("{year}{songs} tracks · {dur}"),
-                        )
-                    }
-                    None => ("…".into(), String::new(), String::new()),
-                };
-
-                let rating_stars = h_flex().gap_0p5().children((1..=5u8).map(|r| {
-                    div()
-                        .id(("rate", r as usize))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| this.rate_album(r, cx)))
-                        .child(
-                            Icon::new(if r <= album_rating {
-                                IconName::Star
-                            } else {
-                                IconName::StarOff
-                            })
-                            .small()
-                            .text_color(if r <= album_rating {
-                                cx.theme().accent
-                            } else {
-                                cx.theme().muted_foreground
-                            }),
-                        )
-                }));
-
-                h_flex()
-                    .gap_4()
-                    .items_end()
-                    .child(
-                        div()
-                            .size(px(180.))
-                            .rounded_md()
-                            .bg(cx.theme().muted)
-                            .overflow_hidden()
-                            .when_some(self.art_path.clone(), |this, path| {
-                                this.child(img(path).size(px(180.)).rounded_md())
-                            }),
+        let header = {
+            let (name, artist, artist_id, meta) = match &self.album {
+                Some(a) => {
+                    let songs = a.album.song_count.unwrap_or(a.song.len() as u32);
+                    let dur = a
+                        .album
+                        .duration
+                        .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
+                        .unwrap_or_default();
+                    let year = a.album.year.map(|y| format!("{y} · ")).unwrap_or_default();
+                    (
+                        a.album.name.clone(),
+                        a.album.artist.clone().unwrap_or_default(),
+                        a.album.artist_id.clone(),
+                        format!("{year}{songs} tracks · {dur}"),
                     )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(div().text_xl().child(name))
-                                    .child(
-                                        Button::new("album-star")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(Icon::new(if album_starred {
-                                                IconName::Star
-                                            } else {
-                                                IconName::StarOff
-                                            }))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_album_star(cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("album-share")
-                                            .ghost()
-                                            .xsmall()
-                                            .label("Share")
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.share_album(cx)),
-                                            ),
-                                    ),
-                            )
-                            .child(div().child(artist))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(meta),
-                            )
-                            .child(rating_stars),
-                    )
+                }
+                None => ("…".into(), String::new(), None, String::new()),
             };
+            let has_songs = self.album.as_ref().is_some_and(|a| !a.song.is_empty());
+
+            let rating_stars = h_flex().gap_0p5().children((1..=5u8).map(|r| {
+                div()
+                    .id(("rate", r as usize))
+                    .cursor_pointer()
+                    .text_color(if r <= album_rating {
+                        cx.theme().accent
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.rate_album(r, cx)))
+                    .child(app_icon(if r <= album_rating {
+                        icons::STAR_FILLED
+                    } else {
+                        icons::STAR_OUTLINE
+                    }))
+            }));
+
+            h_flex()
+                .gap_4()
+                .items_end()
+                .child(
+                    div()
+                        .size(px(180.))
+                        .rounded_md()
+                        .bg(cx.theme().muted)
+                        .overflow_hidden()
+                        .when_some(self.art_path.clone(), |this, path| {
+                            this.child(img(path).size(px(180.)).rounded_md())
+                        }),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().text_xl().child(name))
+                                .child(
+                                    Button::new("album-star")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(app_icon(if album_starred {
+                                            icons::STAR_FILLED
+                                        } else {
+                                            icons::STAR_OUTLINE
+                                        }))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.toggle_album_star(cx)
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("album-share")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Share")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.share_album(cx)),
+                                        ),
+                                ),
+                        )
+                        .child(match artist_id {
+                            // Artist name links to the artist page.
+                            Some(id) => div()
+                                .id("album-artist")
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(cx.theme().accent))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(AlbumDetailEvent::OpenArtist(id.clone()));
+                                }))
+                                .child(artist)
+                                .into_any_element(),
+                            None => div().child(artist).into_any_element(),
+                        })
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(meta),
+                        )
+                        .child(rating_stars)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .mt_1()
+                                .child(
+                                    Button::new("album-play")
+                                        .primary()
+                                        .xsmall()
+                                        .icon(app_icon(icons::PLAY))
+                                        .label("Play")
+                                        .disabled(!has_songs)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.play_from(0, cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("album-shuffle")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(app_icon(icons::SHUFFLE))
+                                        .label("Shuffle")
+                                        .disabled(!has_songs)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.play_shuffled(cx)),
+                                        ),
+                                ),
+                        ),
+                )
+        };
+
+        let info_prefs = self.session.read(cx).settings.track_info.clone();
 
         let rows: Vec<_> = self
             .album
@@ -407,9 +463,15 @@ impl Render for AlbumDetailView {
                 let is_playing = playing_id.as_deref() == Some(song.id.as_str());
                 let starred = song.starred.is_some();
                 let track_no = song.track.map(|t| t.to_string()).unwrap_or_default();
+                let extras = track_extras(song, &info_prefs, false);
                 let dur = song
                     .duration
                     .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
+                    .unwrap_or_default();
+                let plays = song
+                    .play_count
+                    .filter(|&p| p > 0)
+                    .map(|p| p.to_string())
                     .unwrap_or_default();
                 let song_next = song.clone();
                 let song_enq = song.clone();
@@ -423,10 +485,12 @@ impl Render for AlbumDetailView {
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().muted))
                     .when(is_playing, |s| {
+                        // `primary` is the vivid theme colour; `accent` is a
+                        // background tint with poor text contrast.
                         s.bg(cx.theme().muted)
                             .border_l_2()
-                            .border_color(cx.theme().accent)
-                            .text_color(cx.theme().accent)
+                            .border_color(cx.theme().primary)
+                            .text_color(cx.theme().primary)
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -443,6 +507,16 @@ impl Render for AlbumDetailView {
                             .truncate()
                             .child(song.title.clone()),
                     )
+                    .when(!extras.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .max_w(px(320.))
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .truncate()
+                                .child(extras),
+                        )
+                    })
                     // Hover actions: play-next, enqueue, star, add-to-playlist.
                     .child(
                         h_flex()
@@ -453,7 +527,7 @@ impl Render for AlbumDetailView {
                                 Button::new(("t-next", i))
                                     .ghost()
                                     .xsmall()
-                                    .label("⏵+")
+                                    .icon(app_icon(icons::SKIP_FORWARD))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.player.update(cx, |p, cx| {
                                             p.play_next(vec![song_next.clone()], cx)
@@ -477,10 +551,10 @@ impl Render for AlbumDetailView {
                                 Button::new(("t-star", i))
                                     .ghost()
                                     .xsmall()
-                                    .icon(Icon::new(if starred {
-                                        IconName::Star
+                                    .icon(app_icon(if starred {
+                                        icons::STAR_FILLED
                                     } else {
-                                        IconName::StarOff
+                                        icons::STAR_OUTLINE
                                     }))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_song_star(i, cx);
@@ -489,8 +563,23 @@ impl Render for AlbumDetailView {
                             )
                             .child(self.playlist_popover(i, song, cx)),
                     )
+                    // Play count and duration: fixed right-aligned columns,
+                    // same text size, extra margin between them.
                     .child(
-                        div()
+                        h_flex()
+                            .w(px(40.))
+                            .flex_none()
+                            .justify_end()
+                            .mr_3()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(plays),
+                    )
+                    .child(
+                        h_flex()
+                            .w(px(44.))
+                            .flex_none()
+                            .justify_end()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(dur),

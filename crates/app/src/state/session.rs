@@ -18,8 +18,8 @@ pub struct Session {
     pub settings: Settings,
     pub client: Option<SubsonicClient>,
     pub status: ConnectionStatus,
-    /// Selected library id; None = all libraries.
-    pub library_id: Option<String>,
+    /// Selected library ids; empty = all libraries.
+    pub library_ids: Vec<String>,
     /// Libraries the user can access (from getMusicFolders). The switcher only
     /// shows when there is more than one.
     pub music_folders: Vec<MusicFolder>,
@@ -32,12 +32,12 @@ impl Session {
             tracing::warn!("failed to load settings: {e:#}");
             Settings::default()
         });
-        let library_id = settings.library_id.clone();
+        let library_ids = settings.library_ids.clone();
         let mut this = Self {
             settings,
             client: None,
             status: ConnectionStatus::Disconnected,
-            library_id,
+            library_ids,
             music_folders: Vec::new(),
         };
         if let Some(server) = this.settings.server.clone() {
@@ -151,13 +151,11 @@ impl Session {
             .await;
             let _ = this.update(cx, |session, cx| {
                 if let Ok(folders) = result {
-                    // Drop a stale selection that the server no longer offers.
-                    if let Some(sel) = &session.library_id
-                        && !folders.iter().any(|f| &f.id() == sel)
-                    {
-                        session.library_id = None;
-                        session.settings.library_id = None;
-                    }
+                    // Drop stale selections that the server no longer offers.
+                    session
+                        .library_ids
+                        .retain(|sel| folders.iter().any(|f| &f.id() == sel));
+                    session.settings.library_ids = session.library_ids.clone();
                     session.music_folders = folders;
                     cx.notify();
                 }
@@ -166,15 +164,42 @@ impl Session {
         .detach();
     }
 
-    /// Select a library (None = all). Persisted; observers reload their views.
-    pub fn set_library(&mut self, library_id: Option<String>, cx: &mut Context<Self>) {
-        if self.library_id == library_id {
-            return;
+    /// Toggle one library in the selection. Persisted; observers reload
+    /// their views. Selecting every library collapses to "all" (empty).
+    pub fn toggle_library(&mut self, library_id: String, cx: &mut Context<Self>) {
+        if let Some(pos) = self.library_ids.iter().position(|id| *id == library_id) {
+            self.library_ids.remove(pos);
+        } else {
+            self.library_ids.push(library_id);
+            if self.library_ids.len() == self.music_folders.len() {
+                self.library_ids.clear();
+            }
         }
-        self.library_id = library_id.clone();
-        self.settings.library_id = library_id;
+        self.settings.library_ids = self.library_ids.clone();
         self.persist_settings();
         cx.notify();
+    }
+
+    /// Clear the selection back to "all libraries".
+    pub fn select_all_libraries(&mut self, cx: &mut Context<Self>) {
+        if self.library_ids.is_empty() {
+            return;
+        }
+        self.library_ids.clear();
+        self.settings.library_ids.clear();
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Library ids catalog fetches should query: `[None]` for all libraries,
+    /// otherwise one entry per selected library (requests are merged by the
+    /// caller — the Subsonic API takes a single musicFolderId per request).
+    pub fn library_query_ids(&self) -> Vec<Option<String>> {
+        if self.library_ids.is_empty() {
+            vec![None]
+        } else {
+            self.library_ids.iter().cloned().map(Some).collect()
+        }
     }
 
     pub fn persist_settings(&self) {

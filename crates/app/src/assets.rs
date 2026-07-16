@@ -33,3 +33,27 @@ impl AssetSource for Assets {
         Ok(names)
     }
 }
+
+/// Build an [`gpui_component::Icon`] for an app-bundled icon path.
+pub fn app_icon(path: &'static str) -> gpui_component::Icon {
+    gpui_component::Icon::default().path(path)
+}
+
+/// Icon paths for use with [`app_icon`]. Kept together so views don't
+/// hardcode asset strings.
+pub mod icons {
+    pub const PLAY: &str = "icons/play.svg";
+    pub const PAUSE: &str = "icons/pause.svg";
+    pub const SKIP_BACK: &str = "icons/skip-back.svg";
+    pub const SKIP_FORWARD: &str = "icons/skip-forward.svg";
+    pub const SHUFFLE: &str = "icons/shuffle.svg";
+    pub const REPEAT: &str = "icons/repeat.svg";
+    pub const REPEAT_1: &str = "icons/repeat-one.svg";
+    pub const LIST_PLUS: &str = "icons/list-plus.svg";
+    pub const VOLUME_LOW: &str = "icons/volume-1.svg";
+    pub const VOLUME_HIGH: &str = "icons/volume-2.svg";
+    pub const MUSIC: &str = "icons/music.svg";
+    pub const STAR_FILLED: &str = "icons/star-filled.svg";
+    /// Outline star from the gpui-component bundle (same artwork, no fill).
+    pub const STAR_OUTLINE: &str = "icons/star.svg";
+}

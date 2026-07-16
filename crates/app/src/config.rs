@@ -28,12 +28,8 @@ pub fn recent_played_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("recently_played.json"))
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SpotifyApiConfig {
-    pub enabled: bool,
-    pub client_id: Option<String>,
-    pub client_secret: Option<String>,
+pub fn waveform_cache_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("waveform"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,8 +38,11 @@ pub struct Settings {
     pub server: Option<ServerConfig>,
     /// Volume in [0.0, 1.0].
     pub volume: f32,
-    /// Selected library (music folder) id; None = all libraries.
+    /// Legacy single-library selection; migrated into `library_ids` on load.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub library_id: Option<String>,
+    /// Selected library (music folder) ids; empty = all libraries.
+    pub library_ids: Vec<String>,
     /// Streaming/transcoding preferences.
     pub transcoding: Transcoding,
     /// Colour theme.
@@ -58,8 +57,98 @@ pub struct Settings {
     pub default_repeat: RepeatMode,
     /// On-disk artwork cache cap in megabytes.
     pub artwork_cache_mb: u32,
-    /// Spotify API credentials for artist enrichment.
-    pub spotify: SpotifyApiConfig,
+    /// Page shown right after connecting.
+    pub default_page: DefaultPage,
+    /// Last selected album list filter, restored across sessions.
+    pub album_sort: AlbumSort,
+    /// Cover-art tile size in the album grid.
+    pub cover_size: CoverSize,
+    /// Extra columns shown next to song titles in track lists.
+    pub track_info: TrackInfo,
+    /// Render the seek bar as the track's waveform (downloads each track a
+    /// second time to decode it).
+    pub waveform_seekbar: bool,
+}
+
+/// Cover-art tile size for the album grid. The value doubles as the pixel
+/// resolution requested/decoded for grid thumbnails, so smaller tiles fetch
+/// and render smaller textures — full-res art is only used on detail pages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoverSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    ExtraLarge,
+}
+
+impl CoverSize {
+    /// Rendered tile edge in logical pixels.
+    pub fn px(self) -> f32 {
+        match self {
+            Self::Small => 120.,
+            Self::Medium => 160.,
+            Self::Large => 200.,
+            Self::ExtraLarge => 260.,
+        }
+    }
+
+    /// Resolution to request/decode for grid thumbnails. Bumped ~1.5× over the
+    /// tile size so HiDPI screens stay crisp without decoding full art.
+    pub fn art_px(self) -> u32 {
+        (self.px() * 1.5) as u32
+    }
+}
+
+/// Which section opens after a successful connect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultPage {
+    #[default]
+    Albums,
+    Artists,
+    Favorites,
+    Recent,
+    Radio,
+}
+
+/// Album grid sort/filter, mirrors the Subsonic getAlbumList2 types we expose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlbumSort {
+    #[default]
+    All,
+    New,
+    Recent,
+    Frequent,
+    Random,
+    Starred,
+}
+
+/// Which extra fields to show next to song titles in album/playlist views.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackInfo {
+    pub artist: bool,
+    pub album: bool,
+    pub year: bool,
+    pub genre: bool,
+    pub bitrate: bool,
+    pub plays: bool,
+}
+
+impl Default for TrackInfo {
+    fn default() -> Self {
+        Self {
+            artist: true,
+            album: false,
+            year: false,
+            genre: false,
+            bitrate: false,
+            plays: false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -68,6 +157,7 @@ impl Default for Settings {
             server: None,
             volume: 1.0,
             library_id: None,
+            library_ids: Vec::new(),
             transcoding: Transcoding::default(),
             theme: ThemePref::default(),
             client_titlebar: true,
@@ -75,7 +165,11 @@ impl Default for Settings {
             default_shuffle: false,
             default_repeat: RepeatMode::Off,
             artwork_cache_mb: 256,
-            spotify: SpotifyApiConfig::default(),
+            default_page: DefaultPage::default(),
+            album_sort: AlbumSort::default(),
+            cover_size: CoverSize::default(),
+            track_info: TrackInfo::default(),
+            waveform_seekbar: false,
         }
     }
 }
@@ -189,7 +283,16 @@ impl Settings {
         let path = settings_path()?;
         match fs::read_to_string(&path) {
             Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+                let mut settings: Self =
+                    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+                // Migrate the pre-multi-select single library selection.
+                if settings.library_ids.is_empty()
+                    && let Some(id) = settings.library_id.take()
+                {
+                    settings.library_ids = vec![id];
+                }
+                settings.library_id = None;
+                Ok(settings)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
                 volume: 1.0,
@@ -248,7 +351,7 @@ pub fn delete_password(server_url: &str, username: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImportedThemesFile, Settings, SpotifyApiConfig};
+    use super::ImportedThemesFile;
 
     #[test]
     fn imported_theme_json_deserializes_named_theme() {
@@ -260,22 +363,5 @@ mod tests {
         assert_eq!(theme.mode, "dark");
         assert_eq!(theme.background.as_deref(), Some("#000000"));
         assert_eq!(theme.foreground.as_deref(), Some("#ffffff"));
-    }
-
-    #[test]
-    fn spotify_settings_round_trip_through_toml() {
-        let settings = Settings {
-            spotify: SpotifyApiConfig {
-                enabled: true,
-                client_id: Some("client-id".into()),
-                client_secret: Some("client-secret".into()),
-            },
-            ..Settings::default()
-        };
-        let text = toml::to_string(&settings).unwrap();
-        let parsed: Settings = toml::from_str(&text).unwrap();
-        assert!(parsed.spotify.enabled);
-        assert_eq!(parsed.spotify.client_id.as_deref(), Some("client-id"));
-        assert_eq!(parsed.spotify.client_secret.as_deref(), Some("client-secret"));
     }
 }

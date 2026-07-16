@@ -1,3 +1,3 @@
 pub mod artwork;
 pub mod runtime;
-pub mod spotify;
+pub mod waveform;

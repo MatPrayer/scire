@@ -15,12 +15,12 @@ use gpui_component::{
 };
 use subsonic::SubsonicClient;
 
-use crate::services::artwork;
+use crate::assets::{app_icon, icons};
+use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
 use crate::ui::format_duration;
-use crate::ui::icons::{TransportIcon, transport_btn_small};
 
 const ART_SIZE: u32 = 600;
 /// Tiny fetch for color extraction — low-res average is a fast palette sample.
@@ -28,6 +28,13 @@ const BG_ART_SIZE: u32 = 32;
 
 pub enum FullscreenEvent {
     Close,
+}
+
+/// Optional side panel next to the controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidePanel {
+    Queue,
+    Lyrics,
 }
 
 impl EventEmitter<FullscreenEvent> for FullscreenPlayer {}
@@ -41,6 +48,12 @@ pub struct FullscreenPlayer {
     bg_art_path: Option<PathBuf>,
     gradient_colors: Option<(gpui::Rgba, gpui::Rgba)>,
     last_cover_id: Option<String>,
+    panel: Option<SidePanel>,
+    /// Lyrics text for the song in `lyrics_for`; None while loading or when
+    /// the server has none.
+    lyrics: Option<String>,
+    lyrics_for: Option<String>,
+    lyrics_loading: bool,
 }
 
 impl FullscreenPlayer {
@@ -79,7 +92,7 @@ impl FullscreenPlayer {
         })
         .detach();
 
-        // Watch player for song changes to update the background art.
+        // Watch player for song changes to update background art and lyrics.
         cx.observe(&player, |this: &mut Self, player, cx| {
             let cover = player
                 .read(cx)
@@ -94,6 +107,7 @@ impl FullscreenPlayer {
                     this.fetch_art(cover_id, cx);
                 }
             }
+            this.maybe_fetch_lyrics(cx);
             cx.notify();
         })
         .detach();
@@ -107,11 +121,185 @@ impl FullscreenPlayer {
             bg_art_path: None,
             gradient_colors: None,
             last_cover_id: None,
+            panel: None,
+            lyrics: None,
+            lyrics_for: None,
+            lyrics_loading: false,
         }
+    }
+
+    fn toggle_panel(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
+        self.panel = if self.panel == Some(panel) {
+            None
+        } else {
+            Some(panel)
+        };
+        self.maybe_fetch_lyrics(cx);
+        cx.notify();
+    }
+
+    /// Fetch lyrics for the current song when the lyrics panel is open.
+    fn maybe_fetch_lyrics(&mut self, cx: &mut Context<Self>) {
+        if self.panel != Some(SidePanel::Lyrics) {
+            return;
+        }
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        let (id, artist, title) = {
+            let p = self.player.read(cx);
+            let Some(song) = p.current_song() else {
+                self.lyrics = None;
+                self.lyrics_for = None;
+                return;
+            };
+            (
+                song.id.clone(),
+                song.artist.clone(),
+                Some(song.title.clone()),
+            )
+        };
+        if self.lyrics_for.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        self.lyrics = None;
+        self.lyrics_for = Some(id.clone());
+        self.lyrics_loading = true;
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .get_lyrics(artist.as_deref(), title.as_deref())
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.lyrics_for.as_deref() == Some(id.as_str()) {
+                    view.lyrics_loading = false;
+                    view.lyrics = result.ok().and_then(|l| l.value).filter(|v| !v.is_empty());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
         self.session.read(cx).client.clone()
+    }
+
+    /// Right-hand queue list: click a row to jump to it.
+    fn render_queue_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (rows, current) = {
+            let p = self.player.read(cx);
+            let rows: Vec<(usize, String, String)> = p
+                .queue
+                .iter_ordered()
+                .map(|(pos, s)| (pos, s.title.clone(), s.artist.clone().unwrap_or_default()))
+                .collect();
+            (rows, p.queue.current_pos())
+        };
+        let items: Vec<gpui::AnyElement> = rows
+            .into_iter()
+            .map(|(pos, title, artist)| {
+                let is_current = current == Some(pos);
+                h_flex()
+                    .id(gpui::SharedString::from(format!("fsq-{pos}")))
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted.opacity(0.6)))
+                    .when(is_current, |s| s.text_color(cx.theme().primary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.player.update(cx, |p, cx| p.jump_to(pos, cx));
+                    }))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().truncate().child(title))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(artist),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .w(px(320.))
+            .h_full()
+            .py_12()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Queue"),
+            )
+            .child(
+                v_flex()
+                    .id("fs-queue-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .gap_0p5()
+                    .children(items),
+            )
+            .into_any_element()
+    }
+
+    /// Right-hand lyrics panel (classic getLyrics, unsynced text).
+    fn render_lyrics_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let body: gpui::AnyElement = if self.lyrics_loading {
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Loading…")
+                .into_any_element()
+        } else {
+            match &self.lyrics {
+                Some(text) => v_flex()
+                    .gap_1()
+                    .children(text.lines().map(|line| {
+                        div()
+                            .text_sm()
+                            .child(if line.is_empty() { " " } else { line }.to_string())
+                    }))
+                    .into_any_element(),
+                None => div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No lyrics found")
+                    .into_any_element(),
+            }
+        };
+        v_flex()
+            .w(px(320.))
+            .h_full()
+            .py_12()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Lyrics"),
+            )
+            .child(
+                v_flex()
+                    .id("fs-lyrics-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .into_any_element()
     }
 
     fn fetch_art(&self, cover_id: String, cx: &mut Context<Self>) {
@@ -231,10 +419,12 @@ impl Render for FullscreenPlayer {
             .map(format_duration)
             .unwrap_or_else(|| "-:--".into());
 
-        let repeat_icon = if repeat == RepeatMode::One {
-            TransportIcon::RepeatOne
-        } else {
-            TransportIcon::Repeat
+        let icon_btn = |id: &'static str, icon_path: &'static str, active: bool| {
+            Button::new(id)
+                .ghost()
+                .small()
+                .icon(app_icon(icon_path))
+                .when(active, |b| b.primary())
         };
 
         div()
@@ -280,163 +470,231 @@ impl Render for FullscreenPlayer {
                         })),
                 ),
             )
-            // Main content column.
+            // Main content: big art on the left, controls on the right,
+            // optional queue/lyrics panel at the far right.
             .child(
-                v_flex()
+                h_flex()
                     .size_full()
                     .items_center()
-                    .justify_center()
-                    .gap_6()
-                    .px_8()
-                    // Album art.
+                    .gap_8()
+                    .px_10()
+                    // Album art — takes the left half.
                     .child(
                         div()
-                            .size(px(280.))
-                            .rounded_2xl()
-                            .bg(cx.theme().muted)
-                            .overflow_hidden()
-                            .shadow_xl()
-                            .when_some(self.art_path.clone(), |this, path| {
-                                this.child(img(path).size(px(280.)).rounded_2xl())
-                            }),
-                    )
-                    // Track info.
-                    .child(
-                        v_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_semibold()
-                                    .max_w(px(480.))
-                                    .text_center()
-                                    .truncate()
-                                    .when(!has_track, |s: gpui::Div| {
-                                        s.text_color(cx.theme().muted_foreground)
-                                    })
-                                    .child(title.unwrap_or_else(|| "Nothing playing".into())),
-                            )
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .max_w(px(480.))
-                                    .text_center()
-                                    .truncate()
-                                    .child(artist.unwrap_or_default()),
-                            )
-                            .when_some(album, |this, alb| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(alb),
-                                )
-                            }),
-                    )
-                    // Seek bar.
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .max_w(px(480.))
-                            .gap_2()
-                            .items_center()
-                            .when(is_radio, |this| {
-                                this.child(
-                                    div()
-                                        .flex_1()
-                                        .text_sm()
-                                        .text_color(cx.theme().accent)
-                                        .text_center()
-                                        .child("● LIVE"),
-                                )
-                            })
-                            .when(!is_radio, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(time_now),
-                                )
-                                .child(div().flex_1().child(Slider::new(&self.seek)))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(time_total),
-                                )
-                            }),
-                    )
-                    // Transport controls.
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_center()
-                            .child(
-                                transport_btn_small("fs-shuffle", TransportIcon::Shuffle, shuffle)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.player.update(cx, |p, cx| p.toggle_shuffle(cx));
-                                    })),
-                            )
-                            .child(
-                                transport_btn_small("fs-prev", TransportIcon::SkipBack, false)
-                                    .disabled(!has_track)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.player.update(cx, |p, cx| p.previous(cx));
-                                    })),
-                            )
-                            .child(
-                                Button::new("fs-play")
-                                    .primary()
-                                    .loading(buffering)
-                                    .when(!buffering, |b| {
-                                        b.icon(Icon::new(if playing {
-                                            TransportIcon::Pause
-                                        } else {
-                                            TransportIcon::Play
-                                        }))
-                                    })
-                                    .disabled(!has_track)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.player.update(cx, |p, cx| p.toggle_play(cx));
-                                    })),
-                            )
-                            .child(
-                                transport_btn_small("fs-next", TransportIcon::SkipForward, false)
-                                    .disabled(!has_track)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.player.update(cx, |p, cx| p.next(cx));
-                                    })),
-                            )
-                            .child(
-                                transport_btn_small(
-                                    "fs-repeat",
-                                    repeat_icon,
-                                    repeat != RepeatMode::Off,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.player.update(cx, |p, cx| p.cycle_repeat(cx));
-                                    },
-                                )),
-                            ),
-                    )
-                    // Volume — same width as the seek bar; wide slider for touch-friendly control.
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .max_w(px(480.))
-                            .gap_3()
+                            .flex_1()
+                            .h_full()
+                            .flex()
                             .items_center()
                             .justify_center()
                             .child(
-                                Icon::new(TransportIcon::Volume)
-                                    .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                div()
+                                    .size(px(if self.panel.is_some() { 320. } else { 420. }))
+                                    .rounded_2xl()
+                                    .bg(cx.theme().muted)
+                                    .overflow_hidden()
+                                    .shadow_xl()
+                                    .when_some(self.art_path.clone(), |this, path| {
+                                        this.child(
+                                            img(path)
+                                                .size(px(if self.panel.is_some() {
+                                                    320.
+                                                } else {
+                                                    420.
+                                                }))
+                                                .rounded_2xl(),
+                                        )
+                                    }),
+                            ),
+                    )
+                    // Info + controls column.
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .max_w(px(560.))
+                            .gap_5()
+                            .justify_center()
+                            // Track info, left-aligned.
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_3xl()
+                                            .font_semibold()
+                                            .truncate()
+                                            .when(!has_track, |s: gpui::Div| {
+                                                s.text_color(cx.theme().muted_foreground)
+                                            })
+                                            .child(
+                                                title.unwrap_or_else(|| "Nothing playing".into()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .truncate()
+                                            .child(artist.unwrap_or_default()),
+                                    )
+                                    .when_some(album, |this, alb| {
+                                        this.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .truncate()
+                                                .child(alb),
+                                        )
+                                    }),
                             )
-                            .child(div().w(px(420.)).child(Slider::new(&self.volume))),
-                    ),
+                            // Seek bar — full column width, larger text.
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_3()
+                                    .items_center()
+                                    .when(is_radio, |this| {
+                                        this.child(
+                                            div()
+                                                .flex_1()
+                                                .text_sm()
+                                                .text_color(cx.theme().accent)
+                                                .text_center()
+                                                .child("● LIVE"),
+                                        )
+                                    })
+                                    .when(!is_radio, |this| {
+                                        this.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(time_now),
+                                        )
+                                        .child(div().flex_1().child(Slider::new(&self.seek)))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(time_total),
+                                        )
+                                    }),
+                            )
+                            // Transport controls.
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(
+                                        icon_btn("fs-shuffle", icons::SHUFFLE, shuffle).on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.player
+                                                    .update(cx, |p, cx| p.toggle_shuffle(cx));
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        icon_btn("fs-prev", icons::SKIP_BACK, false)
+                                            .disabled(!has_track)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.player.update(cx, |p, cx| p.previous(cx));
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("fs-play")
+                                            .primary()
+                                            .icon(if playing {
+                                                app_icon(icons::PAUSE)
+                                            } else {
+                                                app_icon(icons::PLAY)
+                                            })
+                                            .loading(buffering)
+                                            .disabled(!has_track)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.player.update(cx, |p, cx| p.toggle_play(cx));
+                                            })),
+                                    )
+                                    .child(
+                                        icon_btn("fs-next", icons::SKIP_FORWARD, false)
+                                            .disabled(!has_track)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.player.update(cx, |p, cx| p.next(cx));
+                                            })),
+                                    )
+                                    .child(
+                                        icon_btn(
+                                            "fs-repeat",
+                                            if repeat == RepeatMode::One {
+                                                icons::REPEAT_1
+                                            } else {
+                                                icons::REPEAT
+                                            },
+                                            repeat != RepeatMode::Off,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.player.update(cx, |p, cx| p.cycle_repeat(cx));
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            // Volume — same width as the seek bar.
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(app_icon(icons::VOLUME_LOW)),
+                                    )
+                                    .child(div().flex_1().child(Slider::new(&self.volume)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(app_icon(icons::VOLUME_HIGH)),
+                                    ),
+                            )
+                            // Panel toggles.
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("fs-queue-btn")
+                                            .ghost()
+                                            .small()
+                                            .icon(Icon::new(IconName::PanelRight))
+                                            .label("Queue")
+                                            .when(self.panel == Some(SidePanel::Queue), |b| {
+                                                b.primary()
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_panel(SidePanel::Queue, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("fs-lyrics-btn")
+                                            .ghost()
+                                            .small()
+                                            .icon(Icon::new(IconName::BookOpen))
+                                            .label("Lyrics")
+                                            .when(self.panel == Some(SidePanel::Lyrics), |b| {
+                                                b.primary()
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_panel(SidePanel::Lyrics, cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    // Optional side panel.
+                    .when_some(self.panel, |this, panel| {
+                        this.child(match panel {
+                            SidePanel::Queue => self.render_queue_panel(cx),
+                            SidePanel::Lyrics => self.render_lyrics_panel(cx),
+                        })
+                    }),
             )
     }
 }

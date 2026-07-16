@@ -3,7 +3,7 @@
 use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
-use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use crate::state::player::PlayerState;
 use crate::state::radio::RadioState;
@@ -72,7 +72,7 @@ impl Render for RadioView {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().muted))
-                    .when(is_playing, |s| s.text_color(cx.theme().accent))
+                    .when(is_playing, |s| s.text_color(cx.theme().primary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let (name, url) = (name.clone(), url.clone());
                         this.player.update(cx, |p, cx| p.play_radio(name, url, cx));
@@ -96,7 +96,7 @@ impl Render for RadioView {
                         Button::new(("radio-del", i))
                             .ghost()
                             .xsmall()
-                            .label("✕")
+                            .icon(Icon::new(IconName::Close))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.radio.update(cx, |r, cx| r.delete(id.clone(), cx));
                                 cx.stop_propagation();

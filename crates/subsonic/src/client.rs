@@ -6,7 +6,7 @@ use crate::auth::Credentials;
 use crate::error::{ApiErrorCode, Error};
 
 pub(crate) const API_VERSION: &str = "1.16.1";
-pub(crate) const CLIENT_NAME: &str = "navidrome-rusty";
+pub(crate) const CLIENT_NAME: &str = "Scirè";
 
 /// Async Subsonic API client.
 ///

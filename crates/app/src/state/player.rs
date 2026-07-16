@@ -164,6 +164,18 @@ impl PlayerState {
         self.start_current(cx);
     }
 
+    /// Replace the queue with `songs`, enable shuffle, and start at a random
+    /// song.
+    pub fn play_queue_shuffled(&mut self, songs: Vec<Song>, cx: &mut Context<Self>) {
+        if songs.is_empty() {
+            return;
+        }
+        let start = rand::random_range(0..songs.len());
+        self.queue.replace(songs, start);
+        self.queue.set_shuffle(true);
+        self.start_current(cx);
+    }
+
     /// Append songs to the end of the queue.
     pub fn enqueue(&mut self, songs: Vec<Song>, cx: &mut Context<Self>) {
         let was_empty = self.queue.is_empty();

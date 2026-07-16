@@ -2,9 +2,10 @@
 
 use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, prelude::*};
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use subsonic::{AnnotationTarget, Starred, SubsonicClient};
 
+use crate::assets::{app_icon, icons};
 use crate::services::runtime;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
@@ -49,18 +50,36 @@ impl FavoritesView {
         let Some(client) = self.client(cx) else {
             return;
         };
-        let library_id = self.session.read(cx).library_id.clone();
+        let libraries = self.session.read(cx).library_query_ids();
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
-                client
-                    .get_starred2(library_id.as_ref())
-                    .await
-                    .map_err(anyhow::Error::from)
+                // Fetch starred items per selected library and merge,
+                // deduping anything starred in several libraries.
+                let mut merged: Option<subsonic::Starred> = None;
+                let mut seen = std::collections::HashSet::new();
+                for lib in &libraries {
+                    let mut s = client
+                        .get_starred2(lib.as_ref())
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                    s.artist.retain(|a| seen.insert(format!("ar:{}", a.id)));
+                    s.album.retain(|a| seen.insert(format!("al:{}", a.id)));
+                    s.song.retain(|x| seen.insert(format!("s:{}", x.id)));
+                    match &mut merged {
+                        Some(m) => {
+                            m.artist.extend(s.artist);
+                            m.album.extend(s.album);
+                            m.song.extend(s.song);
+                        }
+                        None => merged = Some(s),
+                    }
+                }
+                Ok::<_, anyhow::Error>(merged)
             })
             .await;
             let _ = this.update(cx, |view, cx| {
                 match result {
-                    Ok(starred) => view.starred = Some(starred),
+                    Ok(starred) => view.starred = starred,
                     Err(e) => view.error = Some(format!("{e:#}")),
                 }
                 cx.notify();
@@ -145,7 +164,7 @@ impl Render for FavoritesView {
                                 Button::new(("fav-unstar-s", i))
                                     .ghost()
                                     .xsmall()
-                                    .icon(Icon::new(IconName::Star))
+                                    .icon(app_icon(icons::STAR_FILLED))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.unstar(AnnotationTarget::Song, id.clone(), cx);
                                         cx.stop_propagation();
@@ -191,7 +210,7 @@ impl Render for FavoritesView {
                                 Button::new(("fav-unstar-a", i))
                                     .ghost()
                                     .xsmall()
-                                    .icon(Icon::new(IconName::Star))
+                                    .icon(app_icon(icons::STAR_FILLED))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.unstar(AnnotationTarget::Album, unstar_id.clone(), cx);
                                         cx.stop_propagation();
@@ -224,7 +243,7 @@ impl Render for FavoritesView {
                                 Button::new(("fav-unstar-r", i))
                                     .ghost()
                                     .xsmall()
-                                    .icon(Icon::new(IconName::Star))
+                                    .icon(app_icon(icons::STAR_FILLED))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.unstar(
                                             AnnotationTarget::Artist,

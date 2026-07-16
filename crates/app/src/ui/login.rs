@@ -101,7 +101,7 @@ impl Render for LoginView {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().sidebar)
                     .shadow_lg()
-                    .child(div().text_xl().child("Navidrome"))
+                    .child(div().text_xl().child("Scirè"))
                     .child(
                         div()
                             .text_sm()

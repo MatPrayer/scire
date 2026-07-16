@@ -31,7 +31,7 @@ async fn ping_sends_token_auth_params() {
     let q: std::collections::HashMap<_, _> = req.url.query_pairs().collect();
     assert_eq!(q["u"], "joe");
     assert_eq!(q["v"], "1.16.1");
-    assert_eq!(q["c"], "navidrome-rusty");
+    assert_eq!(q["c"], "Scirè");
     assert_eq!(q["f"], "json");
     let salt = q["s"].to_string();
     let expected = format!("{:x}", md5_of(&format!("sesame{salt}")));
@@ -172,4 +172,81 @@ async fn scrobble_sends_submission_flag() {
         .await;
 
     client(&server.uri()).scrobble("s-1", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn get_lyrics_sends_params_and_parses() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getLyrics"))
+        .and(query_param("artist", "Muse"))
+        .and(query_param("title", "Uprising"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""lyrics":{"artist":"Muse","title":"Uprising","value":"Paranoia is in bloom\nThe PR transmissions will resume"}"#,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let lyrics = client(&server.uri())
+        .get_lyrics(Some("Muse"), Some("Uprising"))
+        .await
+        .unwrap();
+    assert_eq!(lyrics.artist.as_deref(), Some("Muse"));
+    assert!(lyrics.value.unwrap().starts_with("Paranoia"));
+}
+
+#[tokio::test]
+async fn get_lyrics_missing_is_empty() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getLyrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(r#""lyrics":{}"#)))
+        .mount(&server)
+        .await;
+
+    let lyrics = client(&server.uri())
+        .get_lyrics(Some("Nobody"), Some("Nothing"))
+        .await
+        .unwrap();
+    assert!(lyrics.value.is_none());
+}
+
+#[tokio::test]
+async fn get_artist_info2_parses_bio_and_images() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getArtistInfo2"))
+        .and(query_param("id", "ar-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""artistInfo2":{"biography":"Legendary band. <a target='_blank' href=\"https://last.fm/x\" rel=\"nofollow\">Read more on Last.fm</a>","musicBrainzId":"mbid-1","lastFmUrl":"https://last.fm/x","smallImageUrl":"https://img/s.jpg","mediumImageUrl":"https://img/m.jpg","largeImageUrl":"https://img/l.jpg"}"#,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let info = client(&server.uri())
+        .get_artist_info2("ar-1")
+        .await
+        .unwrap();
+    assert!(
+        info.biography
+            .as_ref()
+            .unwrap()
+            .starts_with("Legendary band.")
+    );
+    assert_eq!(info.image_url(), Some("https://img/l.jpg"));
+}
+
+#[tokio::test]
+async fn get_artist_info2_missing_fields_default() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getArtistInfo2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(r#""artistInfo2":{}"#)))
+        .mount(&server)
+        .await;
+
+    let info = client(&server.uri())
+        .get_artist_info2("ar-2")
+        .await
+        .unwrap();
+    assert!(info.biography.is_none());
+    assert!(info.image_url().is_none());
 }

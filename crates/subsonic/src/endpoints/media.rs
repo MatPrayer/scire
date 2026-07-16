@@ -1,7 +1,24 @@
 use reqwest::Url;
+use serde::Deserialize;
 
 use crate::client::SubsonicClient;
 use crate::error::Error;
+
+/// Unsynced lyrics from getLyrics. `value` is None when the server has no
+/// lyrics for the song.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Lyrics {
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LyricsWrapper {
+    #[serde(default)]
+    lyrics: Lyrics,
+}
 
 /// Options for building a stream URL.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +53,23 @@ impl SubsonicClient {
             params.push(("size", &s));
         }
         self.build_url("getCoverArt", &params)
+    }
+
+    /// Song lyrics looked up by artist/title (classic Subsonic getLyrics).
+    pub async fn get_lyrics(
+        &self,
+        artist: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<Lyrics, Error> {
+        let mut params: Vec<(&str, &str)> = Vec::new();
+        if let Some(a) = artist {
+            params.push(("artist", a));
+        }
+        if let Some(t) = title {
+            params.push(("title", t));
+        }
+        let w: LyricsWrapper = self.get("getLyrics", &params).await?;
+        Ok(w.lyrics)
     }
 
     /// Report playback to the server.

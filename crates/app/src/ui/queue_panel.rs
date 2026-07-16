@@ -54,7 +54,7 @@ impl Render for QueuePanel {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().muted))
-                    .when(is_current, |s| s.text_color(cx.theme().accent))
+                    .when(is_current, |s| s.text_color(cx.theme().primary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.player.update(cx, |p, cx| p.jump_to(pos, cx));
                     }))
