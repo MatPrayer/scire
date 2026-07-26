@@ -3,7 +3,8 @@
 use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
 };
 
 use crate::state::player::PlayerState;
@@ -53,8 +54,16 @@ impl Render for QueuePanel {
                     .gap_2()
                     .rounded_md()
                     .cursor_pointer()
+                    // Accent bar + tinted background marks the playing track;
+                    // transparent border on the rest keeps rows aligned.
+                    .border_l_2()
+                    .border_color(gpui::transparent_black())
                     .hover(|s| s.bg(cx.theme().muted))
-                    .when(is_current, |s| s.text_color(cx.theme().primary))
+                    .when(is_current, |s| {
+                        s.bg(cx.theme().primary.opacity(0.12))
+                            .border_color(cx.theme().primary)
+                            .text_color(cx.theme().primary)
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.player.update(cx, |p, cx| p.jump_to(pos, cx));
                     }))
@@ -62,7 +71,13 @@ impl Render for QueuePanel {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_sm().truncate().child(title))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .truncate()
+                                    .when(is_current, |s| s.font_medium())
+                                    .child(title),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -96,8 +111,7 @@ impl Render for QueuePanel {
                                         .icon(Icon::new(IconName::ArrowUp))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.player.update(cx, |p, cx| {
-                                                p.queue.move_item(pos, pos - 1);
-                                                cx.notify();
+                                                p.move_queue_item(pos, pos - 1, cx);
                                             });
                                             cx.stop_propagation();
                                         })),
@@ -111,8 +125,7 @@ impl Render for QueuePanel {
                                         .icon(Icon::new(IconName::ArrowDown))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.player.update(cx, |p, cx| {
-                                                p.queue.move_item(pos, pos + 1);
-                                                cx.notify();
+                                                p.move_queue_item(pos, pos + 1, cx);
                                             });
                                             cx.stop_propagation();
                                         })),

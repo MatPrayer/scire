@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, linear_color_stop,
-    linear_gradient, prelude::*, px,
+    Animation, AnimationExt as _, Context, Entity, EventEmitter, IntoElement, Render, Window, div,
+    ease_out_quint, img, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
@@ -16,6 +16,7 @@ use gpui_component::{
 use subsonic::SubsonicClient;
 
 use crate::assets::{app_icon, icons};
+use crate::config::FullscreenBackground;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
@@ -54,6 +55,12 @@ pub struct FullscreenPlayer {
     lyrics: Option<String>,
     lyrics_for: Option<String>,
     lyrics_loading: bool,
+    /// Waveform peaks for the track in `waveform_for` (when the waveform
+    /// seek bar is enabled and the decode finished).
+    waveform: Option<Vec<f32>>,
+    waveform_for: Option<String>,
+    /// True while the exit animation plays, before the overlay unmounts.
+    closing: bool,
 }
 
 impl FullscreenPlayer {
@@ -77,9 +84,7 @@ impl FullscreenPlayer {
             let fraction = value.start();
             this.player.update(cx, |p, _| {
                 if let Some(total) = p.duration {
-                    p.seek(Duration::from_secs_f32(
-                        total.as_secs_f32() * fraction.clamp(0., 1.),
-                    ));
+                    p.seek(crate::ui::seek_position(total, fraction));
                 }
             });
         })
@@ -108,6 +113,14 @@ impl FullscreenPlayer {
                 }
             }
             this.maybe_fetch_lyrics(cx);
+            this.maybe_fetch_waveform(cx);
+            cx.notify();
+        })
+        .detach();
+
+        // Settings toggle for the waveform seek bar lives on the session.
+        cx.observe(&session, |this: &mut Self, _, cx| {
+            this.maybe_fetch_waveform(cx);
             cx.notify();
         })
         .detach();
@@ -125,7 +138,89 @@ impl FullscreenPlayer {
             lyrics: None,
             lyrics_for: None,
             lyrics_loading: false,
+            waveform: None,
+            waveform_for: None,
+            closing: false,
         }
+    }
+
+    /// Start the exit animation, then emit Close so the overlay unmounts.
+    pub fn begin_close(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(190))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // Skip if a quick reopen already cancelled the close.
+                if this.closing {
+                    this.closing = false;
+                    cx.emit(FullscreenEvent::Close);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Reset state so a fresh open plays the entrance (not a stale exit).
+    pub fn reset_for_open(&mut self, cx: &mut Context<Self>) {
+        self.closing = false;
+        cx.notify();
+    }
+
+    /// Kick off a waveform decode when the current track changed (and the
+    /// setting is on). Same flow as the player bar; the on-disk peak cache
+    /// makes the second consumer effectively free.
+    fn maybe_fetch_waveform(&mut self, cx: &mut Context<Self>) {
+        let enabled = self.session.read(cx).settings.waveform_seekbar;
+        let song_id = {
+            let p = self.player.read(cx);
+            if !enabled || p.is_radio() {
+                None
+            } else {
+                p.current_song().map(|s| s.id.clone())
+            }
+        };
+        let Some(id) = song_id else {
+            self.waveform = None;
+            self.waveform_for = None;
+            return;
+        };
+        if self.waveform_for.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        let opts = subsonic::StreamOptions {
+            format: Some("mp3".into()),
+            max_bit_rate: Some(96),
+        };
+        let url = self
+            .session
+            .read(cx)
+            .client
+            .as_ref()
+            .and_then(|c| c.stream_url(&id, &opts).ok().map(|u| u.to_string()));
+        let Some(url) = url else { return };
+        self.waveform = None;
+        self.waveform_for = Some(id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(crate::services::waveform::fetch_peaks(url, id.clone()))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                // Ignore results for a track that is no longer current.
+                if view.waveform_for.as_deref() == Some(id.as_str()) {
+                    match result {
+                        Ok(peaks) => view.waveform = Some(peaks),
+                        Err(e) => tracing::warn!("waveform peaks failed: {e:#}"),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn toggle_panel(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
@@ -210,8 +305,14 @@ impl FullscreenPlayer {
                     .gap_2()
                     .rounded_md()
                     .cursor_pointer()
+                    .border_l_2()
+                    .border_color(gpui::transparent_black())
                     .hover(|s| s.bg(cx.theme().muted.opacity(0.6)))
-                    .when(is_current, |s| s.text_color(cx.theme().primary))
+                    .when(is_current, |s| {
+                        s.bg(cx.theme().primary.opacity(0.12))
+                            .border_color(cx.theme().primary)
+                            .text_color(cx.theme().primary)
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.player.update(cx, |p, cx| p.jump_to(pos, cx));
                     }))
@@ -219,7 +320,13 @@ impl FullscreenPlayer {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_sm().truncate().child(title))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .truncate()
+                                    .when(is_current, |s| s.font_medium())
+                                    .child(title),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -302,6 +409,63 @@ impl FullscreenPlayer {
             .into_any_element()
     }
 
+    /// The background layer for the chosen mode (behind the readability scrim).
+    fn render_background(
+        &self,
+        mode: FullscreenBackground,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let base = || div().absolute().left_0().top_0().size_full();
+        let (top, bot) = self
+            .gradient_colors
+            .unwrap_or((gpui::Rgba::from(cx.theme().muted), gpui::Rgba::from(cx.theme().background)));
+        match mode {
+            FullscreenBackground::Solid => base().bg(cx.theme().background).into_any_element(),
+            FullscreenBackground::Gradient => base()
+                .bg(linear_gradient(
+                    160.,
+                    linear_color_stop(scale_rgb(top, 0.5), 0.),
+                    linear_color_stop(scale_rgb(bot, 0.5), 1.),
+                ))
+                .into_any_element(),
+            FullscreenBackground::Vibrant => base()
+                .bg(linear_gradient(
+                    160.,
+                    linear_color_stop(scale_rgb(top, 0.9), 0.),
+                    linear_color_stop(scale_rgb(bot, 0.9), 1.),
+                ))
+                .into_any_element(),
+            FullscreenBackground::BlurredArt => base()
+                .bg(cx.theme().muted)
+                .overflow_hidden()
+                // The tiny 32px art scaled to full size reads as a soft blur.
+                .when_some(self.bg_art_path.clone(), |this, path| {
+                    this.child(img(path).size_full())
+                })
+                .into_any_element(),
+            FullscreenBackground::Animated => base()
+                .with_animation(
+                    "fs-bg-anim",
+                    Animation::new(Duration::from_secs(14)).repeat(),
+                    move |this, delta| {
+                        // Colourful diagonal sweep: vivid palette colours cross
+                        // -fade while the gradient wobbles around the diagonal.
+                        let ph = delta * std::f32::consts::TAU;
+                        let mix = ph.sin() * 0.5 + 0.5;
+                        let c1 = scale_rgb(vivid(lerp_rgb(top, bot, mix), 1.7), 0.9);
+                        let c2 = scale_rgb(vivid(lerp_rgb(bot, top, mix), 1.7), 0.9);
+                        let angle = 135. + ph.cos() * 30.;
+                        this.bg(linear_gradient(
+                            angle,
+                            linear_color_stop(c1, 0.),
+                            linear_color_stop(c2, 1.),
+                        ))
+                    },
+                )
+                .into_any_element(),
+        }
+    }
+
     fn fetch_art(&self, cover_id: String, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
@@ -362,14 +526,45 @@ fn extract_dominant_colors(path: &std::path::Path) -> Option<(gpui::Rgba, gpui::
     if top_n == 0 || bot_n == 0 {
         return None;
     }
-    let darken = 0.6f32;
+    // Raw averages; the render darkens/brightens per background mode.
     let avg = |acc: [u64; 3], n: u64| gpui::Rgba {
-        r: (acc[0] as f32 / n as f32 / 255.0) * darken,
-        g: (acc[1] as f32 / n as f32 / 255.0) * darken,
-        b: (acc[2] as f32 / n as f32 / 255.0) * darken,
+        r: acc[0] as f32 / n as f32 / 255.0,
+        g: acc[1] as f32 / n as f32 / 255.0,
+        b: acc[2] as f32 / n as f32 / 255.0,
         a: 1.0,
     };
     Some((avg(top, top_n), avg(bot, bot_n)))
+}
+
+/// Scale an RGB colour's brightness (keeps alpha opaque).
+fn scale_rgb(c: gpui::Rgba, f: f32) -> gpui::Rgba {
+    gpui::Rgba {
+        r: (c.r * f).clamp(0., 1.),
+        g: (c.g * f).clamp(0., 1.),
+        b: (c.b * f).clamp(0., 1.),
+        a: 1.0,
+    }
+}
+
+/// Push a colour's channels away from their mean to boost saturation.
+fn vivid(c: gpui::Rgba, amt: f32) -> gpui::Rgba {
+    let mean = (c.r + c.g + c.b) / 3.0;
+    gpui::Rgba {
+        r: (mean + (c.r - mean) * amt).clamp(0., 1.),
+        g: (mean + (c.g - mean) * amt).clamp(0., 1.),
+        b: (mean + (c.b - mean) * amt).clamp(0., 1.),
+        a: 1.0,
+    }
+}
+
+/// Linear blend between two RGB colours.
+fn lerp_rgb(a: gpui::Rgba, b: gpui::Rgba, t: f32) -> gpui::Rgba {
+    gpui::Rgba {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
+    }
 }
 
 impl Render for FullscreenPlayer {
@@ -414,41 +609,56 @@ impl Render for FullscreenPlayer {
                 .update(cx, |s, cx| s.set_value(fraction, window, cx));
         }
 
+        let seek_fraction = match duration {
+            Some(total) if total > Duration::ZERO => {
+                (position.as_secs_f32() / total.as_secs_f32()).clamp(0., 1.)
+            }
+            _ => 0.,
+        };
+        let waveform_enabled = self.session.read(cx).settings.waveform_seekbar;
+        let detailed_volume = self.session.read(cx).settings.detailed_volume;
+        let volume_level = self.player.read(cx).volume;
+        let replay_gain = self.player.read(cx).replay_gain_active();
+        let stream_info = crate::ui::stream_info_line(
+            self.player.read(cx),
+            &self.session.read(cx).settings,
+        );
+
         let time_now = format_duration(position);
         let time_total = duration
             .map(format_duration)
             .unwrap_or_else(|| "-:--".into());
 
+        let bg_mode = self.session.read(cx).settings.fullscreen_bg;
+        // Dark scrim opacity for readability, tuned per background mode.
+        let scrim = match bg_mode {
+            FullscreenBackground::Solid => 0.0,
+            FullscreenBackground::Gradient => 0.4,
+            FullscreenBackground::Vibrant => 0.18,
+            FullscreenBackground::BlurredArt => 0.55,
+            FullscreenBackground::Animated => 0.35,
+        };
+        let panel_open = self.panel.is_some();
+        let art_size = if panel_open { 360. } else { 460. };
+
         let icon_btn = |id: &'static str, icon_path: &'static str, active: bool| {
             Button::new(id)
                 .ghost()
-                .small()
+                .large()
                 .icon(app_icon(icon_path))
                 .when(active, |b| b.primary())
         };
 
-        div()
+        let root = div()
             .absolute()
             .left_0()
             .top_0()
             .size_full()
+            // Swallow mouse events so clicks don't fall through to the UI below.
+            .occlude()
             .bg(cx.theme().background)
-            // Gradient derived from album palette.
-            .when_some(self.gradient_colors, |this, (top_color, bot_color)| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .size_full()
-                        .bg(linear_gradient(
-                            160.,
-                            linear_color_stop(top_color, 0.),
-                            linear_color_stop(bot_color, 1.),
-                        )),
-                )
-            })
-            // Readability overlay.
+            .child(self.render_background(bg_mode, cx))
+            // Readability scrim.
             .child(
                 div()
                     .absolute()
@@ -456,29 +666,35 @@ impl Render for FullscreenPlayer {
                     .top_0()
                     .size_full()
                     .bg(cx.theme().background)
-                    .opacity(0.45),
+                    .opacity(scrim),
             )
-            // Close button.
+            // Close button — clearly labelled pill, top right.
             .child(
-                div().absolute().top_3().right_3().child(
-                    Button::new("fs-close")
-                        .ghost()
-                        .small()
-                        .icon(Icon::new(IconName::Close))
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.emit(FullscreenEvent::Close);
-                        })),
-                ),
+                div()
+                    .absolute()
+                    .top_4()
+                    .right_4()
+                    .rounded_full()
+                    .bg(cx.theme().muted.opacity(0.55))
+                    .child(
+                        Button::new("fs-close")
+                            .ghost()
+                            .icon(Icon::new(IconName::ChevronDown))
+                            .label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.begin_close(cx);
+                            })),
+                    ),
             )
-            // Main content: big art on the left, controls on the right,
-            // optional queue/lyrics panel at the far right.
+            // Main content: album art on the left, info + controls on the
+            // right, optional side panel + vertical volume at the far right.
             .child(
                 h_flex()
                     .size_full()
                     .items_center()
                     .gap_8()
                     .px_10()
-                    // Album art — takes the left half.
+                    // Album art — left half.
                     .child(
                         div()
                             .flex_1()
@@ -488,34 +704,28 @@ impl Render for FullscreenPlayer {
                             .justify_center()
                             .child(
                                 div()
-                                    .size(px(if self.panel.is_some() { 320. } else { 420. }))
+                                    .size(px(art_size))
+                                    .flex_none()
                                     .rounded_2xl()
                                     .bg(cx.theme().muted)
                                     .overflow_hidden()
                                     .shadow_xl()
                                     .when_some(self.art_path.clone(), |this, path| {
-                                        this.child(
-                                            img(path)
-                                                .size(px(if self.panel.is_some() {
-                                                    320.
-                                                } else {
-                                                    420.
-                                                }))
-                                                .rounded_2xl(),
-                                        )
+                                        this.child(img(path).size(px(art_size)).rounded_2xl())
                                     }),
                             ),
                     )
-                    // Info + controls column.
+                    // Info + controls column — right of the cover.
                     .child(
                         v_flex()
                             .flex_1()
                             .max_w(px(560.))
-                            .gap_5()
                             .justify_center()
-                            // Track info, left-aligned.
+                            .gap_5()
+                            // Track info.
                             .child(
                                 v_flex()
+                                    .max_w(px(560.))
                                     .gap_1()
                                     .child(
                                         div()
@@ -546,10 +756,11 @@ impl Render for FullscreenPlayer {
                                         )
                                     }),
                             )
-                            // Seek bar — full column width, larger text.
+                            // Seek bar.
                             .child(
                                 h_flex()
                                     .w_full()
+                                    .max_w(px(640.))
                                     .gap_3()
                                     .items_center()
                                     .when(is_radio, |this| {
@@ -569,7 +780,23 @@ impl Render for FullscreenPlayer {
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(time_now),
                                         )
-                                        .child(div().flex_1().child(Slider::new(&self.seek)))
+                                        .map(|this| {
+                                            match (waveform_enabled, self.waveform.clone()) {
+                                                (true, Some(peaks)) => {
+                                                    this.child(crate::ui::waveform_seek_bar(
+                                                        &peaks,
+                                                        seek_fraction,
+                                                        34.,
+                                                        cx.theme().primary,
+                                                        cx.theme().muted_foreground.opacity(0.35),
+                                                        self.player.clone(),
+                                                    ))
+                                                }
+                                                _ => this.child(
+                                                    div().flex_1().child(Slider::new(&self.seek)),
+                                                ),
+                                            }
+                                        })
                                         .child(
                                             div()
                                                 .text_sm()
@@ -578,10 +805,30 @@ impl Render for FullscreenPlayer {
                                         )
                                     }),
                             )
+                            // Stream info + ReplayGain: quiet, centered line.
+                            .when(stream_info.is_some() || replay_gain.is_some(), |this| {
+                                this.child(
+                                    h_flex()
+                                        .gap_3()
+                                        .items_center()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                        .when_some(stream_info, |this, info| {
+                                            this.child(div().child(info))
+                                        })
+                                        .when_some(replay_gain, |this, (label, db)| {
+                                            let text = match db {
+                                                Some(db) => format!("RG {db:+.1} dB · {label}"),
+                                                None => format!("RG · {label}"),
+                                            };
+                                            this.child(div().child(text))
+                                        }),
+                                )
+                            })
                             // Transport controls.
                             .child(
                                 h_flex()
-                                    .gap_3()
+                                    .gap_4()
                                     .items_center()
                                     .child(
                                         icon_btn("fs-shuffle", icons::SHUFFLE, shuffle).on_click(
@@ -601,6 +848,7 @@ impl Render for FullscreenPlayer {
                                     .child(
                                         Button::new("fs-play")
                                             .primary()
+                                            .large()
                                             .icon(if playing {
                                                 app_icon(icons::PAUSE)
                                             } else {
@@ -636,34 +884,14 @@ impl Render for FullscreenPlayer {
                                         ),
                                     ),
                             )
-                            // Volume — same width as the seek bar.
+                            // Queue / Lyrics toggles — larger.
                             .child(
                                 h_flex()
-                                    .w_full()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(app_icon(icons::VOLUME_LOW)),
-                                    )
-                                    .child(div().flex_1().child(Slider::new(&self.volume)))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(app_icon(icons::VOLUME_HIGH)),
-                                    ),
-                            )
-                            // Panel toggles.
-                            .child(
-                                h_flex()
-                                    .gap_2()
+                                    .gap_3()
                                     .child(
                                         Button::new("fs-queue-btn")
                                             .ghost()
-                                            .small()
+                                            .large()
                                             .icon(Icon::new(IconName::PanelRight))
                                             .label("Queue")
                                             .when(self.panel == Some(SidePanel::Queue), |b| {
@@ -676,7 +904,7 @@ impl Render for FullscreenPlayer {
                                     .child(
                                         Button::new("fs-lyrics-btn")
                                             .ghost()
-                                            .small()
+                                            .large()
                                             .icon(Icon::new(IconName::BookOpen))
                                             .label("Lyrics")
                                             .when(self.panel == Some(SidePanel::Lyrics), |b| {
@@ -688,6 +916,46 @@ impl Render for FullscreenPlayer {
                                     ),
                             ),
                     )
+                    // Short vertical volume slider, right of the controls
+                    // (hidden during live radio).
+                    .when(!is_radio, |this| {
+                        this.child(
+                            v_flex()
+                                .h_full()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(app_icon(icons::VOLUME_HIGH)),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(160.))
+                                        .child(Slider::new(&self.volume).vertical()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(app_icon(icons::VOLUME_LOW)),
+                                )
+                                .when(detailed_volume, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{}%",
+                                                (volume_level * 100.).round() as u32
+                                            )),
+                                    )
+                                }),
+                        )
+                    })
                     // Optional side panel.
                     .when_some(self.panel, |this, panel| {
                         this.child(match panel {
@@ -695,6 +963,23 @@ impl Render for FullscreenPlayer {
                             SidePanel::Lyrics => self.render_lyrics_panel(cx),
                         })
                     }),
+            );
+
+        // Entrance fades/slides in on mount; exit reverses it before unmount.
+        if self.closing {
+            root.with_animation(
+                "fs-exit",
+                Animation::new(Duration::from_secs_f64(0.19)).with_easing(ease_out_quint()),
+                |this, delta| this.opacity(1. - delta).top(px(delta * 24.)),
             )
+            .into_any_element()
+        } else {
+            root.with_animation(
+                "fs-enter",
+                Animation::new(Duration::from_secs_f64(0.22)).with_easing(ease_out_quint()),
+                |this, delta| this.opacity(delta).top(px((1. - delta) * 24.)),
+            )
+            .into_any_element()
+        }
     }
 }

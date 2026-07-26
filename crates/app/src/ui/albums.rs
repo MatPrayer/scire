@@ -9,6 +9,7 @@ use gpui::{
     px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use subsonic::{Album, AlbumListType, SubsonicClient};
 
@@ -16,6 +17,7 @@ use crate::assets::{app_icon, icons};
 use crate::config::AlbumSort;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
+use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
 
 const PAGE_SIZE: u32 = 100;
@@ -126,11 +128,22 @@ fn merge_ready(state: &mut TabState, tab: AlbumSort) -> Vec<Album> {
 
 pub enum AlbumsEvent {
     OpenAlbum(String),
+    OpenArtist(String),
+}
+
+/// How a context-menu action should enqueue an album's songs.
+#[derive(Clone, Copy)]
+enum QueueMode {
+    Play,
+    Shuffle,
+    PlayNext,
+    Enqueue,
 }
 
 pub struct AlbumsView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
+    playlists: Entity<PlaylistsState>,
     /// Albums for each filter tab, loaded independently and lazily.
     tabs: HashMap<AlbumSort, TabState>,
     art_paths: HashMap<String, PathBuf>,
@@ -148,6 +161,7 @@ impl AlbumsView {
     pub fn new(
         session: Entity<Session>,
         player: Entity<PlayerState>,
+        playlists: Entity<PlaylistsState>,
         cx: &mut Context<Self>,
     ) -> Self {
         let active_tab = session.read(cx).settings.album_sort;
@@ -155,6 +169,7 @@ impl AlbumsView {
         let mut this = Self {
             session,
             player,
+            playlists,
             tabs: HashMap::new(),
             art_paths: HashMap::new(),
             active_tab,
@@ -273,8 +288,8 @@ impl AlbumsView {
         }
     }
 
-    /// Fetch the album's songs and start playing them.
-    fn play_album(&mut self, album_id: String, shuffle: bool, cx: &mut Context<Self>) {
+    /// Fetch the album's songs and act on them (play / shuffle / queue).
+    fn queue_album(&mut self, album_id: String, mode: QueueMode, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
@@ -289,13 +304,48 @@ impl AlbumsView {
             .await;
             match result {
                 Ok(album) => {
-                    let _ = player.update(cx, |p, cx| {
-                        if shuffle {
-                            p.play_queue_shuffled(album.song, cx);
-                        } else {
-                            p.play_queue(album.song, 0, cx);
-                        }
+                    let _ = player.update(cx, |p, cx| match mode {
+                        QueueMode::Play => p.play_queue(album.song, 0, cx),
+                        QueueMode::Shuffle => p.play_queue_shuffled(album.song, cx),
+                        QueueMode::PlayNext => p.play_next(album.song, cx),
+                        QueueMode::Enqueue => p.enqueue(album.song, cx),
                     });
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.error = Some(format!("{e:#}"));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Fetch the album's songs and append them all to a playlist.
+    fn add_album_to_playlist(
+        &mut self,
+        album_id: String,
+        playlist_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        let playlists = self.playlists.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .get_album(&album_id)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            match result {
+                Ok(album) => {
+                    let ids: Vec<String> = album.song.iter().map(|s| s.id.clone()).collect();
+                    let _ = playlists
+                        .update(cx, |pl, cx| pl.add_songs(playlist_id, ids, cx));
                 }
                 Err(e) => {
                     let _ = this.update(cx, |view, cx| {
@@ -366,6 +416,17 @@ impl AlbumsView {
         let name = album.name.clone();
         let artist = album.artist.clone().unwrap_or_default();
         let year = album.year.map(|y| y.to_string()).unwrap_or_default();
+        // Right-click context menu data.
+        let menu_id = album.id.clone();
+        let menu_artist_id = album.artist_id.clone();
+        let view = cx.entity();
+        let menu_pl_list: Vec<(String, String)> = self
+            .playlists
+            .read(cx)
+            .playlists
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
 
         v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
@@ -403,7 +464,7 @@ impl AlbumsView {
                                     .primary()
                                     .icon(app_icon(icons::PLAY))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.play_album(play_id.clone(), false, cx);
+                                        this.queue_album(play_id.clone(), QueueMode::Play, cx);
                                         cx.stop_propagation();
                                     })),
                             ),
@@ -429,6 +490,56 @@ impl AlbumsView {
                         )
                     }),
             )
+            .context_menu(move |menu, window, cx| {
+                let act = |mode: QueueMode| {
+                    let view = view.clone();
+                    let id = menu_id.clone();
+                    move |_: &_, _: &mut Window, cx: &mut gpui::App| {
+                        view.update(cx, |v, cx| v.queue_album(id.clone(), mode, cx));
+                    }
+                };
+                let pl_list = menu_pl_list.clone();
+                let pl_view = view.clone();
+                let pl_album = menu_id.clone();
+                let mut menu = menu
+                    .item(PopupMenuItem::new("Play").on_click(act(QueueMode::Play)))
+                    .item(PopupMenuItem::new("Shuffle").on_click(act(QueueMode::Shuffle)))
+                    .item(PopupMenuItem::new("Play next").on_click(act(QueueMode::PlayNext)))
+                    .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
+                    .submenu("Save to playlist", window, cx, move |sub, _w, _c| {
+                        if pl_list.is_empty() {
+                            return sub
+                                .item(PopupMenuItem::new("No playlists yet").disabled(true));
+                        }
+                        let mut sub = sub;
+                        for (pid, pname) in &pl_list {
+                            let view = pl_view.clone();
+                            let pid = pid.clone();
+                            let album = pl_album.clone();
+                            sub = sub.item(PopupMenuItem::new(pname.clone()).on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    view.update(cx, |v, cx| {
+                                        v.add_album_to_playlist(album.clone(), pid.clone(), cx)
+                                    });
+                                },
+                            ));
+                        }
+                        sub
+                    });
+                if let Some(aid) = menu_artist_id.clone() {
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::separator()).item(
+                        PopupMenuItem::new("Go to artist").on_click(
+                            move |_, _, cx: &mut gpui::App| {
+                                view.update(cx, |_, cx| {
+                                    cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
+                                });
+                            },
+                        ),
+                    );
+                }
+                menu
+            })
     }
 }
 
@@ -496,7 +607,9 @@ impl Render for AlbumsView {
             .when_some(self.error.clone(), |this, e| {
                 this.child(div().text_color(cx.theme().danger).text_sm().child(e))
             })
-            .child(h_flex().flex_wrap().gap_4().children(cards))
+            // Centered so the leftover space of the ragged last row is split
+            // evenly — left and right gutters stay equal at any window width.
+            .child(h_flex().flex_wrap().justify_center().gap_4().children(cards))
             // Loading indicator while the next page streams in.
             .when(loading, |this| {
                 this.child(

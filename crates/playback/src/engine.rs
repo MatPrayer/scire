@@ -33,6 +33,10 @@ async fn control_loop(
     let mut output: Option<rodio::MixerDeviceSink> = None;
     let mut sink: Option<rodio::Player> = None;
     let mut volume: f32 = 1.0;
+    // Chosen output device name (None = OS default) and the currently-loaded
+    // track, retained so a device switch can reopen and resume in place.
+    let mut selected_device: Option<String> = None;
+    let mut current: Option<TrackSource> = None;
     // In-flight preparation of the next track for gapless transition.
     let mut prefetch: Option<JoinHandle<Result<Prepared, PlaybackError>>> = None;
     let mut ticker = tokio::time::interval(TICK);
@@ -49,11 +53,18 @@ async fn control_loop(
                             s.stop();
                         }
                         let _ = event_tx.send(Event::Buffering);
-                        match start_track(&mut output, &track, volume).await {
+                        let output_was_open = output.is_some();
+                        match start_track(&mut output, &selected_device, &track, volume).await {
                             Ok(new_sink) => {
+                                if !output_was_open {
+                                    let _ = event_tx.send(Event::OutputOpened {
+                                        device: resolved_device_name(&selected_device),
+                                    });
+                                }
                                 if let Some(d) = track.duration_hint {
                                     let _ = event_tx.send(Event::DurationKnown(d));
                                 }
+                                current = Some(track);
                                 sink = Some(new_sink);
                                 playing = true;
                                 let _ = event_tx.send(Event::Playing);
@@ -83,7 +94,53 @@ async fn control_loop(
                         if let Some(s) = sink.take() {
                             s.stop();
                         }
+                        current = None;
                         playing = false;
+                    }
+                    Command::SetOutputDevice(name) => {
+                        if name != selected_device {
+                            selected_device = name;
+                            let _ = event_tx.send(Event::OutputOpened {
+                                device: resolved_device_name(&selected_device),
+                            });
+                            // Reopen on the new device, resuming the current
+                            // track at its position (paused stays paused).
+                            let resume = playing;
+                            let pos = sink.as_ref().map(|s| s.get_pos());
+                            abort_prefetch(&mut prefetch);
+                            if let Some(s) = sink.take() {
+                                s.stop();
+                            }
+                            output = None;
+                            if let Some(track) = current.clone() {
+                                let _ = event_tx.send(Event::Buffering);
+                                match start_track(&mut output, &selected_device, &track, volume)
+                                    .await
+                                {
+                                    Ok(new_sink) => {
+                                        if let Some(p) = pos
+                                            && let Err(e) = new_sink.try_seek(p)
+                                        {
+                                            tracing::warn!("seek after device switch failed: {e}");
+                                        }
+                                        if !resume {
+                                            new_sink.pause();
+                                        }
+                                        sink = Some(new_sink);
+                                        playing = resume;
+                                        let _ = event_tx.send(if resume {
+                                            Event::Playing
+                                        } else {
+                                            Event::Paused
+                                        });
+                                    }
+                                    Err(e) => {
+                                        playing = false;
+                                        let _ = event_tx.send(Event::Failed(e.to_string()));
+                                    }
+                                }
+                            }
+                        }
                     }
                     Command::Seek(pos) => {
                         if let Some(s) = &sink {
@@ -124,6 +181,7 @@ async fn control_loop(
                             &output,
                             volume,
                             &event_tx,
+                            &mut current,
                         );
                         playing = auto;
                         let _ = event_tx.send(Event::TrackEnded { auto_advanced: auto });
@@ -137,6 +195,59 @@ async fn control_loop(
             }
         }
     }
+}
+
+/// Name of the OS default output device (what `open_default_sink` uses).
+/// cpal's ALSA host only reports a generic "default", so on Linux ask
+/// PulseAudio/PipeWire for the real sink description first.
+fn default_output_device_name() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(desc) = pulse_default_sink_description() {
+        return Some(desc);
+    }
+    use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
+    rodio::cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.description().ok())
+        .map(|desc| desc.name().to_string())
+}
+
+/// Human-readable description of the default PulseAudio/PipeWire sink, via
+/// `pactl` (best-effort; None when unavailable).
+#[cfg(target_os = "linux")]
+fn pulse_default_sink_description() -> Option<String> {
+    use std::process::Command;
+    let out = Command::new("pactl")
+        .env("LC_ALL", "C") // keep field labels unlocalized
+        .arg("get-default-sink")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sink = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sink.is_empty() {
+        return None;
+    }
+    let out = Command::new("pactl")
+        .env("LC_ALL", "C")
+        .args(["list", "sinks"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut in_target = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("Name:") {
+            in_target = name.trim() == sink;
+        } else if in_target && let Some(desc) = line.strip_prefix("Description:") {
+            return Some(desc.trim().to_string());
+        }
+    }
+    None
 }
 
 fn abort_prefetch(prefetch: &mut Option<JoinHandle<Result<Prepared, PlaybackError>>>) {
@@ -154,6 +265,7 @@ fn try_start_prefetched(
     output: &Option<rodio::MixerDeviceSink>,
     volume: f32,
     event_tx: &mpsc::UnboundedSender<Event>,
+    current: &mut Option<TrackSource>,
 ) -> bool {
     let Some(handle) = prefetch.take() else {
         return false;
@@ -169,14 +281,16 @@ fn try_start_prefetched(
     };
     let Some(out) = output else { return false };
 
+    let track = prepared.track.clone();
     let player = rodio::Player::connect_new(out.mixer());
     player.set_volume(volume);
     player.append(prepared.decoder);
     player.play();
     *sink = Some(player);
-    if let Some(d) = prepared.track.duration_hint {
+    if let Some(d) = track.duration_hint {
         let _ = event_tx.send(Event::DurationKnown(d));
     }
+    *current = Some(track);
     true
 }
 
@@ -216,18 +330,18 @@ async fn prepare(track: TrackSource) -> Result<Prepared, PlaybackError> {
     Ok(Prepared { track, decoder })
 }
 
-/// Open the HTTP source, build a decoder, and start a new player.
+/// Open the HTTP source, build a decoder, and start a new player on the
+/// selected output device (opening it if not already open).
 async fn start_track(
     output: &mut Option<rodio::MixerDeviceSink>,
+    selected_device: &Option<String>,
     track: &TrackSource,
     volume: f32,
 ) -> Result<rodio::Player, PlaybackError> {
     let prepared = prepare(track.clone()).await?;
 
     if output.is_none() {
-        let device_sink = rodio::DeviceSinkBuilder::open_default_sink()
-            .map_err(|e| PlaybackError::Output(e.to_string()))?;
-        *output = Some(device_sink);
+        *output = Some(open_output(selected_device)?);
     }
     let out = output.as_ref().expect("output just initialized");
 
@@ -236,4 +350,32 @@ async fn start_track(
     player.append(prepared.decoder);
     player.play();
     Ok(player)
+}
+
+/// Open the sink for `selected` (a cpal device description name), falling back
+/// to the system default when None or when the named device is gone.
+fn open_output(selected: &Option<String>) -> Result<rodio::MixerDeviceSink, PlaybackError> {
+    use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
+    if let Some(name) = selected
+        && let Ok(devices) = rodio::cpal::default_host().output_devices()
+    {
+        for dev in devices {
+            if dev.description().ok().map(|d| d.name().to_string()).as_deref() == Some(name.as_str())
+            {
+                return rodio::DeviceSinkBuilder::from_device(dev)
+                    .and_then(|b| b.open_stream())
+                    .map_err(|e| PlaybackError::Output(e.to_string()));
+            }
+        }
+    }
+    rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| PlaybackError::Output(e.to_string()))
+}
+
+/// Display name for the selected device: the chosen name, or the resolved
+/// default device description when None.
+fn resolved_device_name(selected: &Option<String>) -> Option<String> {
+    match selected {
+        Some(name) => Some(name.clone()),
+        None => default_output_device_name(),
+    }
 }

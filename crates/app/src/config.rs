@@ -32,6 +32,10 @@ pub fn waveform_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("waveform"))
 }
 
+pub fn queue_path() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("queue.json"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -68,6 +72,34 @@ pub struct Settings {
     /// Render the seek bar as the track's waveform (downloads each track a
     /// second time to decode it).
     pub waveform_seekbar: bool,
+    /// Show format/bitrate/sample-rate of the current track in the player bar.
+    pub stream_info_bar: bool,
+    /// Show a precise percentage readout next to the volume slider.
+    pub detailed_volume: bool,
+    /// Show the queue-toggle button in the bottom player bar.
+    pub show_queue_button: bool,
+    /// ReplayGain loudness-normalization mode.
+    pub replay_gain: ReplayGainMode,
+    /// Chosen audio output device (cpal description name); None = OS default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+    /// What to do when the play queue reaches its end.
+    pub queue_end: QueueEndBehavior,
+    /// Background style of the fullscreen now-playing overlay.
+    pub fullscreen_bg: FullscreenBackground,
+}
+
+/// ReplayGain normalization source. Track uses per-track gain; Album keeps
+/// relative loudness within an album (falls back to track gain when absent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayGainMode {
+    #[default]
+    Off,
+    Track,
+    Album,
+    /// Album gain when the queue is a single album, track gain otherwise.
+    Auto,
 }
 
 /// Cover-art tile size for the album grid. The value doubles as the pixel
@@ -99,6 +131,34 @@ impl CoverSize {
     pub fn art_px(self) -> u32 {
         (self.px() * 1.5) as u32
     }
+}
+
+/// Background style for the fullscreen now-playing overlay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenBackground {
+    /// Solid theme background.
+    Solid,
+    /// Dark two-tone gradient from the album palette.
+    #[default]
+    Gradient,
+    /// Brighter, more saturated album-palette gradient.
+    Vibrant,
+    /// The cover art blown up (soft/blurred) behind a dark scrim.
+    BlurredArt,
+    /// Slowly rotating album-palette gradient.
+    Animated,
+}
+
+/// What happens when the play queue reaches its end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueEndBehavior {
+    /// Stop but keep the queue and the last track in the player bar.
+    #[default]
+    Keep,
+    /// Clear the queue and reset the player bar to empty.
+    Clear,
 }
 
 /// Which section opens after a successful connect.
@@ -170,6 +230,13 @@ impl Default for Settings {
             cover_size: CoverSize::default(),
             track_info: TrackInfo::default(),
             waveform_seekbar: false,
+            stream_info_bar: false,
+            detailed_volume: false,
+            show_queue_button: true,
+            replay_gain: ReplayGainMode::Off,
+            output_device: None,
+            queue_end: QueueEndBehavior::Keep,
+            fullscreen_bg: FullscreenBackground::Gradient,
         }
     }
 }

@@ -90,13 +90,14 @@ async fn update_playlist_sends_indices_and_additions() {
     Mock::given(path("/rest/updatePlaylist"))
         .and(query_param("playlistId", "pl-1"))
         .and(query_param("name", "Renamed"))
+        .and(query_param("comment", "desc"))
         .respond_with(ResponseTemplate::new(200).set_body_string(ok_empty()))
         .expect(1)
         .mount(&server)
         .await;
 
     client(&server.uri())
-        .update_playlist("pl-1", Some("Renamed"), &["s-9"], &[0, 3])
+        .update_playlist("pl-1", Some("Renamed"), Some("desc"), &["s-9"], &[0, 3])
         .await
         .unwrap();
 

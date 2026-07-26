@@ -1,6 +1,7 @@
 //! Left navigation rail: library switcher + sections + playlists.
 
 use gpui::{App, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
@@ -27,28 +28,22 @@ pub enum SidebarAction {
     AllLibraries,
     /// Collapse/expand the library switcher.
     ToggleLibrarySection,
+    /// Collapse/expand the playlist list.
+    TogglePlaylistSection,
 }
 
 pub struct SidebarModel {
     pub active: Option<NavSection>,
     pub active_playlist: Option<String>,
-    pub playlists: Vec<(String, String)>, // (id, name)
+    pub playlists: Vec<(String, String, bool)>, // (id, name, shared-by-other-user)
     /// Available libraries (id, name); switcher shown only when > 1.
     pub libraries: Vec<(String, String)>,
     /// Selected library ids; empty = all libraries.
     pub selected_libraries: Vec<String>,
     /// Library switcher folded away (header stays clickable).
     pub libraries_collapsed: bool,
-}
-
-fn section_label(text: &'static str, cx: &App) -> impl IntoElement {
-    div()
-        .px_3()
-        .pt_3()
-        .pb_1()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(text)
+    /// Playlist list folded away (header stays clickable).
+    pub playlists_collapsed: bool,
 }
 
 pub fn render_sidebar(
@@ -160,33 +155,87 @@ pub fn render_sidebar(
         }
     }
 
+    // Collapsible "Playlists" header: label + chevron (click to fold) on the
+    // left, a "+" new-playlist button on the right.
+    let playlists_header = {
+        let on_toggle = on_action.clone();
+        let on_new = on_action.clone();
+        h_flex()
+            .px_3()
+            .pt_3()
+            .pb_1()
+            .items_center()
+            .justify_between()
+            .child(
+                h_flex()
+                    .id("pl-header")
+                    .gap_1()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .on_click(move |_, window, cx| {
+                        on_toggle(SidebarAction::TogglePlaylistSection, window, cx)
+                    })
+                    .child("Playlists")
+                    .child(
+                        Icon::new(if model.playlists_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .xsmall(),
+                    ),
+            )
+            .child(
+                Button::new("pl-new")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Plus))
+                    .on_click(move |_, window, cx| {
+                        on_new(SidebarAction::NewPlaylist, window, cx)
+                    }),
+            )
+    };
+
     let mut playlist_items: Vec<gpui::AnyElement> = Vec::new();
-    for (id, name) in model.playlists.iter() {
-        let on_action = on_action.clone();
-        let id = id.clone();
-        let is_active = model.active_playlist.as_deref() == Some(id.as_str());
-        playlist_items.push(
-            div()
-                // Stable per-playlist element id (index would shift on reorder).
-                .id(SharedString::from(format!("sidebar-pl-{id}")))
-                .px_3()
-                .py_1()
-                .rounded_lg()
-                .cursor_pointer()
-                .text_sm()
-                .truncate()
-                .when(is_active, |s| s.bg(cx.theme().muted))
-                .when(!is_active, |s| s.text_color(cx.theme().muted_foreground))
-                .hover(|s| s.bg(cx.theme().muted))
-                .on_click(move |_, window, cx| {
-                    on_action(SidebarAction::OpenPlaylist(id.clone()), window, cx)
-                })
-                .child(name.clone())
-                .into_any_element(),
-        );
+    if !model.playlists_collapsed {
+        for (id, name, shared) in model.playlists.iter() {
+            let on_action = on_action.clone();
+            let id = id.clone();
+            let shared = *shared;
+            let is_active = model.active_playlist.as_deref() == Some(id.as_str());
+            playlist_items.push(
+                h_flex()
+                    // Stable per-playlist element id (index would shift on reorder).
+                    .id(SharedString::from(format!("sidebar-pl-{id}")))
+                    .px_3()
+                    .py_1()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .text_sm()
+                    .when(is_active, |s| s.bg(cx.theme().muted))
+                    .when(!is_active, |s| s.text_color(cx.theme().muted_foreground))
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .on_click(move |_, window, cx| {
+                        on_action(SidebarAction::OpenPlaylist(id.clone()), window, cx)
+                    })
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    // Playlists owned by another user get a person marker.
+                    .when(shared, |s| {
+                        s.child(
+                            Icon::new(IconName::User)
+                                .xsmall()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
     }
 
-    let on_new = on_action.clone();
     v_flex()
         .w(px(210.))
         .h_full()
@@ -218,7 +267,7 @@ pub fn render_sidebar(
             NavSection::Favorites,
         ))
         .child(nav_item("Radio", IconName::Globe, NavSection::Radio))
-        .child(section_label("Playlists", cx))
+        .child(playlists_header)
         .child(
             v_flex()
                 .id("sidebar-playlists")
@@ -227,22 +276,6 @@ pub fn render_sidebar(
                 .overflow_y_scroll()
                 .gap_0p5()
                 .children(playlist_items),
-        )
-        .child(
-            h_flex()
-                .id("new-playlist")
-                .px_3()
-                .py_1p5()
-                .gap_2()
-                .items_center()
-                .rounded_lg()
-                .cursor_pointer()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .hover(|s| s.bg(cx.theme().muted))
-                .on_click(move |_, window, cx| on_new(SidebarAction::NewPlaylist, window, cx))
-                .child(Icon::new(IconName::Plus).small())
-                .child("New playlist"),
         )
         .child(nav_item(
             "Settings",

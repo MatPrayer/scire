@@ -25,7 +25,8 @@ impl RepeatMode {
 /// The queue holds songs in canonical order; `order` is the play order
 /// (identity when shuffle is off, permutation when on). `current` indexes
 /// into `order`.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Queue {
     songs: Vec<Song>,
     order: Vec<usize>,
@@ -35,6 +36,22 @@ pub struct Queue {
 }
 
 impl Queue {
+    /// Structural sanity check for queues deserialized from disk: `order`
+    /// must be a permutation of song indices and `current` must be in range.
+    pub fn is_valid(&self) -> bool {
+        if self.order.len() != self.songs.len() {
+            return false;
+        }
+        let mut seen = vec![false; self.songs.len()];
+        for &idx in &self.order {
+            if idx >= self.songs.len() || seen[idx] {
+                return false;
+            }
+            seen[idx] = true;
+        }
+        self.current.is_none_or(|c| c < self.order.len())
+    }
+
     /// Replace the queue and start at `songs[start]`.
     pub fn replace(&mut self, songs: Vec<Song>, start: usize) {
         self.songs = songs;

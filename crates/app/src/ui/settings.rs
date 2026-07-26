@@ -5,7 +5,9 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
 
-use crate::config::{CoverSize, DefaultPage, ThemePref};
+use crate::config::{
+    CoverSize, DefaultPage, FullscreenBackground, QueueEndBehavior, ReplayGainMode, ThemePref,
+};
 use crate::services::artwork;
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
@@ -155,6 +157,48 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_stream_info(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.stream_info_bar = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_detailed_volume(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.detailed_volume = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_show_queue_button(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.show_queue_button = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_replay_gain(&mut self, mode: ReplayGainMode, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| s.settings.replay_gain = mode);
+        self.player.update(cx, |p, cx| p.set_replay_gain(mode, cx));
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_fullscreen_bg(&mut self, mode: FullscreenBackground, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| s.settings.fullscreen_bg = mode);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_queue_end(&mut self, mode: QueueEndBehavior, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| s.settings.queue_end = mode);
+        self.player
+            .update(cx, |p, cx| p.set_clear_on_end(mode == QueueEndBehavior::Clear, cx));
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn toggle_track_info(
         &mut self,
         toggle: fn(&mut crate::config::TrackInfo) -> &mut bool,
@@ -202,14 +246,38 @@ impl Render for SettingsView {
                     .map(|srv| (srv.url.clone(), srv.username.clone())),
             )
         };
-        let (default_page, cover_size, track_info, waveform) = {
+        let (default_page, cover_size, track_info, waveform, stream_info, detailed_volume) = {
             let s = &self.session.read(cx).settings;
             (
                 s.default_page,
                 s.cover_size,
                 s.track_info.clone(),
                 s.waveform_seekbar,
+                s.stream_info_bar,
+                s.detailed_volume,
             )
+        };
+        let show_queue_button = self.session.read(cx).settings.show_queue_button;
+        let replay_gain = self.session.read(cx).settings.replay_gain;
+        let rg_btn = |label: &'static str, mode: ReplayGainMode, active: bool| {
+            Button::new(label)
+                .label(label)
+                .when(active, |b| b.primary())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_replay_gain(mode, cx)))
+        };
+        let queue_end = self.session.read(cx).settings.queue_end;
+        let qe_btn = |label: &'static str, mode: QueueEndBehavior, active: bool| {
+            Button::new(label)
+                .label(label)
+                .when(active, |b| b.primary())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_queue_end(mode, cx)))
+        };
+        let fullscreen_bg = self.session.read(cx).settings.fullscreen_bg;
+        let fsbg_btn = |label: &'static str, mode: FullscreenBackground, active: bool| {
+            Button::new(label)
+                .label(label)
+                .when(active, |b| b.primary())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_fullscreen_bg(mode, cx)))
         };
 
         type InfoField = fn(&mut crate::config::TrackInfo) -> &mut bool;
@@ -330,6 +398,46 @@ impl Render for SettingsView {
                                         ThemePref::Custom,
                                         theme == ThemePref::Custom,
                                     )),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("Fullscreen player background"),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .flex_wrap()
+                                            .child(fsbg_btn(
+                                                "Gradient",
+                                                FullscreenBackground::Gradient,
+                                                fullscreen_bg == FullscreenBackground::Gradient,
+                                            ))
+                                            .child(fsbg_btn(
+                                                "Vibrant",
+                                                FullscreenBackground::Vibrant,
+                                                fullscreen_bg == FullscreenBackground::Vibrant,
+                                            ))
+                                            .child(fsbg_btn(
+                                                "Blurred art",
+                                                FullscreenBackground::BlurredArt,
+                                                fullscreen_bg == FullscreenBackground::BlurredArt,
+                                            ))
+                                            .child(fsbg_btn(
+                                                "Animated",
+                                                FullscreenBackground::Animated,
+                                                fullscreen_bg == FullscreenBackground::Animated,
+                                            ))
+                                            .child(fsbg_btn(
+                                                "Solid",
+                                                FullscreenBackground::Solid,
+                                                fullscreen_bg == FullscreenBackground::Solid,
+                                            )),
+                                    ),
                             ),
                     )
                     // Playback
@@ -370,6 +478,30 @@ impl Render for SettingsView {
                                             })),
                                     )
                                     .child(
+                                        Switch::new("stream-info-bar")
+                                            .checked(stream_info)
+                                            .label("Stream info in player bar")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_stream_info(checked, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Switch::new("detailed-volume")
+                                            .checked(detailed_volume)
+                                            .label("Detailed volume control")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_detailed_volume(checked, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Switch::new("show-queue-button")
+                                            .checked(show_queue_button)
+                                            .label("Queue button in player bar")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_show_queue_button(checked, cx);
+                                            })),
+                                    )
+                                    .child(
                                         div()
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
@@ -377,6 +509,87 @@ impl Render for SettingsView {
                                                 "The waveform seek bar downloads each track a \
                                                  second time to decode it, so it uses extra \
                                                  bandwidth.",
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("ReplayGain (loudness normalization)"),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(rg_btn(
+                                                "Off",
+                                                ReplayGainMode::Off,
+                                                replay_gain == ReplayGainMode::Off,
+                                            ))
+                                            .child(rg_btn(
+                                                "Track",
+                                                ReplayGainMode::Track,
+                                                replay_gain == ReplayGainMode::Track,
+                                            ))
+                                            .child(rg_btn(
+                                                "Album",
+                                                ReplayGainMode::Album,
+                                                replay_gain == ReplayGainMode::Album,
+                                            ))
+                                            .child(rg_btn(
+                                                "Auto",
+                                                ReplayGainMode::Auto,
+                                                replay_gain == ReplayGainMode::Auto,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                "Evens out perceived volume using each file's \
+                                                 ReplayGain tags. Track normalizes every song; \
+                                                 Album keeps an album's relative loudness; Auto \
+                                                 uses album gain when playing a whole album and \
+                                                 track gain otherwise. The player bar shows the \
+                                                 applied gain (and the auto-chosen mode).",
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("When the queue ends"),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(qe_btn(
+                                                "Keep queue",
+                                                QueueEndBehavior::Keep,
+                                                queue_end == QueueEndBehavior::Keep,
+                                            ))
+                                            .child(qe_btn(
+                                                "Clear queue",
+                                                QueueEndBehavior::Clear,
+                                                queue_end == QueueEndBehavior::Clear,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                "Keep leaves the finished queue and last track in \
+                                                 the player bar; Clear empties the queue and \
+                                                 resets the player bar.",
                                             ),
                                     ),
                             )

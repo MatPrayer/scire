@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
-use gpui_component::{ActiveTheme as _, StyledExt, h_flex, v_flex};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::link::Link;
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, h_flex, v_flex};
 use subsonic::{Album, ArtistIndex, ArtistInfo2, ArtistWithAlbums, SubsonicClient};
 
 use crate::services::{artwork, runtime};
@@ -156,12 +158,13 @@ pub struct ArtistDetailView {
     art_paths: HashMap<String, PathBuf>,
     artist_image_path: Option<PathBuf>,
     error: Option<String>,
-    top_track: Option<String>,
     /// Biography + image URLs from getArtistInfo2 (Navidrome's agents).
     info: Option<ArtistInfo2>,
     /// An artist-image fetch has started; stops info2's fallback from
     /// racing/overwriting the primary coverArt fetch.
     image_requested: bool,
+    /// Long bios render clamped to a few lines until expanded.
+    bio_expanded: bool,
 }
 
 pub enum ArtistDetailEvent {
@@ -179,9 +182,9 @@ impl ArtistDetailView {
             art_paths: HashMap::new(),
             artist_image_path: None,
             error: None,
-            top_track: None,
             info: None,
             image_requested: false,
+            bio_expanded: false,
         };
         this.load(cx);
         this
@@ -205,16 +208,12 @@ impl ArtistDetailView {
                 match result {
                     Ok(artist) => {
                         let artist_id = artist.artist.id.clone();
-                        let first_album_id = artist.album.first().map(|album| album.id.clone());
                         for album in &artist.album {
                             view.fetch_art(album.id.clone(), album.cover_art.clone(), cx);
                         }
                         let cover = artist.artist.cover_art.clone();
                         view.artist = Some(artist);
                         view.fetch_artist_image(cover, cx);
-                        if let Some(album_id) = first_album_id {
-                            view.fetch_top_track(album_id, cx);
-                        }
                         view.fetch_artist_info(&artist_id, cx);
                     }
                     Err(e) => view.error = Some(format!("{e:#}")),
@@ -280,31 +279,6 @@ impl ArtistDetailView {
         .detach();
     }
 
-    fn fetch_top_track(&self, album_id: String, cx: &mut Context<Self>) {
-        let Some(client) = self.client(cx) else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let result = runtime::spawn_io(async move {
-                client
-                    .get_album(&album_id)
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await;
-            let _ = this.update(cx, |view, cx| {
-                if let Ok(album) = result {
-                    view.top_track = album.song.first().and_then(|song| {
-                        let title = song.title.trim();
-                        (!title.is_empty()).then(|| title.to_string())
-                    });
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     /// Biography and artist image from Navidrome (getArtistInfo2). Falls back
     /// to the artist's own image fields when info2 has no usable image.
     fn fetch_artist_info(&self, artist_id: &str, cx: &mut Context<Self>) {
@@ -354,10 +328,30 @@ impl Render for ArtistDetailView {
             .map(strip_html)
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "No biography is available for this artist yet.".into());
-        let top_track = self
-            .top_track
-            .clone()
-            .unwrap_or_else(|| "No track preview available yet.".into());
+        // Collapse long bios by truncating the string itself: gpui's
+        // line_clamp lets the last line run past the container and its text
+        // measurement cache ignores clamp changes, so it can't do this job.
+        let bio_long = bio.chars().count() > BIO_PREVIEW_CHARS;
+        let bio_text = if self.bio_expanded || !bio_long {
+            bio
+        } else {
+            truncate_at_word(&bio, BIO_PREVIEW_CHARS)
+        };
+        // External links from getArtistInfo2 (same sources as Navidrome's UI).
+        let musicbrainz_url = self
+            .info
+            .as_ref()
+            .and_then(|i| i.music_brainz_id.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("https://musicbrainz.org/artist/{id}"));
+        let lastfm_url = self
+            .info
+            .as_ref()
+            .and_then(|i| i.last_fm_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string);
         let genres = self.artist.as_ref().map(|a| {
             let mut seen = std::collections::HashSet::new();
             a.album
@@ -455,6 +449,7 @@ impl Render for ArtistDetailView {
                     .bg(cx.theme().sidebar)
                     .child(
                         h_flex()
+                            .items_start()
                             .gap_4()
                             .flex_wrap()
                             .child(
@@ -479,7 +474,27 @@ impl Render for ArtistDetailView {
                                             .text_color(cx.theme().muted_foreground)
                                             .child("Bio"),
                                     )
-                                    .child(div().text_sm().child(bio))
+                                    .child(div().text_sm().child(bio_text))
+                                    .when(bio_long, |this| {
+                                        let expanded = self.bio_expanded;
+                                        this.child(
+                                            h_flex().child(
+                                                Button::new("bio-toggle")
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .label(if expanded { "Less" } else { "More" })
+                                                    .icon(Icon::new(if expanded {
+                                                        IconName::ChevronUp
+                                                    } else {
+                                                        IconName::ChevronDown
+                                                    }))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.bio_expanded = !this.bio_expanded;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                        )
+                                    })
                                     .when_some(genres_line, |this, desc| {
                                         this.child(
                                             div()
@@ -488,13 +503,30 @@ impl Render for ArtistDetailView {
                                                 .child(desc),
                                         )
                                     })
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Most famous track"),
-                                    )
-                                    .child(div().text_sm().font_medium().child(top_track)),
+                                    .when(
+                                        musicbrainz_url.is_some() || lastfm_url.is_some(),
+                                        |this| {
+                                            this.child(
+                                                h_flex()
+                                                    .gap_3()
+                                                    .text_sm()
+                                                    .when_some(musicbrainz_url, |this, url| {
+                                                        this.child(
+                                                            Link::new("mb-link")
+                                                                .href(url)
+                                                                .child("MusicBrainz"),
+                                                        )
+                                                    })
+                                                    .when_some(lastfm_url, |this, url| {
+                                                        this.child(
+                                                            Link::new("lastfm-link")
+                                                                .href(url)
+                                                                .child("Last.fm"),
+                                                        )
+                                                    }),
+                                            )
+                                        },
+                                    ),
                             ),
                     ),
             )
@@ -504,6 +536,22 @@ impl Render for ArtistDetailView {
             .child(make_section("Albums".to_string(), album_cards))
             .child(make_section("Singles / EPs".to_string(), single_cards))
     }
+}
+
+/// Collapsed-bio length; roughly four lines at typical window widths.
+const BIO_PREVIEW_CHARS: usize = 400;
+
+/// Cut `text` down to at most `max_chars`, backing up to the last word
+/// boundary, with a trailing ellipsis.
+fn truncate_at_word(text: &str, max_chars: usize) -> String {
+    let byte_cut = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let head = &text[..byte_cut];
+    let cut = head.rfind(char::is_whitespace).unwrap_or(byte_cut);
+    format!("{} …", head[..cut].trim_end())
 }
 
 /// Strip HTML tags and decode the handful of entities Last.fm bios use

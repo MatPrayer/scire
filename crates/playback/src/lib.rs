@@ -37,6 +37,30 @@ pub enum Command {
     PrefetchNext(TrackSource),
     /// Drop any prefetched track (queue changed).
     ClearPrefetch,
+    /// Switch the OS output device by its description name; None = system
+    /// default. Reopens the sink and resumes the current track in place.
+    SetOutputDevice(Option<String>),
+}
+
+/// Enumerate available output device names (cpal descriptions), de-duplicated.
+/// Best-effort: returns an empty list when the host cannot be queried. Skips
+/// the "null" driver so dummy devices don't appear in the picker.
+pub fn output_devices() -> Vec<String> {
+    use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
+    let mut names = Vec::new();
+    if let Ok(devices) = rodio::cpal::default_host().output_devices() {
+        for dev in devices {
+            let Ok(desc) = dev.description() else { continue };
+            if desc.driver().is_some_and(|d| d == "null") {
+                continue;
+            }
+            let name = desc.name().to_string();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// Events emitted by the engine.
@@ -58,6 +82,8 @@ pub enum Event {
     Paused,
     /// Unrecoverable failure for the current track.
     Failed(String),
+    /// Audio output was opened; reports the OS output device name.
+    OutputOpened { device: Option<String> },
 }
 
 #[derive(Debug, Error)]
@@ -120,5 +146,10 @@ impl Player {
     /// Drop any prepared next track (call when the queue changes).
     pub fn clear_prefetch(&self) {
         let _ = self.tx.send(Command::ClearPrefetch);
+    }
+
+    /// Switch output device by name (None = system default).
+    pub fn set_output_device(&self, name: Option<String>) {
+        let _ = self.tx.send(Command::SetOutputDevice(name));
     }
 }

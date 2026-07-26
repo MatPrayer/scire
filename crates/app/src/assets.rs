@@ -6,7 +6,7 @@ use gpui::{AssetSource, Result, SharedString};
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
-#[folder = "assets"]
+#[folder = "$CARGO_MANIFEST_DIR/assets"]
 #[include = "icons/**/*.svg"]
 struct AppAssets;
 
@@ -31,6 +31,20 @@ impl AssetSource for Assets {
         names.sort();
         names.dedup();
         Ok(names)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_assets_include_icons() {
+        let listed: Vec<_> = AppAssets::iter().collect();
+        assert!(
+            AppAssets::get("icons/play.svg").is_some(),
+            "icons/play.svg not embedded; embedded files: {listed:?}"
+        );
     }
 }
 

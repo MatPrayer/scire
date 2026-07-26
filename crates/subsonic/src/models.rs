@@ -89,12 +89,43 @@ pub struct Song {
     pub cover_art: Option<String>,
     pub duration: Option<u32>,
     pub bit_rate: Option<u32>,
+    /// OpenSubsonic extension fields; absent on vanilla Subsonic servers.
+    pub sampling_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
+    pub channel_count: Option<u32>,
     pub content_type: Option<String>,
     pub suffix: Option<String>,
     pub size: Option<u64>,
     pub starred: Option<String>,
     pub user_rating: Option<u8>,
     pub play_count: Option<u64>,
+    /// OpenSubsonic loudness-normalization metadata; absent on vanilla servers.
+    pub replay_gain: Option<ReplayGain>,
+    /// OpenSubsonic per-artist credits (id + name). Empty on vanilla servers;
+    /// falls back to the single `artist`/`artist_id` pair.
+    #[serde(default)]
+    pub artists: Vec<ArtistRef>,
+}
+
+/// A single artist credit as returned in OpenSubsonic `artists` arrays.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistRef {
+    pub id: String,
+    pub name: String,
+}
+
+/// OpenSubsonic ReplayGain block: gains are in dB, peaks are linear
+/// (1.0 = full scale). Any field may be missing depending on server + tags.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayGain {
+    pub track_gain: Option<f32>,
+    pub album_gain: Option<f32>,
+    pub track_peak: Option<f32>,
+    pub album_peak: Option<f32>,
+    pub base_gain: Option<f32>,
+    pub fallback_gain: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

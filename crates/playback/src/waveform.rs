@@ -12,16 +12,51 @@ use crate::PlaybackError;
 /// curve spreads the quiet-to-loud range back out so the shape is readable.
 const GAMMA: f32 = 0.6;
 
+fn build_decoder(bytes: Vec<u8>) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, PlaybackError> {
+    rodio::Decoder::builder()
+        .with_data(Cursor::new(bytes))
+        .with_seekable(true)
+        .build()
+        .map_err(|e| PlaybackError::Decode(e.to_string()))
+}
+
+/// Drop an ID3v2 tag so symphonia's MP3 reader can scan for the first frame
+/// sync. Uses the declared tag size when it looks valid, otherwise just the
+/// 10-byte header (the size is bogus). Returns None if there is no ID3 tag.
+fn strip_id3(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() <= 10 || &bytes[..3] != b"ID3" {
+        return None;
+    }
+    // Synchsafe 28-bit size (7 bits per byte).
+    let size = ((bytes[6] as usize & 0x7f) << 21)
+        | ((bytes[7] as usize & 0x7f) << 14)
+        | ((bytes[8] as usize & 0x7f) << 7)
+        | (bytes[9] as usize & 0x7f);
+    let start = if size > 0 && 10 + size < bytes.len() {
+        10 + size
+    } else {
+        10
+    };
+    Some(bytes[start..].to_vec())
+}
+
 /// Decode `bytes` and reduce the samples to `buckets` values in [0, 1].
 ///
 /// Buckets are RMS loudness (not raw peaks — peaks saturate to a flat block
 /// on compressed material), normalized to the loudest bucket and expanded
 /// with [`GAMMA`].
 pub fn peaks_from_bytes(bytes: Vec<u8>, buckets: usize) -> Result<Vec<f32>, PlaybackError> {
-    let decoder = rodio::Decoder::builder()
-        .with_data(Cursor::new(bytes))
-        .build()
-        .map_err(|e| PlaybackError::Decode(e.to_string()))?;
+    // Normal path. Some transcoders (ffmpeg in streaming mode) emit an MP3 with
+    // an ID3v2 tag whose declared size is 0; symphonia's probe then reads past
+    // the tag into frame data and fails with "out of bounds". Retry once with
+    // the tag header dropped so the MP3 reader scans for the first frame sync.
+    let decoder = match build_decoder(bytes.clone()) {
+        Ok(d) => d,
+        Err(first) => match strip_id3(&bytes) {
+            Some(rest) => build_decoder(rest)?,
+            None => return Err(first),
+        },
+    };
 
     // Stream samples into provisional (sum-of-squares, count) buckets,
     // doubling the bucket width whenever there are too many, so memory stays
@@ -136,5 +171,21 @@ mod tests {
     #[test]
     fn garbage_input_errors() {
         assert!(peaks_from_bytes(vec![1, 2, 3, 4], 10).is_err());
+    }
+
+    #[test]
+    fn strip_id3_handles_bogus_zero_size() {
+        // ID3v2.4 header with a declared size of 0 (as some transcoders emit),
+        // followed by tag data + payload. Only the 10-byte header is dropped.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"ID3\x04\x00\x00\x00\x00\x00\x00");
+        b.extend_from_slice(b"TALBtagdata_and_audio_follows");
+        let rest = strip_id3(&b).expect("has ID3");
+        assert_eq!(rest, &b[10..]);
+    }
+
+    #[test]
+    fn strip_id3_none_without_tag() {
+        assert!(strip_id3(b"\xff\xfbno id3 here").is_none());
     }
 }

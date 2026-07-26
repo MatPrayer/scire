@@ -27,6 +27,9 @@ fn main() {
                 settings.default_shuffle,
                 settings.default_repeat,
                 settings.scrobble_enabled,
+                settings.replay_gain,
+                settings.output_device.clone(),
+                settings.queue_end == config::QueueEndBehavior::Clear,
                 cx,
             );
             player.update(cx, |p, _| {

@@ -5,7 +5,9 @@ use gpui::{
     Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
     NavigationDirection, Render, Window, div, prelude::*, px,
 };
-use gpui_component::{ActiveTheme as _, TitleBar, h_flex, v_flex};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{ActiveTheme as _, StyledExt as _, TitleBar, h_flex, v_flex};
 
 use crate::config::DefaultPage;
 use crate::state::player::PlayerState;
@@ -71,6 +73,12 @@ pub struct RootView {
     last_libraries: Vec<String>,
     /// Sidebar library switcher folded away.
     libraries_collapsed: bool,
+    /// Sidebar playlist list folded away.
+    playlists_collapsed: bool,
+    /// New-playlist dialog state.
+    new_playlist_open: bool,
+    new_pl_name: Entity<InputState>,
+    new_pl_desc: Entity<InputState>,
     focus_handle: FocusHandle,
 }
 
@@ -83,7 +91,8 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let login = cx.new(|cx| LoginView::new(session.clone(), window, cx));
-        let player_bar = cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), cx));
+        let player_bar =
+            cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
         let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), cx));
         let radio = crate::state::radio::init(session.clone(), cx);
         let fullscreen = cx.new(|cx| FullscreenPlayer::new(player.clone(), session.clone(), cx));
@@ -99,7 +108,21 @@ impl RootView {
             match event {
                 PlayerBarEvent::ToggleQueue => this.show_queue = !this.show_queue,
                 PlayerBarEvent::ToggleFullscreen => {
-                    this.show_fullscreen = !this.show_fullscreen;
+                    if this.show_fullscreen {
+                        // Animate out; the Close event flips the flag off.
+                        this.fullscreen.update(cx, |f, cx| f.begin_close(cx));
+                    } else {
+                        this.show_fullscreen = true;
+                        this.fullscreen.update(cx, |f, cx| f.reset_for_open(cx));
+                    }
+                }
+                PlayerBarEvent::OpenAlbum(id) => {
+                    this.show_fullscreen = false;
+                    this.open_album(id.clone(), cx);
+                }
+                PlayerBarEvent::OpenArtist(id) => {
+                    this.show_fullscreen = false;
+                    this.open_artist(id.clone(), cx);
                 }
             }
             cx.notify();
@@ -116,6 +139,18 @@ impl RootView {
         // Re-render the sidebar's playlist list when playlists change.
         cx.observe(&playlists, |_, _, cx| cx.notify()).detach();
 
+        let new_pl_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
+        let new_pl_desc =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Description (optional)"));
+        // Enter in the name field creates the playlist.
+        cx.subscribe(&new_pl_name, |this: &mut Self, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.submit_new_playlist(cx);
+            }
+        })
+        .detach();
+
         // React to connect/disconnect and library switches: build/tear down
         // content views and keep the player's API client fresh.
         cx.observe(&session, |this: &mut Self, session, cx| {
@@ -124,7 +159,7 @@ impl RootView {
             if connected != this.was_connected {
                 this.was_connected = connected;
                 let client = session.read(cx).client.clone();
-                this.player.update(cx, |p, _| p.set_client(client));
+                this.player.update(cx, |p, cx| p.set_client(client, cx));
                 this.content = None;
                 if connected {
                     this.last_libraries = libraries;
@@ -170,6 +205,10 @@ impl RootView {
             was_connected: false,
             last_libraries: Vec::new(),
             libraries_collapsed: false,
+            playlists_collapsed: false,
+            new_playlist_open: false,
+            new_pl_name,
+            new_pl_desc,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -185,11 +224,17 @@ impl RootView {
         self.active_playlist = None;
         self.content = Some(match section {
             NavSection::Albums => {
-                let view =
-                    cx.new(|cx| AlbumsView::new(self.session.clone(), self.player.clone(), cx));
-                cx.subscribe(&view, |this: &mut Self, _, event, cx| {
-                    let AlbumsEvent::OpenAlbum(id) = event;
-                    this.open_album(id.clone(), cx);
+                let view = cx.new(|cx| {
+                    AlbumsView::new(
+                        self.session.clone(),
+                        self.player.clone(),
+                        self.playlists.clone(),
+                        cx,
+                    )
+                });
+                cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
+                    AlbumsEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
+                    AlbumsEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
                 })
                 .detach();
                 Content::Albums(view)
@@ -341,6 +386,93 @@ impl RootView {
         self.content = Some(Content::Playlist(view));
         cx.notify();
     }
+
+    fn open_new_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_pl_name
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.new_pl_desc
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.new_playlist_open = true;
+        self.new_pl_name.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    fn submit_new_playlist(&mut self, cx: &mut Context<Self>) {
+        let name = self.new_pl_name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let desc = self.new_pl_desc.read(cx).value().trim().to_string();
+        let description = (!desc.is_empty()).then_some(desc);
+        self.playlists
+            .update(cx, |p, cx| p.create(name, description, Vec::new(), cx));
+        self.new_playlist_open = false;
+        cx.notify();
+    }
+
+    fn cancel_new_playlist(&mut self, cx: &mut Context<Self>) {
+        self.new_playlist_open = false;
+        cx.notify();
+    }
+
+    fn render_new_playlist_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let field = |label: &'static str, input: &Entity<InputState>| {
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(Input::new(input))
+        };
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .bg(gpui::hsla(0., 0., 0., 0.6))
+            .child(
+                v_flex()
+                    .w(px(440.))
+                    .gap_4()
+                    .p_5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(div().text_lg().font_semibold().child("New playlist"))
+                    .child(field("Name", &self.new_pl_name))
+                    .child(field("Description", &self.new_pl_desc))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("np-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_new_playlist(cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("np-create")
+                                    .primary()
+                                    .label("Create")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_new_playlist(cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 impl Focusable for RootView {
@@ -391,6 +523,14 @@ impl Render for RootView {
             None => div().into_any_element(),
         };
 
+        // Playlists whose owner differs from the logged-in user are "shared".
+        let current_user = self
+            .session
+            .read(cx)
+            .settings
+            .server
+            .as_ref()
+            .map(|s| s.username.clone());
         let sidebar_model = SidebarModel {
             active: self.section,
             active_playlist: self.active_playlist.clone(),
@@ -399,7 +539,13 @@ impl Render for RootView {
                 .read(cx)
                 .playlists
                 .iter()
-                .map(|p| (p.id.clone(), p.name.clone()))
+                .map(|p| {
+                    let shared = match (p.owner.as_ref(), current_user.as_ref()) {
+                        (Some(owner), Some(me)) => owner != me,
+                        _ => false,
+                    };
+                    (p.id.clone(), p.name.clone(), shared)
+                })
                 .collect(),
             libraries: self
                 .session
@@ -410,6 +556,7 @@ impl Render for RootView {
                 .collect(),
             selected_libraries: self.session.read(cx).library_ids.clone(),
             libraries_collapsed: self.libraries_collapsed,
+            playlists_collapsed: self.playlists_collapsed,
         };
 
         let this = cx.entity();
@@ -462,9 +609,11 @@ impl Render for RootView {
                         cx.stop_propagation();
                     }
                     "escape" => {
-                        if this.show_fullscreen {
-                            this.show_fullscreen = false;
-                            cx.notify();
+                        if this.new_playlist_open {
+                            this.cancel_new_playlist(cx);
+                            cx.stop_propagation();
+                        } else if this.show_fullscreen {
+                            this.fullscreen.update(cx, |f, cx| f.begin_close(cx));
                             cx.stop_propagation();
                         } else if this.search_bar.read(cx).is_open() {
                             this.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
@@ -511,9 +660,7 @@ impl Render for RootView {
                                     root.open_playlist(id, window, cx)
                                 }
                                 SidebarAction::NewPlaylist => {
-                                    root.playlists.update(cx, |p, cx| {
-                                        p.create("New Playlist".into(), Vec::new(), cx);
-                                    });
+                                    root.open_new_playlist(window, cx);
                                 }
                                 SidebarAction::ToggleLibrary(id) => {
                                     root.session.update(cx, |s, cx| s.toggle_library(id, cx));
@@ -523,6 +670,10 @@ impl Render for RootView {
                                 }
                                 SidebarAction::ToggleLibrarySection => {
                                     root.libraries_collapsed = !root.libraries_collapsed;
+                                    cx.notify();
+                                }
+                                SidebarAction::TogglePlaylistSection => {
+                                    root.playlists_collapsed = !root.playlists_collapsed;
                                     cx.notify();
                                 }
                             });
@@ -551,6 +702,10 @@ impl Render for RootView {
             .child(self.player_bar.clone())
             // Fullscreen overlay — rendered last so it sits on top.
             .when(show_fullscreen, |this| this.child(fullscreen))
+            // New-playlist dialog on top of everything.
+            .when(self.new_playlist_open, |this| {
+                this.child(self.render_new_playlist_modal(cx))
+            })
             .into_any_element()
     }
 }

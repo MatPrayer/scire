@@ -5,8 +5,11 @@ use std::path::PathBuf;
 
 use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::popover::Popover;
-use gpui_component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+};
 use subsonic::{AlbumWithSongs, AnnotationTarget, Song, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
@@ -30,8 +33,13 @@ pub struct AlbumDetailView {
     album: Option<AlbumWithSongs>,
     art_path: Option<PathBuf>,
     error: Option<String>,
-    /// Transient status line (e.g. "share link copied").
-    notice: Option<String>,
+    /// Last observed playing-song id; used to refresh play counts when a track
+    /// from this album finishes (its scrobble updates the server count).
+    last_playing_id: Option<String>,
+    /// Full-resolution cover lightbox open.
+    show_full_art: bool,
+    /// High-res cover for the lightbox (fetched lazily on first open).
+    full_art_path: Option<PathBuf>,
 }
 
 impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
@@ -44,8 +52,28 @@ impl AlbumDetailView {
         album_id: String,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Highlight the playing track as it changes.
-        cx.observe(&player.clone(), |_, _, cx| cx.notify()).detach();
+        // Highlight the playing track as it changes; refresh play counts when
+        // playback moves off a track belonging to this album.
+        cx.observe(&player.clone(), |this: &mut Self, player, cx| {
+            let cur = player.read(cx).current_song().map(|s| s.id.clone());
+            if cur != this.last_playing_id {
+                let prev = this.last_playing_id.take();
+                this.last_playing_id = cur.clone();
+                let in_album = |id: &Option<String>| {
+                    id.as_ref().is_some_and(|id| {
+                        this.album
+                            .as_ref()
+                            .is_some_and(|a| a.song.iter().any(|s| &s.id == id))
+                    })
+                };
+                if in_album(&prev) || in_album(&cur) {
+                    this.load(cx);
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+        let last_playing_id = player.read(cx).current_song().map(|s| s.id.clone());
         let mut this = Self {
             session,
             player,
@@ -54,46 +82,32 @@ impl AlbumDetailView {
             album: None,
             art_path: None,
             error: None,
-            notice: None,
+            last_playing_id,
+            show_full_art: false,
+            full_art_path: None,
         };
         this.load(cx);
         this
     }
 
-    /// Create a public share for the album and copy the URL to the clipboard.
-    fn share_album(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.session.read(cx).client.clone() else {
-            return;
-        };
-        let id = self.album_id.clone();
-        cx.spawn(async move |this, cx| {
-            let result = runtime::spawn_io(async move {
-                client
-                    .create_share(&[&id], None)
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await;
-            let _ = this.update(cx, |view, cx| {
-                match result {
-                    Ok(share) => {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(share.url.clone()));
-                        view.notice = Some(format!("Share link copied: {}", share.url));
-                    }
-                    Err(e) => {
-                        if let Some(subsonic::Error::Api { .. }) =
-                            e.downcast_ref::<subsonic::Error>()
-                        {
-                            view.notice = Some("Sharing is disabled on this server".into());
-                        } else {
-                            view.error = Some(format!("{e:#}"));
-                        }
-                    }
+    /// Open the full-resolution cover lightbox, fetching a large version once.
+    fn open_full_art(&mut self, cx: &mut Context<Self>) {
+        self.show_full_art = true;
+        if self.full_art_path.is_none()
+            && let Some(client) = self.client(cx)
+            && let Some(cover) = self.album.as_ref().and_then(|a| a.album.cover_art.clone())
+        {
+            cx.spawn(async move |this, cx| {
+                if let Ok(path) = artwork::fetch(client, cover, 1500).await {
+                    let _ = this.update(cx, |view, cx| {
+                        view.full_art_path = Some(path);
+                        cx.notify();
+                    });
                 }
-                cx.notify();
-            });
-        })
-        .detach();
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
@@ -357,25 +371,32 @@ impl Render for AlbumDetailView {
 
             h_flex()
                 .gap_4()
-                .items_end()
+                .items_start()
+                .flex_wrap()
                 .child(
                     div()
-                        .size(px(180.))
-                        .rounded_md()
+                        .id("album-cover")
+                        .size(px(220.))
+                        .rounded_2xl()
                         .bg(cx.theme().muted)
                         .overflow_hidden()
                         .when_some(self.art_path.clone(), |this, path| {
-                            this.child(img(path).size(px(180.)).rounded_md())
+                            // Click to view the cover at full resolution.
+                            this.cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| this.open_full_art(cx)))
+                                .child(img(path).size(px(220.)).rounded_2xl())
                         }),
                 )
                 .child(
                     v_flex()
-                        .gap_1()
+                        .flex_1()
+                        .min_w(px(260.))
+                        .gap_2()
                         .child(
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .child(div().text_xl().child(name))
+                                .child(div().text_2xl().font_medium().child(name))
                                 .child(
                                     Button::new("album-star")
                                         .ghost()
@@ -389,15 +410,6 @@ impl Render for AlbumDetailView {
                                             cx.listener(|this, _, _, cx| {
                                                 this.toggle_album_star(cx)
                                             }),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("album-share")
-                                        .ghost()
-                                        .xsmall()
-                                        .label("Share")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.share_album(cx)),
                                         ),
                                 ),
                         )
@@ -428,7 +440,6 @@ impl Render for AlbumDetailView {
                                 .child(
                                     Button::new("album-play")
                                         .primary()
-                                        .xsmall()
                                         .icon(app_icon(icons::PLAY))
                                         .label("Play")
                                         .disabled(!has_songs)
@@ -439,7 +450,6 @@ impl Render for AlbumDetailView {
                                 .child(
                                     Button::new("album-shuffle")
                                         .ghost()
-                                        .xsmall()
                                         .icon(app_icon(icons::SHUFFLE))
                                         .label("Shuffle")
                                         .disabled(!has_songs)
@@ -475,6 +485,19 @@ impl Render for AlbumDetailView {
                     .unwrap_or_default();
                 let song_next = song.clone();
                 let song_enq = song.clone();
+                // Right-click context menu data.
+                let menu_song = song.clone();
+                let menu_artist_id = song.artist_id.clone();
+                let menu_view = cx.entity();
+                let menu_song_id = song.id.clone();
+                let menu_playlists = self.playlists.clone();
+                let menu_pl_list: Vec<(String, String)> = self
+                    .playlists
+                    .read(cx)
+                    .playlists
+                    .iter()
+                    .map(|p| (p.id.clone(), p.name.clone()))
+                    .collect();
                 h_flex()
                     .id(("track", i))
                     .group("trow")
@@ -584,23 +607,137 @@ impl Render for AlbumDetailView {
                             .text_color(cx.theme().muted_foreground)
                             .child(dur),
                     )
+                    .context_menu(move |menu, window, cx| {
+                        let play_view = menu_view.clone();
+                        let next_view = menu_view.clone();
+                        let next_song = menu_song.clone();
+                        let enq_view = menu_view.clone();
+                        let enq_song = menu_song.clone();
+                        let star_view = menu_view.clone();
+                        // Clone per open: the outer builder is called repeatedly.
+                        let pl_list = menu_pl_list.clone();
+                        let playlists = menu_playlists.clone();
+                        let song_id = menu_song_id.clone();
+                        let mut menu = menu
+                            .item(PopupMenuItem::new("Play").on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    play_view.update(cx, |v, cx| v.play_from(i, cx));
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Play next").on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    let song = next_song.clone();
+                                    next_view.update(cx, |v, cx| {
+                                        v.player.update(cx, |p, cx| p.play_next(vec![song], cx))
+                                    });
+                                },
+                            ))
+                            .item(PopupMenuItem::new("Add to queue").on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    let song = enq_song.clone();
+                                    enq_view.update(cx, |v, cx| {
+                                        v.player.update(cx, |p, cx| p.enqueue(vec![song], cx))
+                                    });
+                                },
+                            ))
+                            .submenu("Save to playlist", window, cx, move |sub, _w, _c| {
+                                if pl_list.is_empty() {
+                                    return sub.item(
+                                        PopupMenuItem::new("No playlists yet").disabled(true),
+                                    );
+                                }
+                                let mut sub = sub;
+                                for (pid, pname) in &pl_list {
+                                    let playlists = playlists.clone();
+                                    let pid = pid.clone();
+                                    let song_id = song_id.clone();
+                                    sub = sub.item(PopupMenuItem::new(pname.clone()).on_click(
+                                        move |_, _, cx: &mut gpui::App| {
+                                            playlists.update(cx, |pl, cx| {
+                                                pl.add_song(pid.clone(), song_id.clone(), cx)
+                                            });
+                                        },
+                                    ));
+                                }
+                                sub
+                            })
+                            .item(
+                                PopupMenuItem::new(if starred { "Unstar" } else { "Star" })
+                                    .on_click(move |_, _, cx: &mut gpui::App| {
+                                        star_view.update(cx, |v, cx| v.toggle_song_star(i, cx));
+                                    }),
+                            );
+                        if let Some(aid) = menu_artist_id.clone() {
+                            let artist_view = menu_view.clone();
+                            menu = menu.item(PopupMenuItem::separator()).item(
+                                PopupMenuItem::new("Go to artist").on_click(
+                                    move |_, _, cx: &mut gpui::App| {
+                                        artist_view.update(cx, |_, cx| {
+                                            cx.emit(AlbumDetailEvent::OpenArtist(aid.clone()))
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        menu
+                    })
                     .into_any_element()
             })
             .collect();
 
-        v_flex()
+        let scroll = v_flex()
             .id("album-detail-scroll")
             .size_full()
             .overflow_y_scroll()
             .p_4()
             .gap_4()
-            .child(header)
-            .when_some(self.notice.clone(), |this, n| {
-                this.child(div().text_color(cx.theme().accent).text_sm().child(n))
-            })
+            // Header card matches the artist page framing.
+            .child(
+                v_flex()
+                    .rounded_2xl()
+                    .p_4()
+                    .gap_4()
+                    .bg(cx.theme().sidebar)
+                    .child(header),
+            )
             .when_some(self.error.clone(), |this, e| {
                 this.child(div().text_color(cx.theme().danger).text_sm().child(e))
             })
-            .child(v_flex().gap_0p5().children(rows))
+            .child(v_flex().gap_0p5().children(rows));
+
+        div()
+            .relative()
+            .size_full()
+            .child(scroll)
+            // Full-resolution cover lightbox; click anywhere to dismiss.
+            .when(self.show_full_art, |this| {
+                this.child(
+                    div()
+                        .id("album-lightbox")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_8()
+                        .occlude()
+                        .cursor_pointer()
+                        .bg(gpui::hsla(0., 0., 0., 0.88))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_full_art = false;
+                            cx.notify();
+                        }))
+                        .when_some(
+                            self.full_art_path.clone().or_else(|| self.art_path.clone()),
+                            |this, path| {
+                                this.child(
+                                    img(path).max_w(px(820.)).max_h(px(820.)).rounded_lg(),
+                                )
+                            },
+                        ),
+                )
+            })
     }
 }

@@ -7,6 +7,7 @@ use gpui::{AppContext as _, Context, Entity};
 use playback::{Event, Player, TrackSource};
 use subsonic::{Song, StreamOptions, SubsonicClient};
 
+use crate::config::ReplayGainMode;
 use crate::services::runtime;
 use crate::state::media::MediaKeys;
 use crate::state::queue::{Queue, RepeatMode};
@@ -32,6 +33,17 @@ pub struct PlayerState {
     pub recently_played: Vec<Song>,
     /// Local path of the current track's cover art (for OS media controls).
     pub current_art_path: Option<std::path::PathBuf>,
+    /// OS output device name, known once the engine opens the audio output.
+    pub output_device: Option<String>,
+    /// Clear the queue + player bar when playback reaches the queue end.
+    clear_on_end: bool,
+    /// ReplayGain mode applied to the effective playback volume.
+    replay_gain_mode: ReplayGainMode,
+    /// Linear gain factor for the current track from ReplayGain (1.0 = none).
+    current_gain: f32,
+    /// The engine has a track loaded. False after startup with a restored
+    /// queue — play must (re)start the current song, not resume.
+    engine_has_track: bool,
 }
 
 impl PlayerState {
@@ -86,6 +98,11 @@ impl PlayerState {
             media_keys,
             recently_played: load_recent(),
             current_art_path: None,
+            output_device: None,
+            clear_on_end: false,
+            replay_gain_mode: ReplayGainMode::Off,
+            current_gain: 1.0,
+            engine_has_track: false,
         }
     }
 
@@ -114,8 +131,16 @@ impl PlayerState {
         .detach();
     }
 
-    pub fn set_client(&mut self, client: Option<SubsonicClient>) {
+    pub fn set_client(&mut self, client: Option<SubsonicClient>, cx: &mut Context<Self>) {
         self.client = client;
+        // A restored queue shows the current track before any playback —
+        // fetch its cover as soon as the server connection is available.
+        if self.client.is_some()
+            && self.current_art_path.is_none()
+            && self.queue.current_song().is_some()
+        {
+            self.fetch_current_art(cx);
+        }
     }
 
     pub fn current_song(&self) -> Option<&Song> {
@@ -140,6 +165,8 @@ impl PlayerState {
     /// Play a live internet-radio stream by its external URL.
     pub fn play_radio(&mut self, name: String, stream_url: String, cx: &mut Context<Self>) {
         self.queue.clear();
+        persist_queue(&self.queue);
+        self.engine_has_track = true;
         self.scrobble.clear();
         self.player.clear_prefetch();
         self.radio_title = Some(name);
@@ -184,6 +211,7 @@ impl PlayerState {
             self.queue.jump_to(0);
             self.start_current(cx);
         } else {
+            persist_queue(&self.queue);
             self.refresh_prefetch(cx);
         }
     }
@@ -196,6 +224,7 @@ impl PlayerState {
             self.queue.jump_to(0);
             self.start_current(cx);
         } else {
+            persist_queue(&self.queue);
             self.refresh_prefetch(cx);
         }
     }
@@ -210,6 +239,7 @@ impl PlayerState {
     pub fn remove_from_queue(&mut self, order_pos: usize, cx: &mut Context<Self>) {
         let was_current = self.queue.current_pos() == Some(order_pos);
         self.queue.remove(order_pos);
+        persist_queue(&self.queue);
         if was_current {
             if self.queue.is_empty() {
                 self.stop(cx);
@@ -224,18 +254,29 @@ impl PlayerState {
 
     pub fn clear_queue(&mut self, cx: &mut Context<Self>) {
         self.queue.clear();
+        persist_queue(&self.queue);
         self.stop(cx);
+    }
+
+    /// Reorder a queue item (from the queue panel).
+    pub fn move_queue_item(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.queue.move_item(from, to);
+        persist_queue(&self.queue);
+        self.refresh_prefetch(cx);
+        cx.notify();
     }
 
     pub fn toggle_shuffle(&mut self, cx: &mut Context<Self>) {
         let on = !self.queue.shuffle;
         self.queue.set_shuffle(on);
+        persist_queue(&self.queue);
         self.refresh_prefetch(cx);
         cx.notify();
     }
 
     pub fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
         self.queue.repeat = self.queue.repeat.cycle();
+        persist_queue(&self.queue);
         self.refresh_prefetch(cx);
         cx.notify();
     }
@@ -263,9 +304,13 @@ impl PlayerState {
         }
     }
 
-    pub fn toggle_play(&mut self, _cx: &mut Context<Self>) {
+    pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
         if self.playing {
             self.player.pause();
+        } else if !self.engine_has_track && !self.is_radio() && self.current_song().is_some() {
+            // Nothing loaded in the engine (restored queue or failed track):
+            // resume would be a no-op, start the current song instead.
+            self.start_current(cx);
         } else {
             self.player.resume();
         }
@@ -273,6 +318,7 @@ impl PlayerState {
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.player.stop();
+        self.engine_has_track = false;
         self.playing = false;
         self.position = Duration::ZERO;
         self.duration = None;
@@ -288,8 +334,111 @@ impl PlayerState {
 
     pub fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
         self.volume = volume.clamp(0.0, 1.0);
-        self.player.set_volume(self.volume);
+        self.push_volume();
         cx.notify();
+    }
+
+    /// Effective engine volume = user volume × ReplayGain factor.
+    fn effective_volume(&self) -> f32 {
+        (self.volume * self.current_gain).clamp(0.0, 4.0)
+    }
+
+    /// Push the effective volume to the engine.
+    fn push_volume(&self) {
+        self.player.set_volume(self.effective_volume());
+    }
+
+    /// Resolve the effective ReplayGain mode: Auto picks Album when the queue
+    /// is a single album, Track otherwise. Other modes pass through.
+    fn effective_rg_mode(&self) -> ReplayGainMode {
+        match self.replay_gain_mode {
+            ReplayGainMode::Auto => {
+                if self.queue_is_album() {
+                    ReplayGainMode::Album
+                } else {
+                    ReplayGainMode::Track
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// True when the queue holds more than one track and they all share the
+    /// same album id (i.e. we're playing a whole album).
+    fn queue_is_album(&self) -> bool {
+        let mut album: Option<&str> = None;
+        let mut count = 0usize;
+        for (_, song) in self.queue.iter_ordered() {
+            let Some(aid) = song.album_id.as_deref() else {
+                return false;
+            };
+            match album {
+                None => album = Some(aid),
+                Some(a) if a == aid => {}
+                _ => return false,
+            }
+            count += 1;
+        }
+        count > 1
+    }
+
+    /// Recompute the ReplayGain factor for the current track and reapply the
+    /// effective volume. Radio and missing tags fall back to unity gain.
+    fn recompute_gain(&mut self) {
+        let mode = self.effective_rg_mode();
+        self.current_gain = if self.is_radio() {
+            1.0
+        } else {
+            self.current_song()
+                .and_then(|s| s.replay_gain.as_ref())
+                .map(|rg| replaygain_linear(rg, mode))
+                .unwrap_or(1.0)
+        };
+        self.push_volume();
+    }
+
+    /// Clear the queue and player bar when the queue ends (from Settings).
+    pub fn set_clear_on_end(&mut self, clear: bool, cx: &mut Context<Self>) {
+        self.clear_on_end = clear;
+        cx.notify();
+    }
+
+    /// Change ReplayGain mode (from Settings) and reapply to the current track.
+    pub fn set_replay_gain(&mut self, mode: ReplayGainMode, cx: &mut Context<Self>) {
+        self.replay_gain_mode = mode;
+        self.recompute_gain();
+        cx.notify();
+    }
+
+    /// Switch the audio output device (None = system default).
+    pub fn set_output_device(&mut self, name: Option<String>, cx: &mut Context<Self>) {
+        self.player.set_output_device(name);
+        cx.notify();
+    }
+
+    /// ReplayGain state for display when the mode is on (and not radio):
+    /// (mode label, applied gain in dB). Auto shows the resolved mode marked
+    /// `(auto)`. The gain is `None` when the current track has no usable tags.
+    pub fn replay_gain_active(&self) -> Option<(String, Option<f32>)> {
+        if self.replay_gain_mode == ReplayGainMode::Off || self.is_radio() {
+            return None;
+        }
+        let mode = self.effective_rg_mode();
+        let base = if mode == ReplayGainMode::Album {
+            "album"
+        } else {
+            "track"
+        };
+        let label = if self.replay_gain_mode == ReplayGainMode::Auto {
+            format!("{base} (auto)")
+        } else {
+            base.to_string()
+        };
+        let db = self
+            .current_song()
+            .and_then(|s| s.replay_gain.as_ref())
+            .map(|rg| 20.0 * replaygain_linear(rg, mode).log10());
+        Some((label, db))
     }
 
     // ----- media keys -----
@@ -364,6 +513,7 @@ impl PlayerState {
         self.scrobble_enabled = scrobble_enabled;
         self.queue.shuffle = default_shuffle;
         self.queue.repeat = default_repeat;
+        persist_queue(&self.queue);
         self.refresh_prefetch(cx);
         cx.notify();
     }
@@ -383,6 +533,7 @@ impl PlayerState {
 
     fn start_current(&mut self, cx: &mut Context<Self>) {
         self.radio_title = None; // leaving radio for library playback
+        persist_queue(&self.queue);
         let Some(song) = self.queue.current_song() else {
             return;
         };
@@ -396,10 +547,14 @@ impl PlayerState {
                 self.duration = duration;
                 self.last_error = None;
                 self.current_art_path = None;
+                // Apply this track's ReplayGain before playback opens so the
+                // engine starts the sink at the normalized volume.
+                self.recompute_gain();
                 self.player.play(TrackSource {
                     url,
                     duration_hint: duration,
                 });
+                self.engine_has_track = true;
                 push_recent(&mut self.recently_played, song_clone);
                 self.refresh_prefetch(cx);
                 let action = self.scrobble.start(song_id);
@@ -462,6 +617,7 @@ impl PlayerState {
                     // queue pointer to match and set up the next prefetch.
                     if let Some(pos) = self.queue.next_pos() {
                         self.queue.advance_to(pos);
+                        persist_queue(&self.queue);
                     }
                     self.position = Duration::ZERO;
                     self.duration = self
@@ -470,6 +626,8 @@ impl PlayerState {
                         .and_then(|s| s.duration)
                         .map(|s| Duration::from_secs(s as u64));
                     self.refresh_prefetch(cx);
+                    // The gapless track carries its own ReplayGain.
+                    self.recompute_gain();
                     if let Some(song) = self.queue.current_song() {
                         let action = self.scrobble.start(song.id.clone());
                         self.fire_scrobble(action, cx);
@@ -478,16 +636,24 @@ impl PlayerState {
                     self.media_keys.set_playing(true, Duration::ZERO);
                 } else {
                     self.playing = false;
+                    self.engine_has_track = false;
                     if let Some(pos) = self.queue.next_pos() {
                         self.queue.advance_to(pos);
                         self.start_current(cx);
+                    } else if self.clear_on_end {
+                        // Reached the queue end: clear it and reset the bar.
+                        self.clear_queue(cx);
                     }
                 }
             }
             Event::Failed(msg) => {
                 self.playing = false;
                 self.buffering = false;
+                self.engine_has_track = false;
                 self.last_error = Some(msg);
+            }
+            Event::OutputOpened { device } => {
+                self.output_device = device;
             }
         }
         cx.notify();
@@ -499,15 +665,82 @@ pub fn init(
     default_shuffle: bool,
     default_repeat: RepeatMode,
     scrobble_enabled: bool,
+    replay_gain: ReplayGainMode,
+    output_device: Option<String>,
+    clear_on_end: bool,
     cx: &mut gpui::App,
 ) -> Entity<PlayerState> {
     cx.new(|cx| {
         let mut state = PlayerState::new(volume, cx);
-        state.queue.shuffle = default_shuffle;
-        state.queue.repeat = default_repeat;
+        state.replay_gain_mode = replay_gain;
+        state.clear_on_end = clear_on_end;
+        if output_device.is_some() {
+            state.player.set_output_device(output_device);
+        }
+        // A restored queue keeps its own shuffle/repeat; the configured
+        // defaults only apply to a fresh session.
+        match load_queue() {
+            Some(queue) => {
+                // Show the restored current track in the bar, paused; the
+                // engine loads it on the first play press.
+                state.duration = queue
+                    .current_song()
+                    .and_then(|s| s.duration)
+                    .map(|s| Duration::from_secs(s as u64));
+                state.queue = queue;
+            }
+            None => {
+                state.queue.shuffle = default_shuffle;
+                state.queue.repeat = default_repeat;
+            }
+        }
         state.scrobble_enabled = scrobble_enabled;
         state
     })
+}
+
+/// Linear gain factor from a ReplayGain block for the given mode. Applies the
+/// base gain offset and clamps against the peak to avoid clipping.
+fn replaygain_linear(rg: &subsonic::ReplayGain, mode: ReplayGainMode) -> f32 {
+    let (gain_db, peak) = match mode {
+        // Auto is resolved to Track/Album before this call; treat as Track.
+        ReplayGainMode::Off => return 1.0,
+        ReplayGainMode::Track | ReplayGainMode::Auto => {
+            (rg.track_gain.or(rg.fallback_gain), rg.track_peak)
+        }
+        ReplayGainMode::Album => (
+            rg.album_gain.or(rg.track_gain).or(rg.fallback_gain),
+            rg.album_peak.or(rg.track_peak),
+        ),
+    };
+    let Some(db) = gain_db else { return 1.0 };
+    let base = rg.base_gain.unwrap_or(0.0);
+    let mut g = 10f32.powf((db + base) / 20.0);
+    if let Some(pk) = peak.filter(|&p| p > 0.0) {
+        g = g.min(1.0 / pk); // clipping prevention
+    }
+    g.clamp(0.0, 4.0)
+}
+
+// ---- queue persistence ----
+
+fn load_queue() -> Option<Queue> {
+    let path = crate::config::queue_path().ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let queue: Queue = serde_json::from_str(&text).ok()?;
+    (queue.is_valid() && !queue.is_empty()).then_some(queue)
+}
+
+fn persist_queue(queue: &Queue) {
+    let Ok(path) = crate::config::queue_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(queue) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 // ---- recently-played helpers ----

@@ -56,12 +56,16 @@ impl SubsonicClient {
         &self,
         playlist_id: &str,
         new_name: Option<&str>,
+        comment: Option<&str>,
         add_song_ids: &[&str],
         remove_indices: &[u32],
     ) -> Result<(), Error> {
         let mut params: Vec<(&str, &str)> = vec![("playlistId", playlist_id)];
         if let Some(name) = new_name {
             params.push(("name", name));
+        }
+        if let Some(comment) = comment {
+            params.push(("comment", comment));
         }
         for id in add_song_ids {
             params.push(("songIdToAdd", id));
