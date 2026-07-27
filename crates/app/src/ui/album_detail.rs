@@ -10,7 +10,7 @@ use gpui_component::popover::Popover;
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
-use subsonic::{AlbumWithSongs, AnnotationTarget, Song, SubsonicClient};
+use subsonic::{AlbumWithSongs, Song, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::services::{artwork, runtime};
@@ -184,9 +184,9 @@ impl AlbumDetailView {
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 if starred {
-                    client.unstar(AnnotationTarget::Album, &id).await
+                    client.unstar("albumId", &id).await
                 } else {
-                    client.star(AnnotationTarget::Album, &id).await
+                    client.star("albumId", &id).await
                 }
                 .map_err(anyhow::Error::from)
             })
@@ -217,9 +217,9 @@ impl AlbumDetailView {
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 if starred {
-                    client.unstar(AnnotationTarget::Song, &id).await
+                    client.unstar("id", &id).await
                 } else {
-                    client.star(AnnotationTarget::Song, &id).await
+                    client.star("id", &id).await
                 }
                 .map_err(anyhow::Error::from)
             })

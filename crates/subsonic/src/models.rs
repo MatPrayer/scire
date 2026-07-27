@@ -196,28 +196,22 @@ pub struct SearchResult3 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlbumListType {
     AlphabeticalByName,
-    AlphabeticalByArtist,
     Newest,
     Recent,
     Frequent,
     Random,
     Starred,
-    ByYear,
-    ByGenre,
 }
 
 impl AlbumListType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AlphabeticalByName => "alphabeticalByName",
-            Self::AlphabeticalByArtist => "alphabeticalByArtist",
             Self::Newest => "newest",
             Self::Recent => "recent",
             Self::Frequent => "frequent",
             Self::Random => "random",
             Self::Starred => "starred",
-            Self::ByYear => "byYear",
-            Self::ByGenre => "byGenre",
         }
     }
 }

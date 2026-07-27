@@ -56,14 +56,6 @@ impl SubsonicClient {
         })
     }
 
-    pub fn username(&self) -> &str {
-        &self.credentials.username
-    }
-
-    pub fn base_url(&self) -> &Url {
-        &self.base_url
-    }
-
     /// Build a fully-authenticated URL for `rest/{endpoint}` with extra params.
     /// Used both for API requests and for stream/coverArt URLs handed to the
     /// playback and artwork layers.

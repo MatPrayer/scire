@@ -40,7 +40,7 @@ pub fn cached(cover_id: &str, size: u32) -> Option<PathBuf> {
         return Some(path);
     }
     let dir = config::artwork_cache_dir().ok()?;
-    let path = dir.join(format!("{}-{size}.img", sanitize(cover_id)));
+    let path = dir.join(format!("{}-{size}.img", config::sanitize(cover_id)));
     if path.exists() {
         mem_cache().lock().unwrap().insert(cache_key, path.clone());
         Some(path)
@@ -58,7 +58,7 @@ pub async fn fetch(client: SubsonicClient, cover_id: String, size: u32) -> Resul
 
     let cache_key = format!("{cover_id}-{size}");
     let dir = config::artwork_cache_dir()?;
-    let path = dir.join(format!("{}-{size}.img", sanitize(&cover_id)));
+    let path = dir.join(format!("{}-{size}.img", config::sanitize(&cover_id)));
 
     // 3. Network fetch.
     let path2 = path.clone();
@@ -111,16 +111,4 @@ fn evict_if_over_cap(dir: &Path) {
             total = total.saturating_sub(len);
         }
     }
-}
-
-fn sanitize(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }

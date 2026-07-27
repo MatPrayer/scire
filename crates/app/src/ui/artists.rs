@@ -584,7 +584,7 @@ fn is_single_or_ep(album: &Album) -> bool {
 
 async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
     let dir = crate::config::artwork_cache_dir()?;
-    let path = dir.join(format!("{}-{}.img", sanitize_name(url), ART_SIZE));
+    let path = dir.join(format!("{}-{}.img", crate::config::sanitize(url), ART_SIZE));
     if path.exists() {
         return Ok(path);
     }
@@ -595,19 +595,6 @@ async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
-}
-
-fn sanitize_name(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

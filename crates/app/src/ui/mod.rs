@@ -246,6 +246,13 @@ pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
         ThemePref::System | ThemePref::Custom => ThemeMode::from(window.appearance()),
     };
     Theme::change(mode, Some(window), cx);
+    let family = SharedString::from(
+        "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans CJK KR, sans-serif",
+    );
+    let theme = Theme::global_mut(cx);
+    theme.font_family = family.clone();
+    Rc::make_mut(&mut theme.light_theme).font_family = Some(family.clone());
+    Rc::make_mut(&mut theme.dark_theme).font_family = Some(family);
     if matches!(pref, ThemePref::Custom) {
         apply_custom_theme_from_settings(cx);
     }
@@ -266,10 +273,12 @@ pub fn apply_custom_theme_from_settings(cx: &mut App) {
         "dark" => ThemeMode::Dark,
         _ => ThemeMode::Light,
     };
-    let mut config = ThemeConfig::default();
-    config.name = SharedString::from(theme.name.clone());
-    config.mode = mode;
-    config.colors = imported_theme_colors(theme);
+    let config = ThemeConfig {
+        name: SharedString::from(theme.name.clone()),
+        mode,
+        colors: imported_theme_colors(theme),
+        ..Default::default()
+    };
     Theme::global_mut(cx).apply_config(&Rc::new(config));
 }
 

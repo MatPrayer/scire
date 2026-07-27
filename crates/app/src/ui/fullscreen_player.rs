@@ -315,6 +315,7 @@ impl FullscreenPlayer {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.player.update(cx, |p, cx| p.jump_to(pos, cx));
+                        cx.stop_propagation();
                     }))
                     .child(
                         v_flex()
@@ -683,6 +684,7 @@ impl Render for FullscreenPlayer {
                             .label("Close")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.begin_close(cx);
+                                cx.stop_propagation();
                             })),
                     ),
             )
@@ -835,6 +837,7 @@ impl Render for FullscreenPlayer {
                                             cx.listener(|this, _, _, cx| {
                                                 this.player
                                                     .update(cx, |p, cx| p.toggle_shuffle(cx));
+                                                cx.stop_propagation();
                                             }),
                                         ),
                                     )
@@ -843,6 +846,7 @@ impl Render for FullscreenPlayer {
                                             .disabled(!has_track)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.player.update(cx, |p, cx| p.previous(cx));
+                                                cx.stop_propagation();
                                             })),
                                     )
                                     .child(
@@ -858,6 +862,7 @@ impl Render for FullscreenPlayer {
                                             .disabled(!has_track)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.player.update(cx, |p, cx| p.toggle_play(cx));
+                                                cx.stop_propagation();
                                             })),
                                     )
                                     .child(
@@ -865,6 +870,7 @@ impl Render for FullscreenPlayer {
                                             .disabled(!has_track)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.player.update(cx, |p, cx| p.next(cx));
+                                                cx.stop_propagation();
                                             })),
                                     )
                                     .child(
@@ -880,6 +886,7 @@ impl Render for FullscreenPlayer {
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
                                                 this.player.update(cx, |p, cx| p.cycle_repeat(cx));
+                                                cx.stop_propagation();
                                             }),
                                         ),
                                     ),
@@ -899,6 +906,7 @@ impl Render for FullscreenPlayer {
                                             })
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_panel(SidePanel::Queue, cx);
+                                                cx.stop_propagation();
                                             })),
                                     )
                                     .child(
@@ -912,6 +920,7 @@ impl Render for FullscreenPlayer {
                                             })
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_panel(SidePanel::Lyrics, cx);
+                                                cx.stop_propagation();
                                             })),
                                     ),
                             ),

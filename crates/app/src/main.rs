@@ -22,16 +22,7 @@ fn main() {
 
             let session = state::session::init(cx);
             let settings = session.read(cx).settings.clone();
-            let player = state::player::init(
-                settings.volume,
-                settings.default_shuffle,
-                settings.default_repeat,
-                settings.scrobble_enabled,
-                settings.replay_gain,
-                settings.output_device.clone(),
-                settings.queue_end == config::QueueEndBehavior::Clear,
-                cx,
-            );
+            let player = state::player::init(&settings, cx);
             player.update(cx, |p, _| {
                 p.set_transcoding(settings.transcoding.to_stream_options())
             });

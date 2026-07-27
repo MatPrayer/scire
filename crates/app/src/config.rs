@@ -381,21 +381,24 @@ impl Settings {
 
 /// Keyring account name: `user@host` so multiple servers can coexist later.
 fn keyring_account(url: &str, username: &str) -> String {
-    let host = url::host(url).unwrap_or_else(|| url.to_string());
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_else(|| url.to_string());
     format!("{username}@{host}")
 }
 
-mod url {
-    /// Tiny host extractor to avoid pulling a full URL crate here.
-    pub fn host(url: &str) -> Option<String> {
-        let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-        let host = rest.split(['/', '?']).next()?;
-        if host.is_empty() {
-            None
-        } else {
-            Some(host.to_string())
-        }
-    }
+/// Sanitize a string for use in filenames: keep only alphanumeric, `-`, `_`.
+pub fn sanitize(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub fn store_password(server_url: &str, username: &str, password: &str) -> Result<()> {

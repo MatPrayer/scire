@@ -15,15 +15,10 @@ use crate::config;
 pub const BUCKETS: usize = 480;
 
 fn cache_path(song_id: &str) -> Option<PathBuf> {
-    let safe: String = song_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    // v3: 480 buckets for a continuous filled waveform.
     Some(
         config::waveform_cache_dir()
             .ok()?
-            .join(format!("{safe}.v3.json")),
+            .join(format!("{}.v3.json", config::sanitize(song_id))),
     )
 }
 

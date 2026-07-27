@@ -3,7 +3,7 @@
 use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, prelude::*};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
-use subsonic::{AnnotationTarget, Starred, SubsonicClient};
+use subsonic::{Starred, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::services::runtime;
@@ -88,16 +88,13 @@ impl FavoritesView {
         .detach();
     }
 
-    fn unstar(&mut self, target: AnnotationTarget, id: String, cx: &mut Context<Self>) {
+    fn unstar(&mut self, param: &'static str, id: String, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
-                client
-                    .unstar(target, &id)
-                    .await
-                    .map_err(anyhow::Error::from)
+                client.unstar(param, &id).await.map_err(anyhow::Error::from)
             })
             .await;
             let _ = this.update(cx, |view, cx| match result {
@@ -166,7 +163,7 @@ impl Render for FavoritesView {
                                     .xsmall()
                                     .icon(app_icon(icons::STAR_FILLED))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.unstar(AnnotationTarget::Song, id.clone(), cx);
+                                        this.unstar("id", id.clone(), cx);
                                         cx.stop_propagation();
                                     })),
                             )
@@ -212,7 +209,7 @@ impl Render for FavoritesView {
                                     .xsmall()
                                     .icon(app_icon(icons::STAR_FILLED))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.unstar(AnnotationTarget::Album, unstar_id.clone(), cx);
+                                        this.unstar("albumId", unstar_id.clone(), cx);
                                         cx.stop_propagation();
                                     })),
                             )
@@ -245,11 +242,7 @@ impl Render for FavoritesView {
                                     .xsmall()
                                     .icon(app_icon(icons::STAR_FILLED))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.unstar(
-                                            AnnotationTarget::Artist,
-                                            unstar_id.clone(),
-                                            cx,
-                                        );
+                                        this.unstar("artistId", unstar_id.clone(), cx);
                                         cx.stop_propagation();
                                     })),
                             )

@@ -1,4 +1,4 @@
-use subsonic::{AnnotationTarget, Credentials, SubsonicClient};
+use subsonic::{Credentials, SubsonicClient};
 use wiremock::matchers::{path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -142,8 +142,8 @@ async fn star_uses_target_specific_param() {
         .await;
 
     let c = client(&server.uri());
-    c.star(AnnotationTarget::Album, "al-1").await.unwrap();
-    c.unstar(AnnotationTarget::Song, "s-1").await.unwrap();
+    c.star("albumId", "al-1").await.unwrap();
+    c.unstar("id", "s-1").await.unwrap();
 }
 
 #[tokio::test]

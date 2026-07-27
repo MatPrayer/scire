@@ -4,25 +4,6 @@ use crate::client::SubsonicClient;
 use crate::error::Error;
 use crate::models::{Album, Artist, LibraryId, Song};
 
-/// Which kind of item an annotation applies to. Subsonic uses different
-/// query params for songs (`id`), albums (`albumId`) and artists (`artistId`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnnotationTarget {
-    Song,
-    Album,
-    Artist,
-}
-
-impl AnnotationTarget {
-    fn param(self) -> &'static str {
-        match self {
-            Self::Song => "id",
-            Self::Album => "albumId",
-            Self::Artist => "artistId",
-        }
-    }
-}
-
 /// Starred items from getStarred2 (ID3 variants).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Starred {
@@ -41,12 +22,14 @@ struct StarredWrapper {
 }
 
 impl SubsonicClient {
-    pub async fn star(&self, target: AnnotationTarget, id: &str) -> Result<(), Error> {
-        self.get_empty("star", &[(target.param(), id)]).await
+    /// `param` is the Subsonic ID parameter: `"id"` for songs, `"albumId"` for
+    /// albums, `"artistId"` for artists.
+    pub async fn star(&self, param: &str, id: &str) -> Result<(), Error> {
+        self.get_empty("star", &[(param, id)]).await
     }
 
-    pub async fn unstar(&self, target: AnnotationTarget, id: &str) -> Result<(), Error> {
-        self.get_empty("unstar", &[(target.param(), id)]).await
+    pub async fn unstar(&self, param: &str, id: &str) -> Result<(), Error> {
+        self.get_empty("unstar", &[(param, id)]).await
     }
 
     /// Rate a song/album/artist 1-5; 0 removes the rating.

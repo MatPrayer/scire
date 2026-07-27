@@ -10,10 +10,6 @@ use crate::models::MusicFolder;
 pub struct ServerInfo {
     #[serde(default)]
     pub server_version: Option<String>,
-    #[serde(default)]
-    pub open_subsonic: Option<bool>,
-    #[serde(rename = "type", default)]
-    pub server_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

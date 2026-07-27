@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity};
 use playback::{Event, Player, TrackSource};
+use souvlaki::{MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig};
 use subsonic::{Song, StreamOptions, SubsonicClient};
+use tokio::sync::mpsc;
 
-use crate::config::ReplayGainMode;
+use crate::config::{ReplayGainMode, Settings};
 use crate::services::runtime;
-use crate::state::media::MediaKeys;
 use crate::state::queue::{Queue, RepeatMode};
 use crate::state::scrobble::{ScrobbleAction, ScrobbleTracker};
 
@@ -28,7 +29,7 @@ pub struct PlayerState {
     stream_opts: StreamOptions,
     /// Set while a live radio stream is playing (title for display).
     radio_title: Option<String>,
-    media_keys: MediaKeys,
+    media_controls: Option<MediaControls>,
     /// Most-recently-played tracks (newest first, max 50). Persisted to disk.
     pub recently_played: Vec<Song>,
     /// Local path of the current track's cover art (for OS media controls).
@@ -66,9 +67,30 @@ impl PlayerState {
         })
         .detach();
 
-        // OS media keys / Now Playing: forward presses into the entity.
-        let (media_tx, mut media_rx) = tokio::sync::mpsc::unbounded_channel();
-        let media_keys = MediaKeys::new(media_tx);
+        // OS media keys / Now Playing: best-effort init, forward presses.
+        let (media_tx, mut media_rx) = mpsc::unbounded_channel();
+        let media_controls = PlatformConfig {
+            display_name: "Scirè",
+            dbus_name: "scire",
+            hwnd: None,
+        };
+        let media_controls = match MediaControls::new(media_controls) {
+            Ok(mut controls) => {
+                let attach = controls.attach(move |event| {
+                    let _ = media_tx.send(event);
+                });
+                if let Err(e) = attach {
+                    tracing::warn!("media controls attach failed: {e:?}");
+                    None
+                } else {
+                    Some(controls)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("media controls unavailable: {e:?}");
+                None
+            }
+        };
         cx.spawn(async move |this, cx| {
             while let Some(event) = media_rx.recv().await {
                 let done = this
@@ -95,7 +117,7 @@ impl PlayerState {
             scrobble_enabled: true,
             stream_opts: StreamOptions::default(),
             radio_title: None,
-            media_keys,
+            media_controls,
             recently_played: load_recent(),
             current_art_path: None,
             output_device: None,
@@ -179,7 +201,11 @@ impl PlayerState {
             duration_hint: None,
         });
         self.sync_media_metadata();
-        self.media_keys.set_playing(true, Duration::ZERO);
+        if let Some(c) = &mut self.media_controls {
+            let _ = c.set_playback(MediaPlayback::Playing {
+                progress: Some(MediaPosition(Duration::ZERO)),
+            });
+        }
         cx.notify();
     }
 
@@ -324,7 +350,9 @@ impl PlayerState {
         self.duration = None;
         self.radio_title = None;
         self.scrobble.clear();
-        self.media_keys.set_stopped();
+        if let Some(c) = &mut self.media_controls {
+            let _ = c.set_playback(MediaPlayback::Stopped);
+        }
         cx.notify();
     }
 
@@ -456,21 +484,23 @@ impl PlayerState {
 
     /// Push current now-playing metadata to the OS media controls.
     fn sync_media_metadata(&mut self) {
-        if let Some((title, subtitle)) = self.now_playing() {
-            let album = self.current_song().and_then(|s| s.album.clone());
-            // Convert local cache path to file:// URL for souvlaki.
-            let cover_url_str: Option<String> = self
-                .current_art_path
-                .as_ref()
-                .and_then(|p| p.to_str())
-                .map(|s| format!("file://{s}"));
-            self.media_keys.set_metadata(
-                &title,
-                &subtitle,
-                album.as_deref(),
-                self.duration,
-                cover_url_str.as_deref(),
-            );
+        let Some((title, subtitle)) = self.now_playing() else {
+            return;
+        };
+        let album = self.current_song().and_then(|s| s.album.clone());
+        let cover_url_str: Option<String> = self
+            .current_art_path
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .map(|s| format!("file://{s}"));
+        if let Some(c) = &mut self.media_controls {
+            let _ = c.set_metadata(MediaMetadata {
+                title: Some(&title),
+                artist: (!subtitle.is_empty()).then_some(subtitle.as_str()),
+                album: album.as_deref(),
+                duration: self.duration,
+                cover_url: cover_url_str.as_deref(),
+            });
         }
     }
 
@@ -561,7 +591,11 @@ impl PlayerState {
                 self.fire_scrobble(action, cx);
                 self.fetch_current_art(cx);
                 self.sync_media_metadata();
-                self.media_keys.set_playing(true, Duration::ZERO);
+                if let Some(c) = &mut self.media_controls {
+                    let _ = c.set_playback(MediaPlayback::Playing {
+                        progress: Some(MediaPosition(Duration::ZERO)),
+                    });
+                }
             }
             Err(e) => {
                 self.buffering = false;
@@ -602,11 +636,19 @@ impl PlayerState {
             Event::Playing => {
                 self.playing = true;
                 self.buffering = false;
-                self.media_keys.set_playing(true, self.position);
+                if let Some(c) = &mut self.media_controls {
+                    let _ = c.set_playback(MediaPlayback::Playing {
+                        progress: Some(MediaPosition(self.position)),
+                    });
+                }
             }
             Event::Paused => {
                 self.playing = false;
-                self.media_keys.set_playing(false, self.position);
+                if let Some(c) = &mut self.media_controls {
+                    let _ = c.set_playback(MediaPlayback::Paused {
+                        progress: Some(MediaPosition(self.position)),
+                    });
+                }
             }
             Event::Buffering => {
                 self.buffering = true;
@@ -633,7 +675,11 @@ impl PlayerState {
                         self.fire_scrobble(action, cx);
                     }
                     self.sync_media_metadata();
-                    self.media_keys.set_playing(true, Duration::ZERO);
+                    if let Some(c) = &mut self.media_controls {
+                        let _ = c.set_playback(MediaPlayback::Playing {
+                            progress: Some(MediaPosition(Duration::ZERO)),
+                        });
+                    }
                 } else {
                     self.playing = false;
                     self.engine_has_track = false;
@@ -660,29 +706,18 @@ impl PlayerState {
     }
 }
 
-pub fn init(
-    volume: f32,
-    default_shuffle: bool,
-    default_repeat: RepeatMode,
-    scrobble_enabled: bool,
-    replay_gain: ReplayGainMode,
-    output_device: Option<String>,
-    clear_on_end: bool,
-    cx: &mut gpui::App,
-) -> Entity<PlayerState> {
+pub fn init(settings: &Settings, cx: &mut gpui::App) -> Entity<PlayerState> {
     cx.new(|cx| {
-        let mut state = PlayerState::new(volume, cx);
-        state.replay_gain_mode = replay_gain;
-        state.clear_on_end = clear_on_end;
-        if output_device.is_some() {
-            state.player.set_output_device(output_device);
+        let mut state = PlayerState::new(settings.volume, cx);
+        state.replay_gain_mode = settings.replay_gain;
+        state.clear_on_end = settings.queue_end == crate::config::QueueEndBehavior::Clear;
+        if settings.output_device.is_some() {
+            state
+                .player
+                .set_output_device(settings.output_device.clone());
         }
-        // A restored queue keeps its own shuffle/repeat; the configured
-        // defaults only apply to a fresh session.
         match load_queue() {
             Some(queue) => {
-                // Show the restored current track in the bar, paused; the
-                // engine loads it on the first play press.
                 state.duration = queue
                     .current_song()
                     .and_then(|s| s.duration)
@@ -690,11 +725,11 @@ pub fn init(
                 state.queue = queue;
             }
             None => {
-                state.queue.shuffle = default_shuffle;
-                state.queue.repeat = default_repeat;
+                state.queue.shuffle = settings.default_shuffle;
+                state.queue.repeat = settings.default_repeat;
             }
         }
-        state.scrobble_enabled = scrobble_enabled;
+        state.scrobble_enabled = settings.scrobble_enabled;
         state
     })
 }
