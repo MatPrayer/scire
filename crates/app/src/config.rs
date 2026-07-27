@@ -43,7 +43,6 @@ pub struct Settings {
     /// Volume in [0.0, 1.0].
     pub volume: f32,
     /// Legacy single-library selection; migrated into `library_ids` on load.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub library_id: Option<String>,
     /// Selected library (music folder) ids; empty = all libraries.
     pub library_ids: Vec<String>,
@@ -257,11 +256,14 @@ pub enum ThemePref {
     System,
     Light,
     Dark,
+<<<<<<< HEAD
     /// Dark base whose accent surfaces (buttons, sliders, progress bar) recolour
     /// from the current album cover. See `ui::apply_adaptive_accent`.
     #[serde(rename = "adaptive")]
     Adaptive,
     #[serde(rename = "custom")]
+=======
+>>>>>>> dc692de (fix: custom theme bleed and invisible borders)
     Custom,
 }
 
@@ -270,49 +272,27 @@ pub struct ImportedThemeDefinition {
     pub name: String,
     #[serde(default)]
     pub mode: String,
-    #[serde(default)]
     pub background: Option<String>,
-    #[serde(default)]
     pub foreground: Option<String>,
-    #[serde(default)]
     pub border: Option<String>,
-    #[serde(default)]
     pub muted: Option<String>,
-    #[serde(default)]
     pub muted_foreground: Option<String>,
-    #[serde(default)]
     pub primary: Option<String>,
-    #[serde(default)]
     pub primary_foreground: Option<String>,
-    #[serde(default)]
     pub secondary: Option<String>,
-    #[serde(default)]
     pub secondary_foreground: Option<String>,
-    #[serde(default)]
     pub accent: Option<String>,
-    #[serde(default)]
     pub accent_foreground: Option<String>,
-    #[serde(default)]
     pub sidebar: Option<String>,
-    #[serde(default)]
     pub sidebar_foreground: Option<String>,
-    #[serde(default)]
     pub success: Option<String>,
-    #[serde(default)]
     pub success_foreground: Option<String>,
-    #[serde(default)]
     pub warning: Option<String>,
-    #[serde(default)]
     pub warning_foreground: Option<String>,
-    #[serde(default)]
     pub danger: Option<String>,
-    #[serde(default)]
     pub danger_foreground: Option<String>,
-    #[serde(default)]
     pub selection: Option<String>,
-    #[serde(default)]
     pub scrollbar_thumb: Option<String>,
-    #[serde(default)]
     pub scrollbar_thumb_hover: Option<String>,
 }
 

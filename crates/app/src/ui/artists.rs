@@ -381,6 +381,8 @@ impl Render for ArtistDetailView {
                     .p_1p5()
                     .gap_1p5()
                     .rounded_lg()
+                    .border_1()
+                    .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().muted))
                     .on_click(cx.listener(move |_, _, _, cx| {

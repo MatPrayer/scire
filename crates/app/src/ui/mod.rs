@@ -19,9 +19,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use directories::ProjectDirs;
+<<<<<<< HEAD
 use gpui::{App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions};
+=======
+use gpui::{App, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions, div, hsla, prelude::*, px};
+>>>>>>> dc692de (fix: custom theme bleed and invisible borders)
 use gpui_component::TitleBar;
-use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
+use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeRegistry};
 
 use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref};
 
@@ -240,6 +244,18 @@ pub fn waveform_seek_bar(
 
 /// Apply the theme preference. `System` follows the OS appearance.
 pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
+    // When switching away from Custom, reset stored theme configs to defaults.
+    // apply_custom_theme_from_settings overwrites dark_theme/light_theme via
+    // Theme::apply_config, causing Dark/Light/System to re-apply custom colors.
+    if !matches!(pref, ThemePref::Custom) {
+        let (light, dark) = {
+            let reg = ThemeRegistry::global(cx);
+            (reg.default_light_theme().clone(), reg.default_dark_theme().clone())
+        };
+        let theme = Theme::global_mut(cx);
+        theme.light_theme = light;
+        theme.dark_theme = dark;
+    }
     let mode = match pref {
         ThemePref::Light => ThemeMode::Light,
         // Adaptive is a dark base; the cover-derived accent is layered on top
@@ -416,6 +432,11 @@ fn imported_theme_colors(theme: &ImportedThemeDefinition) -> ThemeConfigColors {
     colors.scrollbar_thumb = set(&theme.scrollbar_thumb);
     colors.scrollbar_thumb_hover = set(&theme.scrollbar_thumb_hover);
     colors
+}
+
+/// 1px horizontal divider visible on any background.
+pub fn divider() -> gpui::Div {
+    div().h(px(1.)).w_full().bg(hsla(0., 0., 0.5, 0.15))
 }
 
 /// Window open options derived from the client-titlebar preference.

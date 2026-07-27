@@ -345,7 +345,7 @@ impl Render for SettingsView {
                             .p_4()
                             .rounded_lg()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .bg(cx.theme().sidebar)
                             .child(div().text_sm().font_medium().child("Window"))
                             .child(
@@ -373,7 +373,7 @@ impl Render for SettingsView {
                             .p_4()
                             .rounded_lg()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .bg(cx.theme().sidebar)
                             .child(div().text_sm().font_medium().child("Appearance"))
                             .child(
@@ -458,7 +458,7 @@ impl Render for SettingsView {
                             .p_4()
                             .rounded_lg()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .bg(cx.theme().sidebar)
                             .child(div().text_sm().font_medium().child("Playback"))
                             .child(
@@ -641,7 +641,7 @@ impl Render for SettingsView {
                             .p_4()
                             .rounded_lg()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .bg(cx.theme().sidebar)
                             .child(div().text_sm().font_medium().child("Browsing"))
                             .child(
@@ -721,7 +721,7 @@ impl Render for SettingsView {
                             .p_4()
                             .rounded_lg()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .bg(cx.theme().sidebar)
                             .child(div().text_sm().font_medium().child("Streaming"))
                             .child(
@@ -771,7 +771,7 @@ impl Render for SettingsView {
                             .p_4()
                             .rounded_lg()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .bg(cx.theme().sidebar)
                             .child(div().text_sm().font_medium().child("Storage"))
                             .child(
@@ -798,7 +798,7 @@ impl Render for SettingsView {
                                 .p_4()
                                 .rounded_lg()
                                 .border_1()
-                                .border_color(cx.theme().border)
+                                .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                                 .bg(cx.theme().sidebar)
                                 .child(
                                     h_flex()

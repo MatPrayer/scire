@@ -225,6 +225,8 @@ impl Render for PlaylistDetailView {
                     .id(("pl-track", i))
                     .px_2()
                     .py_1()
+                    .border_b_1()
+                    .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                     .gap_3()
                     .rounded_md()
                     .cursor_pointer()

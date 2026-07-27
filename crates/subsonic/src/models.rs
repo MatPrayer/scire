@@ -170,16 +170,6 @@ pub struct RadioStation {
     pub home_page_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Share {
-    pub id: String,
-    pub url: String,
-    pub description: Option<String>,
-    pub created: Option<String>,
-    pub expires: Option<String>,
-    pub visit_count: Option<u64>,
-}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

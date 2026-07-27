@@ -1,23 +1,34 @@
 # AGENTS.md
 
-This repo is Scirè, a Rust desktop client for Navidrome. Start with [README.md](README.md) for features and platform notes, then [CLAUDE.md](CLAUDE.md) for crate layout, testing conventions, and toolchain pinning.
+Scirè — Rust GPUI desktop client for Navidrome.
 
-## Working conventions
-- Keep edits small and targeted. Prefer minimal changes that fit the existing module boundaries.
-- Keep UI code in [crates/app](crates/app), protocol/client logic in [crates/subsonic](crates/subsonic), and audio-engine work in [crates/playback](crates/playback).
-- Preserve the dependency direction UI → services → protocol. Keep GPUI types confined to [crates/app](crates/app), and avoid blocking the GPUI executor with IO.
-- This workspace uses Rust edition 2024; keep changes compatible with let-chains and the current toolchain.
+## First read
+
+- [README.md](README.md) — features, build deps, keyboard shortcuts, theme/pywal workflow
+- [CLAUDE.md](CLAUDE.md) — crate map, async pattern, testing conventions, toolchain pinning
 
 ## Commands
-- Build/run: `cargo run`
-- Test: `cargo test --workspace`, `cargo test -p subsonic`, `cargo test -p playback`
-- Lint/format: `cargo clippy --workspace --all-targets`, `cargo fmt --all`
 
-## Repo-specific notes
-- `gpui` `0.2.2` + `gpui-component` `0.5.1` are a matched pair; do not bump them independently.
-- GPUI builds on macOS may need `runtime_shaders` when only the Command Line Tools are installed and `xcrun metal` is unavailable.
-- `souvlaki` media-key/MPRIS support needs `dbus` on Linux; initialization is best-effort and must not block startup.
+```bash
+cargo run                     # build + launch
+cargo test -p subsonic        # API client tests (fast, no gpui build)
+cargo test -p playback        # audio engine tests (may skip without audio device)
+cargo clippy --workspace --all-targets
+cargo fmt --all
+```
 
-## Testing expectations
-- New Subsonic endpoints should include WireMock coverage in [crates/subsonic/tests/client_test.rs](crates/subsonic/tests/client_test.rs).
-- Playback changes should be covered by [crates/playback/tests/engine_test.rs](crates/playback/tests/engine_test.rs) when feasible.
+## Critical quirks (will cause bugs if missed)
+
+- **Config path**: `~/.config/scire/` (Linux) / `~/Library/Application Support/scire/` (macOS). Was migrated from `com.mirko.navidrome-rusty-client`.
+- **Theme file**: singular `theme.json`, NOT `themes.json`.
+- **Switching away from Custom theme**: `Theme::apply_config()` overwrites `dark_theme`/`light_theme` stored configs. When user switches Custom → Dark/Light/System, those stored configs must be reset to `ThemeRegistry::default_*_theme()` before `Theme::change()` — otherwise custom colors persist. See `apply_theme()` in `ui/mod.rs`.
+- **UI separators**: hardcoded `hsla(0., 0., 0.5, 0.15)` — do NOT use `cx.theme().border` for dividers, row borders, card borders, sidebar borders, or the player-bar top border. Custom theme `border` may have zero alpha.
+- **`PlaybackError`**: single struct `PlaybackError(String)` — NOT a multi-variant enum.
+- **`engine.rs` double `map_err` on `prepare()`**: both needed — outer handles `JoinError`, inner handles `DecoderError`. Do NOT collapse into one.
+
+## Module boundaries to preserve
+
+- `crates/subsonic` — pure async API client. No gpui, no audio. `reqwest` + `serde` only.
+- `crates/playback` — audio engine behind `Player`/`Event` mpsc facade. No gpui types.
+- `crates/app` — gpui binary. `services/` for IO (tokio bridge), `state/` for gpui Entities, `ui/` for views.
+- `gpui` `0.2.2` + `gpui-component` `0.5.1` are a matched pair; do not bump independently.

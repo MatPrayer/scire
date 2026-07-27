@@ -1,6 +1,6 @@
 //! Left navigation rail: library switcher + sections + playlists.
 
-use gpui::{App, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{App, IntoElement, SharedString, Window, div, hsla, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -243,7 +243,7 @@ pub fn render_sidebar(
         .py_2()
         .gap_0p5()
         .border_r_1()
-        .border_color(cx.theme().border)
+        .border_color(hsla(0., 0., 0.5, 0.15))
         .bg(cx.theme().sidebar)
         .when(show_libraries, |this| this.child(library_switcher))
         .child(nav_item(
@@ -267,6 +267,7 @@ pub fn render_sidebar(
             NavSection::Favorites,
         ))
         .child(nav_item("Radio", IconName::Globe, NavSection::Radio))
+        .child(div().px_3().child(super::divider()))
         .child(playlists_header)
         .child(
             v_flex()
@@ -277,6 +278,7 @@ pub fn render_sidebar(
                 .gap_0p5()
                 .children(playlist_items),
         )
+        .child(div().px_3().child(super::divider()))
         .child(nav_item(
             "Settings",
             IconName::Settings,

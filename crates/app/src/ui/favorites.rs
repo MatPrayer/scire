@@ -127,6 +127,8 @@ impl Render for FavoritesView {
                             .id(("fav-song", i))
                             .px_2()
                             .py_1()
+                            .border_b_1()
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .gap_2()
                             .rounded_md()
                             .cursor_pointer()
@@ -175,13 +177,15 @@ impl Render for FavoritesView {
             if !starred.album.is_empty() {
                 rows.push(section_title("Albums", cx));
                 for (i, album) in starred.album.iter().enumerate() {
-                    let open_id = album.id.clone();
                     let unstar_id = album.id.clone();
+                    let open_id = unstar_id.clone();
                     rows.push(
                         h_flex()
                             .id(("fav-album", i))
                             .px_2()
                             .py_1()
+                            .border_b_1()
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                             .gap_2()
                             .rounded_md()
                             .cursor_pointer()
@@ -221,8 +225,8 @@ impl Render for FavoritesView {
             if !starred.artist.is_empty() {
                 rows.push(section_title("Artists", cx));
                 for (i, artist) in starred.artist.iter().enumerate() {
-                    let open_id = artist.id.clone();
                     let unstar_id = artist.id.clone();
+                    let open_id = unstar_id.clone();
                     rows.push(
                         h_flex()
                             .id(("fav-artist", i))

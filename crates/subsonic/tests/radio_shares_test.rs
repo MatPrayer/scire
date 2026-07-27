@@ -72,39 +72,3 @@ async fn delete_radio_station() {
         .unwrap();
 }
 
-#[tokio::test]
-async fn create_share_returns_url() {
-    let server = MockServer::start().await;
-    Mock::given(path("/rest/createShare"))
-        .and(query_param("id", "al-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
-            r#""shares":{"share":[
-                {"id":"sh-1","url":"https://music.example.com/share/abc","description":"listen","visitCount":0}
-            ]}"#,
-        )))
-        .mount(&server)
-        .await;
-
-    let share = client(&server.uri())
-        .create_share(&["al-1"], Some("listen"))
-        .await
-        .unwrap();
-    assert_eq!(share.url, "https://music.example.com/share/abc");
-}
-
-#[tokio::test]
-async fn create_share_disabled_surfaces_error() {
-    let server = MockServer::start().await;
-    Mock::given(path("/rest/createShare"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":50,"message":"Sharing is not enabled"}}}"#,
-        ))
-        .mount(&server)
-        .await;
-
-    let err = client(&server.uri())
-        .create_share(&["al-1"], None)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, subsonic::Error::Api { .. }));
-}
