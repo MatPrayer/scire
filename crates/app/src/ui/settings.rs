@@ -330,6 +330,7 @@ impl Render for SettingsView {
             .size_full()
             .overflow_y_scroll()
             .p_6()
+            .pb(px(148.))
             .child(
                 v_flex()
                     .w_full()
