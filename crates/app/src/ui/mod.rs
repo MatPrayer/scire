@@ -19,11 +19,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use directories::ProjectDirs;
-<<<<<<< HEAD
-use gpui::{App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions};
-=======
-use gpui::{App, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions, div, hsla, prelude::*, px};
->>>>>>> dc692de (fix: custom theme bleed and invisible borders)
+use gpui::{App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions, div, hsla, prelude::*, px};
 use gpui_component::TitleBar;
 use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeRegistry};
 

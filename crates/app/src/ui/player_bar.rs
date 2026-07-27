@@ -3,12 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-<<<<<<< HEAD
     Context, Entity, EventEmitter, Hsla, IntoElement, Render, Window, div, hsla, img,
     linear_color_stop, linear_gradient, prelude::*, px,
-=======
-    Context, Entity, EventEmitter, IntoElement, Render, Window, div, hsla, img, prelude::*, px,
->>>>>>> dc692de (fix: custom theme bleed and invisible borders)
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -371,8 +367,7 @@ impl Render for PlayerBar {
             .gap_4()
             .items_center()
             .border_t_1()
-<<<<<<< HEAD
-            .border_color(cx.theme().border)
+            .border_color(hsla(0., 0., 0.5, 0.15))
             .map(|this| {
                 if is_adaptive {
                     this.bg(linear_gradient(
@@ -384,10 +379,6 @@ impl Render for PlayerBar {
                     this.bg(sidebar)
                 }
             })
-=======
-            .border_color(hsla(0., 0., 0.5, 0.15))
-            .bg(cx.theme().sidebar)
->>>>>>> dc692de (fix: custom theme bleed and invisible borders)
             // Cover opens the fullscreen player; title/artist navigate to the
             // album/artist pages.
             .child(

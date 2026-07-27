@@ -256,14 +256,10 @@ pub enum ThemePref {
     System,
     Light,
     Dark,
-<<<<<<< HEAD
     /// Dark base whose accent surfaces (buttons, sliders, progress bar) recolour
     /// from the current album cover. See `ui::apply_adaptive_accent`.
     #[serde(rename = "adaptive")]
     Adaptive,
-    #[serde(rename = "custom")]
-=======
->>>>>>> dc692de (fix: custom theme bleed and invisible borders)
     Custom,
 }
 
