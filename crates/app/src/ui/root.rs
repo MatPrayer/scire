@@ -9,7 +9,8 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, StyledExt as _, TitleBar, h_flex, v_flex};
 
-use crate::config::DefaultPage;
+use crate::config::{DefaultPage, ThemePref};
+use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::radio::RadioState;
@@ -79,6 +80,9 @@ pub struct RootView {
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
     new_pl_desc: Entity<InputState>,
+    /// Cover id whose colour the Adaptive theme accent was last derived from,
+    /// to avoid re-extracting on every player tick.
+    adaptive_cover: Option<String>,
     focus_handle: FocusHandle,
 }
 
@@ -139,6 +143,12 @@ impl RootView {
         // Re-render the sidebar's playlist list when playlists change.
         cx.observe(&playlists, |_, _, cx| cx.notify()).detach();
 
+        // Adaptive theme: recolour accents when the playing track changes.
+        cx.observe(&player, |this: &mut Self, _, cx| {
+            this.maybe_update_adaptive_accent(cx);
+        })
+        .detach();
+
         let new_pl_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
         let new_pl_desc =
@@ -179,6 +189,8 @@ impl RootView {
                     this.navigate(section, None, cx);
                 }
             }
+            // Pick up theme switches (e.g. to/from Adaptive) from Settings.
+            this.maybe_update_adaptive_accent(cx);
             cx.notify();
         })
         .detach();
@@ -209,8 +221,45 @@ impl RootView {
             new_playlist_open: false,
             new_pl_name,
             new_pl_desc,
+            adaptive_cover: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// When the Adaptive theme is active, derive the accent colour from the
+    /// current track's cover art and recolour the interactive surfaces. Cheap
+    /// no-op for other themes or when the cover hasn't changed.
+    fn maybe_update_adaptive_accent(&mut self, cx: &mut Context<Self>) {
+        if self.session.read(cx).settings.theme != ThemePref::Adaptive {
+            self.adaptive_cover = None;
+            return;
+        }
+        let cover = self
+            .player
+            .read(cx)
+            .current_song()
+            .and_then(|s| s.cover_art.clone());
+        if cover == self.adaptive_cover {
+            return;
+        }
+        self.adaptive_cover = cover.clone();
+        let Some(cover_id) = cover else { return };
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            let accent = runtime::spawn_io(async move {
+                let path = artwork::fetch(client, cover_id, 64).await?;
+                let bytes = std::fs::read(&path)?;
+                crate::ui::accent_from_cover_bytes(&bytes)
+                    .ok_or_else(|| anyhow::anyhow!("cover has no usable accent hue"))
+            })
+            .await;
+            if let Ok(accent) = accent {
+                let _ = cx.update(|cx| crate::ui::apply_adaptive_accent(cx, accent));
+            }
+        })
+        .detach();
     }
 
     fn navigate(

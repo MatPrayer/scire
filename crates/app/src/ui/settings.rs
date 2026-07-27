@@ -378,6 +378,7 @@ impl Render for SettingsView {
                             .child(
                                 h_flex()
                                     .gap_2()
+                                    .flex_wrap()
                                     .child(theme_btn(
                                         "System",
                                         ThemePref::System,
@@ -392,6 +393,11 @@ impl Render for SettingsView {
                                         "Dark",
                                         ThemePref::Dark,
                                         theme == ThemePref::Dark,
+                                    ))
+                                    .child(theme_btn(
+                                        "Adaptive (from cover)",
+                                        ThemePref::Adaptive,
+                                        theme == ThemePref::Adaptive,
                                     ))
                                     .child(theme_btn(
                                         "Custom (themes.json)",

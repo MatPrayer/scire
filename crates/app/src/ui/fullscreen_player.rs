@@ -447,19 +447,26 @@ impl FullscreenPlayer {
             FullscreenBackground::Animated => base()
                 .with_animation(
                     "fs-bg-anim",
-                    Animation::new(Duration::from_secs(14)).repeat(),
+                    Animation::new(Duration::from_secs(13)).repeat(),
                     move |this, delta| {
-                        // Colourful diagonal sweep: vivid palette colours cross
-                        // -fade while the gradient wobbles around the diagonal.
+                        // Continuous, seamless colour flow (gpui gradients are limited
+                        // to two stops, so no scrolling multi-band is possible). The
+                        // two stops cycle in quadrature (sin + cos, 90° apart) around
+                        // the c1<->c2 range: the field drifts one way and loops cleanly
+                        // at delta 1.0 — no there-and-back reversal. Amplitude < 0.5
+                        // keeps the stops off the pure endpoints so the ramp stays soft
+                        // (no hard band); mild vivid keeps it from going muddy.
+                        let c1 = scale_rgb(vivid(top, 1.15), 1.0);
+                        let c2 = scale_rgb(vivid(bot, 1.15), 1.0);
                         let ph = delta * std::f32::consts::TAU;
-                        let mix = ph.sin() * 0.5 + 0.5;
-                        let c1 = scale_rgb(vivid(lerp_rgb(top, bot, mix), 1.7), 0.9);
-                        let c2 = scale_rgb(vivid(lerp_rgb(bot, top, mix), 1.7), 0.9);
-                        let angle = 135. + ph.cos() * 30.;
+                        let a = 0.5 + 0.4 * ph.sin();
+                        let b = 0.5 + 0.4 * (ph + std::f32::consts::FRAC_PI_2).sin();
+                        let left = lerp_rgb(c1, c2, a);
+                        let right = lerp_rgb(c1, c2, b);
                         this.bg(linear_gradient(
-                            angle,
-                            linear_color_stop(c1, 0.),
-                            linear_color_stop(c2, 1.),
+                            229.,
+                            linear_color_stop(left, 0.),
+                            linear_color_stop(right, 1.),
                         ))
                     },
                 )
@@ -694,34 +701,27 @@ impl Render for FullscreenPlayer {
                 h_flex()
                     .size_full()
                     .items_center()
+                    .justify_center()
                     .gap_8()
                     .px_10()
-                    // Album art — left half.
+                    // Album art.
                     .child(
                         div()
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .size(px(art_size))
-                                    .flex_none()
-                                    .rounded_2xl()
-                                    .bg(cx.theme().muted)
-                                    .overflow_hidden()
-                                    .shadow_xl()
-                                    .when_some(self.art_path.clone(), |this, path| {
-                                        this.child(img(path).size(px(art_size)).rounded_2xl())
-                                    }),
-                            ),
+                            .size(px(art_size))
+                            .flex_none()
+                            .rounded_2xl()
+                            .bg(cx.theme().muted)
+                            .overflow_hidden()
+                            .shadow_xl()
+                            .when_some(self.art_path.clone(), |this, path| {
+                                this.child(img(path).size(px(art_size)).rounded_2xl())
+                            }),
                     )
                     // Info + controls column — right of the cover.
                     .child(
                         v_flex()
-                            .flex_1()
-                            .max_w(px(560.))
+                            .flex_none()
+                            .w(px(440.))
                             .justify_center()
                             .gap_5()
                             // Track info.
@@ -942,8 +942,14 @@ impl Render for FullscreenPlayer {
                                         .child(app_icon(icons::VOLUME_HIGH)),
                                 )
                                 .child(
+                                    // gpui-component's vertical slider is a fixed
+                                    // 120px tall; match it so the high/low icons sit
+                                    // symmetrically at each end (no dead space).
                                     div()
-                                        .h(px(160.))
+                                        .h(px(120.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .child(Slider::new(&self.volume).vertical()),
                                 )
                                 .child(

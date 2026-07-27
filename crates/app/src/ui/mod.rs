@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use directories::ProjectDirs;
-use gpui::{App, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions};
+use gpui::{App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions};
 use gpui_component::TitleBar;
 use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 
@@ -242,9 +242,14 @@ pub fn waveform_seek_bar(
 pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
     let mode = match pref {
         ThemePref::Light => ThemeMode::Light,
-        ThemePref::Dark => ThemeMode::Dark,
+        // Adaptive is a dark base; the cover-derived accent is layered on top
+        // afterwards (by the root view, once a cover is known).
+        ThemePref::Dark | ThemePref::Adaptive => ThemeMode::Dark,
         ThemePref::System | ThemePref::Custom => ThemeMode::from(window.appearance()),
     };
+    // Theme::change resets every colour to the mode's defaults, wiping any
+    // previously applied adaptive accent — the root re-applies it on the next
+    // song / theme change.
     Theme::change(mode, Some(window), cx);
     let family = SharedString::from(
         "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans CJK KR, sans-serif",
@@ -256,6 +261,105 @@ pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
     if matches!(pref, ThemePref::Custom) {
         apply_custom_theme_from_settings(cx);
     }
+}
+
+/// Recolour only the interactive accent surfaces — primary buttons, sliders,
+/// progress/seek bar, focus ring, text selection — from a single cover-derived
+/// hue. Backgrounds, text and muted surfaces are left untouched so the UI stays
+/// minimal. Used by the Adaptive theme.
+pub fn apply_adaptive_accent(cx: &mut App, accent: Hsla) {
+    let fg = accent_foreground(accent);
+    let theme = Theme::global_mut(cx);
+    theme.primary = accent;
+    theme.primary_hover = lighten(accent, 0.06);
+    theme.primary_active = darken(accent, 0.06);
+    theme.primary_foreground = fg;
+    theme.slider_bar = accent;
+    theme.slider_thumb = accent;
+    theme.progress_bar = accent;
+    theme.ring = accent;
+    theme.selection = Hsla { a: 0.30, ..accent };
+    cx.refresh_windows();
+}
+
+/// Derive a vivid UI accent hue from cover-art bytes. Each pixel is weighted by
+/// how colourful it is (saturation², peaking at mid lightness); the weighted
+/// circular-mean hue becomes the accent, with S/L pinned so it reads cleanly on
+/// a dark background. Returns `None` for greyscale covers (no usable hue).
+pub fn accent_from_cover_bytes(bytes: &[u8]) -> Option<Hsla> {
+    let img = image::load_from_memory(bytes).ok()?.into_rgb8();
+    let (mut sin, mut cos, mut wsum, mut ssum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for p in img.pixels() {
+        let (h, s, l) = rgb_to_hsl(
+            p[0] as f32 / 255.0,
+            p[1] as f32 / 255.0,
+            p[2] as f32 / 255.0,
+        );
+        if s < 0.12 {
+            continue; // near-grey: no meaningful hue
+        }
+        // Favour saturated, mid-lightness pixels; discount near-black/near-white.
+        let w = s * s * (1.0 - (2.0 * l - 1.0).powi(2));
+        let ang = h * std::f32::consts::TAU;
+        sin += w * ang.sin();
+        cos += w * ang.cos();
+        wsum += w;
+        ssum += w * s;
+    }
+    if wsum < 1e-3 {
+        return None;
+    }
+    let hue = sin.atan2(cos) / std::f32::consts::TAU;
+    let sat = (ssum / wsum * 1.2).clamp(0.5, 0.85);
+    Some(Hsla {
+        h: hue.rem_euclid(1.0),
+        s: sat,
+        l: 0.55,
+        a: 1.0,
+    })
+}
+
+/// Pick black or white text for legibility on the given accent fill.
+fn accent_foreground(accent: Hsla) -> Hsla {
+    let rgb = gpui::Rgba::from(accent);
+    let lum = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+    if lum > 0.6 {
+        Hsla { h: 0., s: 0., l: 0.10, a: 1.0 }
+    } else {
+        Hsla { h: 0., s: 0., l: 0.98, a: 1.0 }
+    }
+}
+
+fn lighten(c: Hsla, amt: f32) -> Hsla {
+    Hsla { l: (c.l + amt).min(1.0), ..c }
+}
+
+fn darken(c: Hsla, amt: f32) -> Hsla {
+    Hsla { l: (c.l - amt).max(0.0), ..c }
+}
+
+/// Standard RGB→HSL (all channels 0..1); hue returned in turns (0..1).
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if max == r {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    (h, s, l)
 }
 
 pub fn apply_custom_theme_from_settings(cx: &mut App) {

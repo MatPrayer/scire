@@ -67,3 +67,9 @@ debug = false
 [profile.release.build-override]
 opt-level = 0
 codegen-units = 16
+
+# Local fork of gpui-component 0.5.1 — single-line change: popover_style shadow
+# removed (was shadow_lg) so context menus don't cast a heavy halo over the
+# bright album grid. See vendor/gpui-component/src/styled.rs.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }

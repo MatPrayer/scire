@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px,
+    Context, Entity, EventEmitter, Hsla, IntoElement, Render, Window, div, hsla, img,
+    linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -15,7 +16,7 @@ use gpui_component::{
 };
 
 use crate::assets::{app_icon, icons};
-use crate::config::ReplayGainMode;
+use crate::config::{ReplayGainMode, ThemePref};
 use crate::services::{runtime, waveform};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
@@ -347,6 +348,17 @@ impl Render for PlayerBar {
                 .when(active, |b| b.primary())
         };
 
+        // Adaptive theme: tint the bar with the cover-derived accent fading to
+        // black; other themes keep the flat sidebar colour.
+        let is_adaptive = self.session.read(cx).settings.theme == ThemePref::Adaptive;
+        let sidebar = cx.theme().sidebar;
+        let accent = cx.theme().primary;
+        let accent_bg = Hsla {
+            l: (accent.l * 0.4).clamp(0.0, 1.0),
+            s: accent.s * 0.85,
+            ..accent
+        };
+
         h_flex()
             .w_full()
             .h(px(124.))
@@ -356,7 +368,17 @@ impl Render for PlayerBar {
             .items_center()
             .border_t_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().sidebar)
+            .map(|this| {
+                if is_adaptive {
+                    this.bg(linear_gradient(
+                        90.,
+                        linear_color_stop(accent_bg, 0.),
+                        linear_color_stop(hsla(0., 0., 0., 1.), 1.),
+                    ))
+                } else {
+                    this.bg(sidebar)
+                }
+            })
             // Cover opens the fullscreen player; title/artist navigate to the
             // album/artist pages.
             .child(
