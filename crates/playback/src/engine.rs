@@ -325,8 +325,8 @@ async fn prepare(track: TrackSource) -> Result<Prepared, PlaybackError> {
         builder.build()
     })
     .await
-    .map_err(|e| PlaybackError::Decode(e.to_string()))?
-    .map_err(|e| PlaybackError::Decode(e.to_string()))?;
+    .map_err(|e| PlaybackError(e.to_string()))?
+    .map_err(|e| PlaybackError(e.to_string()))?;
     Ok(Prepared { track, decoder })
 }
 
@@ -343,7 +343,7 @@ async fn start_track(
     if output.is_none() {
         *output = Some(open_output(selected_device)?);
     }
-    let out = output.as_ref().expect("output just initialized");
+    let out = output.as_ref().ok_or(PlaybackError("no output sink".into()))?;
 
     let player = rodio::Player::connect_new(out.mixer());
     player.set_volume(volume);
@@ -364,11 +364,11 @@ fn open_output(selected: &Option<String>) -> Result<rodio::MixerDeviceSink, Play
             {
                 return rodio::DeviceSinkBuilder::from_device(dev)
                     .and_then(|b| b.open_stream())
-                    .map_err(|e| PlaybackError::Output(e.to_string()));
+                    .map_err(|e| PlaybackError(e.to_string()));
             }
         }
     }
-    rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| PlaybackError::Output(e.to_string()))
+    rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| PlaybackError(e.to_string()))
 }
 
 /// Display name for the selected device: the chosen name, or the resolved

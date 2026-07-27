@@ -48,6 +48,10 @@ mod tests {
     }
 }
 
+/// Bundled Noto Sans fonts for consistent rendering across platforms.
+pub const NOTO_SANS: &[u8] = include_bytes!("../fonts/NotoSans-Regular.ttf");
+pub const NOTO_SANS_JP: &[u8] = include_bytes!("../fonts/NotoSansJP-Regular.ttf");
+
 /// Build an [`gpui_component::Icon`] for an app-bundled icon path.
 pub fn app_icon(path: &'static str) -> gpui_component::Icon {
     gpui_component::Icon::default().path(path)

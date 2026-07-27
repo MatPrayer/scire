@@ -1,0 +1,30 @@
+{
+  "themes": [
+    {
+      "name": "pywal16",
+      "mode": "dark",
+      "background": "{background}",
+      "foreground": "{foreground}",
+      "border": "{color0}",
+      "muted": "{color0}",
+      "muted_foreground": "{color8}",
+      "primary": "{color4}",
+      "primary_foreground": "{background}",
+      "secondary": "{color0}",
+      "secondary_foreground": "{foreground}",
+      "accent": "{color4}",
+      "accent_foreground": "{background}",
+      "sidebar": "{color0}",
+      "sidebar_foreground": "{foreground}",
+      "success": "{color2}",
+      "success_foreground": "{background}",
+      "warning": "{color3}",
+      "warning_foreground": "{background}",
+      "danger": "{color1}",
+      "danger_foreground": "{background}",
+      "selection": "{color8}",
+      "scrollbar_thumb": "{color8}",
+      "scrollbar_thumb_hover": "{color4}"
+    }
+  ]
+}

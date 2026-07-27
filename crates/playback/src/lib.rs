@@ -87,14 +87,8 @@ pub enum Event {
 }
 
 #[derive(Debug, Error)]
-pub enum PlaybackError {
-    #[error("audio output unavailable: {0}")]
-    Output(String),
-    #[error("stream error: {0}")]
-    Stream(String),
-    #[error("decode error: {0}")]
-    Decode(String),
-}
+#[error("{0}")]
+pub struct PlaybackError(pub String);
 
 /// Handle to the playback engine. Cheap to clone.
 #[derive(Debug, Clone)]

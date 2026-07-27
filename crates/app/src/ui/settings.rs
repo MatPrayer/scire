@@ -395,12 +395,16 @@ impl Render for SettingsView {
                                         theme == ThemePref::Dark,
                                     ))
                                     .child(theme_btn(
+<<<<<<< HEAD
                                         "Adaptive (from cover)",
                                         ThemePref::Adaptive,
                                         theme == ThemePref::Adaptive,
                                     ))
                                     .child(theme_btn(
                                         "Custom (themes.json)",
+=======
+                                        "Custom (theme.json)",
+>>>>>>> 04fa946 (feat: bundle fonts, example themes, config migration)
                                         ThemePref::Custom,
                                         theme == ThemePref::Custom,
                                     )),

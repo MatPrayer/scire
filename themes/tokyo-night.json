@@ -1,0 +1,30 @@
+{
+  "themes": [
+    {
+      "name": "Tokyo Night",
+      "mode": "dark",
+      "background": "#1a1b26",
+      "foreground": "#c0caf5",
+      "border": "#1a1b26",
+      "muted": "#1a1b26",
+      "muted_foreground": "#565f89",
+      "primary": "#7aa2f7",
+      "primary_foreground": "#1a1b26",
+      "secondary": "#24283b",
+      "secondary_foreground": "#c0caf5",
+      "accent": "#7dcfff",
+      "accent_foreground": "#1a1b26",
+      "sidebar": "#16161e",
+      "sidebar_foreground": "#a9b1d6",
+      "success": "#9ece6a",
+      "success_foreground": "#1a1b26",
+      "warning": "#e0af68",
+      "warning_foreground": "#1a1b26",
+      "danger": "#f7768e",
+      "danger_foreground": "#1a1b26",
+      "selection": "#33467c",
+      "scrollbar_thumb": "#565f89",
+      "scrollbar_thumb_hover": "#7aa2f7"
+    }
+  ]
+}

@@ -26,8 +26,8 @@ use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref};
 
 fn settings_theme_path() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("com", "mirko", "navidrome-rusty-client")?;
-    Some(dirs.config_dir().join("themes.json"))
+    let dirs = ProjectDirs::from("", "", "scire")?;
+    Some(dirs.config_dir().join("theme.json"))
 }
 
 /// Seek position for a `fraction` [0,1] of `total`, guarding against NaN /
@@ -252,7 +252,7 @@ pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
     // song / theme change.
     Theme::change(mode, Some(window), cx);
     let family = SharedString::from(
-        "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans CJK KR, sans-serif",
+        "Noto Sans, Noto Sans JP, Noto Sans CJK SC, Noto Sans CJK KR, sans-serif",
     );
     let theme = Theme::global_mut(cx);
     theme.font_family = family.clone();

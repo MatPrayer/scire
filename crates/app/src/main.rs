@@ -4,6 +4,8 @@ mod services;
 mod state;
 mod ui;
 
+use std::borrow::Cow;
+
 use gpui::{App, AppContext as _, Application, Bounds, WindowBounds, px, size};
 use gpui_component::Root;
 
@@ -19,6 +21,13 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
+
+            cx.text_system()
+                .add_fonts(vec![
+                    Cow::Borrowed(assets::NOTO_SANS),
+                    Cow::Borrowed(assets::NOTO_SANS_JP),
+                ])
+                .expect("failed to load Noto fonts");
 
             let session = state::session::init(cx);
             let settings = session.read(cx).settings.clone();

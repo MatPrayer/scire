@@ -17,17 +17,17 @@ pub(crate) type StreamReader = StreamDownload<TempStorageProvider>;
 pub(crate) async fn open(url: &str) -> Result<(StreamReader, Option<u64>), PlaybackError> {
     let stream = HttpStream::<Client>::create(
         url.parse()
-            .map_err(|e| PlaybackError::Stream(format!("bad url: {e}")))?,
+            .map_err(|e| PlaybackError(format!("bad url: {e}")))?,
     )
     .await
-    .map_err(|e| PlaybackError::Stream(e.to_string()))?;
+    .map_err(|e| PlaybackError(e.to_string()))?;
 
     let content_length = stream.content_length();
 
     let reader =
         StreamDownload::from_stream(stream, TempStorageProvider::new(), Settings::default())
             .await
-            .map_err(|e| PlaybackError::Stream(e.to_string()))?;
+            .map_err(|e| PlaybackError(e.to_string()))?;
 
     Ok((reader, content_length))
 }

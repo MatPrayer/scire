@@ -17,7 +17,7 @@ fn build_decoder(bytes: Vec<u8>) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, Play
         .with_data(Cursor::new(bytes))
         .with_seekable(true)
         .build()
-        .map_err(|e| PlaybackError::Decode(e.to_string()))
+        .map_err(|e| PlaybackError(e.to_string()))
 }
 
 /// Drop an ID3v2 tag so symphonia's MP3 reader can scan for the first frame
@@ -89,7 +89,7 @@ pub fn peaks_from_bytes(bytes: Vec<u8>, buckets: usize) -> Result<Vec<f32>, Play
         acc.push((sum, n));
     }
     if acc.is_empty() {
-        return Err(PlaybackError::Decode("track decoded to no samples".into()));
+        return Err(PlaybackError("track decoded to no samples".into()));
     }
 
     // Resample to exactly `buckets` (RMS over the combined range), then

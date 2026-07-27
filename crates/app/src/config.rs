@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::queue::RepeatMode;
 
-const KEYRING_SERVICE: &str = "navidrome-rusty-client";
+const KEYRING_SERVICE: &str = "scire";
 
 fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("com", "mirko", "navidrome-rusty-client")
+    ProjectDirs::from("", "", "scire")
         .context("cannot determine platform config directories")
 }
 
@@ -187,7 +187,7 @@ pub enum AlbumSort {
 }
 
 /// Which extra fields to show next to song titles in album/playlist views.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrackInfo {
     pub artist: bool,
@@ -196,19 +196,6 @@ pub struct TrackInfo {
     pub genre: bool,
     pub bitrate: bool,
     pub plays: bool,
-}
-
-impl Default for TrackInfo {
-    fn default() -> Self {
-        Self {
-            artist: true,
-            album: false,
-            year: false,
-            genre: false,
-            bitrate: false,
-            plays: false,
-        }
-    }
 }
 
 impl Default for Settings {
@@ -228,7 +215,10 @@ impl Default for Settings {
             default_page: DefaultPage::default(),
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),
-            track_info: TrackInfo::default(),
+            track_info: TrackInfo {
+                artist: true,
+                ..Default::default()
+            },
             waveform_seekbar: false,
             stream_info_bar: false,
             detailed_volume: false,
