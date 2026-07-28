@@ -47,7 +47,7 @@ pub struct FullscreenPlayer {
     volume: Entity<SliderState>,
     art_path: Option<PathBuf>,
     bg_art_path: Option<PathBuf>,
-    gradient_colors: Option<(gpui::Rgba, gpui::Rgba)>,
+    gradient_palette: Option<Vec<gpui::Rgba>>,
     last_cover_id: Option<String>,
     panel: Option<SidePanel>,
     /// Lyrics text for the song in `lyrics_for`; None while loading or when
@@ -107,7 +107,7 @@ impl FullscreenPlayer {
                 this.last_cover_id = cover.clone();
                 this.art_path = None;
                 this.bg_art_path = None;
-                this.gradient_colors = None;
+                this.gradient_palette = None;
                 if let Some(cover_id) = cover {
                     this.fetch_art(cover_id, cx);
                 }
@@ -132,7 +132,7 @@ impl FullscreenPlayer {
             volume,
             art_path: None,
             bg_art_path: None,
-            gradient_colors: None,
+            gradient_palette: None,
             last_cover_id: None,
             panel: None,
             lyrics: None,
@@ -417,9 +417,14 @@ impl FullscreenPlayer {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let base = || div().absolute().left_0().top_0().size_full();
-        let (top, bot) = self
-            .gradient_colors
-            .unwrap_or((gpui::Rgba::from(cx.theme().muted), gpui::Rgba::from(cx.theme().background)));
+        let palette: Vec<gpui::Rgba> = self.gradient_palette.clone().unwrap_or_else(|| {
+            vec![
+                gpui::Rgba::from(cx.theme().muted),
+                gpui::Rgba::from(cx.theme().background),
+            ]
+        });
+        let top = palette[0];
+        let bot = *palette.last().unwrap();
         match mode {
             FullscreenBackground::Solid => base().bg(cx.theme().background).into_any_element(),
             FullscreenBackground::Gradient => base()
@@ -444,33 +449,62 @@ impl FullscreenPlayer {
                     this.child(img(path).size_full())
                 })
                 .into_any_element(),
-            FullscreenBackground::Animated => base()
-                .with_animation(
-                    "fs-bg-anim",
-                    Animation::new(Duration::from_secs(13)).repeat(),
-                    move |this, delta| {
-                        // Continuous, seamless colour flow (gpui gradients are limited
-                        // to two stops, so no scrolling multi-band is possible). The
-                        // two stops cycle in quadrature (sin + cos, 90° apart) around
-                        // the c1<->c2 range: the field drifts one way and loops cleanly
-                        // at delta 1.0 — no there-and-back reversal. Amplitude < 0.5
-                        // keeps the stops off the pure endpoints so the ramp stays soft
-                        // (no hard band); mild vivid keeps it from going muddy.
-                        let c1 = scale_rgb(vivid(top, 1.15), 1.0);
-                        let c2 = scale_rgb(vivid(bot, 1.15), 1.0);
-                        let ph = delta * std::f32::consts::TAU;
-                        let a = 0.5 + 0.4 * ph.sin();
-                        let b = 0.5 + 0.4 * (ph + std::f32::consts::FRAC_PI_2).sin();
-                        let left = lerp_rgb(c1, c2, a);
-                        let right = lerp_rgb(c1, c2, b);
-                        this.bg(linear_gradient(
-                            229.,
-                            linear_color_stop(left, 0.),
-                            linear_color_stop(right, 1.),
-                        ))
-                    },
-                )
-                .into_any_element(),
+            FullscreenBackground::Animated => {
+                // A single 2-stop ramp between an album's (usually low-variance) colours
+                // reads as a static, banded diagonal — that's the "bar". Instead stack
+                // TWO translucent gradients at crossing angles: their band lines never
+                // align, so there's no visible seam, and they expose several hues at once
+                // for a richer field. Both phases advance monotonically through the
+                // palette-as-cycle (wrap is a lerp), so flow is always one direction.
+                let ring: Vec<gpui::Rgba> = {
+                    // Boosted saturation + a floor of variance so mono covers still move.
+                    let r: Vec<gpui::Rgba> =
+                        palette.iter().map(|&c| scale_rgb(vivid(c, 1.5), 1.0)).collect();
+                    if r.len() < 2 {
+                        let b = *r.first().unwrap_or(&gpui::Rgba::from(cx.theme().background));
+                        vec![b, scale_rgb(b, 1.5), scale_rgb(b, 0.6)]
+                    } else {
+                        r
+                    }
+                };
+                let ring2 = ring.clone();
+                let anim_layer =
+                    |id: &'static str, angle: f32, ring: Vec<gpui::Rgba>, oa: f32, ob: f32, alpha: f32| {
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .size_full()
+                            .with_animation(
+                                id,
+                                // Slower: full palette sweep over 40s.
+                                Animation::new(Duration::from_secs(40)).repeat(),
+                                move |this, delta| {
+                                    let n = ring.len();
+                                    let sample = |offset: f32| -> gpui::Rgba {
+                                        let pos = (delta + offset).rem_euclid(1.0) * n as f32;
+                                        let i0 = pos.floor() as usize % n;
+                                        let i1 = (i0 + 1) % n;
+                                        let mut c = lerp_rgb(ring[i0], ring[i1], pos.fract());
+                                        c.a = alpha;
+                                        c
+                                    };
+                                    this.bg(linear_gradient(
+                                        angle,
+                                        linear_color_stop(sample(oa), 0.),
+                                        linear_color_stop(sample(ob), 1.),
+                                    ))
+                                },
+                            )
+                    };
+                base()
+                    // Solid base so the translucent layers composite over something.
+                    .bg(scale_rgb(bot, 0.5))
+                    .overflow_hidden()
+                    .child(anim_layer("fs-bg-a", 229., ring, 0.0, 0.5, 1.0))
+                    .child(anim_layer("fs-bg-b", 63., ring2, 0.28, 0.78, 0.55))
+                    .into_any_element()
+            }
         }
     }
 
@@ -493,10 +527,10 @@ impl FullscreenPlayer {
         // Tiny version for color extraction.
         cx.spawn(async move |this, cx| {
             if let Ok(path) = artwork::fetch(client2, cover_id2, BG_ART_SIZE).await {
-                let colors = extract_dominant_colors(&path);
+                let colors = extract_palette(&path);
                 let _ = this.update(cx, |view, cx| {
                     view.bg_art_path = Some(path);
-                    view.gradient_colors = colors;
+                    view.gradient_palette = colors;
                     cx.notify();
                 });
             }
@@ -505,7 +539,10 @@ impl FullscreenPlayer {
     }
 }
 
-fn extract_dominant_colors(path: &std::path::Path) -> Option<(gpui::Rgba, gpui::Rgba)> {
+/// Average colour of each horizontal band, top→bottom. More bands = richer
+/// palette for the animated gradient to sweep through. Empty bands are skipped.
+fn extract_palette(path: &std::path::Path) -> Option<Vec<gpui::Rgba>> {
+    const BANDS: usize = 5;
     let bytes = std::fs::read(path).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.into_rgb8();
     let w = img.width();
@@ -513,35 +550,29 @@ fn extract_dominant_colors(path: &std::path::Path) -> Option<(gpui::Rgba, gpui::
     if w == 0 || h == 0 {
         return None;
     }
-    let mid = h / 2;
-    let mut top = [0u64; 3];
-    let mut bot = [0u64; 3];
-    let mut top_n = 0u64;
-    let mut bot_n = 0u64;
+    let mut acc = [[0u64; 3]; BANDS];
+    let mut n = [0u64; BANDS];
     for (_, y, pixel) in img.enumerate_pixels() {
-        if y < mid {
-            top[0] += pixel[0] as u64;
-            top[1] += pixel[1] as u64;
-            top[2] += pixel[2] as u64;
-            top_n += 1;
-        } else {
-            bot[0] += pixel[0] as u64;
-            bot[1] += pixel[1] as u64;
-            bot[2] += pixel[2] as u64;
-            bot_n += 1;
-        }
-    }
-    if top_n == 0 || bot_n == 0 {
-        return None;
+        let band = ((y as u64 * BANDS as u64) / h as u64).min(BANDS as u64 - 1) as usize;
+        acc[band][0] += pixel[0] as u64;
+        acc[band][1] += pixel[1] as u64;
+        acc[band][2] += pixel[2] as u64;
+        n[band] += 1;
     }
     // Raw averages; the render darkens/brightens per background mode.
-    let avg = |acc: [u64; 3], n: u64| gpui::Rgba {
-        r: acc[0] as f32 / n as f32 / 255.0,
-        g: acc[1] as f32 / n as f32 / 255.0,
-        b: acc[2] as f32 / n as f32 / 255.0,
-        a: 1.0,
-    };
-    Some((avg(top, top_n), avg(bot, bot_n)))
+    let palette: Vec<gpui::Rgba> = (0..BANDS)
+        .filter(|&i| n[i] > 0)
+        .map(|i| gpui::Rgba {
+            r: acc[i][0] as f32 / n[i] as f32 / 255.0,
+            g: acc[i][1] as f32 / n[i] as f32 / 255.0,
+            b: acc[i][2] as f32 / n[i] as f32 / 255.0,
+            a: 1.0,
+        })
+        .collect();
+    if palette.is_empty() {
+        return None;
+    }
+    Some(palette)
 }
 
 /// Scale an RGB colour's brightness (keeps alpha opaque).
@@ -638,13 +669,27 @@ impl Render for FullscreenPlayer {
             .unwrap_or_else(|| "-:--".into());
 
         let bg_mode = self.session.read(cx).settings.fullscreen_bg;
-        // Dark scrim opacity for readability, tuned per background mode.
+        // Mean perceptual luminance of the current palette (0 = black, 1 = white).
+        // Bright covers wash out the grey text, so scale the dark scrim up with it.
+        let luma = self
+            .gradient_palette
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                p.iter()
+                    .map(|c| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b)
+                    .sum::<f32>()
+                    / p.len() as f32
+            })
+            .unwrap_or(0.0);
+        // Dark scrim opacity for readability, tuned per background mode. The color-
+        // dependent modes add a luminance term so bright palettes stay legible.
         let scrim = match bg_mode {
             FullscreenBackground::Solid => 0.0,
-            FullscreenBackground::Gradient => 0.4,
-            FullscreenBackground::Vibrant => 0.18,
+            FullscreenBackground::Gradient => 0.4 + 0.3 * luma,
+            FullscreenBackground::Vibrant => 0.18 + 0.4 * luma,
             FullscreenBackground::BlurredArt => 0.55,
-            FullscreenBackground::Animated => 0.35,
+            FullscreenBackground::Animated => 0.3 + 0.4 * luma,
         };
         let panel_open = self.panel.is_some();
         let art_size = if panel_open { 360. } else { 460. };
