@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, KeyDownEvent, Render, Window, deferred, div, img,
-    prelude::*, px,
+    Context, Entity, EventEmitter, IntoElement, KeyDownEvent, Render, ScrollHandle, Window,
+    deferred, div, img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -53,6 +53,9 @@ pub struct SearchBar {
     palette: bool,
     /// Highlighted row for arrow-key navigation (palette mode).
     selected: usize,
+    /// Scroll handle for the palette results, so arrow keys can scroll the
+    /// highlighted row into view.
+    results_scroll: ScrollHandle,
     searching: bool,
     error: Option<String>,
     art_paths: HashMap<String, PathBuf>,
@@ -87,6 +90,7 @@ impl SearchBar {
             open: false,
             palette: false,
             selected: 0,
+            results_scroll: ScrollHandle::new(),
             searching: false,
             error: None,
             art_paths: HashMap::new(),
@@ -154,7 +158,37 @@ impl SearchBar {
             return;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
+        if let Some(child) = self.selected_child_index() {
+            self.results_scroll.scroll_to_item(child);
+        }
         cx.notify();
+    }
+
+    /// Index of the selected row among the scroll container's children (which
+    /// interleave section titles with rows), so we can scroll it into view.
+    fn selected_child_index(&self) -> Option<usize> {
+        let r = self.results.as_ref()?;
+        let counts = [
+            r.artist.len().min(MAX_ARTISTS),
+            r.album.len().min(MAX_ALBUMS),
+            r.song.len().min(MAX_SONGS),
+        ];
+        let mut child = 0;
+        let mut item = 0;
+        for n in counts {
+            if n == 0 {
+                continue;
+            }
+            child += 1; // section title
+            for _ in 0..n {
+                if item == self.selected {
+                    return Some(child);
+                }
+                child += 1;
+                item += 1;
+            }
+        }
+        None
     }
 
     /// Activate the highlighted row (Enter in palette mode).
@@ -616,6 +650,7 @@ impl SearchBar {
                         .id("palette-scroll")
                         .max_h(px(480.))
                         .overflow_y_scroll()
+                        .track_scroll(&self.results_scroll)
                         .p_1()
                         .children(rows),
                 )

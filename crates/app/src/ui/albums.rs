@@ -5,8 +5,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle, Window, div, img, prelude::*,
-    px,
+    App, Context, Entity, EventEmitter, IntoElement, Render, UniformListScrollHandle, Window, div,
+    img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -157,7 +157,8 @@ pub struct AlbumsView {
     /// Resolution thumbnails are currently fetched at; tracked so a cover-size
     /// change can drop stale art and refetch at the new resolution.
     art_px: u32,
-    scroll: ScrollHandle,
+    /// Virtualized row scroll handle: only visible rows are built/uploaded.
+    scroll: UniformListScrollHandle,
     error: Option<String>,
 }
 
@@ -182,7 +183,7 @@ impl AlbumsView {
             art_repaint_pending: false,
             active_tab,
             art_px,
-            scroll: ScrollHandle::new(),
+            scroll: UniformListScrollHandle::new(),
             error: None,
         };
         this.load_more(active_tab, cx);
@@ -289,8 +290,9 @@ impl AlbumsView {
 
     /// Load the next page when the grid is scrolled near its bottom.
     fn maybe_load_more_on_scroll(&mut self, cx: &mut Context<Self>) {
-        let scrolled = -self.scroll.offset().y;
-        let max = self.scroll.max_offset().height;
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let scrolled = -base.offset().y;
+        let max = base.max_offset().height;
         if max - scrolled < px(LOAD_AHEAD_PX) {
             self.load_more(self.active_tab, cx);
         }
@@ -439,11 +441,12 @@ impl AlbumsView {
 
     fn render_card(
         &self,
+        entity: &Entity<Self>,
         index: usize,
         album: &Album,
         tile: f32,
-        cx: &Context<Self>,
-    ) -> impl IntoElement + use<> {
+        cx: &App,
+    ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = album.id.clone();
         let art = self.art_paths.get(&album.id).cloned();
@@ -453,7 +456,9 @@ impl AlbumsView {
         // Right-click context menu data.
         let menu_id = album.id.clone();
         let menu_artist_id = album.artist_id.clone();
-        let view = cx.entity();
+        let view = entity.clone();
+        let open_view = entity.clone();
+        let play_view = entity.clone();
         let menu_pl_list: Vec<(String, String)> = self
             .playlists
             .read(cx)
@@ -473,9 +478,9 @@ impl AlbumsView {
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().muted))
-            .on_click(cx.listener(move |_, _, _, cx| {
-                cx.emit(AlbumsEvent::OpenAlbum(id.clone()));
-            }))
+            .on_click(move |_, _, cx: &mut App| {
+                open_view.update(cx, |_, cx| cx.emit(AlbumsEvent::OpenAlbum(id.clone())));
+            })
             .child(
                 div()
                     .size(px(tile))
@@ -499,16 +504,22 @@ impl AlbumsView {
                                 Button::new(("card-play", index))
                                     .primary()
                                     .icon(app_icon(icons::PLAY))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.queue_album(play_id.clone(), QueueMode::Play, cx);
+                                    .on_click(move |_, _, cx: &mut App| {
+                                        play_view.update(cx, |this, cx| {
+                                            this.queue_album(play_id.clone(), QueueMode::Play, cx);
+                                        });
                                         cx.stop_propagation();
-                                    })),
+                                    }),
                             ),
                     ),
             )
             .child(
                 v_flex()
+                    // Fixed height (fits name + artist + optional year) so cards
+                    // stay uniform — required for the virtualized row list.
+                    .h(px(54.))
                     .gap_0()
+                    .overflow_hidden()
                     .child(div().text_sm().truncate().child(name))
                     .child(
                         div()
@@ -575,6 +586,7 @@ impl AlbumsView {
                 }
                 menu
             })
+            .into_any_element()
     }
 }
 
@@ -601,35 +613,70 @@ impl Render for AlbumsView {
 
         // If the loaded content doesn't fill the viewport (no scrollbar yet),
         // keep fetching until it does or the list is exhausted.
+        let base = self.scroll.0.borrow().base_handle.clone();
         let needs_fill = self
             .tabs
             .get(&active)
             .is_some_and(|t| !t.loading && !t.exhausted && !t.albums.is_empty())
-            && self.scroll.max_offset().height <= px(0.);
+            && base.max_offset().height <= px(0.);
         if needs_fill {
             self.load_more(active, cx);
         }
 
-        let (albums, loading) = self
+        let (album_count, loading) = self
             .tabs
             .get(&active)
-            .map(|t| (&t.albums[..], t.loading))
-            .unwrap_or((&[], false));
+            .map(|t| (t.albums.len(), t.loading))
+            .unwrap_or((0, false));
 
-        let cards: Vec<_> = albums
-            .iter()
-            .enumerate()
-            .map(|(i, album)| self.render_card(i, album, tile, cx).into_any_element())
-            .collect();
+        // Columns from the measured viewport width; falls back to a guess on
+        // the very first frame (before layout), then self-corrects.
+        let width = f32::from(base.bounds().size.width);
+        let card_w = tile + 12.;
+        let gap = 16.;
+        let cols = if width > 0. {
+            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
+        } else {
+            5
+        };
+        let row_count = album_count.div_ceil(cols);
+
+        let entity = cx.entity();
+        let grid = uniform_list("albums-grid", row_count, move |range, _window, cx| {
+            let view = entity.read(cx);
+            let Some(tab) = view.tabs.get(&active) else {
+                return Vec::new();
+            };
+            range
+                .map(|row| {
+                    let start = row * cols;
+                    let end = ((row + 1) * cols).min(tab.albums.len());
+                    let cards: Vec<_> = tab.albums[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(j, album)| view.render_card(&entity, start + j, album, tile, cx))
+                        .collect();
+                    // Centered so the ragged last row's leftover space splits
+                    // evenly — left/right gutters stay equal at any width.
+                    h_flex()
+                        .w_full()
+                        .gap_4()
+                        .justify_center()
+                        .pb_3()
+                        .children(cards)
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>()
+        })
+        .flex_1()
+        .track_scroll(self.scroll.clone())
+        .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+            this.maybe_load_more_on_scroll(cx);
+        }));
 
         v_flex()
             .id("albums-scroll")
             .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
-                this.maybe_load_more_on_scroll(cx);
-            }))
             .p_4()
             .gap_3()
             .child(
@@ -642,15 +689,7 @@ impl Render for AlbumsView {
             .when_some(self.error.clone(), |this, e| {
                 this.child(div().text_color(cx.theme().danger).text_sm().child(e))
             })
-            // Centered so the leftover space of the ragged last row is split
-            // evenly — left and right gutters stay equal at any window width.
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_4()
-                    .children(cards),
-            )
+            .child(grid)
             // Loading indicator while the next page streams in.
             .when(loading, |this| {
                 this.child(
