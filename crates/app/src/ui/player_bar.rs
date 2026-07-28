@@ -72,27 +72,30 @@ impl PlayerBar {
         let vol_input =
             cx.new(|cx| InputState::new(window, cx).default_value(db_string(initial_volume)));
 
-        cx.subscribe(&vol_input, |this: &mut Self, _, event: &InputEvent, cx| match event {
-            InputEvent::PressEnter { .. } => {
-                let raw = this.vol_input.read(cx).value().to_string();
-                if let Some(v) = parse_db(&raw) {
-                    this.player.update(cx, |p, cx| p.set_volume(v, cx));
-                    this.session.update(cx, |s, _| {
-                        s.settings.volume = v;
-                        s.persist_settings();
-                    });
+        cx.subscribe(
+            &vol_input,
+            |this: &mut Self, _, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    let raw = this.vol_input.read(cx).value().to_string();
+                    if let Some(v) = parse_db(&raw) {
+                        this.player.update(cx, |p, cx| p.set_volume(v, cx));
+                        this.session.update(cx, |s, _| {
+                            s.settings.volume = v;
+                            s.persist_settings();
+                        });
+                    }
+                    cx.notify();
                 }
-                cx.notify();
-            }
-            InputEvent::Focus => {
-                this.vol_input_focused = true;
-            }
-            InputEvent::Blur => {
-                this.vol_input_focused = false;
-                cx.notify();
-            }
-            InputEvent::Change => {}
-        })
+                InputEvent::Focus => {
+                    this.vol_input_focused = true;
+                }
+                InputEvent::Blur => {
+                    this.vol_input_focused = false;
+                    cx.notify();
+                }
+                InputEvent::Change => {}
+            },
+        )
         .detach();
 
         cx.observe(&player, |this: &mut Self, _, cx| {
@@ -229,7 +232,12 @@ fn db_string(v: f32) -> String {
 /// Parse a dB number the user typed into an amplitude [0,1]. Returns None for
 /// unparseable text (so the current value is kept).
 fn parse_db(raw: &str) -> Option<f32> {
-    let t = raw.trim().trim_end_matches("dB").trim().trim_end_matches("dB").trim();
+    let t = raw
+        .trim()
+        .trim_end_matches("dB")
+        .trim()
+        .trim_end_matches("dB")
+        .trim();
     if t.eq_ignore_ascii_case("-inf") || t.is_empty() {
         return Some(0.0);
     }
@@ -293,10 +301,8 @@ impl Render for PlayerBar {
                 (None, Vec::new())
             }
         };
-        let stream_info = crate::ui::stream_info_line(
-            self.player.read(cx),
-            &self.session.read(cx).settings,
-        );
+        let stream_info =
+            crate::ui::stream_info_line(self.player.read(cx), &self.session.read(cx).settings);
         let volume = self.player.read(cx).volume;
         let detailed_volume = self.session.read(cx).settings.detailed_volume;
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
@@ -487,8 +493,7 @@ impl Render for PlayerBar {
                                                 })
                                                 .on_hover(cx.listener(
                                                     move |this, hovered: &bool, _, cx| {
-                                                        let now =
-                                                            hovered.then_some(i);
+                                                        let now = hovered.then_some(i);
                                                         if this.artist_hovered != now
                                                             && (this.artist_hovered == Some(i)
                                                                 || *hovered)
@@ -684,8 +689,7 @@ impl Render for PlayerBar {
                                             ("Album", ReplayGainMode::Album),
                                             ("Auto", ReplayGainMode::Auto),
                                         ];
-                                        let mut menu =
-                                            v_flex().gap_0p5().min_w(px(140.));
+                                        let mut menu = v_flex().gap_0p5().min_w(px(140.));
                                         for (i, (lbl, mode)) in opts.into_iter().enumerate() {
                                             let player = player.clone();
                                             let session = session.clone();
@@ -803,65 +807,66 @@ impl Render for PlayerBar {
                         this.child(
                             // Click the device name to switch outputs.
                             h_flex().w_full().child(
-                            Popover::new("output-device")
-                                .trigger(
-                                    Button::new("output-device-trigger")
-                                        .ghost()
-                                        .xsmall()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .icon(Icon::new(IconName::ChevronDown).xsmall())
-                                        .label(device),
-                                )
-                                .content(move |_state, _window, cx| {
-                                    let opts: Vec<(String, Option<String>)> =
-                                        std::iter::once(("System default".to_string(), None))
-                                            .chain(
-                                                playback::output_devices()
-                                                    .into_iter()
-                                                    .map(|d| (d.clone(), Some(d))),
-                                            )
-                                            .collect();
-                                    let mut menu = v_flex()
-                                        .id("output-device-menu")
-                                        .gap_0p5()
-                                        .min_w(px(220.))
-                                        .max_h(px(280.))
-                                        .overflow_y_scroll();
-                                    for (i, (label, value)) in opts.into_iter().enumerate() {
-                                        let is_sel = selected.as_deref() == value.as_deref();
-                                        let player = player.clone();
-                                        let session = session.clone();
-                                        menu = menu.child(
-                                            div()
-                                                .id(("dev-opt", i))
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
-                                                .cursor_pointer()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .hover(|s| s.bg(cx.theme().muted))
-                                                .when(is_sel, |s| {
-                                                    s.text_color(cx.theme().primary)
-                                                })
-                                                .on_click(cx.listener(
-                                                    move |state, _, window, cx| {
-                                                        let v = value.clone();
-                                                        player.update(cx, |p, cx| {
-                                                            p.set_output_device(v.clone(), cx)
-                                                        });
-                                                        session.update(cx, |s, _| {
-                                                            s.settings.output_device = v.clone();
-                                                            s.persist_settings();
-                                                        });
-                                                        state.dismiss(window, cx);
-                                                    },
-                                                ))
-                                                .child(label),
-                                        );
-                                    }
-                                    menu
-                                }),
+                                Popover::new("output-device")
+                                    .trigger(
+                                        Button::new("output-device-trigger")
+                                            .ghost()
+                                            .xsmall()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .icon(Icon::new(IconName::ChevronDown).xsmall())
+                                            .label(device),
+                                    )
+                                    .content(move |_state, _window, cx| {
+                                        let opts: Vec<(String, Option<String>)> =
+                                            std::iter::once(("System default".to_string(), None))
+                                                .chain(
+                                                    playback::output_devices()
+                                                        .into_iter()
+                                                        .map(|d| (d.clone(), Some(d))),
+                                                )
+                                                .collect();
+                                        let mut menu = v_flex()
+                                            .id("output-device-menu")
+                                            .gap_0p5()
+                                            .min_w(px(220.))
+                                            .max_h(px(280.))
+                                            .overflow_y_scroll();
+                                        for (i, (label, value)) in opts.into_iter().enumerate() {
+                                            let is_sel = selected.as_deref() == value.as_deref();
+                                            let player = player.clone();
+                                            let session = session.clone();
+                                            menu = menu.child(
+                                                div()
+                                                    .id(("dev-opt", i))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .cursor_pointer()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .hover(|s| s.bg(cx.theme().muted))
+                                                    .when(is_sel, |s| {
+                                                        s.text_color(cx.theme().primary)
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |state, _, window, cx| {
+                                                            let v = value.clone();
+                                                            player.update(cx, |p, cx| {
+                                                                p.set_output_device(v.clone(), cx)
+                                                            });
+                                                            session.update(cx, |s, _| {
+                                                                s.settings.output_device =
+                                                                    v.clone();
+                                                                s.persist_settings();
+                                                            });
+                                                            state.dismiss(window, cx);
+                                                        },
+                                                    ))
+                                                    .child(label),
+                                            );
+                                        }
+                                        menu
+                                    }),
                             ),
                         )
                     }),

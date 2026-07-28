@@ -179,22 +179,25 @@ impl SettingsView {
     }
 
     fn set_replay_gain(&mut self, mode: ReplayGainMode, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.replay_gain = mode);
+        self.session
+            .update(cx, |s, _| s.settings.replay_gain = mode);
         self.player.update(cx, |p, cx| p.set_replay_gain(mode, cx));
         self.persist(cx);
         cx.notify();
     }
 
     fn set_fullscreen_bg(&mut self, mode: FullscreenBackground, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.fullscreen_bg = mode);
+        self.session
+            .update(cx, |s, _| s.settings.fullscreen_bg = mode);
         self.persist(cx);
         cx.notify();
     }
 
     fn set_queue_end(&mut self, mode: QueueEndBehavior, cx: &mut Context<Self>) {
         self.session.update(cx, |s, _| s.settings.queue_end = mode);
-        self.player
-            .update(cx, |p, cx| p.set_clear_on_end(mode == QueueEndBehavior::Clear, cx));
+        self.player.update(cx, |p, cx| {
+            p.set_clear_on_end(mode == QueueEndBehavior::Clear, cx)
+        });
         self.persist(cx);
         cx.notify();
     }

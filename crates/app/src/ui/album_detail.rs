@@ -503,8 +503,6 @@ impl Render for AlbumDetailView {
                     .group("trow")
                     .px_2()
                     .py_1()
-                    .border_b_1()
-                    .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                     .gap_3()
                     .rounded_md()
                     .cursor_pointer()
@@ -734,9 +732,7 @@ impl Render for AlbumDetailView {
                         .when_some(
                             self.full_art_path.clone().or_else(|| self.art_path.clone()),
                             |this, path| {
-                                this.child(
-                                    img(path).max_w(px(820.)).max_h(px(820.)).rounded_lg(),
-                                )
+                                this.child(img(path).max_w(px(820.)).max_h(px(820.)).rounded_lg())
                             },
                         ),
                 )

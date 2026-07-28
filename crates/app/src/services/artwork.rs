@@ -21,6 +21,25 @@ fn mem_cache() -> &'static Mutex<HashMap<String, PathBuf>> {
     IN_MEM.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Shared client so cover fetches reuse pooled keep-alive connections instead
+// of doing a fresh TLS handshake per thumbnail (`reqwest::get` builds a new
+// client every call).
+static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http() -> &'static reqwest::Client {
+    HTTP.get_or_init(reqwest::Client::new)
+}
+
+// Cap concurrent cover downloads. Fast-scrolling a large grid would otherwise
+// spawn hundreds of simultaneous requests + image decodes, saturating the IO
+// runtime and stalling the UI. Excess fetches park cheaply on the semaphore.
+const MAX_CONCURRENT_FETCHES: usize = 8;
+static FETCH_SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+fn fetch_sem() -> &'static tokio::sync::Semaphore {
+    FETCH_SEM.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES))
+}
+
 /// Update the on-disk cache cap (megabytes, clamped to 64–1024).
 pub fn set_cache_cap_mb(mb: u32) {
     let mb = mb.clamp(64, 1024);
@@ -64,8 +83,22 @@ pub async fn fetch(client: SubsonicClient, cover_id: String, size: u32) -> Resul
     let path2 = path.clone();
     let cache_key2 = cache_key.clone();
     runtime::spawn_io(async move {
+        // Throttle: hold a permit for the download so at most
+        // MAX_CONCURRENT_FETCHES run at once. Dropped (cancelled) fetches
+        // release their permit/wait immediately.
+        let _permit = fetch_sem().acquire().await?;
+        // A cover may have been cached by a concurrent request while we waited.
+        if let Some(path) = cached(&cover_id, size) {
+            return Ok(path);
+        }
         let url = client.cover_art_url(&cover_id, Some(size))?;
-        let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+        let bytes = http()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
         std::fs::create_dir_all(&dir)?;
         // Write via temp file so partial downloads never poison the cache.
         let tmp = path2.with_extension("part");

@@ -156,6 +156,10 @@ pub struct ArtistDetailView {
     artist_id: String,
     artist: Option<ArtistWithAlbums>,
     art_paths: HashMap<String, PathBuf>,
+    /// In-flight album-cover downloads, cancelled when the view is dropped.
+    art_tasks: Vec<gpui::Task<()>>,
+    /// A coalesced repaint is scheduled (batches cover arrivals).
+    art_repaint_pending: bool,
     artist_image_path: Option<PathBuf>,
     error: Option<String>,
     /// Biography + image URLs from getArtistInfo2 (Navidrome's agents).
@@ -180,6 +184,8 @@ impl ArtistDetailView {
             artist_id,
             artist: None,
             art_paths: HashMap::new(),
+            art_tasks: Vec::new(),
+            art_repaint_pending: false,
             artist_image_path: None,
             error: None,
             info: None,
@@ -234,13 +240,31 @@ impl ArtistDetailView {
         let Some(client) = self.client(cx) else {
             return;
         };
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             if let Ok(path) = artwork::fetch(client, cover_id, ART_SIZE).await {
                 let _ = this.update(cx, |view, cx| {
                     view.art_paths.insert(album_id, path);
-                    cx.notify();
+                    view.schedule_art_repaint(cx);
                 });
             }
+        });
+        self.art_tasks.push(task);
+    }
+
+    /// Coalesce cover-arrival repaints into ~one re-render per burst.
+    fn schedule_art_repaint(&mut self, cx: &mut Context<Self>) {
+        if self.art_repaint_pending {
+            return;
+        }
+        self.art_repaint_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(80))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.art_repaint_pending = false;
+                cx.notify();
+            });
         })
         .detach();
     }

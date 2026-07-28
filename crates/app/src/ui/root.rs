@@ -95,8 +95,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let login = cx.new(|cx| LoginView::new(session.clone(), window, cx));
-        let player_bar =
-            cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
+        let player_bar = cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
         let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), cx));
         let radio = crate::state::radio::init(session.clone(), cx);
         let fullscreen = cx.new(|cx| FullscreenPlayer::new(player.clone(), session.clone(), cx));
@@ -149,16 +148,18 @@ impl RootView {
         })
         .detach();
 
-        let new_pl_name =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
+        let new_pl_name = cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
         let new_pl_desc =
             cx.new(|cx| InputState::new(window, cx).placeholder("Description (optional)"));
         // Enter in the name field creates the playlist.
-        cx.subscribe(&new_pl_name, |this: &mut Self, _, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.submit_new_playlist(cx);
-            }
-        })
+        cx.subscribe(
+            &new_pl_name,
+            |this: &mut Self, _, event: &InputEvent, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.submit_new_playlist(cx);
+                }
+            },
+        )
         .detach();
 
         // React to connect/disconnect and library switches: build/tear down
@@ -502,22 +503,12 @@ impl RootView {
                         h_flex()
                             .justify_end()
                             .gap_2()
-                            .child(
-                                Button::new("np-cancel")
-                                    .ghost()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel_new_playlist(cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("np-create")
-                                    .primary()
-                                    .label("Create")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_new_playlist(cx)
-                                    })),
-                            ),
+                            .child(Button::new("np-cancel").ghost().label("Cancel").on_click(
+                                cx.listener(|this, _, _, cx| this.cancel_new_playlist(cx)),
+                            ))
+                            .child(Button::new("np-create").primary().label("Create").on_click(
+                                cx.listener(|this, _, _, cx| this.submit_new_playlist(cx)),
+                            )),
                     ),
             )
             .into_any_element()
@@ -612,6 +603,7 @@ impl Render for RootView {
         let fullscreen = self.fullscreen.clone();
         let show_fullscreen = self.show_fullscreen;
         let client_titlebar = self.session.read(cx).settings.client_titlebar;
+        let palette_open = self.search_bar.read(cx).is_palette();
 
         v_flex()
             .size_full()
@@ -664,13 +656,23 @@ impl Render for RootView {
                         } else if this.show_fullscreen {
                             this.fullscreen.update(cx, |f, cx| f.begin_close(cx));
                             cx.stop_propagation();
-                        } else if this.search_bar.read(cx).is_open() {
+                        } else if this.search_bar.read(cx).is_palette()
+                            || this.search_bar.read(cx).is_open()
+                        {
                             this.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
                             cx.stop_propagation();
                         }
                     }
                     "/" if !is_text_input => {
                         this.search_bar.update(cx, |sb, cx| sb.focus(window, cx));
+                        cx.stop_propagation();
+                    }
+                    // Ctrl+K (Cmd+K on macOS) opens the centered command palette.
+                    "k" if event.keystroke.modifiers.control
+                        || event.keystroke.modifiers.platform =>
+                    {
+                        this.search_bar
+                            .update(cx, |sb, cx| sb.open_palette(window, cx));
                         cx.stop_propagation();
                     }
                     "[" => {
@@ -737,14 +739,18 @@ impl Render for RootView {
                             .h_full()
                             .child(content)
                             // Global search, overlaid top right so it sits on
-                            // the same row as each page's filter tabs.
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(14.))
-                                    .right(px(16.))
-                                    .child(self.search_bar.clone()),
-                            ),
+                            // the same row as each page's filter tabs. Hidden
+                            // while the centered command palette is open (the
+                            // same entity can't be mounted twice).
+                            .when(!palette_open, |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(14.))
+                                        .right(px(16.))
+                                        .child(self.search_bar.clone()),
+                                )
+                            }),
                     )
                     .when(self.show_queue, |this| this.child(self.queue_panel.clone())),
             )
@@ -754,6 +760,29 @@ impl Render for RootView {
             // New-playlist dialog on top of everything.
             .when(self.new_playlist_open, |this| {
                 this.child(self.render_new_playlist_modal(cx))
+            })
+            // Centered command palette (Ctrl/Cmd+K): dimmed full-window backdrop
+            // with the search box near the top. Backdrop click dismisses; the
+            // box itself occludes so inner clicks don't fall through.
+            .when(palette_open, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .bg(gpui::hsla(0., 0., 0., 0.55))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
+                            }),
+                        )
+                        .child(div().mt(px(96.)).child(self.search_bar.clone())),
+                )
             })
             .into_any_element()
     }

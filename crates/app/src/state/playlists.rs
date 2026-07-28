@@ -72,7 +72,10 @@ impl PlaylistsState {
                     .await
                     .map_err(anyhow::Error::from)?;
                 // Description is a separate updatePlaylist `comment` call.
-                if let Some(comment) = description.as_deref().map(str::trim).filter(|c| !c.is_empty())
+                if let Some(comment) = description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
                 {
                     client
                         .update_playlist(&pl.playlist.id, None, Some(comment), &[], &[])

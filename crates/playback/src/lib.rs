@@ -50,7 +50,9 @@ pub fn output_devices() -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(devices) = rodio::cpal::default_host().output_devices() {
         for dev in devices {
-            let Ok(desc) = dev.description() else { continue };
+            let Ok(desc) = dev.description() else {
+                continue;
+            };
             if desc.driver().is_some_and(|d| d == "null") {
                 continue;
             }

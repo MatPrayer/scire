@@ -147,6 +147,12 @@ pub struct AlbumsView {
     /// Albums for each filter tab, loaded independently and lazily.
     tabs: HashMap<AlbumSort, TabState>,
     art_paths: HashMap<String, PathBuf>,
+    /// In-flight cover downloads, kept so they're cancelled when this view is
+    /// dropped on navigation (instead of leaking and starving the next page).
+    art_tasks: Vec<gpui::Task<()>>,
+    /// A coalesced repaint is scheduled; batches a burst of cover arrivals
+    /// into one re-render instead of one per completed download.
+    art_repaint_pending: bool,
     active_tab: AlbumSort,
     /// Resolution thumbnails are currently fetched at; tracked so a cover-size
     /// change can drop stale art and refetch at the new resolution.
@@ -172,6 +178,8 @@ impl AlbumsView {
             playlists,
             tabs: HashMap::new(),
             art_paths: HashMap::new(),
+            art_tasks: Vec::new(),
+            art_repaint_pending: false,
             active_tab,
             art_px,
             scroll: ScrollHandle::new(),
@@ -344,8 +352,7 @@ impl AlbumsView {
             match result {
                 Ok(album) => {
                     let ids: Vec<String> = album.song.iter().map(|s| s.id.clone()).collect();
-                    let _ = playlists
-                        .update(cx, |pl, cx| pl.add_songs(playlist_id, ids, cx));
+                    let _ = playlists.update(cx, |pl, cx| pl.add_songs(playlist_id, ids, cx));
                 }
                 Err(e) => {
                     let _ = this.update(cx, |view, cx| {
@@ -378,13 +385,38 @@ impl AlbumsView {
         };
         let album_id = album.id.clone();
         let art_px = self.art_px;
-        cx.spawn(async move |this, cx| {
+        // Soft-cap the bag: oldest entries are the earliest-scrolled covers,
+        // long since downloaded, so dropping their handles just frees memory.
+        if self.art_tasks.len() > 256 {
+            self.art_tasks.drain(0..128);
+        }
+        let task = cx.spawn(async move |this, cx| {
             if let Ok(path) = artwork::fetch(client, cover_id, art_px).await {
                 let _ = this.update(cx, |view, cx| {
                     view.art_paths.insert(album_id, path);
-                    cx.notify();
+                    view.schedule_art_repaint(cx);
                 });
             }
+        });
+        self.art_tasks.push(task);
+    }
+
+    /// Coalesce cover-arrival repaints: a fast scroll completes many downloads
+    /// in quick succession; batch them into ~one re-render per frame-ish rather
+    /// than re-rendering the whole grid on every single completion.
+    fn schedule_art_repaint(&mut self, cx: &mut Context<Self>) {
+        if self.art_repaint_pending {
+            return;
+        }
+        self.art_repaint_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(80))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.art_repaint_pending = false;
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -393,6 +425,8 @@ impl AlbumsView {
     /// current `art_px` (called when the cover-size setting changes).
     fn refetch_art(&mut self, cx: &mut Context<Self>) {
         self.art_paths.clear();
+        // Cancel in-flight downloads at the old resolution.
+        self.art_tasks.clear();
         let albums: Vec<Album> = self
             .tabs
             .get(&self.active_tab)
@@ -510,8 +544,7 @@ impl AlbumsView {
                     .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
                     .submenu("Save to playlist", window, cx, move |sub, _w, _c| {
                         if pl_list.is_empty() {
-                            return sub
-                                .item(PopupMenuItem::new("No playlists yet").disabled(true));
+                            return sub.item(PopupMenuItem::new("No playlists yet").disabled(true));
                         }
                         let mut sub = sub;
                         for (pid, pname) in &pl_list {
@@ -611,7 +644,13 @@ impl Render for AlbumsView {
             })
             // Centered so the leftover space of the ragged last row is split
             // evenly — left and right gutters stay equal at any window width.
-            .child(h_flex().flex_wrap().justify_center().gap_4().children(cards))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_4()
+                    .children(cards),
+            )
             // Loading indicator while the next page streams in.
             .when(loading, |this| {
                 this.child(

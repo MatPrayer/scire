@@ -192,9 +192,7 @@ pub fn render_sidebar(
                     .ghost()
                     .xsmall()
                     .icon(Icon::new(IconName::Plus))
-                    .on_click(move |_, window, cx| {
-                        on_new(SidebarAction::NewPlaylist, window, cx)
-                    }),
+                    .on_click(move |_, window, cx| on_new(SidebarAction::NewPlaylist, window, cx)),
             )
     };
 

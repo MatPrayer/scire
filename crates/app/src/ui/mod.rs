@@ -19,7 +19,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use directories::ProjectDirs;
-use gpui::{App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions, div, hsla, prelude::*, px};
+use gpui::{
+    App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions, div, hsla,
+    prelude::*, px,
+};
 use gpui_component::TitleBar;
 use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeRegistry};
 
@@ -199,22 +202,25 @@ pub fn waveform_seek_bar(
         .flex_1()
         .h(px(height))
         .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, move |event: &gpui::MouseDownEvent, _, cx| {
-            let Some(bounds) = bounds_for_click.get() else {
-                return;
-            };
-            let w = f32::from(bounds.size.width);
-            if w <= 0. {
-                return;
-            }
-            let x = f32::from(event.position.x) - f32::from(bounds.origin.x);
-            let target = (x / w).clamp(0., 1.);
-            player.update(cx, |player, _| {
-                if let Some(total) = player.duration {
-                    player.seek(seek_position(total, target));
+        .on_mouse_down(
+            MouseButton::Left,
+            move |event: &gpui::MouseDownEvent, _, cx| {
+                let Some(bounds) = bounds_for_click.get() else {
+                    return;
+                };
+                let w = f32::from(bounds.size.width);
+                if w <= 0. {
+                    return;
                 }
-            });
-        })
+                let x = f32::from(event.position.x) - f32::from(bounds.origin.x);
+                let target = (x / w).clamp(0., 1.);
+                player.update(cx, |player, _| {
+                    if let Some(total) = player.duration {
+                        player.seek(seek_position(total, target));
+                    }
+                });
+            },
+        )
         .child(
             gpui::canvas(
                 |_, _, _| {},
@@ -246,7 +252,10 @@ pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
     if !matches!(pref, ThemePref::Custom) {
         let (light, dark) = {
             let reg = ThemeRegistry::global(cx);
-            (reg.default_light_theme().clone(), reg.default_dark_theme().clone())
+            (
+                reg.default_light_theme().clone(),
+                reg.default_dark_theme().clone(),
+            )
         };
         let theme = Theme::global_mut(cx);
         theme.light_theme = light;
@@ -336,18 +345,34 @@ fn accent_foreground(accent: Hsla) -> Hsla {
     let rgb = gpui::Rgba::from(accent);
     let lum = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
     if lum > 0.6 {
-        Hsla { h: 0., s: 0., l: 0.10, a: 1.0 }
+        Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.10,
+            a: 1.0,
+        }
     } else {
-        Hsla { h: 0., s: 0., l: 0.98, a: 1.0 }
+        Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.98,
+            a: 1.0,
+        }
     }
 }
 
 fn lighten(c: Hsla, amt: f32) -> Hsla {
-    Hsla { l: (c.l + amt).min(1.0), ..c }
+    Hsla {
+        l: (c.l + amt).min(1.0),
+        ..c
+    }
 }
 
 fn darken(c: Hsla, amt: f32) -> Hsla {
-    Hsla { l: (c.l - amt).max(0.0), ..c }
+    Hsla {
+        l: (c.l - amt).max(0.0),
+        ..c
+    }
 }
 
 /// Standard RGB→HSL (all channels 0..1); hue returned in turns (0..1).

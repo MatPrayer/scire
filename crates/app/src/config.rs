@@ -12,8 +12,7 @@ use crate::state::queue::RepeatMode;
 const KEYRING_SERVICE: &str = "scire";
 
 fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("", "", "scire")
-        .context("cannot determine platform config directories")
+    ProjectDirs::from("", "", "scire").context("cannot determine platform config directories")
 }
 
 pub fn settings_path() -> Result<PathBuf> {

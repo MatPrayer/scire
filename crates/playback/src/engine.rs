@@ -343,7 +343,9 @@ async fn start_track(
     if output.is_none() {
         *output = Some(open_output(selected_device)?);
     }
-    let out = output.as_ref().ok_or(PlaybackError("no output sink".into()))?;
+    let out = output
+        .as_ref()
+        .ok_or(PlaybackError("no output sink".into()))?;
 
     let player = rodio::Player::connect_new(out.mixer());
     player.set_volume(volume);
@@ -360,7 +362,12 @@ fn open_output(selected: &Option<String>) -> Result<rodio::MixerDeviceSink, Play
         && let Ok(devices) = rodio::cpal::default_host().output_devices()
     {
         for dev in devices {
-            if dev.description().ok().map(|d| d.name().to_string()).as_deref() == Some(name.as_str())
+            if dev
+                .description()
+                .ok()
+                .map(|d| d.name().to_string())
+                .as_deref()
+                == Some(name.as_str())
             {
                 return rodio::DeviceSinkBuilder::from_device(dev)
                     .and_then(|b| b.open_stream())

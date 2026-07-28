@@ -6,14 +6,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, Window, deferred, div, img, prelude::*, px,
+    Context, Entity, EventEmitter, IntoElement, KeyDownEvent, Render, Window, deferred, div, img,
+    prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
-use subsonic::SearchResult3;
+use subsonic::{SearchResult3, Song};
 
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
@@ -32,6 +33,14 @@ pub enum SearchBarEvent {
     OpenArtist(String),
 }
 
+/// A keyboard-selectable result, in the same order rows are rendered
+/// (artists, then albums, then songs). Index into this list == `selected`.
+enum PaletteItem {
+    Artist(String),
+    Album(String),
+    Song(Box<Song>),
+}
+
 pub struct SearchBar {
     session: Entity<Session>,
     player: Entity<PlayerState>,
@@ -40,6 +49,10 @@ pub struct SearchBar {
     /// Dropdown visibility; results stay cached while hidden so reopening
     /// the same query is instant.
     open: bool,
+    /// Centered command-palette mode (Ctrl/Cmd+K) vs. the inline top-right bar.
+    palette: bool,
+    /// Highlighted row for arrow-key navigation (palette mode).
+    selected: usize,
     searching: bool,
     error: Option<String>,
     art_paths: HashMap<String, PathBuf>,
@@ -55,11 +68,9 @@ impl SearchBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Search…")
-                .clean_on_escape()
-        });
+        // No `clean_on_escape`: Escape must reach our own handlers to close the
+        // palette / dropdown, not be swallowed to clear the field.
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
 
         cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -74,6 +85,8 @@ impl SearchBar {
             input,
             results: None,
             open: false,
+            palette: false,
+            selected: 0,
             searching: false,
             error: None,
             art_paths: HashMap::new(),
@@ -90,17 +103,80 @@ impl SearchBar {
         self.open
     }
 
-    /// Close the dropdown and clear the query (root's Escape handler).
+    pub fn is_palette(&self) -> bool {
+        self.palette
+    }
+
+    /// Open the centered command palette (Ctrl/Cmd+K) with a fresh query.
+    pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = true;
+        self.selected = 0;
+        self.results = None;
+        self.open = false;
+        self.input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Close the dropdown/palette and clear the query (root's Escape handler).
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
+        self.palette = false;
+        self.selected = 0;
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.results = None;
         cx.notify();
     }
 
+    /// Flat list of selectable rows, in render order. `selected` indexes this.
+    fn items(&self) -> Vec<PaletteItem> {
+        let mut v = Vec::new();
+        if let Some(r) = &self.results {
+            for a in r.artist.iter().take(MAX_ARTISTS) {
+                v.push(PaletteItem::Artist(a.id.clone()));
+            }
+            for a in r.album.iter().take(MAX_ALBUMS) {
+                v.push(PaletteItem::Album(a.id.clone()));
+            }
+            for s in r.song.iter().take(MAX_SONGS) {
+                v.push(PaletteItem::Song(Box::new(s.clone())));
+            }
+        }
+        v
+    }
+
+    /// Move the highlight by `delta`, wrapping at the ends.
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.items().len();
+        if n == 0 {
+            return;
+        }
+        self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
+        cx.notify();
+    }
+
+    /// Activate the highlighted row (Enter in palette mode).
+    fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.items();
+        let Some(item) = items.into_iter().nth(self.selected) else {
+            return;
+        };
+        match item {
+            PaletteItem::Artist(id) => cx.emit(SearchBarEvent::OpenArtist(id)),
+            PaletteItem::Album(id) => cx.emit(SearchBarEvent::OpenAlbum(id)),
+            PaletteItem::Song(song) => {
+                self.player
+                    .update(cx, |p, cx| p.play_queue(vec![*song], 0, cx));
+            }
+        }
+        self.dismiss(window, cx);
+    }
+
     fn on_query_changed(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
+        self.selected = 0;
         let generation = self.generation;
         let empty = self.input.read(cx).value().trim().is_empty();
         if empty {
@@ -166,6 +242,7 @@ impl SearchBar {
                     Ok(r) => {
                         bar.fetch_result_art(&r, cx);
                         bar.results = Some(r);
+                        bar.selected = 0;
                         bar.error = None;
                     }
                     Err(e) => bar.error = Some(format!("{e:#}")),
@@ -262,14 +339,25 @@ impl SearchBar {
             .into_any_element()
     }
 
-    fn render_dropdown(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Selected-row highlight (palette arrow-key navigation). Mirrors the
+    /// album track-list convention: muted fill + a `primary` left border.
+    fn row_selected(&self, idx: usize) -> bool {
+        self.palette && idx == self.selected
+    }
+
+    /// Build the result rows shared by the inline dropdown and the palette.
+    /// The flat selectable index is threaded so the highlighted row matches
+    /// `selected`; section titles do not advance it.
+    fn result_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        let mut idx = 0usize;
 
         if let Some(results) = &self.results {
             if !results.artist.is_empty() {
                 rows.push(Self::section_title("Artists", cx));
                 for (i, artist) in results.artist.iter().take(MAX_ARTISTS).enumerate() {
                     let id = artist.id.clone();
+                    let sel = self.row_selected(idx);
                     rows.push(
                         h_flex()
                             .id(("sb-artist", i))
@@ -280,6 +368,11 @@ impl SearchBar {
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|s| s.bg(cx.theme().muted))
+                            .when(sel, |s| {
+                                s.bg(cx.theme().muted)
+                                    .border_l_2()
+                                    .border_color(cx.theme().primary)
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.emit(SearchBarEvent::OpenArtist(id.clone()));
                                 this.dismiss(window, cx);
@@ -295,6 +388,7 @@ impl SearchBar {
                             )
                             .into_any_element(),
                     );
+                    idx += 1;
                 }
             }
 
@@ -302,6 +396,7 @@ impl SearchBar {
                 rows.push(Self::section_title("Albums", cx));
                 for (i, album) in results.album.iter().take(MAX_ALBUMS).enumerate() {
                     let id = album.id.clone();
+                    let sel = self.row_selected(idx);
                     rows.push(
                         h_flex()
                             .id(("sb-album", i))
@@ -312,6 +407,11 @@ impl SearchBar {
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|s| s.bg(cx.theme().muted))
+                            .when(sel, |s| {
+                                s.bg(cx.theme().muted)
+                                    .border_l_2()
+                                    .border_color(cx.theme().primary)
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.emit(SearchBarEvent::OpenAlbum(id.clone()));
                                 this.dismiss(window, cx);
@@ -336,6 +436,7 @@ impl SearchBar {
                             )
                             .into_any_element(),
                     );
+                    idx += 1;
                 }
             }
 
@@ -345,6 +446,7 @@ impl SearchBar {
                 for (i, song) in results.song.iter().take(MAX_SONGS).enumerate() {
                     let play = song.clone();
                     let enqueue = song.clone();
+                    let sel = self.row_selected(idx);
                     rows.push(
                         h_flex()
                             .id(("sb-song", i))
@@ -355,6 +457,11 @@ impl SearchBar {
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|s| s.bg(cx.theme().muted))
+                            .when(sel, |s| {
+                                s.bg(cx.theme().muted)
+                                    .border_l_2()
+                                    .border_color(cx.theme().primary)
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.player.update(cx, |p, cx| {
                                     p.play_queue(vec![play.clone()], 0, cx);
@@ -389,6 +496,7 @@ impl SearchBar {
                             )
                             .into_any_element(),
                     );
+                    idx += 1;
                 }
             }
 
@@ -425,8 +533,14 @@ impl SearchBar {
             );
         }
 
+        rows
+    }
+
+    fn render_dropdown(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         v_flex()
             .id("search-dropdown")
+            // Swallow mouse events so clicks land on rows, not the page beneath.
+            .occlude()
             .absolute()
             .top(px(38.))
             .right_0()
@@ -440,13 +554,92 @@ impl SearchBar {
             .bg(cx.theme().popover)
             .text_color(cx.theme().popover_foreground)
             .shadow_lg()
-            .children(rows)
+            .children(self.result_rows(cx))
+            .into_any_element()
+    }
+
+    /// Centered command-palette box: large input on top, scrollable results
+    /// below. Arrow/Enter/Escape are handled in the capture phase so they
+    /// drive selection instead of reaching the input or the root shortcuts.
+    fn render_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let has_query = !self.input.read(cx).value().trim().is_empty();
+        let rows = self.result_rows(cx);
+        v_flex()
+            .id("search-palette")
+            .occlude()
+            .w(px(620.))
+            .max_h(px(560.))
+            .rounded_xl()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .shadow_lg()
+            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                match e.keystroke.key.as_str() {
+                    "down" => {
+                        this.move_selection(1, cx);
+                        cx.stop_propagation();
+                    }
+                    "up" => {
+                        this.move_selection(-1, cx);
+                        cx.stop_propagation();
+                    }
+                    "enter" => {
+                        this.activate_selected(window, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        this.dismiss(window, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(
+                h_flex()
+                    .p_3()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(Icon::new(IconName::Search)),
+                    )
+                    .child(div().flex_1().child(Input::new(&self.input))),
+            )
+            .when(has_query || self.searching, |this| {
+                this.child(
+                    v_flex()
+                        .id("palette-scroll")
+                        .max_h(px(480.))
+                        .overflow_y_scroll()
+                        .p_1()
+                        .children(rows),
+                )
+            })
+            .when(!has_query && !self.searching, |this| {
+                this.child(
+                    div()
+                        .p_4()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Type to search artists, albums and songs…"),
+                )
+            })
             .into_any_element()
     }
 }
 
 impl Render for SearchBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.palette {
+            // The centered box only; root supplies the full-window backdrop.
+            return self.render_palette(cx);
+        }
+
         let has_query = !self.input.read(cx).value().trim().is_empty();
 
         h_flex()
@@ -469,5 +662,6 @@ impl Render for SearchBar {
                 // rendered after this header row.
                 this.child(deferred(self.render_dropdown(cx)))
             })
+            .into_any_element()
     }
 }

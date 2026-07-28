@@ -207,8 +207,8 @@ impl FullscreenPlayer {
         self.waveform = None;
         self.waveform_for = Some(id.clone());
         cx.spawn(async move |this, cx| {
-            let result = runtime::spawn_io(crate::services::waveform::fetch_peaks(url, id.clone()))
-                .await;
+            let result =
+                runtime::spawn_io(crate::services::waveform::fetch_peaks(url, id.clone())).await;
             let _ = this.update(cx, |view, cx| {
                 // Ignore results for a track that is no longer current.
                 if view.waveform_for.as_deref() == Some(id.as_str()) {
@@ -458,45 +458,53 @@ impl FullscreenPlayer {
                 // palette-as-cycle (wrap is a lerp), so flow is always one direction.
                 let ring: Vec<gpui::Rgba> = {
                     // Boosted saturation + a floor of variance so mono covers still move.
-                    let r: Vec<gpui::Rgba> =
-                        palette.iter().map(|&c| scale_rgb(vivid(c, 1.5), 1.0)).collect();
+                    let r: Vec<gpui::Rgba> = palette
+                        .iter()
+                        .map(|&c| scale_rgb(vivid(c, 1.5), 1.0))
+                        .collect();
                     if r.len() < 2 {
-                        let b = *r.first().unwrap_or(&gpui::Rgba::from(cx.theme().background));
+                        let b = *r
+                            .first()
+                            .unwrap_or(&gpui::Rgba::from(cx.theme().background));
                         vec![b, scale_rgb(b, 1.5), scale_rgb(b, 0.6)]
                     } else {
                         r
                     }
                 };
                 let ring2 = ring.clone();
-                let anim_layer =
-                    |id: &'static str, angle: f32, ring: Vec<gpui::Rgba>, oa: f32, ob: f32, alpha: f32| {
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .size_full()
-                            .with_animation(
-                                id,
-                                // Slower: full palette sweep over 40s.
-                                Animation::new(Duration::from_secs(40)).repeat(),
-                                move |this, delta| {
-                                    let n = ring.len();
-                                    let sample = |offset: f32| -> gpui::Rgba {
-                                        let pos = (delta + offset).rem_euclid(1.0) * n as f32;
-                                        let i0 = pos.floor() as usize % n;
-                                        let i1 = (i0 + 1) % n;
-                                        let mut c = lerp_rgb(ring[i0], ring[i1], pos.fract());
-                                        c.a = alpha;
-                                        c
-                                    };
-                                    this.bg(linear_gradient(
-                                        angle,
-                                        linear_color_stop(sample(oa), 0.),
-                                        linear_color_stop(sample(ob), 1.),
-                                    ))
-                                },
-                            )
-                    };
+                let anim_layer = |id: &'static str,
+                                  angle: f32,
+                                  ring: Vec<gpui::Rgba>,
+                                  oa: f32,
+                                  ob: f32,
+                                  alpha: f32| {
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .size_full()
+                        .with_animation(
+                            id,
+                            // Slower: full palette sweep over 40s.
+                            Animation::new(Duration::from_secs(40)).repeat(),
+                            move |this, delta| {
+                                let n = ring.len();
+                                let sample = |offset: f32| -> gpui::Rgba {
+                                    let pos = (delta + offset).rem_euclid(1.0) * n as f32;
+                                    let i0 = pos.floor() as usize % n;
+                                    let i1 = (i0 + 1) % n;
+                                    let mut c = lerp_rgb(ring[i0], ring[i1], pos.fract());
+                                    c.a = alpha;
+                                    c
+                                };
+                                this.bg(linear_gradient(
+                                    angle,
+                                    linear_color_stop(sample(oa), 0.),
+                                    linear_color_stop(sample(ob), 1.),
+                                ))
+                            },
+                        )
+                };
                 base()
                     // Solid base so the translucent layers composite over something.
                     .bg(scale_rgb(bot, 0.5))
@@ -658,10 +666,8 @@ impl Render for FullscreenPlayer {
         let detailed_volume = self.session.read(cx).settings.detailed_volume;
         let volume_level = self.player.read(cx).volume;
         let replay_gain = self.player.read(cx).replay_gain_active();
-        let stream_info = crate::ui::stream_info_line(
-            self.player.read(cx),
-            &self.session.read(cx).settings,
-        );
+        let stream_info =
+            crate::ui::stream_info_line(self.player.read(cx), &self.session.read(cx).settings);
 
         let time_now = format_duration(position);
         let time_total = duration

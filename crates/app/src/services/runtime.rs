@@ -21,7 +21,21 @@ fn runtime() -> &'static Runtime {
     })
 }
 
+/// Aborts the wrapped tokio task if dropped before it finishes. Lets a gpui
+/// task's cancellation (e.g. a view dropped on navigation) propagate down and
+/// stop the underlying IO instead of leaking it on the runtime.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Spawn `fut` on the IO runtime; await the returned future from gpui.
+///
+/// If the returned future is dropped before completion (the awaiting gpui task
+/// was cancelled), the spawned IO task is aborted rather than left running.
 ///
 /// Panics in the spawned future surface as an `Err` here (JoinError is
 /// converted to a readable message rather than propagating the panic).
@@ -32,7 +46,8 @@ where
 {
     let handle = runtime().spawn(fut);
     async move {
-        match handle.await {
+        let mut guard = AbortOnDrop(handle);
+        match std::pin::Pin::new(&mut guard.0).await {
             Ok(result) => result,
             Err(e) => Err(anyhow::anyhow!("io task failed: {e}")),
         }

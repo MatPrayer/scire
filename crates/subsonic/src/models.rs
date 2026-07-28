@@ -170,7 +170,6 @@ pub struct RadioStation {
     pub home_page_url: Option<String>,
 }
 
-
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult3 {
