@@ -26,6 +26,9 @@ pub struct TrackSource {
     pub duration_hint: Option<Duration>,
     /// Local file path. `Some` → use local file IO instead of HTTP stream.
     pub path: Option<PathBuf>,
+    /// Consumer-side identity (song id), echoed back in `TrackEnded::started`
+    /// so a gapless hand-over can be matched to the right queue entry.
+    pub id: Option<String>,
 }
 
 /// Commands accepted by the engine.
@@ -37,10 +40,12 @@ pub enum Command {
     Stop,
     Seek(Duration),
     SetVolume(f32),
-    /// Pre-open and pre-decode the next track for near-gapless transition.
-    /// The engine auto-starts it when the current track drains.
+    /// Pre-open and pre-decode the next track for a gapless transition. The
+    /// engine appends it to the live player shortly before the current track
+    /// ends, so playback flows into it without a break.
     PrefetchNext(TrackSource),
-    /// Drop any prefetched track (queue changed).
+    /// Drop any prefetched track (queue changed). Ignored once the track has
+    /// been appended — rodio's queue cannot give it back.
     ClearPrefetch,
     /// Switch the OS output device by its description name; None = system
     /// default. Reopens the sink and resumes the current track in place.
@@ -78,9 +83,15 @@ pub enum Event {
     /// Total duration became known (decode or hint).
     DurationKnown(Duration),
     /// Track finished on its own (not via Stop). When `auto_advanced` the
-    /// engine already started the prefetched next track — the consumer should
-    /// advance its queue pointer without sending Play.
-    TrackEnded { auto_advanced: bool },
+    /// engine already flowed gaplessly into the prefetched track — the consumer
+    /// should advance its queue pointer without sending Play, and `started`
+    /// carries that track's `TrackSource::id` (it was committed seconds
+    /// earlier, so a queue edit since then may make it differ from what the
+    /// consumer expects next).
+    TrackEnded {
+        auto_advanced: bool,
+        started: Option<String>,
+    },
     /// Source is being fetched/buffered.
     Buffering,
     /// Playback started/resumed.

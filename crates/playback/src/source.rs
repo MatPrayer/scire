@@ -4,11 +4,16 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use std::time::Duration;
+
+use rodio::source::SeekError;
+use rodio::{ChannelCount, Sample, SampleRate, Source};
 use stream_download::http::HttpStream;
 use stream_download::http::reqwest::Client;
 use stream_download::source::SourceStream;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
+use tokio::sync::mpsc;
 
 use crate::PlaybackError;
 
@@ -68,4 +73,73 @@ pub(crate) async fn open_local(path: &Path) -> Result<(SourceReader, Option<u64>
         .ok()
         .map(|m| m.len());
     Ok((SourceReader::Local(file), len))
+}
+
+/// Wraps a decoder so the engine learns the exact sample at which it runs out.
+///
+/// Gapless playback keeps several tracks queued inside one `rodio::Player`, so
+/// polling `Player::empty()` can no longer tell tracks apart: this reports the
+/// hand-over the instant rodio's queue pulls the last sample of `serial`.
+pub(crate) struct EndSignal<S> {
+    inner: S,
+    serial: u64,
+    /// Taken on the first exhaustion so the signal fires exactly once.
+    tx: Option<mpsc::UnboundedSender<u64>>,
+}
+
+impl<S> EndSignal<S> {
+    pub(crate) fn new(inner: S, serial: u64, tx: mpsc::UnboundedSender<u64>) -> Self {
+        Self {
+            inner,
+            serial,
+            tx: Some(tx),
+        }
+    }
+}
+
+impl<S: Source> Iterator for EndSignal<S> {
+    type Item = Sample;
+
+    #[inline]
+    fn next(&mut self) -> Option<Sample> {
+        let sample = self.inner.next();
+        if sample.is_none()
+            && let Some(tx) = self.tx.take()
+        {
+            let _ = tx.send(self.serial);
+        }
+        sample
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<S: Source> Source for EndSignal<S> {
+    #[inline]
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+
+    #[inline]
+    fn channels(&self) -> ChannelCount {
+        self.inner.channels()
+    }
+
+    #[inline]
+    fn sample_rate(&self) -> SampleRate {
+        self.inner.sample_rate()
+    }
+
+    #[inline]
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+
+    #[inline]
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        self.inner.try_seek(pos)
+    }
 }

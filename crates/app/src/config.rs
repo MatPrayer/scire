@@ -94,6 +94,8 @@ pub struct Settings {
     /// Directories to scan for local music files. Empty = local music disabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_music_dirs: Vec<PathBuf>,
+    /// Show the vertical volume slider in the fullscreen now-playing overlay.
+    pub fullscreen_volume: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -235,6 +237,7 @@ impl Default for Settings {
             queue_end: QueueEndBehavior::Keep,
             fullscreen_bg: FullscreenBackground::Gradient,
             local_music_dirs: Vec::new(),
+            fullscreen_volume: false,
         }
     }
 }

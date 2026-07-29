@@ -24,6 +24,13 @@ const PAGE_SIZE: u32 = 100;
 /// Load the next page when scrolled within this many pixels of the bottom.
 const LOAD_AHEAD_PX: f32 = 600.;
 
+/// Card text metrics. The line heights are explicit because gpui's default
+/// line box for these font sizes clips descenders; the block height is fixed
+/// so every card is the same size (a requirement of the virtualized rows).
+const NAME_LINE_H: f32 = 20.;
+const META_LINE_H: f32 = 17.;
+const TEXT_BLOCK_H: f32 = NAME_LINE_H * 2. + META_LINE_H * 2.;
+
 /// All selectable filters, in display order.
 const TABS: &[AlbumSort] = &[
     AlbumSort::All,
@@ -515,15 +522,28 @@ impl AlbumsView {
             )
             .child(
                 v_flex()
-                    // Fixed height (fits name + artist + optional year) so cards
-                    // stay uniform — required for the virtualized row list.
-                    .h(px(54.))
+                    // Fixed height (fits a two-line name + artist + optional
+                    // year) so cards stay uniform — required for the
+                    // virtualized row list. Line heights are set explicitly:
+                    // the default line box is tight enough to clip descenders
+                    // (y, g, j) inside the overflow-hidden text block.
+                    .h(px(TEXT_BLOCK_H))
                     .gap_0()
                     .overflow_hidden()
-                    .child(div().text_sm().truncate().child(name))
+                    .child(
+                        div()
+                            // Long titles wrap onto a second line instead of
+                            // being cut mid-word; anything longer is clipped.
+                            .max_h(px(NAME_LINE_H * 2.))
+                            .overflow_hidden()
+                            .text_sm()
+                            .line_height(px(NAME_LINE_H))
+                            .child(name),
+                    )
                     .child(
                         div()
                             .text_xs()
+                            .line_height(px(META_LINE_H))
                             .text_color(cx.theme().muted_foreground)
                             .truncate()
                             .child(artist),
@@ -532,6 +552,7 @@ impl AlbumsView {
                         this.child(
                             div()
                                 .text_xs()
+                                .line_height(px(META_LINE_H))
                                 .text_color(cx.theme().muted_foreground)
                                 .child(year),
                         )
@@ -669,36 +690,54 @@ impl Render for AlbumsView {
                 .collect::<Vec<_>>()
         })
         .flex_1()
+        .px_4()
         .track_scroll(self.scroll.clone())
         .on_scroll_wheel(cx.listener(|this, _, _, cx| {
             this.maybe_load_more_on_scroll(cx);
         }));
 
+        // No bottom padding: the grid runs to the window edge so rows slide
+        // under the player bar instead of stopping short of it with a gap.
         v_flex()
             .id("albums-scroll")
             .size_full()
-            .p_4()
+            .relative()
+            .pt_4()
             .gap_3()
             .child(
                 h_flex()
                     .items_center()
                     .gap_4()
+                    .px_4()
                     .child(div().text_lg().child("Albums"))
                     .child(tabs),
             )
             .when_some(self.error.clone(), |this, e| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
+                this.child(
+                    div()
+                        .px_4()
+                        .text_color(cx.theme().danger)
+                        .text_sm()
+                        .child(e),
+                )
             })
             .child(grid)
-            // Loading indicator while the next page streams in.
+            // Loading indicator while the next page streams in — floated over
+            // the grid's bottom edge so it doesn't shorten the scroll area.
             .when(loading, |this| {
                 this.child(
-                    h_flex().justify_center().py_2().child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Loading…"),
-                    ),
+                    h_flex()
+                        .absolute()
+                        .bottom_2()
+                        .left_0()
+                        .right_0()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Loading…"),
+                        ),
                 )
             })
     }

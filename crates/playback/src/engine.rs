@@ -1,20 +1,44 @@
-//! Engine control loop: owns the rodio output and sink on a blocking thread,
+//! Engine control loop: owns the rodio output and player on a blocking thread,
 //! driven by commands from the `Player` handle.
+//!
+//! Gapless playback: one `rodio::Player` survives across tracks. The prepared
+//! next track is appended into that player's queue shortly before the current
+//! one ends, so rodio hands over between them sample-continuously (no new
+//! player, no silence in between). The hand-over is observed through an
+//! `EndSignal` wrapper rather than by polling, so the reported track switch is
+//! sample-accurate too.
 
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::source::{self, SourceReader};
+use crate::source::{self, EndSignal, SourceReader};
 use crate::{Command, Event, PlaybackError, TrackSource};
 
 const TICK: Duration = Duration::from_millis(500);
 
-/// A fully-opened, decoded-and-ready next track.
+/// How long before the end of the current track its successor is appended.
+/// Must exceed `TICK` so the tick that spots the window still lands before the
+/// hand-over; kept short because an appended track can no longer be pulled back
+/// out of rodio's queue.
+const COMMIT_LEAD: Duration = Duration::from_secs(3);
+
+/// A fully-opened, decoded-and-ready track, not yet handed to rodio.
 struct Prepared {
     track: TrackSource,
     decoder: rodio::Decoder<SourceReader>,
+    /// Length according to the decoder, used when the server gave no hint.
+    decoded_duration: Option<Duration>,
+}
+
+/// A track that has been appended to the player's queue: either playing now or
+/// waiting directly behind the one that is.
+struct Loaded {
+    track: TrackSource,
+    /// Identifies this append in `EndSignal` messages.
+    serial: u64,
+    duration: Option<Duration>,
 }
 
 pub(crate) fn spawn(
@@ -36,9 +60,21 @@ async fn control_loop(
     // Chosen output device name (None = OS default) and the currently-loaded
     // track, retained so a device switch can reopen and resume in place.
     let mut selected_device: Option<String> = None;
-    let mut current: Option<TrackSource> = None;
-    // In-flight preparation of the next track for gapless transition.
-    let mut prefetch: Option<JoinHandle<Result<Prepared, PlaybackError>>> = None;
+    let mut current: Option<Loaded> = None;
+    // Next track already appended behind `current` (committed, cannot be
+    // withdrawn) and the one prepared but still withheld.
+    let mut queued: Option<Loaded> = None;
+    let mut pending: Option<Prepared> = None;
+    // In-flight preparation of the next track; results arrive on `prep_rx`
+    // tagged with the generation that requested them, so a superseded prefetch
+    // that lands late is discarded.
+    let mut prefetch: Option<JoinHandle<()>> = None;
+    let mut prefetch_gen: u64 = 0;
+    let (prep_tx, mut prep_rx) =
+        mpsc::unbounded_channel::<(u64, Result<Prepared, PlaybackError>)>();
+    // Track-exhaustion signals from appended sources.
+    let (end_tx, mut end_rx) = mpsc::unbounded_channel::<u64>();
+    let mut serials: u64 = 0;
     let mut ticker = tokio::time::interval(TICK);
     let mut playing = false;
 
@@ -48,23 +84,34 @@ async fn control_loop(
                 let Some(cmd) = cmd else { break }; // all Player handles dropped
                 match cmd {
                     Command::Play(track) => {
-                        abort_prefetch(&mut prefetch);
+                        drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
+                        queued = None;
+                        current = None;
                         if let Some(s) = sink.take() {
                             s.stop();
                         }
                         let _ = event_tx.send(Event::Buffering);
                         let output_was_open = output.is_some();
-                        match start_track(&mut output, &selected_device, &track, volume).await {
-                            Ok(new_sink) => {
+                        match start_track(
+                            &mut output,
+                            &selected_device,
+                            track,
+                            volume,
+                            &mut serials,
+                            &end_tx,
+                        )
+                        .await
+                        {
+                            Ok((new_sink, loaded)) => {
                                 if !output_was_open {
                                     let _ = event_tx.send(Event::OutputOpened {
                                         device: resolved_device_name(&selected_device),
                                     });
                                 }
-                                if let Some(d) = track.duration_hint {
+                                if let Some(d) = loaded.duration {
                                     let _ = event_tx.send(Event::DurationKnown(d));
                                 }
-                                current = Some(track);
+                                current = Some(loaded);
                                 sink = Some(new_sink);
                                 playing = true;
                                 let _ = event_tx.send(Event::Playing);
@@ -90,7 +137,8 @@ async fn control_loop(
                         }
                     }
                     Command::Stop => {
-                        abort_prefetch(&mut prefetch);
+                        drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
+                        queued = None;
                         if let Some(s) = sink.take() {
                             s.stop();
                         }
@@ -107,17 +155,26 @@ async fn control_loop(
                             // track at its position (paused stays paused).
                             let resume = playing;
                             let pos = sink.as_ref().map(|s| s.get_pos());
-                            abort_prefetch(&mut prefetch);
+                            // An already-appended next track dies with the old
+                            // player; re-prepare it so gapless survives.
+                            let requeue = queued.take().map(|l| l.track);
                             if let Some(s) = sink.take() {
                                 s.stop();
                             }
                             output = None;
-                            if let Some(track) = current.clone() {
+                            if let Some(loaded) = current.take() {
                                 let _ = event_tx.send(Event::Buffering);
-                                match start_track(&mut output, &selected_device, &track, volume)
-                                    .await
+                                match start_track(
+                                    &mut output,
+                                    &selected_device,
+                                    loaded.track,
+                                    volume,
+                                    &mut serials,
+                                    &end_tx,
+                                )
+                                .await
                                 {
-                                    Ok(new_sink) => {
+                                    Ok((new_sink, loaded)) => {
                                         if let Some(p) = pos
                                             && let Err(e) = new_sink.try_seek(p)
                                         {
@@ -126,6 +183,7 @@ async fn control_loop(
                                         if !resume {
                                             new_sink.pause();
                                         }
+                                        current = Some(loaded);
                                         sink = Some(new_sink);
                                         playing = resume;
                                         let _ = event_tx.send(if resume {
@@ -139,6 +197,15 @@ async fn control_loop(
                                         let _ = event_tx.send(Event::Failed(e.to_string()));
                                     }
                                 }
+                            }
+                            if let Some(track) = requeue {
+                                start_prefetch(
+                                    track,
+                                    &mut prefetch,
+                                    &mut prefetch_gen,
+                                    &mut pending,
+                                    &prep_tx,
+                                );
                             }
                         }
                     }
@@ -158,11 +225,74 @@ async fn control_loop(
                         }
                     }
                     Command::PrefetchNext(track) => {
-                        abort_prefetch(&mut prefetch);
-                        prefetch = Some(tokio::spawn(prepare(track)));
+                        if let Some(q) = &queued {
+                            // Already appended into rodio's queue, which offers
+                            // no way to take it back out. It plays, and the
+                            // consumer resyncs from `TrackEnded::started`.
+                            if q.track.url != track.url {
+                                tracing::debug!("prefetch changed after commit; keeping committed track");
+                            }
+                        } else {
+                            start_prefetch(
+                                track,
+                                &mut prefetch,
+                                &mut prefetch_gen,
+                                &mut pending,
+                                &prep_tx,
+                            );
+                        }
                     }
                     Command::ClearPrefetch => {
-                        abort_prefetch(&mut prefetch);
+                        drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
+                    }
+                }
+            }
+            Some((generation, result)) = prep_rx.recv() => {
+                if generation == prefetch_gen {
+                    prefetch = None;
+                    match result {
+                        Ok(prepared) => {
+                            pending = Some(prepared);
+                            commit_next(
+                                &mut pending,
+                                &mut queued,
+                                &sink,
+                                current.as_ref(),
+                                &mut serials,
+                                &end_tx,
+                            );
+                        }
+                        Err(e) => tracing::warn!("prefetch failed: {e}"),
+                    }
+                }
+            }
+            Some(serial) = end_rx.recv() => {
+                // Ignore signals from sources of a superseded player: only the
+                // track we believe is playing can end.
+                if current.as_ref().is_some_and(|c| c.serial == serial) {
+                    if let Some(next) = queued.take() {
+                        // rodio already flowed into the appended track.
+                        let started = next.track.id.clone();
+                        let duration = next.duration;
+                        current = Some(next);
+                        playing = true;
+                        let _ = event_tx.send(Event::TrackEnded { auto_advanced: true, started });
+                        if let Some(d) = duration {
+                            let _ = event_tx.send(Event::DurationKnown(d));
+                        }
+                        let _ = event_tx.send(Event::Playing);
+                    } else {
+                        // Nothing lined up: drop the drained player so it stops
+                        // feeding keep-alive silence to the mixer.
+                        if let Some(s) = sink.take() {
+                            s.stop();
+                        }
+                        current = None;
+                        playing = false;
+                        let _ = event_tx.send(Event::TrackEnded {
+                            auto_advanced: false,
+                            started: None,
+                        });
                     }
                 }
             }
@@ -171,25 +301,26 @@ async fn control_loop(
                     && playing
                 {
                     if s.empty() {
-                        // Track drained. Start the prefetched next track if
-                        // it is ready; otherwise report a plain end and let
-                        // the consumer drive the next Play.
+                        // Belt-and-braces: the end signal should have arrived
+                        // first. Report the end so playback cannot wedge.
                         sink = None;
-                        let auto = try_start_prefetched(
-                            &mut prefetch,
-                            &mut sink,
-                            &output,
-                            volume,
-                            &event_tx,
-                            &mut current,
-                        );
-                        playing = auto;
-                        let _ = event_tx.send(Event::TrackEnded { auto_advanced: auto });
-                        if auto {
-                            let _ = event_tx.send(Event::Playing);
-                        }
+                        current = None;
+                        queued = None;
+                        playing = false;
+                        let _ = event_tx.send(Event::TrackEnded {
+                            auto_advanced: false,
+                            started: None,
+                        });
                     } else {
                         let _ = event_tx.send(Event::Position(s.get_pos()));
+                        commit_next(
+                            &mut pending,
+                            &mut queued,
+                            &sink,
+                            current.as_ref(),
+                            &mut serials,
+                            &end_tx,
+                        );
                     }
                 }
             }
@@ -250,63 +381,80 @@ fn pulse_default_sink_description() -> Option<String> {
     None
 }
 
-fn abort_prefetch(prefetch: &mut Option<JoinHandle<Result<Prepared, PlaybackError>>>) {
+/// Start preparing `track`, superseding any prefetch already in flight.
+fn start_prefetch(
+    track: TrackSource,
+    prefetch: &mut Option<JoinHandle<()>>,
+    generation: &mut u64,
+    pending: &mut Option<Prepared>,
+    prep_tx: &mpsc::UnboundedSender<(u64, Result<Prepared, PlaybackError>)>,
+) {
+    drop_prefetch(prefetch, generation, pending);
+    let generation = *generation;
+    let tx = prep_tx.clone();
+    *prefetch = Some(tokio::spawn(async move {
+        let result = prepare(track).await;
+        let _ = tx.send((generation, result));
+    }));
+}
+
+/// Abandon the in-flight and the ready-but-uncommitted next track. Bumping the
+/// generation makes any result still on its way irrelevant.
+fn drop_prefetch(
+    prefetch: &mut Option<JoinHandle<()>>,
+    generation: &mut u64,
+    pending: &mut Option<Prepared>,
+) {
     if let Some(handle) = prefetch.take() {
         handle.abort();
     }
+    *generation += 1;
+    *pending = None;
 }
 
-/// If a prefetched track finished preparing, start it on a fresh player and
-/// return true. A prefetch still in flight is aborted (the consumer will send
-/// a regular Play, which re-opens the source anyway).
-fn try_start_prefetched(
-    prefetch: &mut Option<JoinHandle<Result<Prepared, PlaybackError>>>,
-    sink: &mut Option<rodio::Player>,
-    output: &Option<rodio::MixerDeviceSink>,
-    volume: f32,
-    event_tx: &mpsc::UnboundedSender<Event>,
-    current: &mut Option<TrackSource>,
-) -> bool {
-    let Some(handle) = prefetch.take() else {
-        return false;
-    };
-    if !handle.is_finished() {
-        handle.abort();
-        return false;
+/// Append the prepared next track into the live player once the current track
+/// is within `COMMIT_LEAD` of its end, making the hand-over gapless. Nothing
+/// happens while the window is still far off, since an appended track cannot be
+/// withdrawn if the queue changes.
+fn commit_next(
+    pending: &mut Option<Prepared>,
+    queued: &mut Option<Loaded>,
+    sink: &Option<rodio::Player>,
+    current: Option<&Loaded>,
+    serials: &mut u64,
+    end_tx: &mpsc::UnboundedSender<u64>,
+) {
+    if pending.is_none() || queued.is_some() {
+        return;
     }
-    // is_finished: now_or_never-style await cannot block.
-    let prepared = match futures_now(handle) {
-        Some(Ok(p)) => p,
-        _ => return false,
-    };
-    let Some(out) = output else { return false };
-
-    let track = prepared.track.clone();
-    let player = rodio::Player::connect_new(out.mixer());
-    player.set_volume(volume);
-    player.append(prepared.decoder);
-    player.play();
-    *sink = Some(player);
-    if let Some(d) = track.duration_hint {
-        let _ = event_tx.send(Event::DurationKnown(d));
+    let Some(s) = sink else { return };
+    // Without a known length there is no window to wait for: append now rather
+    // than risk missing the join.
+    if let Some(total) = current.and_then(|c| c.duration)
+        && total.saturating_sub(s.get_pos()) > COMMIT_LEAD
+    {
+        return;
     }
-    *current = Some(track);
-    true
+    let prepared = pending.take().expect("checked above");
+    *queued = Some(append(s, prepared, serials, end_tx));
 }
 
-/// Resolve a finished JoinHandle without awaiting (caller checked
-/// `is_finished`). Returns None on join error (panic/abort).
-fn futures_now(
-    handle: JoinHandle<Result<Prepared, PlaybackError>>,
-) -> Option<Result<Prepared, PlaybackError>> {
-    use std::future::Future as _;
-    use std::task::{Context, Poll};
-    let mut handle = handle;
-    let waker = std::task::Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    match std::pin::Pin::new(&mut handle).poll(&mut cx) {
-        Poll::Ready(Ok(result)) => Some(result),
-        _ => None,
+/// Hand a prepared track to the player's queue and describe what was appended.
+fn append(
+    sink: &rodio::Player,
+    prepared: Prepared,
+    serials: &mut u64,
+    end_tx: &mpsc::UnboundedSender<u64>,
+) -> Loaded {
+    *serials += 1;
+    let serial = *serials;
+    sink.append(EndSignal::new(prepared.decoder, serial, end_tx.clone()));
+    Loaded {
+        // Server metadata wins over the decoder's guess; the decoder covers
+        // sources the server said nothing about.
+        duration: prepared.track.duration_hint.or(prepared.decoded_duration),
+        track: prepared.track,
+        serial,
     }
 }
 
@@ -332,7 +480,12 @@ async fn prepare(track: TrackSource) -> Result<Prepared, PlaybackError> {
     .await
     .map_err(|e| PlaybackError(e.to_string()))?
     .map_err(|e| PlaybackError(e.to_string()))?;
-    Ok(Prepared { track, decoder })
+    let decoded_duration = rodio::Source::total_duration(&decoder);
+    Ok(Prepared {
+        track,
+        decoder,
+        decoded_duration,
+    })
 }
 
 /// Open the HTTP source, build a decoder, and start a new player on the
@@ -340,10 +493,12 @@ async fn prepare(track: TrackSource) -> Result<Prepared, PlaybackError> {
 async fn start_track(
     output: &mut Option<rodio::MixerDeviceSink>,
     selected_device: &Option<String>,
-    track: &TrackSource,
+    track: TrackSource,
     volume: f32,
-) -> Result<rodio::Player, PlaybackError> {
-    let prepared = prepare(track.clone()).await?;
+    serials: &mut u64,
+    end_tx: &mpsc::UnboundedSender<u64>,
+) -> Result<(rodio::Player, Loaded), PlaybackError> {
+    let prepared = prepare(track).await?;
 
     if output.is_none() {
         *output = Some(open_output(selected_device)?);
@@ -354,9 +509,9 @@ async fn start_track(
 
     let player = rodio::Player::connect_new(out.mixer());
     player.set_volume(volume);
-    player.append(prepared.decoder);
+    let loaded = append(&player, prepared, serials, end_tx);
     player.play();
-    Ok(player)
+    Ok((player, loaded))
 }
 
 /// Open the sink for `selected` (a cpal device description name), falling back

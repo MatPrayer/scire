@@ -9,7 +9,9 @@ use gpui_component::link::Link;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, h_flex, v_flex};
 use subsonic::{Album, ArtistIndex, ArtistInfo2, ArtistWithAlbums, SubsonicClient};
 
+use crate::assets::{app_icon, icons};
 use crate::services::{artwork, runtime};
+use crate::state::player::PlayerState;
 use crate::state::session::Session;
 
 const ART_SIZE: u32 = 320;
@@ -153,6 +155,7 @@ impl Render for ArtistsView {
 /// One artist's albums.
 pub struct ArtistDetailView {
     session: Entity<Session>,
+    player: Entity<PlayerState>,
     artist_id: String,
     artist: Option<ArtistWithAlbums>,
     art_paths: HashMap<String, PathBuf>,
@@ -178,9 +181,15 @@ pub enum ArtistDetailEvent {
 impl EventEmitter<ArtistDetailEvent> for ArtistDetailView {}
 
 impl ArtistDetailView {
-    pub fn new(session: Entity<Session>, artist_id: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<Session>,
+        player: Entity<PlayerState>,
+        artist_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             session,
+            player,
             artist_id,
             artist: None,
             art_paths: HashMap::new(),
@@ -226,6 +235,35 @@ impl ArtistDetailView {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Fetch an album's songs and start playing them.
+    fn play_album(&mut self, album_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        let player = self.player.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .get_album(&album_id)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            match result {
+                Ok(album) => {
+                    let _ = player.update(cx, |p, cx| p.play_queue(album.song, 0, cx));
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.error = Some(format!("{e:#}"));
+                        cx.notify();
+                    });
+                }
+            }
         })
         .detach();
     }
@@ -395,12 +433,14 @@ impl Render for ArtistDetailView {
         let mut album_cards: Vec<gpui::AnyElement> = Vec::new();
         let mut single_cards: Vec<gpui::AnyElement> = Vec::new();
         if let Some(artist) = self.artist.as_ref() {
-            for album in &artist.album {
+            for (index, album) in artist.album.iter().enumerate() {
                 let id = album.id.clone();
+                let play_id = album.id.clone();
                 let art = self.art_paths.get(&album.id).cloned();
                 let year = album.year.map(|y| y.to_string()).unwrap_or_default();
                 let card = v_flex()
                     .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
+                    .group("aacard")
                     .w(px(172.))
                     .p_1p5()
                     .gap_1p5()
@@ -419,17 +459,46 @@ impl Render for ArtistDetailView {
                             .bg(cx.theme().muted)
                             .overflow_hidden()
                             .shadow_sm()
+                            .relative()
                             .when_some(art, |this, path| {
                                 this.child(img(path).size(px(160.)).rounded_lg())
-                            }),
+                            })
+                            // Hover play button over the artwork, same as the
+                            // album grid's cards.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom_2()
+                                    .right_2()
+                                    .opacity(0.)
+                                    .group_hover("aacard", |s| s.opacity(1.))
+                                    .child(
+                                        Button::new(("artist-album-play", index))
+                                            .primary()
+                                            .icon(app_icon(icons::PLAY))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.play_album(play_id.clone(), cx);
+                                                cx.stop_propagation();
+                                            })),
+                                    ),
+                            ),
                     )
                     .child(
                         v_flex()
                             .gap_0()
-                            .child(div().text_sm().truncate().child(album.name.clone()))
+                            // Explicit line heights: the default line box clips
+                            // descenders (y, g, j) inside truncated text.
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .line_height(px(20.))
+                                    .truncate()
+                                    .child(album.name.clone()),
+                            )
                             .child(
                                 div()
                                     .text_xs()
+                                    .line_height(px(17.))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(year),
                             ),

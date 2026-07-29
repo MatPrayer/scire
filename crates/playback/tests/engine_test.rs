@@ -46,6 +46,7 @@ async fn plays_wav_stream_to_completion() {
         url: format!("{}/rest/stream", server.uri()),
         duration_hint: Some(Duration::from_millis(500)),
         path: None,
+        id: None,
     });
 
     let mut saw_playing = false;
@@ -76,6 +77,54 @@ async fn plays_wav_stream_to_completion() {
     assert!(saw_playing, "never saw Playing event");
 }
 
+/// ALAC lives in an m4a container and is outside rodio's default codec set —
+/// a Navidrome library streaming raw Apple Lossless must still decode. The
+/// fixture also has its `moov` atom at the end, so this exercises the decoder
+/// seeking backwards through the HTTP source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plays_alac_m4a_stream() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "audio/mp4")
+                .set_body_bytes(include_bytes!("fixtures/alac.m4a").to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    player.play(TrackSource {
+        url: format!("{}/rest/stream", server.uri()),
+        duration_hint: Some(Duration::from_millis(300)),
+        path: None,
+        id: None,
+    });
+
+    let deadline = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::TrackEnded { .. } => break,
+                    Event::Failed(msg) => {
+                        if msg.contains("audio output unavailable") {
+                            eprintln!("skipping: no audio device ({msg})");
+                            return;
+                        }
+                        panic!("ALAC playback failed: {msg}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("timed out waiting for TrackEnded"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefetched_track_auto_advances() {
     let server = MockServer::start().await;
@@ -94,14 +143,17 @@ async fn prefetched_track_auto_advances() {
         url: format!("{}/rest/stream?id=1", server.uri()),
         duration_hint: Some(Duration::from_millis(500)),
         path: None,
+        id: None,
     });
     player.prefetch_next(TrackSource {
         url: format!("{}/rest/stream?id=2", server.uri()),
         duration_hint: Some(Duration::from_millis(500)),
         path: None,
+        id: Some("2".into()),
     });
 
     let mut ends = Vec::new();
+    let mut end_times = Vec::new();
     let deadline = tokio::time::sleep(Duration::from_secs(20));
     tokio::pin!(deadline);
 
@@ -109,8 +161,9 @@ async fn prefetched_track_auto_advances() {
         tokio::select! {
             event = events.recv() => {
                 match event.expect("event channel closed early") {
-                    Event::TrackEnded { auto_advanced } => {
-                        ends.push(auto_advanced);
+                    Event::TrackEnded { auto_advanced, started } => {
+                        ends.push((auto_advanced, started));
+                        end_times.push(std::time::Instant::now());
                         if ends.len() == 2 { break; }
                     }
                     Event::Failed(msg) => {
@@ -126,8 +179,17 @@ async fn prefetched_track_auto_advances() {
             _ = &mut deadline => panic!("timed out; ends so far: {ends:?}"),
         }
     }
-    // First end transitions into the prefetched track; second is a plain end.
-    assert_eq!(ends, vec![true, false]);
+    // First end transitions into the prefetched track (reporting which one);
+    // second is a plain end.
+    assert_eq!(ends, vec![(true, Some("2".to_string())), (false, None)]);
+    // Coarse gapless guard: the second track is 500ms of audio, so the two ends
+    // must be about that far apart. Re-opening a player between them (the
+    // non-gapless path) adds the poll interval plus source setup on top.
+    let between = end_times[1] - end_times[0];
+    assert!(
+        between < Duration::from_millis(800),
+        "transition was not gapless: {between:?} between track ends"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -146,6 +208,7 @@ async fn plays_local_wav_to_completion() {
         url: String::new(), // unused when path is set
         duration_hint: Some(Duration::from_millis(500)),
         path: Some(wav_path.clone()),
+        id: None,
     });
 
     let mut saw_playing = false;
@@ -185,6 +248,7 @@ async fn local_file_missing_errors() {
         url: String::new(),
         duration_hint: None,
         path: Some(PathBuf::from("/nonexistent/test.wav")),
+        id: None,
     });
 
     let deadline = tokio::time::sleep(Duration::from_secs(10));

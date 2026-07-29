@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
-use subsonic::SubsonicClient;
+use subsonic::{Song, SubsonicClient};
 
 use crate::config;
 use crate::services::runtime;
@@ -50,16 +50,33 @@ fn cache_cap_bytes() -> u64 {
     CACHE_CAP_BYTES.load(Ordering::Relaxed)
 }
 
-/// Synchronous cache lookup (in-memory index, then disk). Never touches the
-/// network. Returns the cached file path if the art was already downloaded,
+/// Cover identity for a song: the id to request from the server, and the key it
+/// is cached under. Navidrome mints a distinct cover id per file (`mf-<song>`),
+/// so keying the cache on it re-downloads identical album art for every track —
+/// group by album instead, and fetch whichever track's id we saw first.
+///
+/// The key drops the server's cache-busting suffix, so art replaced on the
+/// server keeps serving from cache here until the entry is evicted.
+pub fn song_cover(song: &Song) -> Option<(String, String)> {
+    let cover_id = song.cover_art.clone()?;
+    let key = song
+        .album_id
+        .as_ref()
+        .map_or_else(|| cover_id.clone(), |album| format!("album-{album}"));
+    Some((cover_id, key))
+}
+
+/// Synchronous cache lookup (in-memory index, then disk) by cache key — the
+/// cover id itself, or the album-scoped key from [`song_cover`]. Never touches
+/// the network. Returns the cached file path if the art was already downloaded,
 /// so callers can render it on the first frame instead of waiting on a task.
-pub fn cached(cover_id: &str, size: u32) -> Option<PathBuf> {
-    let cache_key = format!("{cover_id}-{size}");
+pub fn cached(key: &str, size: u32) -> Option<PathBuf> {
+    let cache_key = format!("{key}-{size}");
     if let Some(path) = mem_cache().lock().unwrap().get(&cache_key).cloned() {
         return Some(path);
     }
     let dir = config::artwork_cache_dir().ok()?;
-    let path = dir.join(format!("{}-{size}.img", config::sanitize(cover_id)));
+    let path = dir.join(format!("{}-{size}.img", config::sanitize(key)));
     if path.exists() {
         mem_cache().lock().unwrap().insert(cache_key, path.clone());
         Some(path)
@@ -70,14 +87,27 @@ pub fn cached(cover_id: &str, size: u32) -> Option<PathBuf> {
 
 /// Fetch cover art for `cover_id` at `size` px, returning a cached file path.
 pub async fn fetch(client: SubsonicClient, cover_id: String, size: u32) -> Result<PathBuf> {
+    let key = cover_id.clone();
+    fetch_as(client, cover_id, key, size).await
+}
+
+/// Like [`fetch`], but stores the result under `key` so several cover ids that
+/// resolve to the same image (all tracks of an album) share one cache entry and
+/// one download. Pair it with [`song_cover`].
+pub async fn fetch_as(
+    client: SubsonicClient,
+    cover_id: String,
+    key: String,
+    size: u32,
+) -> Result<PathBuf> {
     // 1 + 2. In-memory / disk hit (no network).
-    if let Some(path) = cached(&cover_id, size) {
+    if let Some(path) = cached(&key, size) {
         return Ok(path);
     }
 
-    let cache_key = format!("{cover_id}-{size}");
+    let cache_key = format!("{key}-{size}");
     let dir = config::artwork_cache_dir()?;
-    let path = dir.join(format!("{}-{size}.img", config::sanitize(&cover_id)));
+    let path = dir.join(format!("{}-{size}.img", config::sanitize(&key)));
 
     // 3. Network fetch.
     let path2 = path.clone();
@@ -88,7 +118,7 @@ pub async fn fetch(client: SubsonicClient, cover_id: String, size: u32) -> Resul
         // release their permit/wait immediately.
         let _permit = fetch_sem().acquire().await?;
         // A cover may have been cached by a concurrent request while we waited.
-        if let Some(path) = cached(&cover_id, size) {
+        if let Some(path) = cached(&key, size) {
             return Ok(path);
         }
         let url = client.cover_art_url(&cover_id, Some(size))?;

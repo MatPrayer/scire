@@ -23,6 +23,7 @@ use gpui::{
     App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions, div, hsla,
     prelude::*, px,
 };
+use gpui_component::ActiveTheme as _;
 use gpui_component::TitleBar;
 use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeRegistry};
 
@@ -281,6 +282,23 @@ pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
     Rc::make_mut(&mut theme.dark_theme).font_family = Some(family);
     if matches!(pref, ThemePref::Custom) {
         apply_custom_theme_from_settings(cx);
+    }
+}
+
+/// The colour the bottom player bar is tinted with: a darkened, slightly
+/// desaturated take on the cover-derived accent under the Adaptive theme, the
+/// flat sidebar colour otherwise. The fullscreen overlay ends its gradient on
+/// this same colour so the two surfaces read as one design.
+pub fn player_tint(pref: ThemePref, cx: &App) -> Hsla {
+    if pref == ThemePref::Adaptive {
+        let accent = cx.theme().primary;
+        Hsla {
+            l: (accent.l * 0.4).clamp(0.0, 1.0),
+            s: accent.s * 0.85,
+            ..accent
+        }
+    } else {
+        cx.theme().sidebar
     }
 }
 

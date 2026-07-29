@@ -25,7 +25,7 @@ Speaks Subsonic API v1.16.1 + OpenSubsonic. Runs on macOS and Linux.
 
 | Area | Capabilities |
 |------|-------------|
-| **Playback** | Stream FLAC/MP3/OGG via HTTP ; seek, pause, resume ; ReplayGain (track/album/auto) ; output device selection (macOS + PulseAudio/PipeWire) |
+| **Playback** | Stream FLAC/MP3/OGG via HTTP ; gapless track transitions ; seek, pause, resume ; ReplayGain (track/album/auto) ; output device selection (macOS + PulseAudio/PipeWire) |
 | **Browse** | Album grid with infinite scroll and sort (name/new/recent/frequent/random/starred) ; artist index with bios and images |
 | **Search** | Global search bar (`/` shortcut) — songs, albums, artists via `search3` |
 | **Queue** | Shuffle, repeat (off / all / one), drag-free reorder, play-next, clear ; persisted across restarts |
@@ -37,7 +37,7 @@ Speaks Subsonic API v1.16.1 + OpenSubsonic. Runs on macOS and Linux.
 | **Transcoding** | Per-session format (mp3/ogg/raw) and max bitrate |
 | **Theming** | Light / Dark / Follow-system ; custom theme JSON ; CJK font support |
 | **Fullscreen player** | Album art, track info, waveform seek bar, lyrics panel, queue panel, background gradient from album colours |
-| **Waveform seek bar** | Per-track amplitude envelope (480 buckets, cached to disk) — click to seek |
+| **Waveform seek bar** | Per-track amplitude envelope (480 buckets, cached to disk) — click to seek ; next track's peaks computed while the current one plays |
 | **OS media keys** | Media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS) |
 | **Artwork cache** | LRU-evicted disk cache (configurable capacity) ; HiDPI-aware resolution bump |
 | **Navigation** | Mouse back/forward buttons ; bracket keys ; configurable default page |
@@ -141,7 +141,7 @@ Cargo workspace with three crates. Strict dependency direction:
 ```
 
 - **`crates/subsonic`** — Pure async Subsonic/OpenSubsonic API client. `reqwest` + `serde` only. Every request carries fresh token auth. Endpoint methods are grouped by domain. `stream_url()`/`cover_art_url()` build authenticated URLs without issuing requests.
-- **`crates/playback`** — Audio engine behind a command/event facade (`Player` ↔ `Event` via tokio `mpsc`). Uses `rodio` for audio output, `stream-download` for HTTP streaming with seek support. Exposes waveform utilities for offline peak extraction.
+- **`crates/playback`** — Audio engine behind a command/event facade (`Player` ↔ `Event` via tokio `mpsc`). Uses `rodio` for audio output, `stream-download` for HTTP streaming with seek support. Keeps one rodio player across tracks and appends the prefetched next track shortly before the current one ends, so transitions are gapless. Exposes waveform utilities for offline peak extraction.
 - **`crates/app`** — The GPUI binary. Layers: `services/` for IO (tokio bridge, artwork cache, waveform fetch), `state/` for gpui Entities (session, player, queue, playlists, radio), `ui/` for views.
 
 All three milestones implemented: M1 (connect/browse/play), M2 (search/queue/playlists/star), M3 (multi-library, scrobbling, radio, transcoding, theming, media keys, artwork cache) — plus waveform seek bar, fullscreen player, lyrics, artist bios, persisted queue, configurable start page.

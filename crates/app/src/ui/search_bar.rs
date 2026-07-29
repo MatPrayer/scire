@@ -58,6 +58,7 @@ pub struct SearchBar {
     results_scroll: ScrollHandle,
     searching: bool,
     error: Option<String>,
+    /// Album-scoped art key (or plain cover id for albums/artists) → path.
     art_paths: HashMap<String, PathBuf>,
     generation: u64,
 }
@@ -289,45 +290,47 @@ impl SearchBar {
 
     /// Resolve thumbnails for the rows we will actually show.
     fn fetch_result_art(&mut self, results: &SearchResult3, cx: &mut Context<Self>) {
-        let cover_ids: Vec<String> = results
+        // (cover id, cache key) — song covers are keyed per album so several
+        // hits off one record share a single download.
+        let cover_ids: Vec<(String, String)> = results
             .song
             .iter()
             .take(MAX_SONGS)
-            .filter_map(|s| s.cover_art.clone())
+            .filter_map(artwork::song_cover)
             .chain(
                 results
                     .album
                     .iter()
                     .take(MAX_ALBUMS)
-                    .filter_map(|a| a.cover_art.clone()),
+                    .filter_map(|a| a.cover_art.clone().map(|id| (id.clone(), id))),
             )
             .chain(
                 results
                     .artist
                     .iter()
                     .take(MAX_ARTISTS)
-                    .filter_map(|a| a.cover_art.clone()),
+                    .filter_map(|a| a.cover_art.clone().map(|id| (id.clone(), id))),
             )
             .collect();
-        for cover_id in cover_ids {
-            if self.art_paths.contains_key(&cover_id) {
+        for (cover_id, key) in cover_ids {
+            if self.art_paths.contains_key(&key) {
                 continue;
             }
             // Synchronous cache hit: no task, renders with the results.
-            if let Some(path) = artwork::cached(&cover_id, ART_SIZE) {
-                self.art_paths.insert(cover_id, path);
+            if let Some(path) = artwork::cached(&key, ART_SIZE) {
+                self.art_paths.insert(key, path);
                 continue;
             }
             let Some(client) = self.session.read(cx).client.clone() else {
                 return;
             };
-            let id = cover_id.clone();
             cx.spawn(async move |this, cx| {
                 if let Ok(path) =
-                    runtime::spawn_io(artwork::fetch(client, id.clone(), ART_SIZE)).await
+                    runtime::spawn_io(artwork::fetch_as(client, cover_id, key.clone(), ART_SIZE))
+                        .await
                 {
                     let _ = this.update(cx, |bar, cx| {
-                        bar.art_paths.insert(id, path);
+                        bar.art_paths.insert(key, path);
                         cx.notify();
                     });
                 }
@@ -338,11 +341,11 @@ impl SearchBar {
 
     fn thumb(
         &self,
-        cover_art: Option<&String>,
+        art_key: Option<String>,
         fallback: IconName,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        let path = cover_art.and_then(|id| self.art_paths.get(id).cloned());
+        let path = art_key.and_then(|key| self.art_paths.get(&key).cloned());
         div()
             .size(px(32.))
             .flex_none()
@@ -411,7 +414,7 @@ impl SearchBar {
                                 cx.emit(SearchBarEvent::OpenArtist(id.clone()));
                                 this.dismiss(window, cx);
                             }))
-                            .child(self.thumb(artist.cover_art.as_ref(), IconName::CircleUser, cx))
+                            .child(self.thumb(artist.cover_art.clone(), IconName::CircleUser, cx))
                             .child(
                                 div()
                                     .text_sm()
@@ -451,7 +454,7 @@ impl SearchBar {
                                 this.dismiss(window, cx);
                             }))
                             .child(self.thumb(
-                                album.cover_art.as_ref(),
+                                album.cover_art.clone(),
                                 IconName::LayoutDashboard,
                                 cx,
                             ))
@@ -502,7 +505,11 @@ impl SearchBar {
                                 });
                                 this.dismiss(window, cx);
                             }))
-                            .child(self.thumb(song.cover_art.as_ref(), IconName::Star, cx))
+                            .child(self.thumb(
+                                artwork::song_cover(song).map(|(_, key)| key),
+                                IconName::Star,
+                                cx,
+                            ))
                             .child(
                                 v_flex()
                                     .flex_1()

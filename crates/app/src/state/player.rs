@@ -10,9 +10,12 @@ use subsonic::{Song, StreamOptions, SubsonicClient};
 use tokio::sync::mpsc;
 
 use crate::config::{ReplayGainMode, Settings};
-use crate::services::runtime;
+use crate::services::{artwork, runtime};
 use crate::state::queue::{Queue, RepeatMode};
 use crate::state::scrobble::{ScrobbleAction, ScrobbleTracker};
+
+/// Cover size fetched for the player bar / OS media controls.
+const ART_SIZE: u32 = 300;
 
 pub struct PlayerState {
     player: Player,
@@ -34,6 +37,10 @@ pub struct PlayerState {
     pub recently_played: Vec<Song>,
     /// Local path of the current track's cover art (for OS media controls).
     pub current_art_path: Option<std::path::PathBuf>,
+    /// Art cache key `current_art_path` belongs to (album-scoped — Navidrome
+    /// gives every track its own cover id). Consecutive tracks off one album
+    /// share it, so the art is kept instead of re-fetched between them.
+    current_art_key: Option<String>,
     /// OS output device name, known once the engine opens the audio output.
     pub output_device: Option<String>,
     /// Clear the queue + player bar when playback reaches the queue end.
@@ -45,6 +52,11 @@ pub struct PlayerState {
     /// The engine has a track loaded. False after startup with a restored
     /// queue — play must (re)start the current song, not resume.
     engine_has_track: bool,
+    /// Mirror of the waveform seek-bar setting: peaks are only worth computing
+    /// ahead of time when something is going to draw them.
+    waveform_enabled: bool,
+    /// Song id whose peaks were last prewarmed, so the work fires once.
+    waveform_prewarmed_for: Option<String>,
 }
 
 impl PlayerState {
@@ -120,11 +132,14 @@ impl PlayerState {
             media_controls,
             recently_played: load_recent(),
             current_art_path: None,
+            current_art_key: None,
             output_device: None,
             clear_on_end: false,
             replay_gain_mode: ReplayGainMode::Off,
             current_gain: 1.0,
             engine_has_track: false,
+            waveform_enabled: false,
+            waveform_prewarmed_for: None,
         }
     }
 
@@ -161,7 +176,7 @@ impl PlayerState {
             && self.current_art_path.is_none()
             && self.queue.current_song().is_some()
         {
-            self.fetch_current_art(cx);
+            self.refresh_current_art(cx);
         }
     }
 
@@ -200,7 +215,10 @@ impl PlayerState {
             url: stream_url,
             duration_hint: None,
             path: None,
+            id: None,
         });
+        // Radio has no queue song behind it: drop the last track's cover.
+        self.refresh_current_art(cx);
         self.sync_media_metadata();
         if let Some(c) = &mut self.media_controls {
             let _ = c.set_playback(MediaPlayback::Playing {
@@ -505,23 +523,118 @@ impl PlayerState {
         }
     }
 
-    /// Fetch cover art for the current song and update OS media controls once
-    /// the path is available.
-    fn fetch_current_art(&mut self, cx: &mut Context<Self>) {
-        let Some(cover_id) = self.queue.current_song().and_then(|s| s.cover_art.clone()) else {
+    /// Point the cover art at whatever is current, fetching it only when the
+    /// art actually changed. Tracks from one album share an art key, so the art
+    /// (and the OS media-control metadata) survives the switch untouched
+    /// instead of blanking and reloading between them.
+    fn refresh_current_art(&mut self, cx: &mut Context<Self>) {
+        let cover = self.current_song().and_then(artwork::song_cover);
+        let new_key = cover.as_ref().map(|(_, key)| key.clone());
+        if new_key == self.current_art_key && (new_key.is_none() || self.current_art_path.is_some())
+        {
+            return;
+        }
+        self.current_art_key = new_key;
+        let Some((cover_id, key)) = cover else {
             self.current_art_path = None;
             return;
         };
+        // Already on disk (previous play, album view, prewarm): adopt it now so
+        // the player bar never renders a frame without art.
+        if let Some(path) = artwork::cached(&key, ART_SIZE) {
+            self.current_art_path = Some(path);
+            self.sync_media_metadata();
+            return;
+        }
+        self.current_art_path = None;
         let Some(client) = self.client.clone() else {
             return;
         };
         cx.spawn(async move |this, cx| {
-            if let Ok(path) = crate::services::artwork::fetch(client, cover_id, 300).await {
-                let _ = this.update(cx, |state, _cx| {
-                    state.current_art_path = Some(path);
-                    state.sync_media_metadata();
+            if let Ok(path) = artwork::fetch_as(client, cover_id, key.clone(), ART_SIZE).await {
+                let _ = this.update(cx, |state, cx| {
+                    // Playback may have moved to another album meanwhile.
+                    if state.current_art_key.as_deref() == Some(key.as_str()) {
+                        state.current_art_path = Some(path);
+                        state.sync_media_metadata();
+                        cx.notify();
+                    }
                 });
             }
+        })
+        .detach();
+    }
+
+    /// Whether the waveform seek bar is on. Peaks for the next track are only
+    /// precomputed when something will draw them.
+    pub fn set_waveform_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.waveform_enabled != enabled {
+            self.waveform_enabled = enabled;
+            self.prewarm_next_waveform(cx);
+        }
+    }
+
+    /// Decode the next track's waveform peaks now, while the current track is
+    /// still playing, so the seek bar has them the moment it starts instead of
+    /// downloading and decoding a whole track under the user.
+    fn prewarm_next_waveform(&mut self, cx: &mut Context<Self>) {
+        if !self.waveform_enabled {
+            return;
+        }
+        let Some(song_id) = self
+            .queue
+            .next_pos()
+            .and_then(|pos| self.queue.iter_ordered().nth(pos))
+            .map(|(_, s)| s.id.clone())
+        else {
+            return;
+        };
+        // Repeat One points at the current track, which already has its peaks.
+        if self.waveform_prewarmed_for.as_deref() == Some(song_id.as_str())
+            || self.current_song().map(|s| s.id.as_str()) == Some(song_id.as_str())
+        {
+            return;
+        }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        let Ok(url) = client.stream_url(&song_id, &crate::services::waveform::stream_options())
+        else {
+            return;
+        };
+        self.waveform_prewarmed_for = Some(song_id.clone());
+        let url = url.to_string();
+        cx.spawn(async move |_, _| {
+            if let Err(e) =
+                runtime::spawn_io(crate::services::waveform::fetch_peaks(url, song_id)).await
+            {
+                tracing::debug!("waveform prewarm failed: {e:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Warm the disk cache with the next track's cover so a hand-over into a
+    /// different album shows art immediately. No-op when it is the same album
+    /// or already cached.
+    fn prewarm_next_art(&self, cx: &mut Context<Self>) {
+        let Some((cover_id, key)) = self
+            .queue
+            .next_pos()
+            .and_then(|pos| self.queue.iter_ordered().nth(pos))
+            .and_then(|(_, s)| artwork::song_cover(s))
+        else {
+            return;
+        };
+        if Some(&key) == self.current_art_key.as_ref() || artwork::cached(&key, ART_SIZE).is_some()
+        {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            let _ = artwork::fetch_as(client, cover_id, key, ART_SIZE).await;
         })
         .detach();
     }
@@ -591,19 +704,23 @@ impl PlayerState {
         self.position = Duration::ZERO;
         self.duration = duration;
         self.last_error = None;
-        self.current_art_path = None;
+        // Apply this track's ReplayGain before playback opens so the engine
+        // starts the sink at the normalized volume.
         self.recompute_gain();
         self.player.play(TrackSource {
             url,
             duration_hint: duration,
             path,
+            id: Some(song_id.clone()),
         });
         self.engine_has_track = true;
         push_recent(&mut self.recently_played, song_clone);
+        // Art first: the prefetch prewarms the *next* cover against the
+        // current one, so the current one has to be settled by then.
+        self.refresh_current_art(cx);
         self.refresh_prefetch(cx);
         let action = self.scrobble.start(song_id);
         self.fire_scrobble(action, cx);
-        self.fetch_current_art(cx);
         self.sync_media_metadata();
         if let Some(c) = &mut self.media_controls {
             let _ = c.set_playback(MediaPlayback::Playing {
@@ -615,7 +732,7 @@ impl PlayerState {
 
     /// Point the engine's prefetch slot at whatever plays after the current
     /// track (honoring repeat), or clear it.
-    fn refresh_prefetch(&mut self, _cx: &mut Context<Self>) {
+    fn refresh_prefetch(&mut self, cx: &mut Context<Self>) {
         let next = self.queue.next_pos().and_then(|pos| {
             let song = self.queue.iter_ordered().nth(pos).map(|(_, s)| s)?;
             let duration = song.duration.map(|s| Duration::from_secs(s as u64));
@@ -628,12 +745,37 @@ impl PlayerState {
                 url,
                 duration_hint: duration,
                 path,
+                id: Some(song.id.clone()),
             })
         });
         match next {
             Some(source) => self.player.prefetch_next(source),
             None => self.player.clear_prefetch(),
         }
+        self.prewarm_next_art(cx);
+        self.prewarm_next_waveform(cx);
+    }
+
+    /// Queue position the engine actually moved into on a gapless hand-over.
+    /// The next track is committed to the audio queue a few seconds ahead, so a
+    /// queue edit in that window can leave `next_pos` pointing elsewhere —
+    /// then the id the engine started wins.
+    fn advanced_pos(&self, started: Option<&str>) -> Option<usize> {
+        let next = self.queue.next_pos();
+        let Some(id) = started else { return next };
+        if next.is_some_and(|pos| {
+            self.queue
+                .iter_ordered()
+                .nth(pos)
+                .is_some_and(|(_, s)| s.id == id)
+        }) {
+            return next;
+        }
+        self.queue
+            .iter_ordered()
+            .find(|(_, s)| s.id == id)
+            .map(|(pos, _)| pos)
+            .or(next)
     }
 
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
@@ -666,11 +808,14 @@ impl PlayerState {
             Event::Buffering => {
                 self.buffering = true;
             }
-            Event::TrackEnded { auto_advanced } => {
+            Event::TrackEnded {
+                auto_advanced,
+                started,
+            } => {
                 if auto_advanced {
-                    // Engine already started the prefetched track; move the
+                    // Engine already flowed into the prefetched track; move the
                     // queue pointer to match and set up the next prefetch.
-                    if let Some(pos) = self.queue.next_pos() {
+                    if let Some(pos) = self.advanced_pos(started.as_deref()) {
                         self.queue.advance_to(pos);
                         persist_queue(&self.queue);
                     }
@@ -680,6 +825,9 @@ impl PlayerState {
                         .current_song()
                         .and_then(|s| s.duration)
                         .map(|s| Duration::from_secs(s as u64));
+                    // Same album as the track that just ended: the art stays as
+                    // it is. A new album swaps it (prewarmed, so it is instant).
+                    self.refresh_current_art(cx);
                     self.refresh_prefetch(cx);
                     // The gapless track carries its own ReplayGain.
                     self.recompute_gain();
@@ -724,6 +872,7 @@ pub fn init(settings: &Settings, cx: &mut gpui::App) -> Entity<PlayerState> {
         let mut state = PlayerState::new(settings.volume, cx);
         state.replay_gain_mode = settings.replay_gain;
         state.clear_on_end = settings.queue_end == crate::config::QueueEndBehavior::Clear;
+        state.waveform_enabled = settings.waveform_seekbar;
         if settings.output_device.is_some() {
             state
                 .player

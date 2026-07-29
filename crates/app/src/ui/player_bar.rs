@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, Hsla, IntoElement, Render, Window, div, hsla, img,
-    linear_color_stop, linear_gradient, prelude::*, px,
+    Context, Entity, EventEmitter, IntoElement, Render, Window, div, hsla, img, linear_color_stop,
+    linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -170,12 +170,7 @@ impl PlayerBar {
         if self.waveform_for.as_deref() == Some(id.as_str()) {
             return;
         }
-        // A low-bitrate transcode keeps the extra download small — the
-        // amplitude envelope survives lossy compression just fine.
-        let opts = subsonic::StreamOptions {
-            format: Some("mp3".into()),
-            max_bit_rate: Some(96),
-        };
+        let opts = waveform::stream_options();
         let url = self
             .session
             .read(cx)
@@ -355,15 +350,12 @@ impl Render for PlayerBar {
         };
 
         // Adaptive theme: tint the bar with the cover-derived accent fading to
-        // black; other themes keep the flat sidebar colour.
-        let is_adaptive = self.session.read(cx).settings.theme == ThemePref::Adaptive;
+        // black; other themes keep the flat sidebar colour. The tint is shared
+        // with the fullscreen overlay's gradient (see `ui::player_tint`).
+        let theme_pref = self.session.read(cx).settings.theme;
+        let is_adaptive = theme_pref == ThemePref::Adaptive;
         let sidebar = cx.theme().sidebar;
-        let accent = cx.theme().primary;
-        let accent_bg = Hsla {
-            l: (accent.l * 0.4).clamp(0.0, 1.0),
-            s: accent.s * 0.85,
-            ..accent
-        };
+        let accent_bg = crate::ui::player_tint(theme_pref, cx);
 
         h_flex()
             .w_full()

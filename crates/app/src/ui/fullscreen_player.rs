@@ -48,7 +48,8 @@ pub struct FullscreenPlayer {
     art_path: Option<PathBuf>,
     bg_art_path: Option<PathBuf>,
     gradient_palette: Option<Vec<gpui::Rgba>>,
-    last_cover_id: Option<String>,
+    /// Album-scoped art key the loaded art belongs to (see `artwork::song_cover`).
+    last_art_key: Option<String>,
     panel: Option<SidePanel>,
     /// Lyrics text for the song in `lyrics_for`; None while loading or when
     /// the server has none.
@@ -98,18 +99,19 @@ impl FullscreenPlayer {
         .detach();
 
         // Watch player for song changes to update background art and lyrics.
+        // Keyed on the album-scoped art key, not the song's cover id: Navidrome
+        // gives each track its own, so comparing those would reload identical
+        // art (and re-extract the gradient palette) on every track change.
         cx.observe(&player, |this: &mut Self, player, cx| {
-            let cover = player
-                .read(cx)
-                .current_song()
-                .and_then(|s| s.cover_art.clone());
-            if cover != this.last_cover_id {
-                this.last_cover_id = cover.clone();
+            let cover = player.read(cx).current_song().and_then(artwork::song_cover);
+            let key = cover.as_ref().map(|(_, key)| key.clone());
+            if key != this.last_art_key {
+                this.last_art_key = key;
                 this.art_path = None;
                 this.bg_art_path = None;
                 this.gradient_palette = None;
-                if let Some(cover_id) = cover {
-                    this.fetch_art(cover_id, cx);
+                if let Some((cover_id, key)) = cover {
+                    this.fetch_art(cover_id, key, cx);
                 }
             }
             this.maybe_fetch_lyrics(cx);
@@ -133,7 +135,7 @@ impl FullscreenPlayer {
             art_path: None,
             bg_art_path: None,
             gradient_palette: None,
-            last_cover_id: None,
+            last_art_key: None,
             panel: None,
             lyrics: None,
             lyrics_for: None,
@@ -193,10 +195,7 @@ impl FullscreenPlayer {
         if self.waveform_for.as_deref() == Some(id.as_str()) {
             return;
         }
-        let opts = subsonic::StreamOptions {
-            format: Some("mp3".into()),
-            max_bit_rate: Some(96),
-        };
+        let opts = crate::services::waveform::stream_options();
         let url = self
             .session
             .read(cx)
@@ -424,21 +423,25 @@ impl FullscreenPlayer {
             ]
         });
         let top = palette[0];
-        let bot = *palette.last().unwrap();
+        // Design continuity: every colour-driven background ends on the exact
+        // tint the bottom player bar fades from, so the overlay and the bar
+        // read as the same surface.
+        let tint: gpui::Rgba =
+            crate::ui::player_tint(self.session.read(cx).settings.theme, cx).into();
         match mode {
             FullscreenBackground::Solid => base().bg(cx.theme().background).into_any_element(),
             FullscreenBackground::Gradient => base()
                 .bg(linear_gradient(
                     160.,
                     linear_color_stop(scale_rgb(top, 0.5), 0.),
-                    linear_color_stop(scale_rgb(bot, 0.5), 1.),
+                    linear_color_stop(tint, 1.),
                 ))
                 .into_any_element(),
             FullscreenBackground::Vibrant => base()
                 .bg(linear_gradient(
                     160.,
                     linear_color_stop(scale_rgb(top, 0.9), 0.),
-                    linear_color_stop(scale_rgb(bot, 0.9), 1.),
+                    linear_color_stop(tint, 1.),
                 ))
                 .into_any_element(),
             FullscreenBackground::BlurredArt => base()
@@ -458,10 +461,13 @@ impl FullscreenPlayer {
                 // palette-as-cycle (wrap is a lerp), so flow is always one direction.
                 let ring: Vec<gpui::Rgba> = {
                     // Boosted saturation + a floor of variance so mono covers still move.
-                    let r: Vec<gpui::Rgba> = palette
+                    // The player-bar tint is one of the cycle's stops, so the
+                    // sweep keeps passing back through the bar's colour.
+                    let mut r: Vec<gpui::Rgba> = palette
                         .iter()
                         .map(|&c| scale_rgb(vivid(c, 1.5), 1.0))
                         .collect();
+                    r.push(tint);
                     if r.len() < 2 {
                         let b = *r
                             .first()
@@ -506,8 +512,9 @@ impl FullscreenPlayer {
                         )
                 };
                 base()
-                    // Solid base so the translucent layers composite over something.
-                    .bg(scale_rgb(bot, 0.5))
+                    // Solid base so the translucent layers composite over
+                    // something — the player-bar tint again.
+                    .bg(tint)
                     .overflow_hidden()
                     .child(anim_layer("fs-bg-a", 229., ring, 0.0, 0.5, 1.0))
                     .child(anim_layer("fs-bg-b", 63., ring2, 0.28, 0.78, 0.55))
@@ -516,15 +523,16 @@ impl FullscreenPlayer {
         }
     }
 
-    fn fetch_art(&self, cover_id: String, cx: &mut Context<Self>) {
+    fn fetch_art(&self, cover_id: String, key: String, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
         let client2 = client.clone();
         let cover_id2 = cover_id.clone();
+        let key2 = key.clone();
         // Full-res for the center art card.
         cx.spawn(async move |this, cx| {
-            if let Ok(path) = artwork::fetch(client, cover_id, ART_SIZE).await {
+            if let Ok(path) = artwork::fetch_as(client, cover_id, key, ART_SIZE).await {
                 let _ = this.update(cx, |view, cx| {
                     view.art_path = Some(path);
                     cx.notify();
@@ -534,7 +542,7 @@ impl FullscreenPlayer {
         .detach();
         // Tiny version for color extraction.
         cx.spawn(async move |this, cx| {
-            if let Ok(path) = artwork::fetch(client2, cover_id2, BG_ART_SIZE).await {
+            if let Ok(path) = artwork::fetch_as(client2, cover_id2, key2, BG_ART_SIZE).await {
                 let colors = extract_palette(&path);
                 let _ = this.update(cx, |view, cx| {
                     view.bg_art_path = Some(path);
@@ -663,6 +671,7 @@ impl Render for FullscreenPlayer {
             _ => 0.,
         };
         let waveform_enabled = self.session.read(cx).settings.waveform_seekbar;
+        let show_volume = self.session.read(cx).settings.fullscreen_volume;
         let detailed_volume = self.session.read(cx).settings.detailed_volume;
         let volume_level = self.player.read(cx).volume;
         let replay_gain = self.player.read(cx).replay_gain_active();
@@ -738,6 +747,11 @@ impl Render for FullscreenPlayer {
                     .child(
                         Button::new("fs-close")
                             .ghost()
+                            // Pill rounding to match the wrapper: the button's
+                            // default (theme radius) hover fill is squarer than
+                            // the rounded-full backdrop, so the shape appeared
+                            // to change on hover.
+                            .rounded(px(9999.))
                             .icon(Icon::new(IconName::ChevronDown))
                             .label("Close")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -976,9 +990,10 @@ impl Render for FullscreenPlayer {
                                     ),
                             ),
                     )
-                    // Short vertical volume slider, right of the controls
-                    // (hidden during live radio).
-                    .when(!is_radio, |this| {
+                    // Short vertical volume slider, right of the controls —
+                    // off by default (the player bar already has one), opt-in
+                    // via settings; always hidden during live radio.
+                    .when(show_volume && !is_radio, |this| {
                         this.child(
                             v_flex()
                                 .h_full()

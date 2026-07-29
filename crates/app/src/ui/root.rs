@@ -87,8 +87,8 @@ pub struct RootView {
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
     new_pl_desc: Entity<InputState>,
-    /// Cover id whose colour the Adaptive theme accent was last derived from,
-    /// to avoid re-extracting on every player tick.
+    /// Art key (album-scoped) whose colour the Adaptive theme accent was last
+    /// derived from, to avoid re-extracting on every player tick.
     adaptive_cover: Option<String>,
     focus_handle: FocusHandle,
 
@@ -334,22 +334,25 @@ impl RootView {
             self.adaptive_cover = None;
             return;
         }
+        // Album-scoped key: per-song cover ids would re-extract the accent (and
+        // recolour the whole UI) on every track of the same album.
         let cover = self
             .player
             .read(cx)
             .current_song()
-            .and_then(|s| s.cover_art.clone());
-        if cover == self.adaptive_cover {
+            .and_then(artwork::song_cover);
+        let key = cover.as_ref().map(|(_, key)| key.clone());
+        if key == self.adaptive_cover {
             return;
         }
-        self.adaptive_cover = cover.clone();
-        let Some(cover_id) = cover else { return };
+        self.adaptive_cover = key;
+        let Some((cover_id, key)) = cover else { return };
         let Some(client) = self.session.read(cx).client.clone() else {
             return;
         };
         cx.spawn(async move |_, cx| {
             let accent = runtime::spawn_io(async move {
-                let path = artwork::fetch(client, cover_id, 64).await?;
+                let path = artwork::fetch_as(client, cover_id, key, 64).await?;
                 let bytes = std::fs::read(&path)?;
                 crate::ui::accent_from_cover_bytes(&bytes)
                     .ok_or_else(|| anyhow::anyhow!("cover has no usable accent hue"))
@@ -508,7 +511,8 @@ impl RootView {
     fn open_artist(&mut self, id: String, cx: &mut Context<Self>) {
         self.push_history();
         self.current_entry = Some(NavEntry::Artist(id.clone()));
-        let view = cx.new(|cx| ArtistDetailView::new(self.session.clone(), id, cx));
+        let view =
+            cx.new(|cx| ArtistDetailView::new(self.session.clone(), self.player.clone(), id, cx));
         cx.subscribe(&view, |this: &mut Self, _, event, cx| {
             let ArtistDetailEvent::OpenAlbum(id) = event;
             this.open_album(id.clone(), cx);

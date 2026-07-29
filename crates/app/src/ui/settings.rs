@@ -196,6 +196,8 @@ impl SettingsView {
     fn set_waveform(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.waveform_seekbar = enabled);
+        self.player
+            .update(cx, |p, cx| p.set_waveform_enabled(enabled, cx));
         self.persist(cx);
         cx.notify();
     }
@@ -232,6 +234,13 @@ impl SettingsView {
     fn set_fullscreen_bg(&mut self, mode: FullscreenBackground, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.fullscreen_bg = mode);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_fullscreen_volume(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.fullscreen_volume = enabled);
         self.persist(cx);
         cx.notify();
     }
@@ -320,6 +329,7 @@ impl Render for SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_queue_end(mode, cx)))
         };
         let fullscreen_bg = self.session.read(cx).settings.fullscreen_bg;
+        let fullscreen_volume = self.session.read(cx).settings.fullscreen_volume;
         let fsbg_btn = |label: &'static str, mode: FullscreenBackground, active: bool| {
             Button::new(label)
                 .label(label)
@@ -491,6 +501,14 @@ impl Render for SettingsView {
                                                 FullscreenBackground::Solid,
                                                 fullscreen_bg == FullscreenBackground::Solid,
                                             )),
+                                    )
+                                    .child(
+                                        Switch::new("fullscreen-volume")
+                                            .checked(fullscreen_volume)
+                                            .label("Volume slider in fullscreen player")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_fullscreen_volume(checked, cx);
+                                            })),
                                     ),
                             ),
                     )

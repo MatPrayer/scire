@@ -17,7 +17,7 @@ const ART_SIZE: u32 = 200;
 pub struct RecentView {
     player: Entity<PlayerState>,
     session: Entity<Session>,
-    art_paths: HashMap<String, PathBuf>, // cover_art id → cached path
+    art_paths: HashMap<String, PathBuf>, // album-scoped art key → cached path
     fetching: HashSet<String>,
 }
 
@@ -51,38 +51,38 @@ impl RecentView {
         let Some(client) = self.client(cx) else {
             return;
         };
-        let covers: Vec<String> = self
+        // Keyed by album, so a run of tracks off one album downloads its art
+        // once instead of once per file (Navidrome ids covers per song).
+        let covers: Vec<(String, String)> = self
             .player
             .read(cx)
             .recently_played
             .iter()
-            .filter_map(|s| s.cover_art.clone())
-            .filter(|id| !self.art_paths.contains_key(id) && !self.fetching.contains(id))
-            .collect::<std::collections::HashSet<_>>()
+            .filter_map(artwork::song_cover)
+            .filter(|(_, key)| !self.art_paths.contains_key(key) && !self.fetching.contains(key))
+            // key → cover id: one entry (one download) per album.
+            .map(|(cover_id, key)| (key, cover_id))
+            .collect::<std::collections::HashMap<_, _>>()
             .into_iter()
             .collect();
 
-        for cover_id in covers {
+        for (key, cover_id) in covers {
             // Synchronous cache hit: render instantly on restart, no task.
-            if let Some(path) = artwork::cached(&cover_id, ART_SIZE) {
-                self.art_paths.insert(cover_id, path);
+            if let Some(path) = artwork::cached(&key, ART_SIZE) {
+                self.art_paths.insert(key, path);
                 continue;
             }
-            self.fetching.insert(cover_id.clone());
+            self.fetching.insert(key.clone());
             let client = client.clone();
-            let cid = cover_id.clone();
             cx.spawn(async move |this, cx| {
-                if let Ok(path) = artwork::fetch(client, cid.clone(), ART_SIZE).await {
-                    let _ = this.update(cx, |view, cx| {
-                        view.art_paths.insert(cid.clone(), path);
-                        view.fetching.remove(&cid);
-                        cx.notify();
-                    });
-                } else {
-                    let _ = this.update(cx, |view, _cx| {
-                        view.fetching.remove(&cid);
-                    });
-                }
+                let fetched = artwork::fetch_as(client, cover_id, key.clone(), ART_SIZE).await;
+                let _ = this.update(cx, |view, cx| {
+                    if let Ok(path) = fetched {
+                        view.art_paths.insert(key.clone(), path);
+                    }
+                    view.fetching.remove(&key);
+                    cx.notify();
+                });
             })
             .detach();
         }
@@ -98,10 +98,8 @@ impl Render for RecentView {
             .into_iter()
             .enumerate()
             .map(|(i, song)| {
-                let art = song
-                    .cover_art
-                    .as_deref()
-                    .and_then(|id| self.art_paths.get(id))
+                let art = artwork::song_cover(&song)
+                    .and_then(|(_, key)| self.art_paths.get(&key))
                     .cloned();
                 let dur = song
                     .duration
