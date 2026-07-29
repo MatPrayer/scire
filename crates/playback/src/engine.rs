@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::source::{self, StreamReader};
+use crate::source::{self, SourceReader};
 use crate::{Command, Event, PlaybackError, TrackSource};
 
 const TICK: Duration = Duration::from_millis(500);
@@ -14,7 +14,7 @@ const TICK: Duration = Duration::from_millis(500);
 /// A fully-opened, decoded-and-ready next track.
 struct Prepared {
     track: TrackSource,
-    decoder: rodio::Decoder<StreamReader>,
+    decoder: rodio::Decoder<SourceReader>,
 }
 
 pub(crate) fn spawn(
@@ -310,9 +310,14 @@ fn futures_now(
     }
 }
 
-/// Open the HTTP source and build a decoder, ready to append to a player.
+/// Open the source (local file or HTTP) and build a decoder, ready to
+/// append to a player.
 async fn prepare(track: TrackSource) -> Result<Prepared, PlaybackError> {
-    let (reader, byte_len) = source::open(&track.url).await?;
+    let (reader, byte_len) = if let Some(ref path) = track.path {
+        source::open_local(path).await?
+    } else {
+        source::open(&track.url).await?
+    };
     // Decoder construction reads from the (blocking) stream reader; do it off
     // the async thread. byte_len enables seeking + duration calculation.
     let decoder = tokio::task::spawn_blocking(move || {

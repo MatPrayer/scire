@@ -199,6 +199,7 @@ impl PlayerState {
         self.player.play(TrackSource {
             url: stream_url,
             duration_hint: None,
+            path: None,
         });
         self.sync_media_metadata();
         if let Some(c) = &mut self.media_controls {
@@ -571,36 +572,43 @@ impl PlayerState {
         let song_id = song.id.clone();
         let song_clone = song.clone();
         let duration = song.duration.map(|s| Duration::from_secs(s as u64));
-        match self.stream_url(song) {
-            Ok(url) => {
-                self.position = Duration::ZERO;
-                self.duration = duration;
-                self.last_error = None;
-                self.current_art_path = None;
-                // Apply this track's ReplayGain before playback opens so the
-                // engine starts the sink at the normalized volume.
-                self.recompute_gain();
-                self.player.play(TrackSource {
-                    url,
-                    duration_hint: duration,
-                });
-                self.engine_has_track = true;
-                push_recent(&mut self.recently_played, song_clone);
-                self.refresh_prefetch(cx);
-                let action = self.scrobble.start(song_id);
-                self.fire_scrobble(action, cx);
-                self.fetch_current_art(cx);
-                self.sync_media_metadata();
-                if let Some(c) = &mut self.media_controls {
-                    let _ = c.set_playback(MediaPlayback::Playing {
-                        progress: Some(MediaPosition(Duration::ZERO)),
-                    });
+
+        // Local file: use the filesystem path directly; URL is ignored for IO.
+        let (url, path) = if let Some(local) = &song.local_path {
+            ("local".to_string(), Some(std::path::PathBuf::from(local)))
+        } else {
+            match self.stream_url(song) {
+                Ok(u) => (u, None),
+                Err(e) => {
+                    self.buffering = false;
+                    self.last_error = Some(e);
+                    cx.notify();
+                    return;
                 }
             }
-            Err(e) => {
-                self.buffering = false;
-                self.last_error = Some(e);
-            }
+        };
+
+        self.position = Duration::ZERO;
+        self.duration = duration;
+        self.last_error = None;
+        self.current_art_path = None;
+        self.recompute_gain();
+        self.player.play(TrackSource {
+            url,
+            duration_hint: duration,
+            path,
+        });
+        self.engine_has_track = true;
+        push_recent(&mut self.recently_played, song_clone);
+        self.refresh_prefetch(cx);
+        let action = self.scrobble.start(song_id);
+        self.fire_scrobble(action, cx);
+        self.fetch_current_art(cx);
+        self.sync_media_metadata();
+        if let Some(c) = &mut self.media_controls {
+            let _ = c.set_playback(MediaPlayback::Playing {
+                progress: Some(MediaPosition(Duration::ZERO)),
+            });
         }
         cx.notify();
     }
@@ -609,12 +617,17 @@ impl PlayerState {
     /// track (honoring repeat), or clear it.
     fn refresh_prefetch(&mut self, _cx: &mut Context<Self>) {
         let next = self.queue.next_pos().and_then(|pos| {
-            // Repeat One prefetches the same song — still a valid transition.
             let song = self.queue.iter_ordered().nth(pos).map(|(_, s)| s)?;
             let duration = song.duration.map(|s| Duration::from_secs(s as u64));
-            self.stream_url(song).ok().map(|url| TrackSource {
+            let (url, path) = if let Some(local) = &song.local_path {
+                ("local".to_string(), Some(std::path::PathBuf::from(local)))
+            } else {
+                self.stream_url(song).ok().map(|u| (u, None))?
+            };
+            Some(TrackSource {
                 url,
                 duration_hint: duration,
+                path,
             })
         });
         match next {

@@ -2,8 +2,11 @@
 
 use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputState};
 use gpui_component::switch::Switch;
-use gpui_component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+};
 
 use crate::config::{
     CoverSize, DefaultPage, FullscreenBackground, QueueEndBehavior, ReplayGainMode, ThemePref,
@@ -43,17 +46,23 @@ const COVER_SIZES: &[(&str, CoverSize)] = &[
 pub struct SettingsView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
+    dir_input: Entity<InputState>,
 }
 
 impl SettingsView {
     pub fn new(
         session: Entity<Session>,
         player: Entity<PlayerState>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
-        Self { session, player }
+        let dir_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/music"));
+        Self {
+            session,
+            player,
+            dir_input,
+        }
     }
 
     fn persist(&self, cx: &Context<Self>) {
@@ -124,6 +133,40 @@ impl SettingsView {
         let shuffle = self.session.read(cx).settings.default_shuffle;
         self.player.update(cx, |p, cx| {
             p.apply_playback_settings(scrobble, shuffle, mode, cx);
+        });
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn add_local_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.dir_input.read(cx).value().to_string();
+        let trimmed = path.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.session.update(cx, |s, _| {
+            if !s
+                .settings
+                .local_music_dirs
+                .iter()
+                .any(|p| p.to_string_lossy() == trimmed.as_str())
+            {
+                s.settings
+                    .local_music_dirs
+                    .push(std::path::PathBuf::from(&trimmed));
+            }
+        });
+        self.dir_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn remove_local_dir(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| {
+            if idx < s.settings.local_music_dirs.len() {
+                s.settings.local_music_dirs.remove(idx);
+            }
         });
         self.persist(cx);
         cx.notify();
@@ -261,6 +304,7 @@ impl Render for SettingsView {
             )
         };
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
+        let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
         let replay_gain = self.session.read(cx).settings.replay_gain;
         let rg_btn = |label: &'static str, mode: ReplayGainMode, active: bool| {
             Button::new(label)
@@ -761,6 +805,70 @@ impl Render for SettingsView {
                                             bitrate_btn(item, active).into_any_element()
                                         },
                                     ))),
+                            ),
+                    )
+                    // Local Music
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .p_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+                            .bg(cx.theme().sidebar)
+                            .child(div().text_sm().font_medium().child("Local Music"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Directories scanned for local music files"),
+                            )
+                            .child(
+                                v_flex().gap_1().children(
+                                    local_music_dirs.iter().enumerate().map(|(i, p)| {
+                                        let p_str = p.to_string_lossy().to_string();
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_sm()
+                                                    .truncate()
+                                                    .child(p_str.clone()),
+                                            )
+                                            .child(
+                                                Button::new(("rm-local-dir", i))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(gpui_component::Icon::new(
+                                                        gpui_component::IconName::Close,
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.remove_local_dir(i, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .into_any_element()
+                                    }),
+                                ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(300.))
+                                            .child(Input::new(&self.dir_input)),
+                                    )
+                                    .child(
+                                        Button::new("add-local-dir")
+                                            .label("Add")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.add_local_dir(window, cx);
+                                            })),
+                                    ),
                             ),
                     )
                     // Storage

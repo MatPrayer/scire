@@ -105,6 +105,9 @@ pub struct Song {
     /// falls back to the single `artist`/`artist_id` pair.
     #[serde(default)]
     pub artists: Vec<ArtistRef>,
+    /// Absolute path to a local file. `None` for Subsonic tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
 }
 
 /// A single artist credit as returned in OpenSubsonic `artists` arrays.
@@ -202,5 +205,36 @@ impl AlbumListType {
             Self::Random => "random",
             Self::Starred => "starred",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn song_deserializes_without_local_path() {
+        let json = r#"{"id":"1","title":"Test","artist":"Artist"}"#;
+        let song: Song = serde_json::from_str(json).unwrap();
+        assert_eq!(song.id, "1");
+        assert_eq!(song.title, "Test");
+        assert_eq!(song.local_path, None);
+    }
+
+    #[test]
+    fn song_serialization_omits_local_path_when_none() {
+        let json = r#"{"id":"1","title":"Test","artist":"Artist"}"#;
+        let song: Song = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&song).unwrap();
+        assert!(!serialized.contains("local_path"));
+    }
+
+    #[test]
+    fn song_round_trips_local_path() {
+        let mut song: Song = serde_json::from_str(r#"{"id":"1","title":"Test"}"#).unwrap();
+        song.local_path = Some("/music/test.flac".into());
+        let serialized = serde_json::to_string(&song).unwrap();
+        let deserialized: Song = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.local_path.as_deref(), Some("/music/test.flac"));
     }
 }

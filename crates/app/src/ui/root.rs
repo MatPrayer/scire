@@ -1,16 +1,19 @@
-//! Root view: login screen or main layout
+//! Root view: main app layout
 //! (sidebar | content | optional queue panel / player bar).
 
 use gpui::{
     Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    NavigationDirection, Render, Window, div, prelude::*, px,
+    NavigationDirection, Render, SharedString, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, StyledExt as _, TitleBar, h_flex, v_flex};
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use crate::config::{DefaultPage, ThemePref};
-use crate::services::{artwork, runtime};
+use crate::services::{artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::radio::RadioState;
@@ -20,7 +23,7 @@ use crate::ui::albums::{AlbumsEvent, AlbumsView};
 use crate::ui::artists::{ArtistDetailEvent, ArtistDetailView, ArtistsEvent, ArtistsView};
 use crate::ui::favorites::{FavoritesEvent, FavoritesView};
 use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
-use crate::ui::login::LoginView;
+use crate::ui::local_music::LocalMusicView;
 use crate::ui::player_bar::{PlayerBar, PlayerBarEvent};
 use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
 use crate::ui::queue_panel::QueuePanel;
@@ -48,6 +51,7 @@ enum Content {
     Radio(Entity<RadioView>),
     Settings(Entity<SettingsView>),
     Recent(Entity<RecentView>),
+    LocalMusic(Entity<LocalMusicView>),
 }
 
 pub struct RootView {
@@ -55,7 +59,6 @@ pub struct RootView {
     player: Entity<PlayerState>,
     playlists: Entity<PlaylistsState>,
     radio: Entity<RadioState>,
-    login: Entity<LoginView>,
     player_bar: Entity<PlayerBar>,
     queue_panel: Entity<QueuePanel>,
     fullscreen: Entity<FullscreenPlayer>,
@@ -76,6 +79,10 @@ pub struct RootView {
     libraries_collapsed: bool,
     /// Sidebar playlist list folded away.
     playlists_collapsed: bool,
+    /// Shared music library database.
+    library_db: Arc<LibraryDb>,
+    /// Whether initial local/navidrome sync has been triggered.
+    scan_started: bool,
     /// New-playlist dialog state.
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
@@ -84,6 +91,16 @@ pub struct RootView {
     /// to avoid re-extracting on every player tick.
     adaptive_cover: Option<String>,
     focus_handle: FocusHandle,
+
+    // -- First-time setup wizard state --
+    setup_enable_navidrome: bool,
+    setup_server_url: Entity<InputState>,
+    setup_username: Entity<InputState>,
+    setup_password: Entity<InputState>,
+    setup_enable_local: bool,
+    setup_local_dirs: Vec<PathBuf>,
+    setup_dir_input: Entity<InputState>,
+    setup_error: Option<String>,
 }
 
 impl RootView {
@@ -91,11 +108,12 @@ impl RootView {
         session: Entity<Session>,
         player: Entity<PlayerState>,
         playlists: Entity<PlaylistsState>,
+        library_db: Arc<LibraryDb>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let login = cx.new(|cx| LoginView::new(session.clone(), window, cx));
-        let player_bar = cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
+        let player_bar =
+            cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
         let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), cx));
         let radio = crate::state::radio::init(session.clone(), cx);
         let fullscreen = cx.new(|cx| FullscreenPlayer::new(player.clone(), session.clone(), cx));
@@ -142,6 +160,12 @@ impl RootView {
         // Re-render the sidebar's playlist list when playlists change.
         cx.observe(&playlists, |_, _, cx| cx.notify()).detach();
 
+        // -- First-time setup inputs --
+        let setup_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://music.example.com"));
+        let setup_user = cx.new(|cx| InputState::new(window, cx).placeholder("username"));
+        let setup_pass = cx.new(|cx| InputState::new(window, cx).placeholder("password"));
+        let setup_dir = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/music"));
+
         // Adaptive theme: recolour accents when the playing track changes.
         cx.observe(&player, |this: &mut Self, _, cx| {
             this.maybe_update_adaptive_accent(cx);
@@ -174,14 +198,6 @@ impl RootView {
                 this.content = None;
                 if connected {
                     this.last_libraries = libraries;
-                    let start = match session.read(cx).settings.default_page {
-                        DefaultPage::Albums => NavSection::Albums,
-                        DefaultPage::Artists => NavSection::Artists,
-                        DefaultPage::Favorites => NavSection::Favorites,
-                        DefaultPage::Recent => NavSection::Recent,
-                        DefaultPage::Radio => NavSection::Radio,
-                    };
-                    this.navigate(start, None, cx);
                 }
             } else if connected && libraries != this.last_libraries {
                 // Library selection changed: rebuild the current catalog view.
@@ -190,6 +206,80 @@ impl RootView {
                     this.navigate(section, None, cx);
                 }
             }
+
+            let has_local = !session.read(cx).settings.local_music_dirs.is_empty();
+            let has_server = session.read(cx).settings.server.is_some();
+            let lm = has_local && !has_server;
+            // Kick off local scanner (and Navidrome sync) once.
+            // When server + local dirs are both configured, local scan
+            // starts immediately without waiting for Navidrome connect.
+            let should_scan = connected || has_local;
+            if should_scan && !this.scan_started {
+                this.scan_started = true;
+                let dirs: Vec<_> = session
+                    .read(cx)
+                    .settings
+                    .local_music_dirs
+                    .clone();
+                if !dirs.is_empty() {
+                    let lib_db = this.library_db.clone();
+                    cx.spawn(async move |this, cx| {
+                        let scanner = Arc::new(LocalScanner::new(lib_db));
+                        let s = scanner.clone();
+                        let d = dirs.clone();
+                        let _ = runtime::spawn_io(async move {
+                            s.scan(&d)
+                        })
+                        .await;
+                        let _ = this.update(cx, |_, _| {});
+                        // Periodic background scan every 5 minutes.
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                            let s = scanner.clone();
+                            let d = dirs.clone();
+                            let _ = runtime::spawn_io(async move {
+                                s.scan(&d)
+                            }).await;
+                            let _ = this.update(cx, |_, _| {});
+                        }
+                    })
+                    .detach();
+                }
+                if session.read(cx).client.is_some() {
+                    let db = this.library_db.clone();
+                    let client = session.read(cx).client.clone();
+                    cx.spawn(async move |this, cx| {
+                        if let Some(client) = client {
+                            let _ = runtime::spawn_io(async move {
+                                navidrome_sync::sync_navidrome(db, &client, None).await
+                            })
+                            .await;
+                            let _ = this.update(cx, |_, _| {});
+                        }
+                    })
+                    .detach();
+                }
+            }
+
+            // Show content when connected OR when we have a server/local-music
+            // configured (so the sidebar isn't empty during connecting).
+            let configured = has_server || has_local;
+            let navigable = connected || lm || configured;
+            if navigable && this.content.is_none() {
+                let start = if lm {
+                    NavSection::LocalMusic
+                } else {
+                    match session.read(cx).settings.default_page {
+                        DefaultPage::Albums => NavSection::Albums,
+                        DefaultPage::Artists => NavSection::Artists,
+                        DefaultPage::Favorites => NavSection::Favorites,
+                        DefaultPage::Recent => NavSection::Recent,
+                        DefaultPage::Radio => NavSection::Radio,
+                    }
+                };
+                this.navigate(start, None, cx);
+            }
+
             // Pick up theme switches (e.g. to/from Adaptive) from Settings.
             this.maybe_update_adaptive_accent(cx);
             cx.notify();
@@ -201,7 +291,6 @@ impl RootView {
             player,
             playlists,
             radio,
-            login,
             player_bar,
             queue_panel,
             fullscreen,
@@ -216,6 +305,8 @@ impl RootView {
             show_queue: false,
             show_fullscreen: false,
             was_connected: false,
+            library_db,
+            scan_started: false,
             last_libraries: Vec::new(),
             libraries_collapsed: false,
             playlists_collapsed: false,
@@ -224,6 +315,14 @@ impl RootView {
             new_pl_desc,
             adaptive_cover: None,
             focus_handle: cx.focus_handle(),
+            setup_enable_navidrome: true,
+            setup_server_url: setup_url,
+            setup_username: setup_user,
+            setup_password: setup_pass,
+            setup_enable_local: true,
+            setup_local_dirs: Vec::new(),
+            setup_dir_input: setup_dir,
+            setup_error: None,
         }
     }
 
@@ -318,6 +417,12 @@ impl RootView {
                 let view = cx
                     .new(|cx| RadioView::new(self.radio.clone(), self.player.clone(), window, cx));
                 Content::Radio(view)
+            }
+            NavSection::LocalMusic => {
+                let view = cx.new(|cx| {
+                    LocalMusicView::new(self.library_db.clone(), self.player.clone(), cx)
+                });
+                Content::LocalMusic(view)
             }
             NavSection::Settings => {
                 let Some(window) = window else {
@@ -465,6 +570,238 @@ impl RootView {
         cx.notify();
     }
 
+    // ------------------------------------------------------------------
+    // First-time setup wizard
+    // ------------------------------------------------------------------
+
+    fn handle_setup_add_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let val = self.setup_dir_input.read(cx).value().trim().to_string();
+        if !val.is_empty() {
+            self.setup_local_dirs.push(PathBuf::from(val));
+            self.setup_dir_input.update(cx, |s, cx| s.set_value("", window, cx));
+            self.setup_error = None;
+        }
+    }
+
+    fn handle_setup_remove_dir(&mut self, idx: usize) {
+        self.setup_local_dirs.remove(idx);
+    }
+
+    fn handle_setup_submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.setup_enable_navidrome && !self.setup_enable_local {
+            self.setup_error = Some("Select at least Navidrome or Local Music".into());
+            cx.notify();
+            return;
+        }
+
+        if self.setup_enable_navidrome {
+            let url = self.setup_server_url.read(cx).value().trim().to_string();
+            let username = self.setup_username.read(cx).value().trim().to_string();
+            let password = self.setup_password.read(cx).value().to_string();
+            if url.is_empty() {
+                self.setup_error = Some("Enter a Navidrome server URL".into());
+                cx.notify();
+                return;
+            }
+            let mut settings = self.session.read(cx).settings.clone();
+            settings.local_music_dirs = self.setup_local_dirs.clone();
+            self.session.update(cx, |s, cx| {
+                s.settings = settings;
+                s.persist_settings(); // write NOW so first_run becomes false
+                s.connect(url, username, password, true, cx);
+            });
+        } else {
+            let dirs = self.setup_local_dirs.clone();
+            self.session.update(cx, |s, cx| {
+                let mut settings = s.settings.clone();
+                settings.local_music_dirs = dirs;
+                s.settings = settings;
+                s.persist_settings();
+                cx.notify();
+            });
+        }
+    }
+
+    fn render_setup(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let client_titlebar = self.session.read(cx).settings.client_titlebar;
+        let field = |label: &'static str, input: &Entity<InputState>| {
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(Input::new(input))
+        };
+
+        let nav_btn_label = if self.setup_enable_navidrome { "✓ Enable Navidrome streaming" } else { "  Enable Navidrome streaming" };
+        let local_btn_label = if self.setup_enable_local { "✓ Enable Local Music" } else { "  Enable Local Music" };
+
+        let dir_rows: Vec<gpui::AnyElement> = self
+            .setup_local_dirs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let idx = i;
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .flex_1()
+                            .child(p.to_string_lossy().to_string()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("rm-dir-{i}")))
+                            .ghost()
+                            .label("Remove")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.handle_setup_remove_dir(idx);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let content = v_flex()
+            .gap_5()
+            .max_w(px(560.))
+            .w_full()
+            .child(
+                v_flex().gap_1().child(
+                    div()
+                        .text_2xl()
+                        .font_semibold()
+                        .child("Welcome to Scirè"),
+                ).child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Choose how you want to use Scirè. You can change these later in Settings."),
+                ),
+            )
+            // Navidrome section
+            .child(
+                v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("toggle-nav")
+                                    .ghost()
+                                    .label(nav_btn_label)
+                                    .when(self.setup_enable_navidrome, |b| b.primary())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.setup_enable_navidrome = !this.setup_enable_navidrome;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .when(self.setup_enable_navidrome, |this| {
+                        this.child(field("Server URL", &self.setup_server_url))
+                            .child(field("Username", &self.setup_username))
+                            .child(field("Password", &self.setup_password))
+                    }),
+            )
+            // Local music section
+            .child(
+                v_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("toggle-local")
+                            .ghost()
+                            .label(local_btn_label)
+                            .when(self.setup_enable_local, |b| b.primary())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.setup_enable_local = !this.setup_enable_local;
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.setup_enable_local, |this| {
+                        this
+                            .child(Input::new(&self.setup_dir_input))
+                            .child(
+                                Button::new("setup-add-dir")
+                                    .ghost()
+                                    .label("Add directory")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.handle_setup_add_dir(window, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(dir_rows)
+                    }),
+            )
+            // Error
+            .when_some(self.setup_error.clone(), |this, err| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(gpui::red())
+                        .child(err),
+                )
+            })
+            // Submit
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("setup-submit")
+                            .primary()
+                            .label("Get Started")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.handle_setup_submit(window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("You can change these settings anytime in Settings → Account / Local Music."),
+            );
+
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .when(client_titlebar, |this| {
+                this.child(
+                    TitleBar::new().child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Scirè"),
+                    ),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     fn render_new_playlist_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let field = |label: &'static str, input: &Entity<InputState>| {
             v_flex()
@@ -530,25 +867,18 @@ impl Render for RootView {
             window.focus(&self.focus_handle);
         }
 
-        if !connected {
-            let client_titlebar = self.session.read(cx).settings.client_titlebar;
-            return v_flex()
-                .size_full()
-                .bg(cx.theme().background)
-                .text_color(cx.theme().foreground)
-                .when(client_titlebar, |this| {
-                    this.child(
-                        TitleBar::new().child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Scirè"),
-                        ),
-                    )
-                })
-                .child(div().flex_1().min_h_0().child(self.login.clone()))
-                .into_any_element();
+        // First launch: show setup until the user has configured either a
+        // server or local dirs.  Uses in-memory content (not just file existence)
+        // so a failed persist doesn't force the wizard on every restart.
+        let s = self.session.read(cx);
+        let has_server = s.settings.server.is_some();
+        let has_local = !s.settings.local_music_dirs.is_empty();
+        let configured = has_server || has_local;
+        if !connected && !configured {
+            return self.render_setup(window, cx);
         }
+        // Not connected but configured → show main layout (sidebar + empty
+        // content).  The user can reach Settings via sidebar to fix credentials.
 
         let content: gpui::AnyElement = match &self.content {
             Some(Content::Albums(v)) => v.clone().into_any_element(),
@@ -560,6 +890,7 @@ impl Render for RootView {
             Some(Content::Radio(v)) => v.clone().into_any_element(),
             Some(Content::Settings(v)) => v.clone().into_any_element(),
             Some(Content::Recent(v)) => v.clone().into_any_element(),
+            Some(Content::LocalMusic(v)) => v.clone().into_any_element(),
             None => div().into_any_element(),
         };
 

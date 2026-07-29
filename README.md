@@ -1,6 +1,6 @@
 # Scirè
 
-A cross-platform desktop music client for [Navidrome](https://www.navidrome.org/) servers.
+A cross-platform desktop music client for [Navidrome](https://www.navidrome.org/) servers **and local music files**.
 
 Built with [GPUI](https://www.gpui.rs/) (Zed's UI framework) + [gpui-component](https://github.com/longbridge/gpui-component).  
 Speaks Subsonic API v1.16.1 + OpenSubsonic. Runs on macOS and Linux.
@@ -41,6 +41,7 @@ Speaks Subsonic API v1.16.1 + OpenSubsonic. Runs on macOS and Linux.
 | **OS media keys** | Media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS) |
 | **Artwork cache** | LRU-evicted disk cache (configurable capacity) ; HiDPI-aware resolution bump |
 | **Navigation** | Mouse back/forward buttons ; bracket keys ; configurable default page |
+| **Local music (early WIP)** | Directory scanner (`lofty` + `folder.jpg`) populates `LibraryDb` with tracks, albums, artists ; album grid UI with cover art ; incremental mtime-based scanner ; periodic background scan ; engine reads local files via `SourceReader` |
 
 ## Keyboard Shortcuts
 
@@ -71,8 +72,7 @@ scire/
 │   │   │   │   ├── media.rs       # search3, getLyrics, scrobble, setRating
 │   │   │   │   ├── playlists.rs   # CRUD
 │   │   │   │   ├── annotation.rs  # star, unstar
-│   │   │   │   ├── radio.rs       # internet radio CRUD
-│   │   │   │   └── sharing.rs     # createShare
+│   │   │   │   └── radio.rs       # internet radio CRUD
 │   │   │   ├── auth.rs            # md5 token auth
 │   │   │   ├── error.rs           # typed error codes
 │   │   │   └── models.rs          # deserializable response types
@@ -93,7 +93,10 @@ scire/
 │           ├── services/          # IO-bound services
 │           │   ├── runtime.rs     # gpui↔tokio bridge
 │           │   ├── artwork.rs     # Cover art fetch + disk cache
-│           │   └── waveform.rs    # Peak download + cache
+│           │   ├── waveform.rs    # Peak download + cache
+│           │   ├── library_db.rs  # SQLite database for local library
+│           │   ├── local_library.rs # Local file scanner + m3u parser
+│           │   └── navidrome_sync.rs # Navidrome→DB sync
 │           ├── state/             # GPUI entities
 │           │   ├── session.rs     # Connection + settings
 │           │   ├── player.rs      # Queue, transport, scrobble, media keys
@@ -111,6 +114,7 @@ scire/
 │               ├── album_detail.rs
 │               ├── artists.rs
 │               ├── favorites.rs
+│               ├── local_music.rs # Local music browser
 │               ├── recent.rs
 │               ├── search_bar.rs
 │               ├── settings.rs
@@ -140,7 +144,7 @@ Cargo workspace with three crates. Strict dependency direction:
 - **`crates/playback`** — Audio engine behind a command/event facade (`Player` ↔ `Event` via tokio `mpsc`). Uses `rodio` for audio output, `stream-download` for HTTP streaming with seek support. Exposes waveform utilities for offline peak extraction.
 - **`crates/app`** — The GPUI binary. Layers: `services/` for IO (tokio bridge, artwork cache, waveform fetch), `state/` for gpui Entities (session, player, queue, playlists, radio), `ui/` for views.
 
-All three milestones implemented: M1 (connect/browse/play), M2 (search/queue/playlists/star), M3 (multi-library, scrobbling, radio, shares, transcoding, theming, media keys, artwork cache) — plus waveform seek bar, fullscreen player, lyrics, artist bios, persisted queue, configurable start page.
+All three milestones implemented: M1 (connect/browse/play), M2 (search/queue/playlists/star), M3 (multi-library, scrobbling, radio, transcoding, theming, media keys, artwork cache) — plus waveform seek bar, fullscreen player, lyrics, artist bios, persisted queue, configurable start page.
 
 See [`CLAUDE.md`](CLAUDE.md) for the detailed module-level conventions and async pattern.
 
@@ -213,20 +217,20 @@ cp themes/tokyo-night.json ~/.config/scire/theme.json
 
 #### pywal16 integration
 
-[pywal16](https://github.com/eylles/pywal16) generates a colour palette from your wallpaper. Use the template at [`themes/pywal16.json.template`](themes/pywal16.json.template) to produce a Scirè theme:
+[pywal16](https://github.com/eylles/pywal16) generates a colour palette from your wallpaper. Use the template at [`themes/pywal16.json`](themes/pywal16.json) to produce a Scirè theme:
 
 ```bash
-# Install the template so pywal processes it on every run
-cp themes/pywal16.json.template ~/.config/wal/templates/scire-theme.json.template
+# Install so pywal processes it on every run
+cp themes/pywal16.json ~/.config/wal/templates/scire-theme.json
 
-# Run pywal (or it will auto-run on wallpaper change)
+# Run pywal (auto-runs on wallpaper change too)
 wal -i /path/to/wallpaper
 
-# Copy the generated theme into place
+# Copy generated theme into place
 cp ~/.cache/wal/scire-theme.json ~/.config/scire/theme.json
 ```
 
-Then select **Custom** in Scirè's appearance settings. Re-run `wal` and copy the output whenever you change wallpaper.
+Then select **Custom** in Scirè's appearance settings. Re-run `wal` and copy whenever wallpaper changes.
 
 ### CJK font support
 

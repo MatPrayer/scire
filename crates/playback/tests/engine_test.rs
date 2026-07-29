@@ -1,3 +1,5 @@
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use playback::{Event, Player, TrackSource};
@@ -43,6 +45,7 @@ async fn plays_wav_stream_to_completion() {
     player.play(TrackSource {
         url: format!("{}/rest/stream", server.uri()),
         duration_hint: Some(Duration::from_millis(500)),
+        path: None,
     });
 
     let mut saw_playing = false;
@@ -90,10 +93,12 @@ async fn prefetched_track_auto_advances() {
     player.play(TrackSource {
         url: format!("{}/rest/stream?id=1", server.uri()),
         duration_hint: Some(Duration::from_millis(500)),
+        path: None,
     });
     player.prefetch_next(TrackSource {
         url: format!("{}/rest/stream?id=2", server.uri()),
         duration_hint: Some(Duration::from_millis(500)),
+        path: None,
     });
 
     let mut ends = Vec::new();
@@ -123,4 +128,81 @@ async fn prefetched_track_auto_advances() {
     }
     // First end transitions into the prefetched track; second is a plain end.
     assert_eq!(ends, vec![true, false]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plays_local_wav_to_completion() {
+    // Write a temporary WAV file.
+    let dir = std::env::temp_dir().join("scire-test-local");
+    let _ = std::fs::create_dir_all(&dir);
+    let wav_path = dir.join("test.wav");
+    let mut f = std::fs::File::create(&wav_path).unwrap();
+    f.write_all(&wav_bytes()).unwrap();
+    drop(f);
+
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0); // silent test run
+    player.play(TrackSource {
+        url: String::new(), // unused when path is set
+        duration_hint: Some(Duration::from_millis(500)),
+        path: Some(wav_path.clone()),
+    });
+
+    let mut saw_playing = false;
+    let deadline = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Playing => saw_playing = true,
+                    Event::TrackEnded { .. } => break,
+                    Event::Failed(msg) => {
+                        if msg.contains("audio output unavailable") {
+                            eprintln!("skipping: no audio device ({msg})");
+                            let _ = std::fs::remove_file(&wav_path);
+                            return;
+                        }
+                        panic!("local playback failed: {msg}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("timed out waiting for TrackEnded"),
+        }
+    }
+    assert!(saw_playing, "never saw Playing event");
+
+    let _ = std::fs::remove_file(&wav_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_file_missing_errors() {
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    player.play(TrackSource {
+        url: String::new(),
+        duration_hint: None,
+        path: Some(PathBuf::from("/nonexistent/test.wav")),
+    });
+
+    let deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Failed(msg) => {
+                        assert!(msg.contains("local"), "unexpected error: {msg}");
+                        return;
+                    }
+                    Event::Playing => panic!("should not play a non-existent file"),
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("timed out waiting for Failed event"),
+        }
+    }
 }

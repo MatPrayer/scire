@@ -11,8 +11,9 @@ use crate::state::queue::RepeatMode;
 
 const KEYRING_SERVICE: &str = "scire";
 
-fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("", "", "scire").context("cannot determine platform config directories")
+pub(crate) fn project_dirs() -> Result<ProjectDirs> {
+    ProjectDirs::from("", "", "scire")
+        .context("cannot determine platform config directories")
 }
 
 pub fn settings_path() -> Result<PathBuf> {
@@ -33,6 +34,11 @@ pub fn waveform_cache_dir() -> Result<PathBuf> {
 
 pub fn queue_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("queue.json"))
+}
+
+#[allow(dead_code)]
+pub fn library_db_path() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("music.db"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +91,9 @@ pub struct Settings {
     pub queue_end: QueueEndBehavior,
     /// Background style of the fullscreen now-playing overlay.
     pub fullscreen_bg: FullscreenBackground,
+    /// Directories to scan for local music files. Empty = local music disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_music_dirs: Vec<PathBuf>,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -225,6 +234,7 @@ impl Default for Settings {
             output_device: None,
             queue_end: QueueEndBehavior::Keep,
             fullscreen_bg: FullscreenBackground::Gradient,
+            local_music_dirs: Vec::new(),
         }
     }
 }
@@ -390,7 +400,7 @@ pub fn delete_password(server_url: &str, username: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::ImportedThemesFile;
+    use super::{ImportedThemesFile, Settings};
 
     #[test]
     fn imported_theme_json_deserializes_named_theme() {
@@ -402,5 +412,43 @@ mod tests {
         assert_eq!(theme.mode, "dark");
         assert_eq!(theme.background.as_deref(), Some("#000000"));
         assert_eq!(theme.foreground.as_deref(), Some("#ffffff"));
+    }
+
+    #[test]
+    fn settings_default_local_music_dirs_empty() {
+        let s = Settings::default();
+        assert!(s.local_music_dirs.is_empty());
+    }
+
+    #[test]
+    fn settings_toml_round_trip_local_music_dirs() {
+        let toml_input = r#"local_music_dirs = ["/music/flac", "/music/mp3"]
+volume = 0.8
+"#;
+        let s: Settings = toml::from_str(toml_input).unwrap();
+        assert_eq!(s.local_music_dirs.len(), 2);
+        assert_eq!(s.local_music_dirs[0].to_string_lossy(), "/music/flac");
+        assert_eq!(s.local_music_dirs[1].to_string_lossy(), "/music/mp3");
+        assert!((s.volume - 0.8).abs() < f32::EPSILON);
+
+        let output = toml::to_string_pretty(&s).unwrap();
+        let restored: Settings = toml::from_str(&output).unwrap();
+        assert_eq!(restored.local_music_dirs, s.local_music_dirs);
+    }
+
+    #[test]
+    fn settings_backward_compat_no_local_music_dirs() {
+        let toml_input = r#"volume = 0.5
+"#;
+        let s: Settings = toml::from_str(toml_input).unwrap();
+        assert!(s.local_music_dirs.is_empty());
+        assert!((s.volume - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn settings_to_skips_empty_local_music_dirs() {
+        let s = Settings::default();
+        let output = toml::to_string_pretty(&s).unwrap();
+        assert!(!output.contains("local_music_dirs"));
     }
 }

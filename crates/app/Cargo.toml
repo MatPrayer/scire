@@ -31,3 +31,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 souvlaki.workspace = true
 rust-embed = { version = "8.7", features = ["interpolate-folder-path"] }
+rusqlite.workspace = true
+lofty.workspace = true

@@ -63,7 +63,11 @@ impl Session {
 
     /// Validate credentials via `ping`, then persist them on success.
     ///
-    /// `persist` is false when reconnecting with already-saved credentials.
+    /// When `persist` is true, the server config is written to disk immediately
+    /// (before the async connect) so that settings survive an app restart even
+    /// when the ping is still in-flight or fails.
+    /// Client construction runs on the IO runtime to avoid blocking the
+    /// gpui main thread (reqwest may do DNS/proxy/TLS init synchronously).
     pub fn connect(
         &mut self,
         url: String,
@@ -72,26 +76,60 @@ impl Session {
         persist: bool,
         cx: &mut Context<Self>,
     ) {
-        let client = match SubsonicClient::new(&url, Credentials::new(&username, &password)) {
-            Ok(c) => c,
-            Err(e) => {
-                self.status = ConnectionStatus::Failed(e.to_string());
-                cx.notify();
-                return;
-            }
-        };
+        // Persist the server config immediately so first-run detection works
+        // across restarts even if the async ping never completes.
+        if persist {
+            self.settings.server = Some(ServerConfig {
+                url: url.clone(),
+                username: username.clone(),
+                password_plaintext: Some(password.clone()),
+            });
+            self.persist_settings();
+        }
+
         self.status = ConnectionStatus::Connecting;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let ping_client = client.clone();
-            let result =
-                runtime::spawn_io(
-                    async move { ping_client.ping().await.map_err(anyhow::Error::from) },
-                )
-                .await;
+            // Build the SubsonicClient on the IO runtime so reqwest can init
+            // its connector (DNS, proxy, TLS) without freezing the UI.
+            let client = match runtime::spawn_io({
+                let url = url.clone();
+                let username = username.clone();
+                let password = password.clone();
+                async move {
+                    runtime::enter(|| {
+                        SubsonicClient::new(&url, Credentials::new(&username, &password))
+                            .map_err(|e| anyhow::anyhow!("{}", e))
+                    })
+                }
+            })
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = this.update(cx, |session, cx| {
+                        session.client = None;
+                        session.status = ConnectionStatus::Failed(format!("{e}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
 
-            this.update(cx, |session, cx| {
+            let ping_client = client.clone();
+            let result = runtime::spawn_io(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    ping_client.ping(),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("ping timed out after 10 s"))?
+                .map_err(anyhow::Error::from)
+            })
+            .await;
+
+            let _ = this.update(cx, |session, cx| {
                 match result {
                     Ok(_info) => {
                         session.client = Some(client);
@@ -119,7 +157,7 @@ impl Session {
                     }
                 }
                 cx.notify();
-            })
+            });
         })
         .detach();
     }

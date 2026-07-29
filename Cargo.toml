@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/subsonic", "crates/playback", "crates/app"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
@@ -37,6 +37,8 @@ anyhow = "1"
 directories = "6"
 keyring = "4"
 souvlaki = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+lofty = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -52,8 +54,13 @@ opt-level = 0
 debug = true
 incremental = true
 
-[profile.dev.package."*"]
-# gpui is heavy; optimize deps so the dev binary stays usable
+[profile.dev.package.gpui]
+opt-level = 2
+
+[profile.dev.package.gpui-macros]
+opt-level = 2
+
+[profile.dev.package.gpui-component]
 opt-level = 2
 
 [profile.release]

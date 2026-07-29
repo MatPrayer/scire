@@ -10,17 +10,22 @@ mod engine;
 mod source;
 pub mod waveform;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-/// What to play: a fully-authenticated stream URL.
+/// What to play: a fully-authenticated stream URL, or a local file path.
+/// When `path` is `Some`, the engine reads from the local file instead of
+/// fetching the URL (the URL is still set for display/metadata purposes).
 #[derive(Debug, Clone)]
 pub struct TrackSource {
     pub url: String,
     /// Duration hint from server metadata; used until decoding knows better.
     pub duration_hint: Option<Duration>,
+    /// Local file path. `Some` → use local file IO instead of HTTP stream.
+    pub path: Option<PathBuf>,
 }
 
 /// Commands accepted by the engine.
