@@ -395,7 +395,10 @@ impl Render for PlayerBar {
                             .bg(cx.theme().muted)
                             .overflow_hidden()
                             .shadow_sm()
-                            .when_some(art_path, |this, path| {
+                            // Art only with a track: the two branches are
+                            // mutually exclusive, and drawing both stacks the
+                            // placeholder on top of whatever art was last set.
+                            .when_some(art_path.filter(|_| has_track), |this, path| {
                                 this.child(img(path).size(px(76.)).rounded_md())
                             })
                             // Placeholder icon while no artwork.
@@ -406,7 +409,11 @@ impl Render for PlayerBar {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(app_icon(icons::MUSIC))
                             })
-                            .when(has_track, |this| {
+                            // Clickable either way: the fullscreen view is
+                            // worth opening with nothing playing (it is where
+                            // the visualizer lives), and refusing to open it
+                            // once the queue runs out is just a dead end.
+                            .map(|this| {
                                 this.cursor_pointer()
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(PlayerBarEvent::ToggleFullscreen);

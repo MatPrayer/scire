@@ -8,12 +8,14 @@
 //! `EndSignal` wrapper rather than by polling, so the reported track switch is
 //! sample-accurate too.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::source::{self, EndSignal, SourceReader};
+use crate::spectrum::{SpectrumTap, Tap};
 use crate::{Command, Event, PlaybackError, TrackSource};
 
 const TICK: Duration = Duration::from_millis(500);
@@ -44,13 +46,15 @@ struct Loaded {
 pub(crate) fn spawn(
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<Event>,
+    tap: Arc<SpectrumTap>,
 ) {
-    tokio::spawn(control_loop(cmd_rx, event_tx));
+    tokio::spawn(control_loop(cmd_rx, event_tx, tap));
 }
 
 async fn control_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<Event>,
+    tap: Arc<SpectrumTap>,
 ) {
     // rodio output must outlive all players; created lazily on first Play so
     // a missing audio device only fails playback, not app startup.
@@ -99,6 +103,7 @@ async fn control_loop(
                             volume,
                             &mut serials,
                             &end_tx,
+                            &tap,
                         )
                         .await
                         {
@@ -171,6 +176,7 @@ async fn control_loop(
                                     volume,
                                     &mut serials,
                                     &end_tx,
+                                    &tap,
                                 )
                                 .await
                                 {
@@ -260,6 +266,7 @@ async fn control_loop(
                                 current.as_ref(),
                                 &mut serials,
                                 &end_tx,
+                                &tap,
                             );
                         }
                         Err(e) => tracing::warn!("prefetch failed: {e}"),
@@ -320,6 +327,7 @@ async fn control_loop(
                             current.as_ref(),
                             &mut serials,
                             &end_tx,
+                            &tap,
                         );
                     }
                 }
@@ -423,6 +431,7 @@ fn commit_next(
     current: Option<&Loaded>,
     serials: &mut u64,
     end_tx: &mpsc::UnboundedSender<u64>,
+    tap: &Arc<SpectrumTap>,
 ) {
     if pending.is_none() || queued.is_some() {
         return;
@@ -436,7 +445,7 @@ fn commit_next(
         return;
     }
     let prepared = pending.take().expect("checked above");
-    *queued = Some(append(s, prepared, serials, end_tx));
+    *queued = Some(append(s, prepared, serials, end_tx, tap));
 }
 
 /// Hand a prepared track to the player's queue and describe what was appended.
@@ -445,10 +454,18 @@ fn append(
     prepared: Prepared,
     serials: &mut u64,
     end_tx: &mpsc::UnboundedSender<u64>,
+    tap: &Arc<SpectrumTap>,
 ) -> Loaded {
     *serials += 1;
     let serial = *serials;
-    sink.append(EndSignal::new(prepared.decoder, serial, end_tx.clone()));
+    // Tap innermost: it mirrors exactly the samples this track contributes,
+    // and wrapping it inside `EndSignal` keeps the end-of-track detection on
+    // the outermost source where the player pulls from.
+    sink.append(EndSignal::new(
+        Tap::new(prepared.decoder, tap.clone()),
+        serial,
+        end_tx.clone(),
+    ));
     Loaded {
         // Server metadata wins over the decoder's guess; the decoder covers
         // sources the server said nothing about.
@@ -497,6 +514,7 @@ async fn start_track(
     volume: f32,
     serials: &mut u64,
     end_tx: &mpsc::UnboundedSender<u64>,
+    tap: &Arc<SpectrumTap>,
 ) -> Result<(rodio::Player, Loaded), PlaybackError> {
     let prepared = prepare(track).await?;
 
@@ -509,7 +527,7 @@ async fn start_track(
 
     let player = rodio::Player::connect_new(out.mixer());
     player.set_volume(volume);
-    let loaded = append(&player, prepared, serials, end_tx);
+    let loaded = append(&player, prepared, serials, end_tx, tap);
     player.play();
     Ok((player, loaded))
 }

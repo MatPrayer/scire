@@ -13,6 +13,7 @@ pub mod root;
 pub mod search_bar;
 pub mod settings;
 pub mod sidebar;
+pub mod visualizer;
 
 use std::path::PathBuf;
 use std::rc::Rc;

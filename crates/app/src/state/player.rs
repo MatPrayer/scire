@@ -1,6 +1,7 @@
 //! Player state entity: bridges the playback engine's events into gpui and
 //! drives the play queue (shuffle/repeat/prefetch).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity};
@@ -182,6 +183,12 @@ impl PlayerState {
 
     pub fn current_song(&self) -> Option<&Song> {
         self.queue.current_song()
+    }
+
+    /// Live window onto the samples reaching the audio device, for the
+    /// visualizer. Cheap to clone and safe to read from the UI thread.
+    pub fn spectrum_tap(&self) -> Arc<playback::spectrum::SpectrumTap> {
+        self.player.spectrum_tap()
     }
 
     /// Display info for the player bar: (title, subtitle). Radio wins over the
@@ -372,6 +379,12 @@ impl PlayerState {
         if let Some(c) = &mut self.media_controls {
             let _ = c.set_playback(MediaPlayback::Stopped);
         }
+        // Stopping can leave no current song at all (the queue ran out, or its
+        // last entry was removed). The cover has to follow: left alone it keeps
+        // pointing at the track that just ended, and the player bar then draws
+        // stale art underneath its own "nothing playing" placeholder. When a
+        // song *is* still current this is a no-op.
+        self.refresh_current_art(cx);
         cx.notify();
     }
 
@@ -467,7 +480,12 @@ impl PlayerState {
     /// (mode label, applied gain in dB). Auto shows the resolved mode marked
     /// `(auto)`. The gain is `None` when the current track has no usable tags.
     pub fn replay_gain_active(&self) -> Option<(String, Option<f32>)> {
-        if self.replay_gain_mode == ReplayGainMode::Off || self.is_radio() {
+        // Nothing loaded means nothing is being normalised — reporting a mode
+        // here leaves a stray "RG · album" line under an empty player.
+        if self.replay_gain_mode == ReplayGainMode::Off
+            || self.is_radio()
+            || self.current_song().is_none()
+        {
             return None;
         }
         let mode = self.effective_rg_mode();

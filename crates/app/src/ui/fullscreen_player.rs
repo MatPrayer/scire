@@ -1,13 +1,14 @@
 //! Full-window now-playing overlay with dynamic blurred-art background.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt as _, Context, Entity, EventEmitter, IntoElement, Render, Window, div,
-    ease_out_quint, img, linear_color_stop, linear_gradient, prelude::*, px,
+    img, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::popover::Popover;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
@@ -16,16 +17,50 @@ use gpui_component::{
 use subsonic::SubsonicClient;
 
 use crate::assets::{app_icon, icons};
-use crate::config::FullscreenBackground;
+use crate::config::{FullscreenBackground, VisualizerMode};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
 use crate::ui::format_duration;
+use crate::ui::visualizer::Visualizer;
 
 const ART_SIZE: u32 = 600;
 /// Tiny fetch for color extraction — low-res average is a fast palette sample.
 const BG_ART_SIZE: u32 = 32;
+
+/// Entrance duration. Long enough for the zoom to read, short enough that the
+/// overlay never feels like it is loading.
+const ENTER: Duration = Duration::from_millis(340);
+/// Exit is deliberately faster than the entrance — dismissals should feel
+/// immediate. `begin_close` waits this out (plus a frame) before unmounting.
+const EXIT: Duration = Duration::from_millis(220);
+
+/// Decelerating curve — fast start, soft landing.
+fn out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Decelerating curve that overshoots 1.0 slightly before settling. Only used
+/// for geometry (never for opacity, and never as an `Animation` easing — gpui
+/// asserts easings stay inside 0..=1).
+fn out_back(t: f32) -> f32 {
+    const C1: f32 = 1.7;
+    const C3: f32 = C1 + 1.0;
+    1.0 + C3 * (t - 1.0).powi(3) + C1 * (t - 1.0).powi(2)
+}
+
+/// Remap `t` onto the sub-range `start..end` of the timeline, clamped.
+fn phase(t: f32, start: f32, end: f32) -> f32 {
+    ((t - start) / (end - start)).clamp(0.0, 1.0)
+}
+
+/// Name of the scene a mode pins, or `None` for the two that pin nothing.
+fn pinned_scene_label(mode: VisualizerMode) -> Option<&'static str> {
+    VisualizerMode::SCENES
+        .contains(&mode)
+        .then(|| mode.menu_label())
+}
 
 pub enum FullscreenEvent {
     Close,
@@ -60,8 +95,19 @@ pub struct FullscreenPlayer {
     /// seek bar is enabled and the decode finished).
     waveform: Option<Vec<f32>>,
     waveform_for: Option<String>,
-    /// True while the exit animation plays, before the overlay unmounts.
-    closing: bool,
+    /// Spectrum analysis + scene state for the 3D visualizer. Ticked once per
+    /// frame while a scene is running; idle (and unread) when it is off.
+    visualizer: Visualizer,
+    /// Start of the entrance, reset on every open.
+    opened_at: Instant,
+    /// Set when the exit starts; `Some` also means "closing", i.e. the overlay
+    /// is playing its exit and will unmount when the timer in `begin_close`
+    /// fires. Both transitions are driven from these instants rather than
+    /// `with_animation`: an animation's state is keyed by its ancestor
+    /// element-id path, so swapping an enter/exit wrapper around the whole
+    /// overlay would reset every nested animation (content stagger, and the
+    /// 40s background sweep, which would visibly jump).
+    closing_at: Option<Instant>,
 }
 
 impl FullscreenPlayer {
@@ -71,6 +117,7 @@ impl FullscreenPlayer {
         cx: &mut Context<Self>,
     ) -> Self {
         let initial_volume = player.read(cx).volume;
+        let visualizer = Visualizer::new(player.read(cx).spectrum_tap());
         let seek = cx.new(|_| SliderState::new().min(0.).max(1.).step(0.001));
         let volume = cx.new(|_| {
             SliderState::new()
@@ -142,25 +189,27 @@ impl FullscreenPlayer {
             lyrics_loading: false,
             waveform: None,
             waveform_for: None,
-            closing: false,
+            visualizer,
+            opened_at: Instant::now(),
+            closing_at: None,
         }
     }
 
     /// Start the exit animation, then emit Close so the overlay unmounts.
     pub fn begin_close(&mut self, cx: &mut Context<Self>) {
-        if self.closing {
+        if self.closing_at.is_some() {
             return;
         }
-        self.closing = true;
+        self.closing_at = Some(Instant::now());
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(190))
+                .timer(EXIT + Duration::from_millis(16))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // Skip if a quick reopen already cancelled the close.
-                if this.closing {
-                    this.closing = false;
+                if this.closing_at.is_some() {
+                    this.closing_at = None;
                     cx.emit(FullscreenEvent::Close);
                 }
             });
@@ -170,7 +219,22 @@ impl FullscreenPlayer {
 
     /// Reset state so a fresh open plays the entrance (not a stale exit).
     pub fn reset_for_open(&mut self, cx: &mut Context<Self>) {
-        self.closing = false;
+        self.closing_at = None;
+        self.opened_at = Instant::now();
+        // A track is usually already loaded when the overlay opens. The art
+        // observer only fires on song *changes*, and a paused player never
+        // notifies at all, so without this the cover stays blank until the
+        // next track starts.
+        if self.art_path.is_none()
+            && let Some((cover_id, key)) = self
+                .player
+                .read(cx)
+                .current_song()
+                .and_then(artwork::song_cover)
+        {
+            self.last_art_key = Some(key.clone());
+            self.fetch_art(cover_id, key, cx);
+        }
         cx.notify();
     }
 
@@ -230,6 +294,66 @@ impl FullscreenPlayer {
         };
         self.maybe_fetch_lyrics(cx);
         cx.notify();
+    }
+
+    /// Advance the visualizer to the next scene (and off again), persisting the
+    /// choice so the overlay reopens on the same one.
+    fn cycle_visualizer(&mut self, cx: &mut Context<Self>) {
+        let next = self.session.read(cx).settings.visualizer.next();
+        self.set_visualizer(next, cx);
+    }
+
+    /// Jump straight to a mode — what the mini player's scene picker uses, so
+    /// changing scene is one click rather than a walk around the cycle.
+    fn set_visualizer(&mut self, mode: VisualizerMode, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| s.settings.visualizer = mode);
+        self.session.read(cx).persist_settings();
+        cx.notify();
+    }
+
+    /// Menu listing scenes, for the mini player's "More" button. The scenes
+    /// outgrew a row of buttons — five of them crowded the card and made the
+    /// two that are not scenes at all (Off, Auto) harder to pick out.
+    fn scene_menu(&self, trigger: Button, current: VisualizerMode) -> impl IntoElement {
+        let session = self.session.clone();
+        Popover::new("viz-scene-menu")
+            // Opens upward: the trigger sits in a card near the bottom of the
+            // window, and the default downward menu covers the transport.
+            .anchor(gpui::Corner::BottomLeft)
+            .trigger(trigger)
+            .content(move |_state, _window, cx| {
+                let mut menu = v_flex().gap_0p5().min_w(px(150.));
+                for (i, mode) in VisualizerMode::SCENES.into_iter().enumerate() {
+                    let session = session.clone();
+                    menu = menu.child(
+                        div()
+                            .id(("viz-scene", i))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .hover(|s| s.bg(cx.theme().muted))
+                            .when(mode == current, |s| s.text_color(cx.theme().primary))
+                            .on_click(cx.listener(move |state, _, window, cx| {
+                                // Reached through the session rather than this
+                                // view: inside a popover the listener's view is
+                                // the popover's own state. The fullscreen
+                                // player observes the session, so it re-renders
+                                // from this anyway.
+                                session.update(cx, |s, cx| {
+                                    s.settings.visualizer = mode;
+                                    cx.notify();
+                                });
+                                session.read(cx).persist_settings();
+                                state.dismiss(window, cx);
+                            }))
+                            .child(mode.menu_label()),
+                    );
+                }
+                menu
+            })
     }
 
     /// Fetch lyrics for the current song when the lyrics panel is open.
@@ -341,12 +465,21 @@ impl FullscreenPlayer {
 
         v_flex()
             .w(px(320.))
-            .h_full()
-            .py_12()
+            // Same card as the info column and the mini player, so an open
+            // panel reads as part of the player rather than as a list dropped
+            // onto the backdrop.
+            .max_h(px(620.))
+            .p_4()
             .gap_2()
+            .rounded_2xl()
+            .bg(cx.theme().background.opacity(0.55))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.5))
+            .shadow_xl()
             .child(
                 div()
                     .text_sm()
+                    .font_medium()
                     .text_color(cx.theme().muted_foreground)
                     .child("Queue"),
             )
@@ -389,12 +522,21 @@ impl FullscreenPlayer {
         };
         v_flex()
             .w(px(320.))
-            .h_full()
-            .py_12()
+            // Same card as the info column and the mini player, so an open
+            // panel reads as part of the player rather than as a list dropped
+            // onto the backdrop.
+            .max_h(px(620.))
+            .p_4()
             .gap_2()
+            .rounded_2xl()
+            .bg(cx.theme().background.opacity(0.55))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.5))
+            .shadow_xl()
             .child(
                 div()
                     .text_sm()
+                    .font_medium()
                     .text_color(cx.theme().muted_foreground)
                     .child("Lyrics"),
             )
@@ -706,8 +848,74 @@ impl Render for FullscreenPlayer {
             FullscreenBackground::BlurredArt => 0.55,
             FullscreenBackground::Animated => 0.3 + 0.4 * luma,
         };
+        // The visualizer draws light geometry on the theme background, so the
+        // per-mode scrim (tuned for album-art backdrops) would only mute it.
+        // Keep a thin one — enough to seat the text over moving geometry.
+        let viz_mode = self.session.read(cx).settings.visualizer;
+        let scrim = if viz_mode.is_on() { 0.15 } else { scrim };
+        let (mini_title, mini_artist) = (title.clone(), artist.clone());
+        let (mini_time_now, mini_time_total) = (time_now.clone(), time_total.clone());
         let panel_open = self.panel.is_some();
         let art_size = if panel_open { 360. } else { 460. };
+
+        // --- Open/close transition ---------------------------------------
+        // One clock, read straight from state, so the element tree keeps the
+        // same shape (and the same ids) in both directions. Ask for another
+        // frame until it lands; gpui only redraws on demand.
+        let closing = self.closing_at.is_some();
+        let elapsed = self.closing_at.unwrap_or(self.opened_at).elapsed();
+        let span = if closing { EXIT } else { ENTER };
+        let raw = elapsed.as_secs_f32() / span.as_secs_f32();
+        if raw < 1.0 {
+            window.request_animation_frame();
+        }
+        let t = raw.clamp(0.0, 1.0);
+
+        // Visualizer runs off the same on-demand redraw: one FFT + scene step
+        // per frame, and a standing request for the next one while a scene is
+        // up. Off costs nothing — no tick, no frame request, no canvas.
+        if viz_mode.is_on() && !closing {
+            self.visualizer.tick(viz_mode);
+            window.request_animation_frame();
+        }
+
+        // gpui has no transform, so the zoom is four animated insets on an
+        // otherwise unsized absolute element; the extra vertical term slides
+        // the overlay up from / down toward the player bar. Opacity and
+        // geometry run on separate curves — flat on one curve reads as a fade,
+        // not as depth.
+        let (fade, inset, shift) = if closing {
+            // Motion starts immediately (linear term) and accelerates away;
+            // a pure ease-in stalls for the first ~80ms and reads as lag.
+            let motion = 0.35 * t + 0.65 * t * t;
+            // Opacity holds through the first half so the drop is actually
+            // seen — fade it out early and the exit degenerates into a
+            // cross-fade, which is what the travel distance is for.
+            (1.0 - t * t, motion * 26., motion * 64.)
+        } else {
+            // Opacity lands at ~60% of the timeline so the overlay is solid
+            // while the geometry is still easing. `out_back` overshoots, so
+            // the insets go a hair negative at the end and settle back.
+            let motion = out_back(t);
+            (
+                out_cubic(phase(t, 0.0, 0.6)),
+                (1.0 - motion) * 34.,
+                (1.0 - motion) * 46.,
+            )
+        };
+        // Positive top / negative bottom offsets the whole overlay downward:
+        // the entrance shrinks that offset to zero (rises into place), the exit
+        // grows it from zero (drops away).
+        let (top_inset, bottom_inset) = (inset + shift, inset - shift);
+        // Content lags the backdrop on the way in and is inert on the way out.
+        let (content_fade, content_rise) = if closing {
+            (1.0, 0.)
+        } else {
+            (
+                out_cubic(phase(t, 0.10, 0.75)),
+                (1.0 - out_cubic(phase(t, 0.06, 1.0))) * 22.,
+            )
+        };
 
         let icon_btn = |id: &'static str, icon_path: &'static str, active: bool| {
             Button::new(id)
@@ -717,15 +925,218 @@ impl Render for FullscreenPlayer {
                 .when(active, |b| b.primary())
         };
 
-        let root = div()
+        // Floating mini player: while a scene runs it replaces the big cover +
+        // info column, so the visualizer gets the whole window and the controls
+        // sit on top of it in one compact card — including the scene picker,
+        // which is otherwise buried in the cycle button that just got hidden.
+        let mini_player = viz_mode.is_on().then(|| {
+            let mode_btn = |mode: VisualizerMode, current: VisualizerMode| {
+                let id = match mode {
+                    VisualizerMode::Off => "mini-viz-off",
+                    _ => "mini-viz-auto",
+                };
+                Button::new(id)
+                    .ghost()
+                    .small()
+                    .label(mode.menu_label())
+                    .when(mode == current, |b| b.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_visualizer(mode, cx);
+                        cx.stop_propagation();
+                    }))
+            };
+            // Scenes live behind one button: five of them in the row crowded
+            // the card and buried Off and Auto, which are not scenes at all.
+            // The button shows the running scene, so the row still reads as
+            // the current state at a glance.
+            let scene_trigger = Button::new("mini-viz-more")
+                .ghost()
+                .small()
+                .icon(Icon::new(IconName::ChevronDown).xsmall())
+                .label(pinned_scene_label(viz_mode).unwrap_or("More"))
+                .when(pinned_scene_label(viz_mode).is_some(), |b| b.primary());
+
+            div()
+                .absolute()
+                .bottom(px(36.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w(px(560.))
+                        .max_w_full()
+                        .gap_3()
+                        .px_5()
+                        .py_4()
+                        .rounded_2xl()
+                        .shadow_xl()
+                        // Translucent so the scene keeps running behind it,
+                        // opaque enough to read against moving geometry.
+                        .bg(cx.theme().background.opacity(0.72))
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.6))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .size(px(56.))
+                                        .flex_none()
+                                        .rounded_lg()
+                                        .bg(cx.theme().muted)
+                                        .overflow_hidden()
+                                        .when_some(self.art_path.clone(), |this, path| {
+                                            this.child(img(path).size(px(56.)).rounded_lg())
+                                        }),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .font_semibold()
+                                                .truncate()
+                                                .when(!has_track, |s: gpui::Div| {
+                                                    s.text_color(cx.theme().muted_foreground)
+                                                })
+                                                .child(
+                                                    mini_title.unwrap_or_else(|| {
+                                                        "Nothing playing".into()
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .truncate()
+                                                .child(mini_artist.unwrap_or_default()),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            icon_btn("mini-prev", icons::SKIP_BACK, false)
+                                                .disabled(!has_track)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.player.update(cx, |p, cx| p.previous(cx));
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("mini-play")
+                                                .primary()
+                                                .icon(if playing {
+                                                    app_icon(icons::PAUSE)
+                                                } else {
+                                                    app_icon(icons::PLAY)
+                                                })
+                                                .loading(buffering)
+                                                .disabled(!has_track)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.player
+                                                        .update(cx, |p, cx| p.toggle_play(cx));
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            icon_btn("mini-next", icons::SKIP_FORWARD, false)
+                                                .disabled(!has_track)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.player.update(cx, |p, cx| p.next(cx));
+                                                    cx.stop_propagation();
+                                                })),
+                                        ),
+                                ),
+                        )
+                        // Seek row — live radio has nothing to seek.
+                        .when(!is_radio, |this| {
+                            this.child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(mini_time_now),
+                                    )
+                                    .map(|this| match (waveform_enabled, self.waveform.clone()) {
+                                        (true, Some(peaks)) => {
+                                            this.child(crate::ui::waveform_seek_bar(
+                                                &peaks,
+                                                seek_fraction,
+                                                22.,
+                                                cx.theme().primary,
+                                                cx.theme().muted_foreground.opacity(0.35),
+                                                self.player.clone(),
+                                            ))
+                                        }
+                                        _ => this
+                                            .child(div().flex_1().child(Slider::new(&self.seek))),
+                                    })
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(mini_time_total),
+                                    ),
+                            )
+                        })
+                        .when(is_radio, |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().accent)
+                                    .child("\u{25cf} LIVE"),
+                            )
+                        })
+                        // Scene picker.
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .justify_center()
+                                .pt_1()
+                                .border_t_1()
+                                .border_color(cx.theme().border.opacity(0.4))
+                                .child(mode_btn(VisualizerMode::Off, viz_mode))
+                                .child(mode_btn(VisualizerMode::Auto, viz_mode))
+                                .child(self.scene_menu(scene_trigger, viz_mode)),
+                        ),
+                )
+        });
+
+        // No `size_full`: an absolute element with all four insets set and no
+        // explicit size stretches between them, which is what lets the insets
+        // act as a zoom.
+        div()
             .absolute()
-            .left_0()
-            .top_0()
-            .size_full()
+            .left(px(inset))
+            .right(px(inset))
+            .top(px(top_inset))
+            .bottom(px(bottom_inset))
+            .opacity(fade)
             // Swallow mouse events so clicks don't fall through to the UI below.
             .occlude()
             .bg(cx.theme().background)
-            .child(self.render_background(bg_mode, cx))
+            // Visualizer takes over the backdrop when running: it needs the
+            // whole window to read as 3D, and the scrim + content still sit
+            // on top of it.
+            .child(if viz_mode.is_on() {
+                self.visualizer.render(cx.theme().primary)
+            } else {
+                self.render_background(bg_mode, cx)
+            })
             // Readability scrim.
             .child(
                 div()
@@ -762,305 +1173,339 @@ impl Render for FullscreenPlayer {
             )
             // Main content: album art on the left, info + controls on the
             // right, optional side panel + vertical volume at the far right.
-            .child(
-                h_flex()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_8()
-                    .px_10()
-                    // Album art.
-                    .child(
-                        div()
-                            .size(px(art_size))
-                            .flex_none()
-                            .rounded_2xl()
-                            .bg(cx.theme().muted)
-                            .overflow_hidden()
-                            .shadow_xl()
-                            .when_some(self.art_path.clone(), |this, path| {
-                                this.child(img(path).size(px(art_size)).rounded_2xl())
-                            }),
-                    )
-                    // Info + controls column — right of the cover.
-                    .child(
-                        v_flex()
-                            .flex_none()
-                            .w(px(440.))
-                            .justify_center()
-                            .gap_5()
-                            // Track info.
-                            .child(
-                                v_flex()
-                                    .max_w(px(560.))
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_3xl()
-                                            .font_semibold()
-                                            .truncate()
-                                            .when(!has_track, |s: gpui::Div| {
-                                                s.text_color(cx.theme().muted_foreground)
-                                            })
-                                            .child(
-                                                title.unwrap_or_else(|| "Nothing playing".into()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_lg()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .truncate()
-                                            .child(artist.unwrap_or_default()),
-                                    )
-                                    .when_some(album, |this, alb| {
-                                        this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .truncate()
-                                                .child(alb),
-                                        )
-                                    }),
-                            )
-                            // Seek bar.
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .max_w(px(640.))
-                                    .gap_3()
-                                    .items_center()
-                                    .when(is_radio, |this| {
-                                        this.child(
-                                            div()
-                                                .flex_1()
-                                                .text_sm()
-                                                .text_color(cx.theme().accent)
-                                                .text_center()
-                                                .child("● LIVE"),
-                                        )
-                                    })
-                                    .when(!is_radio, |this| {
-                                        this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(time_now),
-                                        )
-                                        .map(|this| {
-                                            match (waveform_enabled, self.waveform.clone()) {
-                                                (true, Some(peaks)) => {
-                                                    this.child(crate::ui::waveform_seek_bar(
-                                                        &peaks,
-                                                        seek_fraction,
-                                                        34.,
-                                                        cx.theme().primary,
-                                                        cx.theme().muted_foreground.opacity(0.35),
-                                                        self.player.clone(),
-                                                    ))
-                                                }
-                                                _ => this.child(
-                                                    div().flex_1().child(Slider::new(&self.seek)),
-                                                ),
-                                            }
-                                        })
+            // Stood down while a scene runs — the visualizer wants the whole
+            // window, and the mini player carries the controls instead.
+            .when(!viz_mode.is_on(), |root| {
+                root.child({
+                    let content = h_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_8()
+                        .px_10()
+                        // Album art.
+                        .child(
+                            div()
+                                .size(px(art_size))
+                                .flex_none()
+                                .rounded_2xl()
+                                .bg(cx.theme().muted)
+                                .overflow_hidden()
+                                .shadow_xl()
+                                .when_some(self.art_path.clone(), |this, path| {
+                                    this.child(img(path).size(px(art_size)).rounded_2xl())
+                                }),
+                        )
+                        // Info + controls column — right of the cover. Same
+                        // card treatment as the mini player and the same
+                        // internal order (info, seek, transport, then a ruled
+                        // row of toggles), so the three players read as one
+                        // design at three sizes rather than three designs.
+                        .child(
+                            v_flex()
+                                .flex_none()
+                                .w(px(480.))
+                                .justify_center()
+                                .gap_5()
+                                .p_6()
+                                .rounded_2xl()
+                                .bg(cx.theme().background.opacity(0.55))
+                                .border_1()
+                                .border_color(cx.theme().border.opacity(0.5))
+                                .shadow_xl()
+                                // Track info.
+                                .child(
+                                    v_flex()
+                                        .max_w(px(560.))
+                                        .gap_1()
                                         .child(
                                             div()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(time_total),
+                                                .text_3xl()
+                                                .font_semibold()
+                                                .truncate()
+                                                .when(!has_track, |s: gpui::Div| {
+                                                    s.text_color(cx.theme().muted_foreground)
+                                                })
+                                                .child(
+                                                    title.unwrap_or_else(|| {
+                                                        "Nothing playing".into()
+                                                    }),
+                                                ),
                                         )
-                                    }),
-                            )
-                            // Stream info + ReplayGain: quiet, centered line.
-                            .when(stream_info.is_some() || replay_gain.is_some(), |this| {
-                                this.child(
-                                    h_flex()
-                                        .gap_3()
-                                        .items_center()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground.opacity(0.8))
-                                        .when_some(stream_info, |this, info| {
-                                            this.child(div().child(info))
-                                        })
-                                        .when_some(replay_gain, |this, (label, db)| {
-                                            let text = match db {
-                                                Some(db) => format!("RG {db:+.1} dB · {label}"),
-                                                None => format!("RG · {label}"),
-                                            };
-                                            this.child(div().child(text))
+                                        .child(
+                                            div()
+                                                .text_lg()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .truncate()
+                                                .child(artist.unwrap_or_default()),
+                                        )
+                                        .when_some(album, |this, alb| {
+                                            this.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .truncate()
+                                                    .child(alb),
+                                            )
                                         }),
                                 )
-                            })
-                            // Transport controls.
-                            .child(
-                                h_flex()
-                                    .gap_4()
-                                    .items_center()
-                                    .child(
-                                        icon_btn("fs-shuffle", icons::SHUFFLE, shuffle).on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.player
-                                                    .update(cx, |p, cx| p.toggle_shuffle(cx));
-                                                cx.stop_propagation();
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        icon_btn("fs-prev", icons::SKIP_BACK, false)
-                                            .disabled(!has_track)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.player.update(cx, |p, cx| p.previous(cx));
-                                                cx.stop_propagation();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("fs-play")
-                                            .primary()
-                                            .large()
-                                            .icon(if playing {
-                                                app_icon(icons::PAUSE)
-                                            } else {
-                                                app_icon(icons::PLAY)
-                                            })
-                                            .loading(buffering)
-                                            .disabled(!has_track)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.player.update(cx, |p, cx| p.toggle_play(cx));
-                                                cx.stop_propagation();
-                                            })),
-                                    )
-                                    .child(
-                                        icon_btn("fs-next", icons::SKIP_FORWARD, false)
-                                            .disabled(!has_track)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.player.update(cx, |p, cx| p.next(cx));
-                                                cx.stop_propagation();
-                                            })),
-                                    )
-                                    .child(
-                                        icon_btn(
-                                            "fs-repeat",
-                                            if repeat == RepeatMode::One {
-                                                icons::REPEAT_1
-                                            } else {
-                                                icons::REPEAT
-                                            },
-                                            repeat != RepeatMode::Off,
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.player.update(cx, |p, cx| p.cycle_repeat(cx));
-                                                cx.stop_propagation();
-                                            }),
-                                        ),
-                                    ),
-                            )
-                            // Queue / Lyrics toggles — larger.
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .child(
-                                        Button::new("fs-queue-btn")
-                                            .ghost()
-                                            .large()
-                                            .icon(Icon::new(IconName::PanelRight))
-                                            .label("Queue")
-                                            .when(self.panel == Some(SidePanel::Queue), |b| {
-                                                b.primary()
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_panel(SidePanel::Queue, cx);
-                                                cx.stop_propagation();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("fs-lyrics-btn")
-                                            .ghost()
-                                            .large()
-                                            .icon(Icon::new(IconName::BookOpen))
-                                            .label("Lyrics")
-                                            .when(self.panel == Some(SidePanel::Lyrics), |b| {
-                                                b.primary()
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_panel(SidePanel::Lyrics, cx);
-                                                cx.stop_propagation();
-                                            })),
-                                    ),
-                            ),
-                    )
-                    // Short vertical volume slider, right of the controls —
-                    // off by default (the player bar already has one), opt-in
-                    // via settings; always hidden during live radio.
-                    .when(show_volume && !is_radio, |this| {
-                        this.child(
-                            v_flex()
-                                .h_full()
-                                .flex_none()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
+                                // Seek bar.
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(app_icon(icons::VOLUME_HIGH)),
+                                    h_flex()
+                                        .w_full()
+                                        .max_w(px(640.))
+                                        .gap_3()
+                                        .items_center()
+                                        .when(is_radio, |this| {
+                                            this.child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().accent)
+                                                    .text_center()
+                                                    .child("● LIVE"),
+                                            )
+                                        })
+                                        .when(!is_radio, |this| {
+                                            this.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(time_now),
+                                            )
+                                            .map(|this| {
+                                                match (waveform_enabled, self.waveform.clone()) {
+                                                    (true, Some(peaks)) => {
+                                                        this.child(crate::ui::waveform_seek_bar(
+                                                            &peaks,
+                                                            seek_fraction,
+                                                            34.,
+                                                            cx.theme().primary,
+                                                            cx.theme()
+                                                                .muted_foreground
+                                                                .opacity(0.35),
+                                                            self.player.clone(),
+                                                        ))
+                                                    }
+                                                    _ => this.child(
+                                                        div()
+                                                            .flex_1()
+                                                            .child(Slider::new(&self.seek)),
+                                                    ),
+                                                }
+                                            })
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(time_total),
+                                            )
+                                        }),
                                 )
+                                // Stream info + ReplayGain: quiet, centered line.
+                                .when(stream_info.is_some() || replay_gain.is_some(), |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                            .when_some(stream_info, |this, info| {
+                                                this.child(div().child(info))
+                                            })
+                                            .when_some(replay_gain, |this, (label, db)| {
+                                                let text = match db {
+                                                    Some(db) => format!("RG {db:+.1} dB · {label}"),
+                                                    None => format!("RG · {label}"),
+                                                };
+                                                this.child(div().child(text))
+                                            }),
+                                    )
+                                })
+                                // Transport controls.
                                 .child(
-                                    // gpui-component's vertical slider is a fixed
-                                    // 120px tall; match it so the high/low icons sit
-                                    // symmetrically at each end (no dead space).
-                                    div()
-                                        .h(px(120.))
-                                        .flex()
+                                    h_flex()
+                                        .w_full()
+                                        .gap_4()
                                         .items_center()
                                         .justify_center()
-                                        .child(Slider::new(&self.volume).vertical()),
+                                        .child(
+                                            icon_btn("fs-shuffle", icons::SHUFFLE, shuffle)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.player
+                                                        .update(cx, |p, cx| p.toggle_shuffle(cx));
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            icon_btn("fs-prev", icons::SKIP_BACK, false)
+                                                .disabled(!has_track)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.player.update(cx, |p, cx| p.previous(cx));
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("fs-play")
+                                                .primary()
+                                                .large()
+                                                .icon(if playing {
+                                                    app_icon(icons::PAUSE)
+                                                } else {
+                                                    app_icon(icons::PLAY)
+                                                })
+                                                .loading(buffering)
+                                                .disabled(!has_track)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.player
+                                                        .update(cx, |p, cx| p.toggle_play(cx));
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            icon_btn("fs-next", icons::SKIP_FORWARD, false)
+                                                .disabled(!has_track)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.player.update(cx, |p, cx| p.next(cx));
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            icon_btn(
+                                                "fs-repeat",
+                                                if repeat == RepeatMode::One {
+                                                    icons::REPEAT_1
+                                                } else {
+                                                    icons::REPEAT
+                                                },
+                                                repeat != RepeatMode::Off,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.player
+                                                        .update(cx, |p, cx| p.cycle_repeat(cx));
+                                                    cx.stop_propagation();
+                                                }),
+                                            ),
+                                        ),
                                 )
+                                // Queue / visualizer / lyrics toggles, ruled
+                                // off below the transport exactly as the mini
+                                // player rules off its scene picker.
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(app_icon(icons::VOLUME_LOW)),
-                                )
-                                .when(detailed_volume, |this| {
-                                    this.child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_3()
+                                        .items_center()
+                                        .justify_center()
+                                        .pt_4()
+                                        .border_t_1()
+                                        .border_color(cx.theme().border.opacity(0.4))
+                                        .child(
+                                            Button::new("fs-queue-btn")
+                                                .ghost()
+                                                .large()
+                                                .icon(Icon::new(IconName::PanelRight))
+                                                .label("Queue")
+                                                .when(self.panel == Some(SidePanel::Queue), |b| {
+                                                    b.primary()
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_panel(SidePanel::Queue, cx);
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("fs-viz-btn")
+                                                .ghost()
+                                                .large()
+                                                .icon(Icon::new(IconName::Frame))
+                                                .label(viz_mode.label())
+                                                .when(viz_mode.is_on(), |b| b.primary())
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cycle_visualizer(cx);
+                                                    cx.stop_propagation();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("fs-lyrics-btn")
+                                                .ghost()
+                                                .large()
+                                                .icon(Icon::new(IconName::BookOpen))
+                                                .label("Lyrics")
+                                                .when(self.panel == Some(SidePanel::Lyrics), |b| {
+                                                    b.primary()
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_panel(SidePanel::Lyrics, cx);
+                                                    cx.stop_propagation();
+                                                })),
+                                        ),
+                                ),
+                        )
+                        // Short vertical volume slider, right of the controls —
+                        // off by default (the player bar already has one), opt-in
+                        // via settings; always hidden during live radio.
+                        .when(show_volume && !is_radio, |this| {
+                            this.child(
+                                v_flex()
+                                    .h_full()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
                                         div()
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(format!(
-                                                "{}%",
-                                                (volume_level * 100.).round() as u32
-                                            )),
+                                            .child(app_icon(icons::VOLUME_HIGH)),
                                     )
-                                }),
-                        )
-                    })
-                    // Optional side panel.
-                    .when_some(self.panel, |this, panel| {
-                        this.child(match panel {
-                            SidePanel::Queue => self.render_queue_panel(cx),
-                            SidePanel::Lyrics => self.render_lyrics_panel(cx),
+                                    .child(
+                                        // gpui-component's vertical slider is a fixed
+                                        // 120px tall; match it so the high/low icons sit
+                                        // symmetrically at each end (no dead space).
+                                        div()
+                                            .h(px(120.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Slider::new(&self.volume).vertical()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(app_icon(icons::VOLUME_LOW)),
+                                    )
+                                    .when(detailed_volume, |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!(
+                                                    "{}%",
+                                                    (volume_level * 100.).round() as u32
+                                                )),
+                                        )
+                                    }),
+                            )
                         })
-                    }),
-            );
+                        // Optional side panel.
+                        .when_some(self.panel, |this, panel| {
+                            this.child(match panel {
+                                SidePanel::Queue => self.render_queue_panel(cx),
+                                SidePanel::Lyrics => self.render_lyrics_panel(cx),
+                            })
+                        });
 
-        // Entrance fades/slides in on mount; exit reverses it before unmount.
-        if self.closing {
-            root.with_animation(
-                "fs-exit",
-                Animation::new(Duration::from_secs_f64(0.19)).with_easing(ease_out_quint()),
-                |this, delta| this.opacity(1. - delta).top(px(delta * 24.)),
-            )
-            .into_any_element()
-        } else {
-            root.with_animation(
-                "fs-enter",
-                Animation::new(Duration::from_secs_f64(0.22)).with_easing(ease_out_quint()),
-                |this, delta| this.opacity(delta).top(px((1. - delta) * 24.)),
-            )
-            .into_any_element()
-        }
+                    // Content trails the backdrop and travels further, so the
+                    // overlay reads as art rising into place rather than one flat
+                    // layer sliding. Entrance only: on the way out it stays put
+                    // while the whole overlay drops, which keeps the exit from
+                    // looking like two things leaving at different speeds.
+                    content.opacity(content_fade).top(px(content_rise))
+                })
+            })
+            .when_some(mini_player, |root, mini| root.child(mini))
     }
 }

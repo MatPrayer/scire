@@ -8,9 +8,11 @@
 
 mod engine;
 mod source;
+pub mod spectrum;
 pub mod waveform;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -112,6 +114,7 @@ pub struct PlaybackError(pub String);
 #[derive(Debug, Clone)]
 pub struct Player {
     tx: mpsc::UnboundedSender<Command>,
+    tap: Arc<spectrum::SpectrumTap>,
 }
 
 impl Player {
@@ -121,8 +124,16 @@ impl Player {
     pub fn new() -> (Player, mpsc::UnboundedReceiver<Event>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        engine::spawn(cmd_rx, event_tx);
-        (Player { tx: cmd_tx }, event_rx)
+        let tap = spectrum::SpectrumTap::new();
+        engine::spawn(cmd_rx, event_tx, tap.clone());
+        (Player { tx: cmd_tx, tap }, event_rx)
+    }
+
+    /// Live window onto the samples reaching the output device, for
+    /// visualizers. Reading it never blocks the audio thread; see
+    /// [`spectrum::SpectrumTap`].
+    pub fn spectrum_tap(&self) -> Arc<spectrum::SpectrumTap> {
+        self.tap.clone()
     }
 
     pub fn play(&self, source: TrackSource) {

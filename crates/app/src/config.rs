@@ -12,8 +12,7 @@ use crate::state::queue::RepeatMode;
 const KEYRING_SERVICE: &str = "scire";
 
 pub(crate) fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("", "", "scire")
-        .context("cannot determine platform config directories")
+    ProjectDirs::from("", "", "scire").context("cannot determine platform config directories")
 }
 
 pub fn settings_path() -> Result<PathBuf> {
@@ -96,6 +95,9 @@ pub struct Settings {
     pub local_music_dirs: Vec<PathBuf>,
     /// Show the vertical volume slider in the fullscreen now-playing overlay.
     pub fullscreen_volume: bool,
+    /// Scene drawn by the fullscreen visualizer; Off hides it. Persisted so the
+    /// overlay comes back the way it was left.
+    pub visualizer: VisualizerMode,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -157,6 +159,82 @@ pub enum FullscreenBackground {
     BlurredArt,
     /// Slowly rotating album-palette gradient.
     Animated,
+}
+
+/// Scene drawn by the fullscreen 3D audio visualizer. The fullscreen player's
+/// button cycles through these in declaration order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerMode {
+    #[default]
+    Off,
+    /// Alternate between the scenes by itself, switching on the music (see
+    /// `ui::visualizer::OnsetSwitcher`).
+    Auto,
+    /// Scrolling spectrum landscape: frequency across, time into the distance.
+    Terrain,
+    /// Flight through rings whose radius is modulated by the spectrum.
+    Tunnel,
+    /// Rotating point cloud displaced along its normals by the spectrum.
+    Sphere,
+    /// Randomly generated wireframe shapes flying at the camera over a
+    /// reactive background — the 2000s media-player look.
+    Retro,
+    /// Wireframe icosphere: bass inflates it, treble roughens its surface.
+    Orb,
+}
+
+impl VisualizerMode {
+    /// Next mode in the cycle, wrapping back to `Off`. `Auto` comes first so
+    /// the music-driven mode — the point of the feature — is one click away,
+    /// with the pinned single scenes after it.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Auto,
+            Self::Auto => Self::Terrain,
+            Self::Terrain => Self::Tunnel,
+            Self::Tunnel => Self::Sphere,
+            Self::Sphere => Self::Retro,
+            Self::Retro => Self::Orb,
+            Self::Orb => Self::Off,
+        }
+    }
+
+    /// Button label: the scene's name while it is running, otherwise the
+    /// feature's name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Visualizer",
+            Self::Auto => "Auto",
+            Self::Terrain => "Terrain",
+            Self::Tunnel => "Tunnel",
+            Self::Sphere => "Sphere",
+            Self::Retro => "Retro",
+            Self::Orb => "Orb",
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Label inside the scene menu, where "Off" is one option among many and
+    /// the button-face wording ("Visualizer") would make no sense.
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            other => other.label(),
+        }
+    }
+
+    /// The scenes, i.e. everything except the two behaviours (`Off`, `Auto`).
+    pub const SCENES: [VisualizerMode; 5] = [
+        VisualizerMode::Terrain,
+        VisualizerMode::Tunnel,
+        VisualizerMode::Sphere,
+        VisualizerMode::Retro,
+        VisualizerMode::Orb,
+    ];
 }
 
 /// What happens when the play queue reaches its end.
@@ -238,6 +316,7 @@ impl Default for Settings {
             fullscreen_bg: FullscreenBackground::Gradient,
             local_music_dirs: Vec::new(),
             fullscreen_volume: false,
+            visualizer: VisualizerMode::Off,
         }
     }
 }
