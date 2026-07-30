@@ -54,7 +54,13 @@ playback = { path = "crates/playback" }
 
 [profile.dev]
 opt-level = 0
-debug = true
+# Full DWARF made each dev binary ~800MB; cargo keeps every stale hashed copy,
+# so target/debug grew to 43GB. Line tables keep backtraces useful (file:line)
+# at a fraction of the size — the tradeoff is no local-variable inspection in a
+# debugger. "unpacked" leaves debug info in the .o files instead of copying it
+# into every linked binary.
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
 incremental = true
 
 [profile.dev.package.gpui]
