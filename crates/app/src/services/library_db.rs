@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
@@ -98,6 +99,9 @@ INSERT INTO _schema_version (version) VALUES (1);
 /// Thread-safe handle to the music library SQLite database.
 pub struct LibraryDb {
     pub(crate) conn: Mutex<Connection>,
+    /// Monotonic counter bumped after every local scan completes.
+    /// Views cheaply detect whether data changed without re-querying.
+    scan_version: AtomicU64,
 }
 
 impl LibraryDb {
@@ -106,6 +110,7 @@ impl LibraryDb {
         let conn = Connection::open(path)?;
         let db = Self {
             conn: Mutex::new(conn),
+            scan_version: AtomicU64::new(0),
         };
         db.run_migrations()?;
         Ok(db)
@@ -116,9 +121,20 @@ impl LibraryDb {
         let conn = Connection::open_in_memory()?;
         let db = Self {
             conn: Mutex::new(conn),
+            scan_version: AtomicU64::new(0),
         };
         db.run_migrations()?;
         Ok(db)
+    }
+
+    /// Monotonic counter bumped after every local scan completes.
+    pub fn scan_version(&self) -> u64 {
+        self.scan_version.load(Ordering::Relaxed)
+    }
+
+    /// Bump the scan version, signalling to views that data may have changed.
+    pub fn bump_scan_version(&self) {
+        self.scan_version.fetch_add(1, Ordering::Relaxed);
     }
 
     // ------------------------------------------------------------------

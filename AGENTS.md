@@ -19,7 +19,7 @@ cargo fmt --all
 
 ## Critical quirks (will cause bugs if missed)
 
-- **Local library is early-stage WIP** — album grid queries DB on every render (no caching), periodic scan is naive (no file-watch), cover cache has no eviction, scanner is single-threaded. Expect rough edges on large libraries (>10k tracks).
+- **Local library** — album grid caches DB reads via `scan_version` counter (no re-query per frame). **LocalAlbumDetailView** shows track listing with play/shuffle/queue per track (no star/rating — not in local DB schema). Periodic scan is naive (no file-watch), cover cache has no eviction, scanner is single-threaded.
 - **`TrackSource.path` for local files**: when `path` is `Some`, the engine calls `source::open_local()` which reads the file directly — the `url` field is ignored for IO (still used for display). Always set `path: None` for Subsonic HTTP streams.
 - **`SourceReader` enum**: `crates/playback/src/source.rs` defines `SourceReader::Http(StreamDownload)` and `SourceReader::Local(File)`. Both implement `Read + Seek` so `rodio::Decoder` accepts either. Do NOT add a third variant without updating both match arms in `source.rs`.
 - **`local_music_dirs` milestone tracking**: local music support is implemented incrementally across M1–M9. Check which milestone the current task belongs to before editing shared code paths (`TrackSource`, `PlayerState::stream_url()`, config/settings).

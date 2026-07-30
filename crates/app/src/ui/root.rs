@@ -25,7 +25,8 @@ use crate::ui::albums::{AlbumsEvent, AlbumsView};
 use crate::ui::artists::{ArtistDetailEvent, ArtistDetailView, ArtistsEvent, ArtistsView};
 use crate::ui::favorites::{FavoritesEvent, FavoritesView};
 use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
-use crate::ui::local_music::LocalMusicView;
+use crate::ui::local_album_detail::LocalAlbumDetailView;
+use crate::ui::local_music::{LocalMusicEvent, LocalMusicView};
 use crate::ui::player_bar::{PlayerBar, PlayerBarEvent};
 use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
 use crate::ui::queue_panel::QueuePanel;
@@ -39,6 +40,7 @@ use crate::ui::sidebar::{NavSection, SidebarAction, SidebarModel, render_sidebar
 enum NavEntry {
     Section(NavSection),
     Album(String),
+    LocalAlbum(String),
     Artist(String),
     Playlist(String),
 }
@@ -49,6 +51,7 @@ enum Content {
     ArtistDetail(Entity<ArtistDetailView>),
     AlbumDetail(Entity<AlbumDetailView>),
     Favorites(Entity<FavoritesView>),
+    LocalAlbumDetail(Entity<LocalAlbumDetailView>),
     Playlist(Entity<PlaylistDetailView>),
     Radio(Entity<RadioView>),
     Settings(Entity<SettingsView>),
@@ -418,6 +421,11 @@ impl RootView {
                 let view = cx.new(|cx| {
                     LocalMusicView::new(self.library_db.clone(), self.player.clone(), cx)
                 });
+                cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+                    let LocalMusicEvent::OpenAlbum(id) = event;
+                    this.open_local_album(id.clone(), cx);
+                })
+                .detach();
                 Content::LocalMusic(view)
             }
             NavSection::Settings => {
@@ -474,6 +482,7 @@ impl RootView {
         match entry {
             NavEntry::Section(section) => self.navigate(section, Some(window), cx),
             NavEntry::Album(id) => self.open_album(id, cx),
+            NavEntry::LocalAlbum(id) => self.open_local_album(id, cx),
             NavEntry::Artist(id) => self.open_artist(id, cx),
             NavEntry::Playlist(id) => self.open_playlist(id, window, cx),
         }
@@ -498,6 +507,16 @@ impl RootView {
         })
         .detach();
         self.content = Some(Content::AlbumDetail(view));
+        cx.notify();
+    }
+
+    fn open_local_album(&mut self, id: String, cx: &mut Context<Self>) {
+        self.push_history();
+        self.current_entry = Some(NavEntry::LocalAlbum(id.clone()));
+        let view = cx.new(|cx| {
+            LocalAlbumDetailView::new(self.library_db.clone(), self.player.clone(), id, cx)
+        });
+        self.content = Some(Content::LocalAlbumDetail(view));
         cx.notify();
     }
 
@@ -891,6 +910,7 @@ impl Render for RootView {
             Some(Content::Artists(v)) => v.clone().into_any_element(),
             Some(Content::ArtistDetail(v)) => v.clone().into_any_element(),
             Some(Content::AlbumDetail(v)) => v.clone().into_any_element(),
+            Some(Content::LocalAlbumDetail(v)) => v.clone().into_any_element(),
             Some(Content::Favorites(v)) => v.clone().into_any_element(),
             Some(Content::Playlist(v)) => v.clone().into_any_element(),
             Some(Content::Radio(v)) => v.clone().into_any_element(),

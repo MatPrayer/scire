@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Window, div, img, prelude::*,
-    px,
+    Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle, SharedString, Window, div,
+    img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -28,13 +28,22 @@ enum QueueMode {
     Enqueue,
 }
 
+#[derive(Clone)]
+pub enum LocalMusicEvent {
+    OpenAlbum(String),
+}
+
 pub struct LocalMusicView {
     db: Arc<LibraryDb>,
     player: Entity<PlayerState>,
     albums: Vec<AlbumRow>,
     art_paths: HashMap<String, PathBuf>,
     scroll: ScrollHandle,
+    /// Last seen scan_version — reload albums only when it changes.
+    scan_version: u64,
 }
+
+impl EventEmitter<LocalMusicEvent> for LocalMusicView {}
 
 impl LocalMusicView {
     pub fn new(db: Arc<LibraryDb>, player: Entity<PlayerState>, cx: &mut Context<Self>) -> Self {
@@ -44,6 +53,7 @@ impl LocalMusicView {
             albums: Vec::new(),
             art_paths: HashMap::new(),
             scroll: ScrollHandle::new(),
+            scan_version: 0,
         };
         view.refresh(cx);
         view
@@ -51,14 +61,15 @@ impl LocalMusicView {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.albums = self.db.albums_by_source("local").unwrap_or_default();
+        self.scan_version = self.db.scan_version();
         // Pre-populate art paths for covers already cached on disk.
         for a in &self.albums {
-            if !self.art_paths.contains_key(&a.id) {
-                if let Some(ref hash) = a.cover_art
-                    && let Some(path) = local_art_path(hash)
-                {
-                    self.art_paths.insert(a.id.clone(), path);
-                }
+            if !self.art_paths.contains_key(&a.id)
+                && let Some(ref hash) = a.cover_art
+                && let Some(path) = local_art_path(hash)
+                && path.exists()
+            {
+                self.art_paths.insert(a.id.clone(), path);
             }
         }
         cx.notify();
@@ -88,11 +99,12 @@ impl LocalMusicView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = album.id.clone();
-        let play_id = album.id.clone();
-        let art = self.art_paths.get(&album.id).cloned();
+        let play_id = id.clone();
+        let art = self.art_paths.get(&id).cloned();
         let name = album.title.clone();
         let artist = album.artist.clone().unwrap_or_default();
         let year = album.year.map(|y| y.to_string()).unwrap_or_default();
+        let sc = album.song_count;
         let view = cx.entity();
 
         v_flex()
@@ -108,8 +120,8 @@ impl LocalMusicView {
             .hover(|s| s.bg(cx.theme().muted))
             .on_click(cx.listener({
                 let click_id = id.clone();
-                move |this, _, _, cx| {
-                    this.queue_album(click_id.clone(), QueueMode::Play, cx);
+                move |_this, _, _, cx| {
+                    cx.emit(LocalMusicEvent::OpenAlbum(click_id.clone()));
                 }
             }))
             .child(
@@ -152,6 +164,14 @@ impl LocalMusicView {
                             .truncate()
                             .child(artist),
                     )
+                    .when(sc > 0, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{sc} tracks")),
+                        )
+                    })
                     .when(!year.is_empty(), |this| {
                         this.child(
                             div()
@@ -179,17 +199,10 @@ impl LocalMusicView {
 
 impl Render for LocalMusicView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Re-read albums from DB so background scan results appear without
-        // manual refresh.
-        self.albums = self.db.albums_by_source("local").unwrap_or_default();
-        for a in &self.albums {
-            if !self.art_paths.contains_key(&a.id) {
-                if let Some(ref hash) = a.cover_art
-                    && let Some(path) = local_art_path(hash)
-                {
-                    self.art_paths.insert(a.id.clone(), path);
-                }
-            }
+        // Refresh only when scan completed (scan_version bumped).
+        let cur_ver = self.db.scan_version();
+        if cur_ver != self.scan_version {
+            self.refresh(cx);
         }
 
         let tile = 160_f32; // ponytail: fixed tile size, make configurable later

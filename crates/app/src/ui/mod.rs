@@ -3,6 +3,7 @@ pub mod albums;
 pub mod artists;
 pub mod favorites;
 pub mod fullscreen_player;
+pub mod local_album_detail;
 pub mod local_music;
 pub mod player_bar;
 pub mod playlist_detail;

@@ -57,6 +57,14 @@ impl LocalScanner {
             scan_dir(self.db.clone(), dir, &exts, &self.progress, &mut seen)?;
         }
         cleanup_stale_entries(&self.db, &seen);
+        // Update album stats from tracks (avoids per-file accounting).
+        let _ = self.db.conn.lock().unwrap().execute_batch(
+            "UPDATE albums SET
+               song_count = (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id),
+               duration   = (SELECT COALESCE(SUM(duration), 0) FROM tracks WHERE tracks.album_id = albums.id)
+             WHERE source = 'local'",
+        );
+        self.db.bump_scan_version();
         self.status.store(DONE, Ordering::Relaxed);
         Ok(())
     }
@@ -125,10 +133,11 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
     let id = path_to_id(&canonical, "local");
 
     // ponytail: O(n) lookup per file; fine until ~10k files. Add index if slow.
-    if let Ok(Some(existing)) = db.get_track(&id) {
-        if existing.file_modified.is_some() && existing.file_modified == modified {
-            return Ok(());
-        }
+    if let Ok(Some(existing)) = db.get_track(&id)
+        && existing.file_modified.is_some()
+        && existing.file_modified == modified
+    {
+        return Ok(());
     }
 
     let tagged = match lofty::read_from_path(path) {

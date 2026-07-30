@@ -615,6 +615,22 @@ impl PlayerState {
     /// (and the OS media-control metadata) survives the switch untouched
     /// instead of blanking and reloading between them.
     fn refresh_current_art(&mut self, cx: &mut Context<Self>) {
+        // Local track: resolve cover from local_art_path directly.
+        if let Some(song) = self.current_song()
+            && song.local_path.is_some()
+            && let Some(hash) = &song.cover_art
+            && let Some(path) = crate::services::local_library::local_art_path(hash)
+            && path.exists()
+        {
+            let new_key = Some(hash.clone());
+            if new_key == self.current_art_key && self.current_art_path.is_some() {
+                return;
+            }
+            self.current_art_key = new_key;
+            self.current_art_path = Some(path);
+            self.sync_media_metadata();
+            return;
+        }
         let cover = self.current_song().and_then(artwork::song_cover);
         let new_key = cover.as_ref().map(|(_, key)| key.clone());
         if new_key == self.current_art_key && (new_key.is_none() || self.current_art_path.is_some())

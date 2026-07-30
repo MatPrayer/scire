@@ -80,7 +80,7 @@ Log in with your Navidrome URL, username and password — or point **Settings �
 | **OS media keys** | Media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS) |
 | **Artwork cache** | LRU-evicted disk cache (configurable cap) · HiDPI-aware resolution bump · album-scoped keys, so Navidrome's per-song cover ids don't re-download identical art |
 | **Navigation** | Mouse back/forward buttons · bracket keys · configurable default page |
-| **Local music** | Directory scanner (`lofty` tags + `folder.jpg` / embedded art) into a SQLite library · incremental mtime-based rescan · periodic background scan · album grid with context menus |
+| **Local music** | Directory scanner (`lofty` tags + `folder.jpg` / embedded art) into a SQLite library · incremental mtime-based rescan · periodic background scan · album grid with cover art (cached, no re-query per frame) · album detail view with track listing, play/shuffle/queue per track · cover art in player bar + fullscreen player · engine reads local files via `SourceReader` |
 
 ## Keyboard Shortcuts
 
@@ -216,7 +216,8 @@ scire/
 │               ├── album_detail.rs
 │               ├── artists.rs
 │               ├── favorites.rs
-│               ├── local_music.rs   # Local music browser
+│               ├── local_music.rs # Local music album grid
+│               ├── local_album_detail.rs # Local album detail view
 │               ├── recent.rs
 │               ├── search_bar.rs    # Inline search + command palette
 │               ├── settings.rs

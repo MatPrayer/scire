@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**Scirè** — cross-platform (macOS + Linux) desktop music client for [Navidrome](https://www.navidrome.org/) servers and local music files, built with GPUI (Zed's UI framework) + [gpui-component](https://github.com/longbridge/gpui-component). Speaks Subsonic API v1.16.1 + OpenSubsonic; identifies as `scire` in the Subsonic `c` param. Local music support (early WIP, M1–M9): engine reads local files via `SourceReader::Local(File)`, album grid UI with cover art, incremental mtime-based scanner, periodic background scan (5 min). See `README.md` for the user-facing feature list and Linux build deps.
+**Scirè** — cross-platform (macOS + Linux) desktop music client for [Navidrome](https://www.navidrome.org/) servers and local music files, built with GPUI (Zed's UI framework) + [gpui-component](https://github.com/longbridge/gpui-component). Speaks Subsonic API v1.16.1 + OpenSubsonic; identifies as `scire` in the Subsonic `c` param. Local music support: engine reads local files via `SourceReader::Local(File)`, album grid UI with cover art (DB cached via `scan_version` counter), album detail view with track listing (`LocalAlbumDetailView`), incremental mtime-based scanner, periodic background scan (5 min). See `README.md` for the user-facing feature list and Linux build deps.
 
 ## Commands
 
