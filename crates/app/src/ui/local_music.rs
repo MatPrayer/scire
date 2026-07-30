@@ -37,11 +37,7 @@ pub struct LocalMusicView {
 }
 
 impl LocalMusicView {
-    pub fn new(
-        db: Arc<LibraryDb>,
-        player: Entity<PlayerState>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(db: Arc<LibraryDb>, player: Entity<PlayerState>, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             db,
             player,
@@ -69,7 +65,9 @@ impl LocalMusicView {
     }
 
     fn queue_album(&mut self, album_id: String, mode: QueueMode, cx: &mut Context<Self>) {
-        let Ok(tracks) = self.db.tracks_by_album(&album_id) else { return };
+        let Ok(tracks) = self.db.tracks_by_album(&album_id) else {
+            return;
+        };
         let songs: Vec<_> = tracks.into_iter().map(|t| t.into_song()).collect();
         if songs.is_empty() {
             return;
@@ -228,15 +226,15 @@ impl Render for LocalMusicView {
                 h_flex()
                     .items_center()
                     .gap_4()
-                    .child(
-                        div()
-                            .child(format!(
-                                "Local Music  ({})",
-                                self.albums.len()
-                            )),
-                    ),
+                    .child(div().child(format!("Local Music  ({})", self.albums.len()))),
             )
-            .child(h_flex().flex_wrap().justify_center().gap_4().children(cards))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_4()
+                    .children(cards),
+            )
             .into_any_element()
     }
 }

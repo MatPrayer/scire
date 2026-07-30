@@ -177,8 +177,22 @@ impl LibraryDb {
               track_no, disc_number, year, genre, duration, local_path, cover_art, file_modified)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             rusqlite::params![
-                id, source, title, artist, artist_id, album, album_id, album_artist,
-                track_no, disc_number, year, genre, duration, local_path, cover_art, file_modified
+                id,
+                source,
+                title,
+                artist,
+                artist_id,
+                album,
+                album_id,
+                album_artist,
+                track_no,
+                disc_number,
+                year,
+                genre,
+                duration,
+                local_path,
+                cover_art,
+                file_modified
             ],
         )?;
         Ok(())
@@ -212,7 +226,11 @@ impl LibraryDb {
     }
 
     /// Search tracks by title, artist, or album (LIKE %query%).
-    pub fn search_tracks(&self, query: &str, limit: usize) -> Result<Vec<TrackRow>, rusqlite::Error> {
+    pub fn search_tracks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{query}%");
         let mut stmt = conn.prepare(
@@ -328,7 +346,9 @@ impl LibraryDb {
             "INSERT OR REPLACE INTO albums
              (id, source, title, artist, artist_id, year, cover_art, song_count, duration)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            rusqlite::params![id, source, title, artist, artist_id, year, cover_art, song_count, duration],
+            rusqlite::params![
+                id, source, title, artist, artist_id, year, cover_art, song_count, duration
+            ],
         )?;
         Ok(())
     }
@@ -476,7 +496,10 @@ impl LibraryDb {
         rows.collect()
     }
 
-    pub fn playlist_entries(&self, playlist_id: &str) -> Result<Vec<PlaylistEntryRow>, rusqlite::Error> {
+    pub fn playlist_entries(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<PlaylistEntryRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, playlist_id, track_source, track_id, entry_order FROM playlist_entries WHERE playlist_id = ?1 ORDER BY entry_order"
@@ -495,8 +518,14 @@ impl LibraryDb {
 
     pub fn remove_playlist(&self, playlist_id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM playlist_entries WHERE playlist_id = ?1", rusqlite::params![playlist_id])?;
-        conn.execute("DELETE FROM playlists WHERE id = ?1", rusqlite::params![playlist_id])?;
+        conn.execute(
+            "DELETE FROM playlist_entries WHERE playlist_id = ?1",
+            rusqlite::params![playlist_id],
+        )?;
+        conn.execute(
+            "DELETE FROM playlists WHERE id = ?1",
+            rusqlite::params![playlist_id],
+        )?;
         Ok(())
     }
 }
@@ -604,7 +633,11 @@ mod tests {
 
     /// Helper: insert a minimal track with just id, source, title.
     fn insert_minimal(db: &LibraryDb, id: &str, source: &str, title: &str) {
-        db.upsert_track(id, source, title, None, None, None, None, None, None, None, None, None, None, None, None, None).unwrap();
+        db.upsert_track(
+            id, source, title, None, None, None, None, None, None, None, None, None, None, None,
+            None, None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -612,7 +645,9 @@ mod tests {
         let db = test_db();
         let conn = db.conn.lock().unwrap();
         let version: i32 = conn
-            .query_row("SELECT MAX(version) FROM _schema_version", [], |row| row.get(0))
+            .query_row("SELECT MAX(version) FROM _schema_version", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(version, 2);
     }
@@ -621,7 +656,13 @@ mod tests {
     fn tables_exist() {
         let db = test_db();
         let conn = db.conn.lock().unwrap();
-        for table in &["tracks", "albums", "artists", "playlists", "playlist_entries"] {
+        for table in &[
+            "tracks",
+            "albums",
+            "artists",
+            "playlists",
+            "playlist_entries",
+        ] {
             let count: i32 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -684,7 +725,25 @@ mod tests {
     #[test]
     fn search_tracks_finds_by_artist() {
         let db = test_db();
-        db.upsert_track("t1", "local", "Song", Some("The Beatles"), None, None, None, None, None, None, None, None, None, None, None, None).unwrap();
+        db.upsert_track(
+            "t1",
+            "local",
+            "Song",
+            Some("The Beatles"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let results = db.search_tracks("Beatles", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "t1");
@@ -693,9 +752,63 @@ mod tests {
     #[test]
     fn tracks_by_album_id() {
         let db = test_db();
-        db.upsert_track("t1", "local", "A", None, None, None, Some("alb1"), None, Some(1), None, None, None, None, None, None, None).unwrap();
-        db.upsert_track("t2", "local", "B", None, None, None, Some("alb1"), None, Some(2), None, None, None, None, None, None, None).unwrap();
-        db.upsert_track("t3", "local", "C", None, None, None, Some("alb2"), None, None, None, None, None, None, None, None, None).unwrap();
+        db.upsert_track(
+            "t1",
+            "local",
+            "A",
+            None,
+            None,
+            None,
+            Some("alb1"),
+            None,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.upsert_track(
+            "t2",
+            "local",
+            "B",
+            None,
+            None,
+            None,
+            Some("alb1"),
+            None,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.upsert_track(
+            "t3",
+            "local",
+            "C",
+            None,
+            None,
+            None,
+            Some("alb2"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let results = db.tracks_by_album("alb1").unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -713,8 +826,30 @@ mod tests {
     #[test]
     fn upsert_album_and_list() {
         let db = test_db();
-        db.upsert_album("alb1", "local", "Test Album", Some("Artist"), None, Some(2024), None, 12, 3600.0).unwrap();
-        db.upsert_album("alb2", "local", "Another Album", None, None, None, None, 8, 2400.0).unwrap();
+        db.upsert_album(
+            "alb1",
+            "local",
+            "Test Album",
+            Some("Artist"),
+            None,
+            Some(2024),
+            None,
+            12,
+            3600.0,
+        )
+        .unwrap();
+        db.upsert_album(
+            "alb2",
+            "local",
+            "Another Album",
+            None,
+            None,
+            None,
+            None,
+            8,
+            2400.0,
+        )
+        .unwrap();
         let albums = db.albums_by_source("local").unwrap();
         assert_eq!(albums.len(), 2);
         // Ordered by title COLLATE NOCASE
@@ -776,8 +911,10 @@ mod tests {
     #[test]
     fn upsert_and_list_playlist() {
         let db = test_db();
-        db.upsert_playlist("pl1", "My Favorites", Some("My favorite songs")).unwrap();
-        db.add_playlist_entry("pl1", Some("local"), Some("track1"), 0).unwrap();
+        db.upsert_playlist("pl1", "My Favorites", Some("My favorite songs"))
+            .unwrap();
+        db.add_playlist_entry("pl1", Some("local"), Some("track1"), 0)
+            .unwrap();
         db.add_playlist_entry("pl1", None, None, 1).unwrap();
         let entries = db.playlist_entries("pl1").unwrap();
         assert_eq!(entries.len(), 2);
@@ -793,7 +930,8 @@ mod tests {
     fn playlist_clear_entries() {
         let db = test_db();
         db.upsert_playlist("pl2", "Empty", None).unwrap();
-        db.add_playlist_entry("pl2", Some("local"), Some("t1"), 0).unwrap();
+        db.add_playlist_entry("pl2", Some("local"), Some("t1"), 0)
+            .unwrap();
         db.clear_playlist_entries("pl2").unwrap();
         assert!(db.playlist_entries("pl2").unwrap().is_empty());
     }

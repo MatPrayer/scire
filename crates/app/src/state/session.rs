@@ -119,13 +119,10 @@ impl Session {
 
             let ping_client = client.clone();
             let result = runtime::spawn_io(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    ping_client.ping(),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("ping timed out after 10 s"))?
-                .map_err(anyhow::Error::from)
+                tokio::time::timeout(std::time::Duration::from_secs(10), ping_client.ping())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("ping timed out after 10 s"))?
+                    .map_err(anyhow::Error::from)
             })
             .await;
 

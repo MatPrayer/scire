@@ -4,9 +4,7 @@ use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::switch::Switch;
-use gpui_component::{
-    ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex,
-};
+use gpui_component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 
 use crate::config::{
     CoverSize, DefaultPage, FullscreenBackground, QueueEndBehavior, ReplayGainMode, ThemePref,
@@ -841,52 +839,42 @@ impl Render for SettingsView {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Directories scanned for local music files"),
                             )
-                            .child(
-                                v_flex().gap_1().children(
-                                    local_music_dirs.iter().enumerate().map(|(i, p)| {
-                                        let p_str = p.to_string_lossy().to_string();
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .text_sm()
-                                                    .truncate()
-                                                    .child(p_str.clone()),
-                                            )
-                                            .child(
-                                                Button::new(("rm-local-dir", i))
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .icon(gpui_component::Icon::new(
-                                                        gpui_component::IconName::Close,
-                                                    ))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.remove_local_dir(i, cx);
-                                                        },
-                                                    )),
-                                            )
-                                            .into_any_element()
-                                    }),
-                                ),
-                            )
+                            .child(v_flex().gap_1().children(
+                                local_music_dirs.iter().enumerate().map(|(i, p)| {
+                                    let p_str = p.to_string_lossy().to_string();
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_sm()
+                                                .truncate()
+                                                .child(p_str.clone()),
+                                        )
+                                        .child(
+                                            Button::new(("rm-local-dir", i))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(gpui_component::Icon::new(
+                                                    gpui_component::IconName::Close,
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.remove_local_dir(i, cx);
+                                                })),
+                                        )
+                                        .into_any_element()
+                                }),
+                            ))
                             .child(
                                 h_flex()
                                     .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(300.))
-                                            .child(Input::new(&self.dir_input)),
-                                    )
-                                    .child(
-                                        Button::new("add-local-dir")
-                                            .label("Add")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.add_local_dir(window, cx);
-                                            })),
-                                    ),
+                                    .child(div().w(px(300.)).child(Input::new(&self.dir_input)))
+                                    .child(Button::new("add-local-dir").label("Add").on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.add_local_dir(window, cx);
+                                        }),
+                                    )),
                             ),
                     )
                     // Storage

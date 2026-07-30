@@ -66,12 +66,9 @@ pub(crate) async fn open(url: &str) -> Result<(SourceReader, Option<u64>), Playb
 /// Open a local file, returning a `SourceReader::Local`. The byte length is
 /// always known for local files.
 pub(crate) async fn open_local(path: &Path) -> Result<(SourceReader, Option<u64>), PlaybackError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| PlaybackError(format!("open local file: {e}")))?;
-    let len = file
-        .metadata()
-        .ok()
-        .map(|m| m.len());
+    let file =
+        std::fs::File::open(path).map_err(|e| PlaybackError(format!("open local file: {e}")))?;
+    let len = file.metadata().ok().map(|m| m.len());
     Ok((SourceReader::Local(file), len))
 }
 

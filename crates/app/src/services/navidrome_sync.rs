@@ -60,7 +60,9 @@ pub async fn sync_navidrome(
                 .map(|id| format!("navidrome:artist:{id}"));
 
             // Upsert artist
-            if let Some(artist_name) = &album.artist && let Some(aid) = &artist_id {
+            if let Some(artist_name) = &album.artist
+                && let Some(aid) = &artist_id
+            {
                 let _ = db.upsert_artist(aid, "navidrome", artist_name, None);
             }
 
@@ -133,10 +135,30 @@ mod tests {
     #[test]
     fn remove_navidrome_clears_tracks() {
         let db = test_db();
-        db.upsert_track("n1", "navidrome", "Song", None, None, None, None, None, None, None, None, None, None, None, None, None)
-            .unwrap();
-        db.upsert_track("l1", "local", "Local", None, None, None, None, None, None, None, None, None, None, None, None, None)
-            .unwrap();
+        db.upsert_track(
+            "n1",
+            "navidrome",
+            "Song",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.upsert_track(
+            "l1", "local", "Local", None, None, None, None, None, None, None, None, None, None,
+            None, None, None,
+        )
+        .unwrap();
         assert_eq!(db.track_count_by_source("navidrome").unwrap(), 1);
         assert_eq!(db.track_count_by_source("local").unwrap(), 1);
         remove_navidrome(&db).unwrap();

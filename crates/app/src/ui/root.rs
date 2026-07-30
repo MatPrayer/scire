@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{DefaultPage, ThemePref};
-use crate::services::{artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync, runtime};
+use crate::services::{
+    artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync, runtime,
+};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::radio::RadioState;
@@ -112,8 +114,7 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let player_bar =
-            cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
+        let player_bar = cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
         let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), cx));
         let radio = crate::state::radio::init(session.clone(), cx);
         let fullscreen = cx.new(|cx| FullscreenPlayer::new(player.clone(), session.clone(), cx));
@@ -161,7 +162,8 @@ impl RootView {
         cx.observe(&playlists, |_, _, cx| cx.notify()).detach();
 
         // -- First-time setup inputs --
-        let setup_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://music.example.com"));
+        let setup_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://music.example.com"));
         let setup_user = cx.new(|cx| InputState::new(window, cx).placeholder("username"));
         let setup_pass = cx.new(|cx| InputState::new(window, cx).placeholder("password"));
         let setup_dir = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/music"));
@@ -216,30 +218,21 @@ impl RootView {
             let should_scan = connected || has_local;
             if should_scan && !this.scan_started {
                 this.scan_started = true;
-                let dirs: Vec<_> = session
-                    .read(cx)
-                    .settings
-                    .local_music_dirs
-                    .clone();
+                let dirs: Vec<_> = session.read(cx).settings.local_music_dirs.clone();
                 if !dirs.is_empty() {
                     let lib_db = this.library_db.clone();
                     cx.spawn(async move |this, cx| {
                         let scanner = Arc::new(LocalScanner::new(lib_db));
                         let s = scanner.clone();
                         let d = dirs.clone();
-                        let _ = runtime::spawn_io(async move {
-                            s.scan(&d)
-                        })
-                        .await;
+                        let _ = runtime::spawn_io(async move { s.scan(&d) }).await;
                         let _ = this.update(cx, |_, _| {});
                         // Periodic background scan every 5 minutes.
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                             let s = scanner.clone();
                             let d = dirs.clone();
-                            let _ = runtime::spawn_io(async move {
-                                s.scan(&d)
-                            }).await;
+                            let _ = runtime::spawn_io(async move { s.scan(&d) }).await;
                             let _ = this.update(cx, |_, _| {});
                         }
                     })
@@ -582,7 +575,8 @@ impl RootView {
         let val = self.setup_dir_input.read(cx).value().trim().to_string();
         if !val.is_empty() {
             self.setup_local_dirs.push(PathBuf::from(val));
-            self.setup_dir_input.update(cx, |s, cx| s.set_value("", window, cx));
+            self.setup_dir_input
+                .update(cx, |s, cx| s.set_value("", window, cx));
             self.setup_error = None;
         }
     }
@@ -640,8 +634,16 @@ impl RootView {
                 .child(Input::new(input))
         };
 
-        let nav_btn_label = if self.setup_enable_navidrome { "✓ Enable Navidrome streaming" } else { "  Enable Navidrome streaming" };
-        let local_btn_label = if self.setup_enable_local { "✓ Enable Local Music" } else { "  Enable Local Music" };
+        let nav_btn_label = if self.setup_enable_navidrome {
+            "✓ Enable Navidrome streaming"
+        } else {
+            "  Enable Navidrome streaming"
+        };
+        let local_btn_label = if self.setup_enable_local {
+            "✓ Enable Local Music"
+        } else {
+            "  Enable Local Music"
+        };
 
         let dir_rows: Vec<gpui::AnyElement> = self
             .setup_local_dirs

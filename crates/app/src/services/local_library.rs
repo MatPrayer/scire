@@ -4,13 +4,13 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use anyhow::Result;
+use lofty::Accessor;
 use lofty::AudioFile;
 use lofty::TaggedFileExt;
-use lofty::Accessor;
 
 use crate::services::library_db::LibraryDb;
 
@@ -45,7 +45,9 @@ impl LocalScanner {
     pub fn scan(&self, dirs: &[PathBuf]) -> Result<()> {
         self.status.store(SCANNING, Ordering::Relaxed);
         self.progress.store(0, Ordering::Relaxed);
-        let exts = ["flac", "mp3", "ogg", "opus", "wav", "aiff", "aac", "m4a", "m4b"];
+        let exts = [
+            "flac", "mp3", "ogg", "opus", "wav", "aiff", "aac", "m4a", "m4b",
+        ];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for dir in dirs {
             if !dir.is_dir() {
@@ -90,7 +92,9 @@ fn scan_dir(
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) && name.starts_with('.') {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with('.')
+        {
             continue;
         }
         if path.is_dir() {
@@ -135,23 +139,29 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
         }
     };
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
-    let (title, artist, album_name, track_no, disc_number, year, genre) =
-        if let Some(tag) = tag {
-            (
-                tag.title()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").to_string()),
-                tag.artist().map(|s| s.to_string()),
-                tag.album().map(|s| s.to_string()),
-                tag.track(),
-                tag.disk(),
-                tag.year(),
-                tag.genre().map(|s| s.to_string()),
-            )
-        } else {
-            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").to_string();
-            (name, None, None, None, None, None, None)
-        };
+    let (title, artist, album_name, track_no, disc_number, year, genre) = if let Some(tag) = tag {
+        (
+            tag.title().map(|s| s.to_string()).unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string()
+            }),
+            tag.artist().map(|s| s.to_string()),
+            tag.album().map(|s| s.to_string()),
+            tag.track(),
+            tag.disk(),
+            tag.year(),
+            tag.genre().map(|s| s.to_string()),
+        )
+    } else {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        (name, None, None, None, None, None, None)
+    };
 
     let duration = tagged.properties().duration().as_secs_f64();
     let duration = if duration > 0.0 { Some(duration) } else { None };
@@ -197,9 +207,13 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
 
 /// Remove DB entries for files no longer on disk.
 fn cleanup_stale_entries(db: &LibraryDb, seen: &std::collections::HashSet<String>) {
-    let Ok(tracks) = db.tracks_by_source("local") else { return };
+    let Ok(tracks) = db.tracks_by_source("local") else {
+        return;
+    };
     for t in &tracks {
-        let Some(ref local_path) = t.local_path else { continue };
+        let Some(ref local_path) = t.local_path else {
+            continue;
+        };
         if !seen.contains(local_path) && !std::path::Path::new(local_path).exists() {
             let _ = db.delete_track(&t.id);
         }
@@ -209,7 +223,10 @@ fn cleanup_stale_entries(db: &LibraryDb, seen: &std::collections::HashSet<String
 /// Parse an .m3u/.m3u8 file, upsert playlist + entries into DB.
 fn import_m3u(db: &Arc<LibraryDb>, path: &Path, root_dir: &Path) -> Result<()> {
     let content = std::fs::read_to_string(path)?;
-    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Playlist");
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Playlist");
     let id = path_to_id(path, "playlist");
 
     db.upsert_playlist(&id, name, None)?;
@@ -229,7 +246,11 @@ fn import_m3u(db: &Arc<LibraryDb>, path: &Path, root_dir: &Path) -> Result<()> {
             PathBuf::from(line)
         } else {
             let rel = parent.join(line);
-            if rel.exists() { rel } else { root_dir.join(line) }
+            if rel.exists() {
+                rel
+            } else {
+                root_dir.join(line)
+            }
         };
         let track_path = std::fs::canonicalize(&track_path).unwrap_or(track_path);
         if !track_path.exists() {
@@ -257,7 +278,9 @@ fn extract_cover(path: &Path, _album: &Option<String>, _artist: &Option<String>)
     if let Some(parent) = path.parent() {
         for candidate in &["folder.jpg", "cover.jpg", "Folder.jpg", "Cover.jpg"] {
             let cp = parent.join(candidate);
-            if cp.is_file() && let Some(cached) = cache_cover_file(&cp) {
+            if cp.is_file()
+                && let Some(cached) = cache_cover_file(&cp)
+            {
                 return Some(cached);
             }
         }
@@ -363,7 +386,9 @@ mod tests {
     #[test]
     fn scan_nonexistent_dir_skips_gracefully() {
         let scanner = LocalScanner::new(test_db());
-        scanner.scan(&[PathBuf::from("/nonexistent_path_xyz")]).unwrap();
+        scanner
+            .scan(&[PathBuf::from("/nonexistent_path_xyz")])
+            .unwrap();
         assert_eq!(scanner.status(), DONE);
     }
 

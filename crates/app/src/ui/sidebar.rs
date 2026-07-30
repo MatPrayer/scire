@@ -266,11 +266,7 @@ pub fn render_sidebar(
             NavSection::Favorites,
         ))
         .child(nav_item("Radio", IconName::Globe, NavSection::Radio))
-        .child(nav_item(
-            "Local",
-            IconName::Folder,
-            NavSection::LocalMusic,
-        ))
+        .child(nav_item("Local", IconName::Folder, NavSection::LocalMusic))
         .child(div().px_3().child(super::divider()))
         .child(playlists_header)
         .child(
