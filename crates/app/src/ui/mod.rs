@@ -101,6 +101,167 @@ pub fn track_extras(
     parts.join(" · ")
 }
 
+/// Scrolling speed and end pauses for [`scrolling_line`].
+const MARQUEE_SPEED: f32 = 34.;
+const MARQUEE_HOLD: f32 = 2.2;
+/// Empty space left past the end of the text at the far end of the travel, so
+/// the last glyph does not sit flush against the clip edge.
+const MARQUEE_TAIL: f32 = 16.;
+
+/// One line of text that scrolls back and forth when it is wider than the
+/// space it is given, and stands still when it fits.
+///
+/// The width has to be passed in: the text is measured against it here, before
+/// layout, so there is nothing to ask. `id` must be unique per call site —
+/// `with_animation` keys its state on the element-id path.
+pub fn scrolling_line(
+    id: &'static str,
+    text: SharedString,
+    width: gpui::Pixels,
+    font_size: gpui::Pixels,
+    weight: gpui::FontWeight,
+    color: Option<Hsla>,
+    window: &mut Window,
+) -> gpui::AnyElement {
+    use gpui::{Animation, AnimationExt as _, TextRun};
+
+    // shape_line rejects newlines, and a title spanning lines is not something
+    // this element could show anyway.
+    let text: SharedString = if text.contains('\n') {
+        text.replace('\n', " ").into()
+    } else {
+        text
+    };
+    let style = window.text_style();
+    let mut font = style.font();
+    font.weight = weight;
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: color.unwrap_or(style.color),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let text_width = window
+        .text_system()
+        .shape_line(text.clone(), font_size, &[run], None)
+        .width;
+
+    let styled = move |el: gpui::Div| {
+        el.text_size(font_size)
+            .font_weight(weight)
+            .map(|el| match color {
+                Some(c) => el.text_color(c),
+                None => el,
+            })
+    };
+
+    if text_width <= width {
+        // Truncate anyway: the measurement is of the whole string, so anything
+        // that reaches here fits, but a stale width would otherwise spill.
+        return styled(div()).truncate().child(text).into_any_element();
+    }
+
+    let travel = f32::from(text_width - width) + MARQUEE_TAIL;
+    let scroll = travel / MARQUEE_SPEED;
+    let total = 2. * scroll + 2. * MARQUEE_HOLD;
+    // Phase boundaries: hold at the start, scroll out, hold at the end, scroll
+    // back. Going back rather than wrapping around keeps the start of the
+    // title — the part that identifies it — on screen most of the time.
+    let (f1, f2, f3) = (
+        MARQUEE_HOLD / total,
+        (MARQUEE_HOLD + scroll) / total,
+        (2. * MARQUEE_HOLD + scroll) / total,
+    );
+
+    div()
+        .w(width)
+        .overflow_hidden()
+        .child(
+            styled(div())
+                .flex_none()
+                .whitespace_nowrap()
+                .relative()
+                .child(text)
+                .with_animation(
+                    id,
+                    Animation::new(Duration::from_secs_f32(total)).repeat(),
+                    move |this, delta| {
+                        let progress = if delta < f1 {
+                            0.
+                        } else if delta < f2 {
+                            (delta - f1) / (f2 - f1)
+                        } else if delta < f3 {
+                            1.
+                        } else {
+                            1. - (delta - f3) / (1. - f3)
+                        };
+                        this.left(px(-travel * progress))
+                    },
+                ),
+        )
+        .into_any_element()
+}
+
+/// "On air" indicator for live radio: a breathing dot beside the label, with
+/// the time spent listening when there is room for it.
+///
+/// `id` must differ per call site — `with_animation` keys its state on the
+/// element-id path, so two badges sharing an id share a phase and, worse,
+/// restart each other whenever one of them is rebuilt.
+pub fn live_badge(
+    id: &'static str,
+    accent: Hsla,
+    elapsed: Option<Duration>,
+    cx: &App,
+) -> gpui::AnyElement {
+    use gpui::{Animation, AnimationExt as _, pulsating_between};
+    use gpui_component::{StyledExt as _, h_flex};
+
+    h_flex()
+        .gap_2()
+        .items_center()
+        .flex_none()
+        .child(
+            div().size(px(8.)).rounded_full().bg(accent).with_animation(
+                id,
+                Animation::new(Duration::from_secs(2))
+                    .repeat()
+                    .with_easing(pulsating_between(0.25, 1.0)),
+                |this, delta| this.opacity(delta),
+            ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_medium()
+                .text_color(accent)
+                .child("LIVE"),
+        )
+        .when_some(elapsed, |this, elapsed| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format_duration(elapsed)),
+            )
+        })
+        .into_any_element()
+}
+
+/// "MP3 · 128 kbps · Jazz" for the station now playing, or None when it did
+/// not say (and when radio is not playing at all).
+pub fn radio_info_line(
+    player: &crate::state::player::PlayerState,
+    settings: &crate::config::Settings,
+) -> Option<String> {
+    if !settings.stream_info_bar {
+        return None;
+    }
+    player.radio_info_line()
+}
+
 /// "FLAC · 1017 kbps · 44.1 kHz · 16-bit · stereo" line for the current
 /// track, or None when disabled in settings / radio / no track.
 pub fn stream_info_line(

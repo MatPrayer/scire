@@ -11,8 +11,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
 };
 
 use crate::assets::{app_icon, icons};
@@ -296,8 +295,11 @@ impl Render for PlayerBar {
                 (None, Vec::new())
             }
         };
-        let stream_info =
-            crate::ui::stream_info_line(self.player.read(cx), &self.session.read(cx).settings);
+        let stream_info = if is_radio {
+            crate::ui::radio_info_line(self.player.read(cx), &self.session.read(cx).settings)
+        } else {
+            crate::ui::stream_info_line(self.player.read(cx), &self.session.read(cx).settings)
+        };
         let volume = self.player.read(cx).volume;
         let detailed_volume = self.session.read(cx).settings.detailed_volume;
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
@@ -340,6 +342,12 @@ impl Render for PlayerBar {
             .map(format_duration)
             .unwrap_or_else(|| "-:--".into());
 
+        // Width of the now-playing block (cover + text) and, so the transport
+        // in between lands in the middle of the bar rather than 50px right of
+        // it, of the volume block facing it. Long titles are handled by
+        // scrolling them, not by widening the column.
+        const SIDE_WIDTH: f32 = 348.;
+
         // Small, quiet transport icon buttons; primary circular play.
         let icon_btn = |id: &'static str, icon_path: &'static str, active: bool| {
             Button::new(id)
@@ -381,7 +389,8 @@ impl Render for PlayerBar {
             // album/artist pages.
             .child(
                 h_flex()
-                    .w(px(348.))
+                    .w(px(SIDE_WIDTH))
+                    .flex_none()
                     .gap_3()
                     .items_center()
                     .child(
@@ -398,16 +407,22 @@ impl Render for PlayerBar {
                             // Art only with a track: the two branches are
                             // mutually exclusive, and drawing both stacks the
                             // placeholder on top of whatever art was last set.
-                            .when_some(art_path.filter(|_| has_track), |this, path| {
+                            .when_some(art_path.filter(|_| has_track && !is_radio), |this, path| {
                                 this.child(img(path).size(px(76.)).rounded_md())
                             })
-                            // Placeholder icon while no artwork.
-                            .when(!has_track, |this| {
-                                this.flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(app_icon(icons::MUSIC))
+                            // Placeholder icon while no artwork. A station has
+                            // none by definition, so it gets its own mark
+                            // rather than an empty slot.
+                            .when(!has_track || is_radio, |this| {
+                                this.flex().items_center().justify_center().map(|this| {
+                                    if is_radio {
+                                        this.text_color(cx.theme().primary)
+                                            .child(app_icon(icons::RADIO).with_size(px(30.)))
+                                    } else {
+                                        this.text_color(cx.theme().muted_foreground)
+                                            .child(app_icon(icons::MUSIC))
+                                    }
+                                })
                             })
                             // Clickable either way: the fullscreen view is
                             // worth opening with nothing playing (it is where
@@ -440,12 +455,19 @@ impl Render for PlayerBar {
                             .min_w_0()
                             .flex_1()
                             .child({
-                                let base = div()
-                                    .text_sm()
-                                    .font_medium()
-                                    .truncate()
-                                    .when(!has_track, |s| s.text_color(cx.theme().muted_foreground))
-                                    .child(title.unwrap_or_else(|| "Not playing".into()));
+                                // Titles longer than the column scroll rather
+                                // than get cut off — radio track titles run
+                                // long, and a clipped one is unreadable.
+                                let title_width = px(SIDE_WIDTH - 76. - 12.);
+                                let base = div().child(crate::ui::scrolling_line(
+                                    "np-title-text",
+                                    title.unwrap_or_else(|| "Not playing".into()).into(),
+                                    title_width,
+                                    window.rem_size() * 0.875,
+                                    gpui::FontWeight::MEDIUM,
+                                    (!has_track).then(|| cx.theme().muted_foreground),
+                                    window,
+                                ));
                                 match album_id {
                                     Some(id) => base
                                         .id("np-title")
@@ -551,14 +573,18 @@ impl Render for PlayerBar {
                         h_flex()
                             .gap_1()
                             .items_center()
-                            .child(icon_btn("shuffle", icons::SHUFFLE, shuffle).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.player.update(cx, |p, cx| p.toggle_shuffle(cx));
-                                }),
-                            ))
+                            // Queue controls mean nothing on a live stream:
+                            // there is no queue, and nothing to skip to.
+                            .child(
+                                icon_btn("shuffle", icons::SHUFFLE, shuffle && !is_radio)
+                                    .disabled(is_radio)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.player.update(cx, |p, cx| p.toggle_shuffle(cx));
+                                    })),
+                            )
                             .child(
                                 icon_btn("prev", icons::SKIP_BACK, false)
-                                    .disabled(!has_track)
+                                    .disabled(!has_track || is_radio)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.player.update(cx, |p, cx| p.previous(cx));
                                     })),
@@ -580,7 +606,7 @@ impl Render for PlayerBar {
                             )
                             .child(
                                 icon_btn("next", icons::SKIP_FORWARD, false)
-                                    .disabled(!has_track)
+                                    .disabled(!has_track || is_radio)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.player.update(cx, |p, cx| p.next(cx));
                                     })),
@@ -593,8 +619,9 @@ impl Render for PlayerBar {
                                     } else {
                                         icons::REPEAT
                                     },
-                                    repeat != RepeatMode::Off,
+                                    repeat != RepeatMode::Off && !is_radio,
                                 )
+                                .disabled(is_radio)
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.player.update(cx, |p, cx| p.cycle_repeat(cx));
@@ -608,15 +635,16 @@ impl Render for PlayerBar {
                             .max_w(px(640.))
                             .gap_2()
                             .items_center()
-                            // Live radio has no timeline — show a label instead.
+                            // Live radio has no timeline: the on-air badge and
+                            // how long the stream has been running take the
+                            // seek bar's place, centred where it would be.
                             .when(is_radio, |this| {
-                                this.child(
-                                    div()
-                                        .flex_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().accent)
-                                        .child("● LIVE"),
-                                )
+                                this.justify_center().child(crate::ui::live_badge(
+                                    "bar-live",
+                                    cx.theme().primary,
+                                    Some(position),
+                                    cx,
+                                ))
                             })
                             .when(!is_radio, |this| {
                                 this.child(
@@ -656,219 +684,233 @@ impl Render for PlayerBar {
             // The three rows share a common left edge; the slider stretches to
             // the right so the block stays anchored to the bar's right side.
             .child(
-                v_flex()
-                    .w(px(240.))
-                    .gap_1p5()
-                    // ReplayGain status chip: highlighted while playing; click
-                    // opens a menu to change or disable the mode.
-                    .when_some(replay_gain, |this, (label, db)| {
-                        let text = match db {
-                            Some(db) => format!("ReplayGain {db:+.1} dB · {label}"),
-                            None => format!("ReplayGain · {label} (no tag)"),
-                        };
-                        let current = self.session.read(cx).settings.replay_gain;
-                        let player = self.player.clone();
-                        let session = self.session.clone();
-                        this.child(
-                            h_flex().w_full().child(
-                                Popover::new("replaygain-menu")
-                                    .trigger(
-                                        // Same quiet style as the device picker.
-                                        Button::new("rg-trigger")
-                                            .ghost()
-                                            .xsmall()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .icon(Icon::new(IconName::ChevronDown).xsmall())
-                                            .label(text),
-                                    )
-                                    .content(move |_state, _window, cx| {
-                                        let opts = [
-                                            ("Off", ReplayGainMode::Off),
-                                            ("Track", ReplayGainMode::Track),
-                                            ("Album", ReplayGainMode::Album),
-                                            ("Auto", ReplayGainMode::Auto),
-                                        ];
-                                        let mut menu = v_flex().gap_0p5().min_w(px(140.));
-                                        for (i, (lbl, mode)) in opts.into_iter().enumerate() {
-                                            let player = player.clone();
-                                            let session = session.clone();
-                                            menu = menu.child(
-                                                div()
-                                                    .id(("rg-opt", i))
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .cursor_pointer()
-                                                    .text_sm()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .hover(|s| s.bg(cx.theme().muted))
-                                                    .when(current == mode, |s| {
-                                                        s.text_color(cx.theme().primary)
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |state, _, window, cx| {
-                                                            player.update(cx, |p, cx| {
-                                                                p.set_replay_gain(mode, cx)
-                                                            });
-                                                            session.update(cx, |s, _| {
-                                                                s.settings.replay_gain = mode;
-                                                                s.persist_settings();
-                                                            });
-                                                            state.dismiss(window, cx);
-                                                        },
-                                                    ))
-                                                    .child(lbl),
-                                            );
-                                        }
-                                        menu
-                                    }),
-                            ),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_5()
-                            .items_center()
-                            // Volume group fills the row; slider stretches.
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(app_icon(icons::VOLUME_HIGH)),
-                                    )
-                                    .map(|this| {
-                                        if detailed_volume {
-                                            // [−] [editable dB] [+] — no slider.
-                                            this.child(
-                                                Button::new("vol-down")
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .label("−")
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.nudge_volume(0.891_25, window, cx)
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(56.))
-                                                    .child(Input::new(&self.vol_input).small()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child("dB"),
-                                            )
-                                            .child(
-                                                Button::new("vol-up")
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .label("+")
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.nudge_volume(1.122_02, window, cx)
-                                                        },
-                                                    )),
-                                            )
-                                            // Spacer keeps the queue button at the edge.
-                                            .child(div().flex_1())
-                                        } else {
-                                            this.child(
-                                                div().flex_1().child(Slider::new(&self.volume)),
-                                            )
-                                        }
-                                    }),
+                h_flex().w(px(SIDE_WIDTH)).flex_none().justify_end().child(
+                    v_flex()
+                        .w(px(240.))
+                        .gap_1p5()
+                        // ReplayGain status chip: highlighted while playing; click
+                        // opens a menu to change or disable the mode.
+                        .when_some(replay_gain, |this, (label, db)| {
+                            let text = match db {
+                                Some(db) => format!("ReplayGain {db:+.1} dB · {label}"),
+                                None => format!("ReplayGain · {label} (no tag)"),
+                            };
+                            let current = self.session.read(cx).settings.replay_gain;
+                            let player = self.player.clone();
+                            let session = self.session.clone();
+                            this.child(
+                                h_flex().w_full().child(
+                                    Popover::new("replaygain-menu")
+                                        .trigger(
+                                            // Same quiet style as the device picker.
+                                            Button::new("rg-trigger")
+                                                .ghost()
+                                                .xsmall()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .icon(Icon::new(IconName::ChevronDown).xsmall())
+                                                .label(text),
+                                        )
+                                        .content(move |_state, _window, cx| {
+                                            let opts = [
+                                                ("Off", ReplayGainMode::Off),
+                                                ("Track", ReplayGainMode::Track),
+                                                ("Album", ReplayGainMode::Album),
+                                                ("Auto", ReplayGainMode::Auto),
+                                            ];
+                                            let mut menu = v_flex().gap_0p5().min_w(px(140.));
+                                            for (i, (lbl, mode)) in opts.into_iter().enumerate() {
+                                                let player = player.clone();
+                                                let session = session.clone();
+                                                menu = menu.child(
+                                                    div()
+                                                        .id(("rg-opt", i))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .cursor_pointer()
+                                                        .text_sm()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .hover(|s| s.bg(cx.theme().muted))
+                                                        .when(current == mode, |s| {
+                                                            s.text_color(cx.theme().primary)
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |state, _, window, cx| {
+                                                                player.update(cx, |p, cx| {
+                                                                    p.set_replay_gain(mode, cx)
+                                                                });
+                                                                session.update(cx, |s, _| {
+                                                                    s.settings.replay_gain = mode;
+                                                                    s.persist_settings();
+                                                                });
+                                                                state.dismiss(window, cx);
+                                                            },
+                                                        ))
+                                                        .child(lbl),
+                                                );
+                                            }
+                                            menu
+                                        }),
+                                ),
                             )
-                            .when(show_queue_button, |this| {
-                                this.child(
-                                    Button::new("queue-toggle")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(Icon::new(IconName::PanelRight))
-                                        .on_click(cx.listener(|_, _, _, cx| {
-                                            cx.emit(PlayerBarEvent::ToggleQueue);
-                                        })),
+                        })
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_5()
+                                .items_center()
+                                // Volume group fills the row; slider stretches.
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(app_icon(icons::VOLUME_HIGH)),
+                                        )
+                                        .map(|this| {
+                                            if detailed_volume {
+                                                // [−] [editable dB] [+] — no slider.
+                                                this.child(
+                                                    Button::new("vol-down")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("−")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.nudge_volume(
+                                                                    0.891_25, window, cx,
+                                                                )
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(56.))
+                                                        .child(Input::new(&self.vol_input).small()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child("dB"),
+                                                )
+                                                .child(
+                                                    Button::new("vol-up")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("+")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.nudge_volume(
+                                                                    1.122_02, window, cx,
+                                                                )
+                                                            },
+                                                        )),
+                                                )
+                                                // Spacer keeps the queue button at the edge.
+                                                .child(div().flex_1())
+                                            } else {
+                                                this.child(
+                                                    div().flex_1().child(Slider::new(&self.volume)),
+                                                )
+                                            }
+                                        }),
                                 )
-                            }),
-                    )
-                    .when_some(device_line, |this, device| {
-                        let selected = self.session.read(cx).settings.output_device.clone();
-                        let player = self.player.clone();
-                        let session = self.session.clone();
-                        this.child(
-                            // Click the device name to switch outputs.
-                            h_flex().w_full().child(
-                                Popover::new("output-device")
-                                    .trigger(
-                                        Button::new("output-device-trigger")
+                                .when(show_queue_button, |this| {
+                                    this.child(
+                                        Button::new("queue-toggle")
                                             .ghost()
                                             .xsmall()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .icon(Icon::new(IconName::ChevronDown).xsmall())
-                                            .label(device),
+                                            .icon(Icon::new(IconName::PanelRight))
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(PlayerBarEvent::ToggleQueue);
+                                            })),
                                     )
-                                    .content(move |_state, _window, cx| {
-                                        let opts: Vec<(String, Option<String>)> =
-                                            std::iter::once(("System default".to_string(), None))
+                                }),
+                        )
+                        .when_some(device_line, |this, device| {
+                            let selected = self.session.read(cx).settings.output_device.clone();
+                            let player = self.player.clone();
+                            let session = self.session.clone();
+                            this.child(
+                                // Click the device name to switch outputs.
+                                h_flex().w_full().child(
+                                    Popover::new("output-device")
+                                        .trigger(
+                                            Button::new("output-device-trigger")
+                                                .ghost()
+                                                .xsmall()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .icon(Icon::new(IconName::ChevronDown).xsmall())
+                                                .label(device),
+                                        )
+                                        .content(move |_state, _window, cx| {
+                                            let opts: Vec<(String, Option<String>)> =
+                                                std::iter::once((
+                                                    "System default".to_string(),
+                                                    None,
+                                                ))
                                                 .chain(
                                                     playback::output_devices()
                                                         .into_iter()
                                                         .map(|d| (d.clone(), Some(d))),
                                                 )
                                                 .collect();
-                                        let mut menu = v_flex()
-                                            .id("output-device-menu")
-                                            .gap_0p5()
-                                            .min_w(px(220.))
-                                            .max_h(px(280.))
-                                            .overflow_y_scroll();
-                                        for (i, (label, value)) in opts.into_iter().enumerate() {
-                                            let is_sel = selected.as_deref() == value.as_deref();
-                                            let player = player.clone();
-                                            let session = session.clone();
-                                            menu = menu.child(
-                                                div()
-                                                    .id(("dev-opt", i))
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .cursor_pointer()
-                                                    .text_sm()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .hover(|s| s.bg(cx.theme().muted))
-                                                    .when(is_sel, |s| {
-                                                        s.text_color(cx.theme().primary)
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |state, _, window, cx| {
-                                                            let v = value.clone();
-                                                            player.update(cx, |p, cx| {
-                                                                p.set_output_device(v.clone(), cx)
-                                                            });
-                                                            session.update(cx, |s, _| {
-                                                                s.settings.output_device =
-                                                                    v.clone();
-                                                                s.persist_settings();
-                                                            });
-                                                            state.dismiss(window, cx);
-                                                        },
-                                                    ))
-                                                    .child(label),
-                                            );
-                                        }
-                                        menu
-                                    }),
-                            ),
-                        )
-                    }),
+                                            let mut menu = v_flex()
+                                                .id("output-device-menu")
+                                                .gap_0p5()
+                                                .min_w(px(220.))
+                                                .max_h(px(280.))
+                                                .overflow_y_scroll();
+                                            for (i, (label, value)) in opts.into_iter().enumerate()
+                                            {
+                                                let is_sel =
+                                                    selected.as_deref() == value.as_deref();
+                                                let player = player.clone();
+                                                let session = session.clone();
+                                                menu = menu.child(
+                                                    div()
+                                                        .id(("dev-opt", i))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .cursor_pointer()
+                                                        .text_sm()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .hover(|s| s.bg(cx.theme().muted))
+                                                        .when(is_sel, |s| {
+                                                            s.text_color(cx.theme().primary)
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |state, _, window, cx| {
+                                                                let v = value.clone();
+                                                                player.update(cx, |p, cx| {
+                                                                    p.set_output_device(
+                                                                        v.clone(),
+                                                                        cx,
+                                                                    )
+                                                                });
+                                                                session.update(cx, |s, _| {
+                                                                    s.settings.output_device =
+                                                                        v.clone();
+                                                                    s.persist_settings();
+                                                                });
+                                                                state.dismiss(window, cx);
+                                                            },
+                                                        ))
+                                                        .child(label),
+                                                );
+                                            }
+                                            menu
+                                        }),
+                                ),
+                            )
+                        }),
+                ),
             )
     }
 }

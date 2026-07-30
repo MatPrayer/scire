@@ -7,6 +7,7 @@
 //! reactor; the control loop is a tokio task).
 
 mod engine;
+pub mod icy;
 mod source;
 pub mod spectrum;
 pub mod waveform;
@@ -104,6 +105,13 @@ pub enum Event {
     Failed(String),
     /// Audio output was opened; reports the OS output device name.
     OutputOpened { device: Option<String> },
+    /// The source that just started is a live stream, and this is what it says
+    /// about itself (ICY response headers).
+    StationInfo(icy::StationInfo),
+    /// Now-playing title advertised by a live stream. Arrives whenever the
+    /// station announces a new one, so it can change many times within a
+    /// single "track" as far as the rest of the app is concerned.
+    StreamTitle(Option<String>),
 }
 
 #[derive(Debug, Error)]

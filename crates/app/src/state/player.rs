@@ -31,8 +31,14 @@ pub struct PlayerState {
     scrobble: ScrobbleTracker,
     scrobble_enabled: bool,
     stream_opts: StreamOptions,
-    /// Set while a live radio stream is playing (title for display).
+    /// Set while a live radio stream is playing: the station's name as
+    /// bookmarked. Doubles as the "this is radio" flag.
     radio_title: Option<String>,
+    /// Track the station says it is playing right now (ICY `StreamTitle`),
+    /// which changes many times over one "track" as far as the queue knows.
+    radio_stream_title: Option<String>,
+    /// What the station said about itself when the stream opened.
+    radio_station: Option<playback::icy::StationInfo>,
     media_controls: Option<MediaControls>,
     /// Most-recently-played tracks (newest first, max 50). Persisted to disk.
     pub recently_played: Vec<Song>,
@@ -130,6 +136,8 @@ impl PlayerState {
             scrobble_enabled: true,
             stream_opts: StreamOptions::default(),
             radio_title: None,
+            radio_stream_title: None,
+            radio_station: None,
             media_controls,
             recently_played: load_recent(),
             current_art_path: None,
@@ -194,8 +202,20 @@ impl PlayerState {
     /// Display info for the player bar: (title, subtitle). Radio wins over the
     /// queue when a live stream is playing.
     pub fn now_playing(&self) -> Option<(String, String)> {
-        if let Some(title) = &self.radio_title {
-            return Some((title.clone(), "Internet radio".into()));
+        if let Some(station) = &self.radio_title {
+            // With ICY metadata the interesting line is the track, and the
+            // station becomes the subtitle; without it the station is all there
+            // is to show.
+            return Some(match self.radio_now_playing() {
+                Some((artist, title)) => (
+                    title,
+                    match artist {
+                        Some(artist) => format!("{artist} · {station}"),
+                        None => station.clone(),
+                    },
+                ),
+                None => (station.clone(), "Live radio".into()),
+            });
         }
         self.current_song()
             .map(|s| (s.title.clone(), s.artist.clone().unwrap_or_default()))
@@ -206,6 +226,53 @@ impl PlayerState {
         self.radio_title.is_some()
     }
 
+    /// The station's name as bookmarked, while radio is playing.
+    pub fn radio_station_name(&self) -> Option<&str> {
+        self.radio_title.as_deref()
+    }
+
+    /// The station's current track, split into `(artist, title)`.
+    ///
+    /// Stations publish one string, by overwhelming convention
+    /// `Artist - Title`; splitting on the *first* separator is what every
+    /// other client does. A title containing " - " loses a word to the artist
+    /// line, which is a better failure than never showing the artist at all.
+    pub fn radio_now_playing(&self) -> Option<(Option<String>, String)> {
+        let raw = self.radio_stream_title.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(match raw.split_once(" - ") {
+            Some((artist, title)) if !artist.trim().is_empty() && !title.trim().is_empty() => {
+                (Some(artist.trim().to_string()), title.trim().to_string())
+            }
+            _ => (None, raw.to_string()),
+        })
+    }
+
+    /// Forget everything about the station being played, on leaving radio.
+    fn clear_radio(&mut self) {
+        self.radio_title = None;
+        self.radio_stream_title = None;
+        self.radio_station = None;
+    }
+
+    /// Codec / bitrate / genre the station advertises, as one line.
+    pub fn radio_info_line(&self) -> Option<String> {
+        let station = self.radio_station.as_ref()?;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(format) = &station.format {
+            parts.push(format.clone());
+        }
+        if let Some(kbps) = station.bitrate.filter(|b| *b > 0) {
+            parts.push(format!("{kbps} kbps"));
+        }
+        if let Some(genre) = &station.genre {
+            parts.push(genre.clone());
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     /// Play a live internet-radio stream by its external URL.
     pub fn play_radio(&mut self, name: String, stream_url: String, cx: &mut Context<Self>) {
         self.queue.clear();
@@ -214,6 +281,8 @@ impl PlayerState {
         self.scrobble.clear();
         self.player.clear_prefetch();
         self.radio_title = Some(name);
+        self.radio_stream_title = None;
+        self.radio_station = None;
         self.position = Duration::ZERO;
         self.duration = None;
         self.last_error = None;
@@ -374,7 +443,7 @@ impl PlayerState {
         self.playing = false;
         self.position = Duration::ZERO;
         self.duration = None;
-        self.radio_title = None;
+        self.clear_radio();
         self.scrobble.clear();
         if let Some(c) = &mut self.media_controls {
             let _ = c.set_playback(MediaPlayback::Stopped);
@@ -694,7 +763,7 @@ impl PlayerState {
     }
 
     fn start_current(&mut self, cx: &mut Context<Self>) {
-        self.radio_title = None; // leaving radio for library playback
+        self.clear_radio(); // leaving radio for library playback
         persist_queue(&self.queue);
         let Some(song) = self.queue.current_song() else {
             return;
@@ -879,6 +948,21 @@ impl PlayerState {
             }
             Event::OutputOpened { device } => {
                 self.output_device = device;
+            }
+            Event::StationInfo(info) => {
+                // Only a live stream produces this, but a library track that
+                // somehow did must not turn the UI into radio.
+                if self.is_radio() {
+                    self.radio_station = Some(info);
+                }
+            }
+            Event::StreamTitle(title) => {
+                if self.is_radio() {
+                    self.radio_stream_title = title;
+                    // The OS now-playing panel should follow the station, not
+                    // sit on the station name for the whole session.
+                    self.sync_media_metadata();
+                }
             }
         }
         cx.notify();

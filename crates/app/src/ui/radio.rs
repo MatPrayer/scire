@@ -50,7 +50,22 @@ impl RadioView {
 
 impl Render for RadioView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let playing_title = self.player.read(cx).now_playing().map(|(t, _)| t);
+        // Match on the station, not on `now_playing()`: once the station
+        // announces a track, that title is the track's, not the station's.
+        let playing_station = self
+            .player
+            .read(cx)
+            .radio_station_name()
+            .map(str::to_string);
+        // What the playing station says is on right now, if anything.
+        let playing_track = self
+            .player
+            .read(cx)
+            .radio_now_playing()
+            .map(|(artist, title)| match artist {
+                Some(artist) => format!("{artist} — {title}"),
+                None => title,
+            });
         let (stations, error) = {
             let r = self.radio.read(cx);
             (r.stations.clone(), r.error.clone())
@@ -60,7 +75,8 @@ impl Render for RadioView {
             .into_iter()
             .enumerate()
             .map(|(i, station)| {
-                let is_playing = playing_title.as_deref() == Some(station.name.as_str());
+                let is_playing = playing_station.as_deref() == Some(station.name.as_str());
+                let now_playing = is_playing.then(|| playing_track.clone()).flatten();
                 let name = station.name.clone();
                 let url = station.stream_url.clone();
                 let id = station.id.clone();
@@ -77,6 +93,14 @@ impl Render for RadioView {
                         let (name, url) = (name.clone(), url.clone());
                         this.player.update(cx, |p, cx| p.play_radio(name, url, cx));
                     }))
+                    .when(is_playing, |this| {
+                        this.child(crate::ui::live_badge(
+                            "radio-row-live",
+                            cx.theme().primary,
+                            None,
+                            cx,
+                        ))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -84,13 +108,15 @@ impl Render for RadioView {
                             .truncate()
                             .child(station.name.clone()),
                     )
+                    // The station's own now-playing line is worth more than its
+                    // URL, so it takes that slot while the station is on.
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .max_w(px(280.))
                             .truncate()
-                            .child(station.stream_url.clone()),
+                            .child(now_playing.unwrap_or_else(|| station.stream_url.clone())),
                     )
                     .child(
                         Button::new(("radio-del", i))

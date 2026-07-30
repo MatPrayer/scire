@@ -32,6 +32,8 @@ struct Prepared {
     decoder: rodio::Decoder<SourceReader>,
     /// Length according to the decoder, used when the server gave no hint.
     decoded_duration: Option<Duration>,
+    /// Set when the source turned out to be a live radio stream.
+    station: Option<crate::icy::StationInfo>,
 }
 
 /// A track that has been appended to the player's queue: either playing now or
@@ -41,6 +43,8 @@ struct Loaded {
     /// Identifies this append in `EndSignal` messages.
     serial: u64,
     duration: Option<Duration>,
+    /// Set when the source turned out to be a live radio stream.
+    station: Option<crate::icy::StationInfo>,
 }
 
 pub(crate) fn spawn(
@@ -104,6 +108,7 @@ async fn control_loop(
                             &mut serials,
                             &end_tx,
                             &tap,
+                            &event_tx,
                         )
                         .await
                         {
@@ -115,6 +120,9 @@ async fn control_loop(
                                 }
                                 if let Some(d) = loaded.duration {
                                     let _ = event_tx.send(Event::DurationKnown(d));
+                                }
+                                if let Some(station) = loaded.station.clone() {
+                                    let _ = event_tx.send(Event::StationInfo(station));
                                 }
                                 current = Some(loaded);
                                 sink = Some(new_sink);
@@ -177,6 +185,7 @@ async fn control_loop(
                                     &mut serials,
                                     &end_tx,
                                     &tap,
+                                    &event_tx,
                                 )
                                 .await
                                 {
@@ -211,6 +220,7 @@ async fn control_loop(
                                     &mut prefetch_gen,
                                     &mut pending,
                                     &prep_tx,
+                                    &event_tx,
                                 );
                             }
                         }
@@ -245,6 +255,7 @@ async fn control_loop(
                                 &mut prefetch_gen,
                                 &mut pending,
                                 &prep_tx,
+                                &event_tx,
                             );
                         }
                     }
@@ -396,12 +407,14 @@ fn start_prefetch(
     generation: &mut u64,
     pending: &mut Option<Prepared>,
     prep_tx: &mpsc::UnboundedSender<(u64, Result<Prepared, PlaybackError>)>,
+    event_tx: &mpsc::UnboundedSender<Event>,
 ) {
     drop_prefetch(prefetch, generation, pending);
     let generation = *generation;
     let tx = prep_tx.clone();
+    let event_tx = event_tx.clone();
     *prefetch = Some(tokio::spawn(async move {
-        let result = prepare(track).await;
+        let result = prepare(track, &event_tx).await;
         let _ = tx.send((generation, result));
     }));
 }
@@ -471,30 +484,77 @@ fn append(
         // sources the server said nothing about.
         duration: prepared.track.duration_hint.or(prepared.decoded_duration),
         track: prepared.track,
+        station: prepared.station,
         serial,
     }
 }
 
+/// How long a decoder may take to identify a source before it is written off.
+/// Needed because an undecodable endless stream does not error — it simply
+/// never yields a packet, which would otherwise wedge playback on "buffering".
+const DECODE_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// Open the source (local file or HTTP) and build a decoder, ready to
 /// append to a player.
-async fn prepare(track: TrackSource) -> Result<Prepared, PlaybackError> {
-    let (reader, byte_len) = if let Some(ref path) = track.path {
-        source::open_local(path).await?
-    } else {
-        source::open(&track.url).await?
-    };
+///
+/// A URL may expand to several candidates (a station playlist listing the same
+/// programme in several formats); they are tried in order and the first that
+/// decodes wins.
+async fn prepare(
+    track: TrackSource,
+    event_tx: &mpsc::UnboundedSender<Event>,
+) -> Result<Prepared, PlaybackError> {
+    if let Some(path) = track.path.clone() {
+        let (reader, byte_len) = source::open_local(&path).await?;
+        return build(track, reader, byte_len, None).await;
+    }
+
+    let candidates = source::stream_candidates(&track.url).await;
+    let mut last = None;
+    for url in &candidates {
+        let attempt = async {
+            let (reader, byte_len, station) = source::open(url, event_tx).await?;
+            build(track.clone(), reader, byte_len, station).await
+        };
+        match attempt.await {
+            Ok(prepared) => return Ok(prepared),
+            Err(e) => {
+                if candidates.len() > 1 {
+                    tracing::warn!("stream {url} unusable ({e}), trying next");
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| PlaybackError("no playable stream".into())))
+}
+
+/// Build a decoder over an opened source.
+async fn build(
+    track: TrackSource,
+    reader: SourceReader,
+    byte_len: Option<u64>,
+    station: Option<crate::icy::StationInfo>,
+) -> Result<Prepared, PlaybackError> {
     // Decoder construction reads from the (blocking) stream reader; do it off
     // the async thread. byte_len enables seeking + duration calculation.
-    let decoder = tokio::task::spawn_blocking(move || {
-        let mut builder = rodio::Decoder::builder()
-            .with_data(reader)
-            .with_seekable(true);
-        if let Some(len) = byte_len {
-            builder = builder.with_byte_len(len);
-        }
-        builder.build()
-    })
+    let decoder = tokio::time::timeout(
+        DECODE_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            // A live stream has no length and no seeking: declaring it seekable
+            // makes the decoder probe backwards through a source that only
+            // moves forward, which costs seconds of startup on a radio stream.
+            let mut builder = rodio::Decoder::builder()
+                .with_data(reader)
+                .with_seekable(byte_len.is_some());
+            if let Some(len) = byte_len {
+                builder = builder.with_byte_len(len);
+            }
+            builder.build()
+        }),
+    )
     .await
+    .map_err(|_| PlaybackError("timed out identifying the stream".into()))?
     .map_err(|e| PlaybackError(e.to_string()))?
     .map_err(|e| PlaybackError(e.to_string()))?;
     let decoded_duration = rodio::Source::total_duration(&decoder);
@@ -502,11 +562,16 @@ async fn prepare(track: TrackSource) -> Result<Prepared, PlaybackError> {
         track,
         decoder,
         decoded_duration,
+        station,
     })
 }
 
 /// Open the HTTP source, build a decoder, and start a new player on the
 /// selected output device (opening it if not already open).
+// Everything here is engine-loop state that has to be threaded through by
+// reference; bundling it into a struct would only move the same list one level
+// out.
+#[allow(clippy::too_many_arguments)]
 async fn start_track(
     output: &mut Option<rodio::MixerDeviceSink>,
     selected_device: &Option<String>,
@@ -515,8 +580,9 @@ async fn start_track(
     serials: &mut u64,
     end_tx: &mpsc::UnboundedSender<u64>,
     tap: &Arc<SpectrumTap>,
+    event_tx: &mpsc::UnboundedSender<Event>,
 ) -> Result<(rodio::Player, Loaded), PlaybackError> {
-    let prepared = prepare(track).await?;
+    let prepared = prepare(track, event_tx).await?;
 
     if output.is_none() {
         *output = Some(open_output(selected_device)?);

@@ -26,6 +26,10 @@ use crate::ui::format_duration;
 use crate::ui::visualizer::Visualizer;
 
 const ART_SIZE: u32 = 600;
+
+/// Text width inside the info card: its 480px minus the 24px padding either
+/// side. Needed as a number because the marquee measures against it.
+const CARD_TEXT_WIDTH: f32 = 432.;
 /// Tiny fetch for color extraction — low-res average is a fast palette sample.
 const BG_ART_SIZE: u32 = 32;
 
@@ -817,8 +821,11 @@ impl Render for FullscreenPlayer {
         let detailed_volume = self.session.read(cx).settings.detailed_volume;
         let volume_level = self.player.read(cx).volume;
         let replay_gain = self.player.read(cx).replay_gain_active();
-        let stream_info =
-            crate::ui::stream_info_line(self.player.read(cx), &self.session.read(cx).settings);
+        let stream_info = if is_radio {
+            crate::ui::radio_info_line(self.player.read(cx), &self.session.read(cx).settings)
+        } else {
+            crate::ui::stream_info_line(self.player.read(cx), &self.session.read(cx).settings)
+        };
 
         let time_now = format_duration(position);
         let time_total = duration
@@ -988,8 +995,18 @@ impl Render for FullscreenPlayer {
                                         .rounded_lg()
                                         .bg(cx.theme().muted)
                                         .overflow_hidden()
-                                        .when_some(self.art_path.clone(), |this, path| {
-                                            this.child(img(path).size(px(56.)).rounded_lg())
+                                        .when_some(
+                                            self.art_path.clone().filter(|_| !is_radio),
+                                            |this, path| {
+                                                this.child(img(path).size(px(56.)).rounded_lg())
+                                            },
+                                        )
+                                        .when(is_radio, |this| {
+                                            this.flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_color(cx.theme().primary)
+                                                .child(app_icon(icons::RADIO))
                                         }),
                                 )
                                 .child(
@@ -1025,7 +1042,7 @@ impl Render for FullscreenPlayer {
                                         .items_center()
                                         .child(
                                             icon_btn("mini-prev", icons::SKIP_BACK, false)
-                                                .disabled(!has_track)
+                                                .disabled(!has_track || is_radio)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.player.update(cx, |p, cx| p.previous(cx));
                                                     cx.stop_propagation();
@@ -1049,7 +1066,7 @@ impl Render for FullscreenPlayer {
                                         )
                                         .child(
                                             icon_btn("mini-next", icons::SKIP_FORWARD, false)
-                                                .disabled(!has_track)
+                                                .disabled(!has_track || is_radio)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.player.update(cx, |p, cx| p.next(cx));
                                                     cx.stop_propagation();
@@ -1093,12 +1110,14 @@ impl Render for FullscreenPlayer {
                             )
                         })
                         .when(is_radio, |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().accent)
-                                    .child("\u{25cf} LIVE"),
-                            )
+                            this.child(h_flex().w_full().justify_center().child(
+                                crate::ui::live_badge(
+                                    "mini-live",
+                                    cx.theme().primary,
+                                    Some(position),
+                                    cx,
+                                ),
+                            ))
                         })
                         // Scene picker.
                         .child(
@@ -1192,8 +1211,23 @@ impl Render for FullscreenPlayer {
                                 .bg(cx.theme().muted)
                                 .overflow_hidden()
                                 .shadow_xl()
-                                .when_some(self.art_path.clone(), |this, path| {
-                                    this.child(img(path).size(px(art_size)).rounded_2xl())
+                                .when_some(
+                                    self.art_path.clone().filter(|_| !is_radio),
+                                    |this, path| {
+                                        this.child(img(path).size(px(art_size)).rounded_2xl())
+                                    },
+                                )
+                                // A station has no artwork; mark the slot as
+                                // radio rather than leaving a blank square the
+                                // size of a record sleeve.
+                                .when(is_radio, |this| {
+                                    this.flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(cx.theme().primary)
+                                        .child(
+                                            app_icon(icons::RADIO).with_size(px(art_size * 0.28)),
+                                        )
                                 }),
                         )
                         // Info + controls column — right of the cover. Same
@@ -1216,22 +1250,28 @@ impl Render for FullscreenPlayer {
                                 // Track info.
                                 .child(
                                     v_flex()
-                                        .max_w(px(560.))
+                                        // Bounded by the card, not by a wider
+                                        // guess: a max wider than the card
+                                        // lets `truncate` clip at the border
+                                        // with no ellipsis, which reads as a
+                                        // rendering fault rather than a long
+                                        // title (radio titles are long).
+                                        .w_full()
                                         .gap_1()
-                                        .child(
-                                            div()
-                                                .text_3xl()
-                                                .font_semibold()
-                                                .truncate()
-                                                .when(!has_track, |s: gpui::Div| {
-                                                    s.text_color(cx.theme().muted_foreground)
-                                                })
-                                                .child(
-                                                    title.unwrap_or_else(|| {
-                                                        "Nothing playing".into()
-                                                    }),
-                                                ),
-                                        )
+                                        // Scrolls when it does not fit the
+                                        // card, rather than being cut off.
+                                        .child(crate::ui::scrolling_line(
+                                            "fs-title-text",
+                                            title
+                                                .clone()
+                                                .unwrap_or_else(|| "Nothing playing".into())
+                                                .into(),
+                                            px(CARD_TEXT_WIDTH),
+                                            window.rem_size() * 1.875,
+                                            gpui::FontWeight::SEMIBOLD,
+                                            (!has_track).then(|| cx.theme().muted_foreground),
+                                            window,
+                                        ))
                                         .child(
                                             div()
                                                 .text_lg()
@@ -1257,14 +1297,12 @@ impl Render for FullscreenPlayer {
                                         .gap_3()
                                         .items_center()
                                         .when(is_radio, |this| {
-                                            this.child(
-                                                div()
-                                                    .flex_1()
-                                                    .text_sm()
-                                                    .text_color(cx.theme().accent)
-                                                    .text_center()
-                                                    .child("● LIVE"),
-                                            )
+                                            this.justify_center().child(crate::ui::live_badge(
+                                                "fs-live",
+                                                cx.theme().primary,
+                                                Some(position),
+                                                cx,
+                                            ))
                                         })
                                         .when(!is_radio, |this| {
                                             this.child(
@@ -1330,16 +1368,23 @@ impl Render for FullscreenPlayer {
                                         .items_center()
                                         .justify_center()
                                         .child(
-                                            icon_btn("fs-shuffle", icons::SHUFFLE, shuffle)
-                                                .on_click(cx.listener(|this, _, _, cx| {
+                                            icon_btn(
+                                                "fs-shuffle",
+                                                icons::SHUFFLE,
+                                                shuffle && !is_radio,
+                                            )
+                                            .disabled(is_radio)
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
                                                     this.player
                                                         .update(cx, |p, cx| p.toggle_shuffle(cx));
                                                     cx.stop_propagation();
-                                                })),
+                                                }),
+                                            ),
                                         )
                                         .child(
                                             icon_btn("fs-prev", icons::SKIP_BACK, false)
-                                                .disabled(!has_track)
+                                                .disabled(!has_track || is_radio)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.player.update(cx, |p, cx| p.previous(cx));
                                                     cx.stop_propagation();
@@ -1364,7 +1409,7 @@ impl Render for FullscreenPlayer {
                                         )
                                         .child(
                                             icon_btn("fs-next", icons::SKIP_FORWARD, false)
-                                                .disabled(!has_track)
+                                                .disabled(!has_track || is_radio)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.player.update(cx, |p, cx| p.next(cx));
                                                     cx.stop_propagation();
@@ -1378,8 +1423,9 @@ impl Render for FullscreenPlayer {
                                                 } else {
                                                     icons::REPEAT
                                                 },
-                                                repeat != RepeatMode::Off,
+                                                repeat != RepeatMode::Off && !is_radio,
                                             )
+                                            .disabled(is_radio)
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| {
                                                     this.player
