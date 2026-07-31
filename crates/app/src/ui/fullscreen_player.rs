@@ -17,7 +17,7 @@ use gpui_component::{
 use subsonic::SubsonicClient;
 
 use crate::assets::{app_icon, icons};
-use crate::config::{FullscreenBackground, VisualizerMode};
+use crate::config::{FullscreenBackground, VisualizerMode, VisualizerSettings};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
@@ -52,6 +52,101 @@ fn out_back(t: f32) -> f32 {
     const C1: f32 = 1.7;
     const C3: f32 = C1 + 1.0;
     1.0 + C3 * (t - 1.0).powi(3) + C1 * (t - 1.0).powi(2)
+}
+
+/// One tunable of the visualizer. Everything the tuning card needs to render
+/// and write a knob lives here, so adding one is a single entry in
+/// [`VizKnob::ALL`] rather than a new field, slider and setter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VizKnob {
+    Sensitivity,
+    Smoothing,
+    Intensity,
+    Motion,
+    SwitchSensitivity,
+    SwitchHold,
+}
+
+impl VizKnob {
+    const ALL: [VizKnob; 6] = [
+        VizKnob::Sensitivity,
+        VizKnob::Smoothing,
+        VizKnob::Intensity,
+        VizKnob::Motion,
+        VizKnob::SwitchSensitivity,
+        VizKnob::SwitchHold,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            VizKnob::Sensitivity => "viz-sensitivity",
+            VizKnob::Smoothing => "viz-smoothing",
+            VizKnob::Intensity => "viz-intensity",
+            VizKnob::Motion => "viz-motion",
+            VizKnob::SwitchSensitivity => "viz-switch-sensitivity",
+            VizKnob::SwitchHold => "viz-switch-hold",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            VizKnob::Sensitivity => "Sensitivity",
+            VizKnob::Smoothing => "Smoothing",
+            VizKnob::Intensity => "Reaction depth",
+            VizKnob::Motion => "Motion speed",
+            VizKnob::SwitchSensitivity => "Auto switch",
+            VizKnob::SwitchHold => "Scene hold",
+        }
+    }
+
+    /// Only shown for the two Auto-mode knobs, which do nothing on a pinned
+    /// scene and would otherwise look broken.
+    fn auto_only(self) -> bool {
+        matches!(self, VizKnob::SwitchSensitivity | VizKnob::SwitchHold)
+    }
+
+    /// (min, max, step) for the slider.
+    fn range(self) -> (f32, f32, f32) {
+        match self {
+            VizKnob::Sensitivity => (0.4, 3.0, 0.05),
+            VizKnob::Smoothing => (0.0, 1.0, 0.02),
+            VizKnob::Intensity => (0.3, 2.5, 0.05),
+            VizKnob::Motion => (0.2, 2.5, 0.05),
+            VizKnob::SwitchSensitivity => (0.4, 2.5, 0.05),
+            VizKnob::SwitchHold => (3.0, 40.0, 1.0),
+        }
+    }
+
+    fn get(self, s: &VisualizerSettings) -> f32 {
+        match self {
+            VizKnob::Sensitivity => s.sensitivity,
+            VizKnob::Smoothing => s.smoothing,
+            VizKnob::Intensity => s.intensity,
+            VizKnob::Motion => s.motion,
+            VizKnob::SwitchSensitivity => s.switch_sensitivity,
+            VizKnob::SwitchHold => s.switch_hold,
+        }
+    }
+
+    fn set(self, s: &mut VisualizerSettings, v: f32) {
+        let (min, max, _) = self.range();
+        let v = v.clamp(min, max);
+        match self {
+            VizKnob::Sensitivity => s.sensitivity = v,
+            VizKnob::Smoothing => s.smoothing = v,
+            VizKnob::Intensity => s.intensity = v,
+            VizKnob::Motion => s.motion = v,
+            VizKnob::SwitchSensitivity => s.switch_sensitivity = v,
+            VizKnob::SwitchHold => s.switch_hold = v,
+        }
+    }
+
+    fn format(self, v: f32) -> String {
+        match self {
+            VizKnob::SwitchHold => format!("{v:.0}s"),
+            _ => format!("{v:.2}×"),
+        }
+    }
 }
 
 /// Remap `t` onto the sub-range `start..end` of the timeline, clamped.
@@ -99,9 +194,15 @@ pub struct FullscreenPlayer {
     /// seek bar is enabled and the decode finished).
     waveform: Option<Vec<f32>>,
     waveform_for: Option<String>,
+    /// Fraction of the seek bar under the cursor, for the hover indicator.
+    seek_hover: Option<f32>,
     /// Spectrum analysis + scene state for the 3D visualizer. Ticked once per
     /// frame while a scene is running; idle (and unread) when it is off.
     visualizer: Visualizer,
+    /// One slider state per visualizer knob, in `VizKnob::ALL` order.
+    viz_knobs: Vec<Entity<SliderState>>,
+    /// Tuning card open over the mini player.
+    viz_tuning_open: bool,
     /// Start of the entrance, reset on every open.
     opened_at: Instant,
     /// Set when the exit starts; `Some` also means "closing", i.e. the overlay
@@ -149,6 +250,35 @@ impl FullscreenPlayer {
         })
         .detach();
 
+        // Visualizer knobs. Each writes straight into the session settings,
+        // which `tick` re-reads every frame — so a drag retunes the scene as
+        // it happens rather than on the next open.
+        let tuning = session.read(cx).settings.visualizer_tuning;
+        let viz_knobs: Vec<Entity<SliderState>> = VizKnob::ALL
+            .into_iter()
+            .map(|knob| {
+                let (min, max, step) = knob.range();
+                let state = cx.new(|_| {
+                    SliderState::new()
+                        .min(min)
+                        .max(max)
+                        .step(step)
+                        .default_value(knob.get(&tuning))
+                });
+                cx.subscribe(&state, move |this: &mut Self, _, event, cx| {
+                    let SliderEvent::Change(value) = event;
+                    let v = value.start();
+                    this.session.update(cx, |s, _| {
+                        knob.set(&mut s.settings.visualizer_tuning, v);
+                        s.persist_settings();
+                    });
+                    cx.notify();
+                })
+                .detach();
+                state
+            })
+            .collect();
+
         // Watch player for song changes to update background art and lyrics.
         // Keyed on the album-scoped art key, not the song's cover id: Navidrome
         // gives each track its own, so comparing those would reload identical
@@ -193,7 +323,10 @@ impl FullscreenPlayer {
             lyrics_loading: false,
             waveform: None,
             waveform_for: None,
+            seek_hover: None,
             visualizer,
+            viz_knobs,
+            viz_tuning_open: false,
             opened_at: Instant::now(),
             closing_at: None,
         }
@@ -313,6 +446,94 @@ impl FullscreenPlayer {
         self.session.update(cx, |s, _| s.settings.visualizer = mode);
         self.session.read(cx).persist_settings();
         cx.notify();
+    }
+
+    /// Put every visualizer knob back to its default, sliders included — a
+    /// slider owns its own value, so resetting the settings alone would leave
+    /// the handles where the user dragged them.
+    fn reset_viz_tuning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let defaults = VisualizerSettings::default();
+        self.session.update(cx, |s, _| {
+            s.settings.visualizer_tuning = defaults;
+            s.persist_settings();
+        });
+        for (knob, state) in VizKnob::ALL.into_iter().zip(self.viz_knobs.clone()) {
+            state.update(cx, |slider, cx| {
+                slider.set_value(knob.get(&defaults), window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// The tuning card: the visualizer's own settings, floating over the scene
+    /// so a knob can be dragged while watching what it does. Lives here rather
+    /// than on the settings page because every one of these is judged by eye.
+    fn viz_tuning_card(&self, mode: VisualizerMode, cx: &mut Context<Self>) -> impl IntoElement {
+        let tuning = self.session.read(cx).settings.visualizer_tuning;
+        let auto = mode == VisualizerMode::Auto;
+
+        let mut rows = v_flex().gap_2p5();
+        for (knob, state) in VizKnob::ALL.into_iter().zip(self.viz_knobs.iter()) {
+            // Auto-only knobs stay visible on a pinned scene (so the card does
+            // not reflow when the mode changes) but read as inactive.
+            let dim = knob.auto_only() && !auto;
+            rows = rows.child(
+                v_flex()
+                    .gap_0p5()
+                    .when(dim, |s| s.opacity(0.45))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_xs().child(knob.label()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(knob.format(knob.get(&tuning))),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .id(knob.id())
+                            .w_full()
+                            .child(Slider::new(state).disabled(dim)),
+                    ),
+            );
+        }
+
+        v_flex()
+            .id("viz-tuning-card")
+            .w(px(260.))
+            .px_5()
+            .py_4()
+            .gap_2()
+            .rounded_2xl()
+            .shadow_xl()
+            // Same translucent shell as the mini player: the two read as one
+            // control surface, and the scene keeps running behind both.
+            .bg(cx.theme().background.opacity(0.72))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.6))
+            // The card is a control surface floating on the scene: clicks in it
+            // must not reach the overlay behind (which closes panels).
+            .occlude()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_sm().font_medium().child("Visualizer"))
+                    .child(
+                        Button::new("viz-tuning-reset")
+                            .ghost()
+                            .xsmall()
+                            .label("Reset")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_viz_tuning(window, cx);
+                            })),
+                    ),
+            )
+            .child(rows)
     }
 
     /// Menu listing scenes, for the mini player's "More" button. The scenes
@@ -893,7 +1114,8 @@ impl Render for FullscreenPlayer {
         // per frame, and a standing request for the next one while a scene is
         // up. Off costs nothing — no tick, no frame request, no canvas.
         if viz_mode.is_on() && !closing {
-            self.visualizer.tick(viz_mode);
+            let tuning = self.session.read(cx).settings.visualizer_tuning;
+            self.visualizer.tick(viz_mode, tuning);
             window.request_animation_frame();
         }
 
@@ -947,6 +1169,11 @@ impl Render for FullscreenPlayer {
         // info column, so the visualizer gets the whole window and the controls
         // sit on top of it in one compact card — including the scene picker,
         // which is otherwise buried in the cycle button that just got hidden.
+        // Built before the mini player's own closures: they borrow `cx`
+        // immutably for their listeners, and the card needs it mutably.
+        let tuning_card = (viz_mode.is_on() && self.viz_tuning_open)
+            .then(|| self.viz_tuning_card(viz_mode, cx).into_any_element());
+
         let mini_player = viz_mode.is_on().then(|| {
             let mode_btn = |mode: VisualizerMode, current: VisualizerMode| {
                 let id = match mode {
@@ -985,163 +1212,227 @@ impl Render for FullscreenPlayer {
                     v_flex()
                         .w(px(560.))
                         .max_w_full()
-                        .gap_3()
-                        .px_5()
-                        .py_4()
-                        .rounded_2xl()
-                        .shadow_xl()
-                        // Translucent so the scene keeps running behind it,
-                        // opaque enough to read against moving geometry.
-                        .bg(cx.theme().background.opacity(0.72))
-                        .border_1()
-                        .border_color(cx.theme().border.opacity(0.6))
+                        // The card hangs off the right edge as an absolute
+                        // child rather than sitting in the flow: in the flow it
+                        // would drag the mini player off centre whenever it
+                        // opened, and the mini player is the thing that has to
+                        // stay put.
+                        .relative()
+                        .when_some(tuning_card, |this, card| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .left(gpui::relative(1.))
+                                    .ml(px(12.))
+                                    .bottom_0()
+                                    .child(card),
+                            )
+                        })
                         .child(
-                            h_flex()
+                            v_flex()
+                                .w_full()
                                 .gap_3()
-                                .items_center()
+                                .px_5()
+                                .py_4()
+                                .rounded_2xl()
+                                .shadow_xl()
+                                // Translucent so the scene keeps running behind it,
+                                // opaque enough to read against moving geometry.
+                                .bg(cx.theme().background.opacity(0.72))
+                                .border_1()
+                                .border_color(cx.theme().border.opacity(0.6))
                                 .child(
-                                    div()
-                                        .size(px(56.))
-                                        .flex_none()
-                                        .rounded_lg()
-                                        .bg(cx.theme().muted)
-                                        .overflow_hidden()
-                                        .when_some(
-                                            self.art_path.clone().filter(|_| !is_radio),
-                                            |this, path| {
-                                                this.child(img(path).size(px(56.)).rounded_lg())
-                                            },
-                                        )
-                                        .when(is_radio, |this| {
-                                            this.flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_color(cx.theme().primary)
-                                                .child(app_icon(icons::RADIO))
-                                        }),
-                                )
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap_0p5()
+                                    h_flex()
+                                        .gap_3()
+                                        .items_center()
                                         .child(
                                             div()
-                                                .font_semibold()
-                                                .truncate()
-                                                .when(!has_track, |s: gpui::Div| {
-                                                    s.text_color(cx.theme().muted_foreground)
-                                                })
+                                                .size(px(56.))
+                                                .flex_none()
+                                                .rounded_lg()
+                                                .bg(cx.theme().muted)
+                                                .overflow_hidden()
+                                                .when_some(
+                                                    self.art_path.clone().filter(|_| !is_radio),
+                                                    |this, path| {
+                                                        this.child(
+                                                            img(path).size(px(56.)).rounded_lg(),
+                                                        )
+                                                    },
+                                                )
+                                                .when(is_radio, |this| {
+                                                    this.flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_color(cx.theme().primary)
+                                                        .child(app_icon(icons::RADIO))
+                                                }),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_0p5()
                                                 .child(
-                                                    mini_title.unwrap_or_else(|| {
-                                                        "Nothing playing".into()
-                                                    }),
+                                                    div()
+                                                        .font_semibold()
+                                                        .truncate()
+                                                        .when(!has_track, |s: gpui::Div| {
+                                                            s.text_color(
+                                                                cx.theme().muted_foreground,
+                                                            )
+                                                        })
+                                                        .child(mini_title.unwrap_or_else(|| {
+                                                            "Nothing playing".into()
+                                                        })),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .truncate()
+                                                        .child(mini_artist.unwrap_or_default()),
                                                 ),
                                         )
                                         .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .truncate()
-                                                .child(mini_artist.unwrap_or_default()),
+                                            h_flex()
+                                                .flex_none()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    icon_btn("mini-prev", icons::SKIP_BACK, false)
+                                                        .disabled(!has_track || is_radio)
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.player
+                                                                .update(cx, |p, cx| p.previous(cx));
+                                                            cx.stop_propagation();
+                                                        })),
+                                                )
+                                                .child(
+                                                    Button::new("mini-play")
+                                                        .primary()
+                                                        .icon(if playing {
+                                                            app_icon(icons::PAUSE)
+                                                        } else {
+                                                            app_icon(icons::PLAY)
+                                                        })
+                                                        .loading(buffering)
+                                                        .disabled(!has_track)
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.player.update(cx, |p, cx| {
+                                                                p.toggle_play(cx)
+                                                            });
+                                                            cx.stop_propagation();
+                                                        })),
+                                                )
+                                                .child(
+                                                    icon_btn(
+                                                        "mini-next",
+                                                        icons::SKIP_FORWARD,
+                                                        false,
+                                                    )
+                                                    .disabled(!has_track || is_radio)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.player.update(cx, |p, cx| p.next(cx));
+                                                        cx.stop_propagation();
+                                                    })),
+                                                ),
                                         ),
                                 )
+                                // Seek row — live radio has nothing to seek.
+                                .when(!is_radio, |this| {
+                                    this.child(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(mini_time_now),
+                                            )
+                                            .map(|this| {
+                                                let bar =
+                                                    match (waveform_enabled, self.waveform.clone())
+                                                    {
+                                                        (true, Some(peaks)) => {
+                                                            crate::ui::waveform_seek_bar(
+                                                                &peaks,
+                                                                seek_fraction,
+                                                                22.,
+                                                                cx.theme().primary,
+                                                                cx.theme()
+                                                                    .muted_foreground
+                                                                    .opacity(0.35),
+                                                                self.player.clone(),
+                                                            )
+                                                        }
+                                                        _ => div()
+                                                            .flex_1()
+                                                            .child(Slider::new(&self.seek))
+                                                            .into_any_element(),
+                                                    };
+                                                let view = cx.entity();
+                                                this.child(crate::ui::seek_hover_wrap(
+                                                    "fs-mini-seek-hover",
+                                                    self.seek_hover,
+                                                    duration,
+                                                    bar,
+                                                    move |fraction, cx| {
+                                                        view.update(cx, |p: &mut Self, cx| {
+                                                            if p.seek_hover != fraction {
+                                                                p.seek_hover = fraction;
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    },
+                                                    cx,
+                                                ))
+                                            })
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(mini_time_total),
+                                            ),
+                                    )
+                                })
+                                .when(is_radio, |this| {
+                                    this.child(h_flex().w_full().justify_center().child(
+                                        crate::ui::live_badge(
+                                            "mini-live",
+                                            cx.theme().primary,
+                                            Some(position),
+                                            cx,
+                                        ),
+                                    ))
+                                })
+                                // Scene picker.
                                 .child(
                                     h_flex()
-                                        .flex_none()
-                                        .gap_2()
+                                        .gap_1()
                                         .items_center()
+                                        .justify_center()
+                                        .pt_1()
+                                        .border_t_1()
+                                        .border_color(cx.theme().border.opacity(0.4))
+                                        .child(mode_btn(VisualizerMode::Off, viz_mode))
+                                        .child(mode_btn(VisualizerMode::Auto, viz_mode))
+                                        .child(self.scene_menu(scene_trigger, viz_mode))
                                         .child(
-                                            icon_btn("mini-prev", icons::SKIP_BACK, false)
-                                                .disabled(!has_track || is_radio)
+                                            Button::new("mini-viz-tune")
+                                                .ghost()
+                                                .small()
+                                                .icon(Icon::new(IconName::Settings2).xsmall())
+                                                .when(self.viz_tuning_open, |b| b.primary())
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.player.update(cx, |p, cx| p.previous(cx));
-                                                    cx.stop_propagation();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("mini-play")
-                                                .primary()
-                                                .icon(if playing {
-                                                    app_icon(icons::PAUSE)
-                                                } else {
-                                                    app_icon(icons::PLAY)
-                                                })
-                                                .loading(buffering)
-                                                .disabled(!has_track)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.player
-                                                        .update(cx, |p, cx| p.toggle_play(cx));
-                                                    cx.stop_propagation();
-                                                })),
-                                        )
-                                        .child(
-                                            icon_btn("mini-next", icons::SKIP_FORWARD, false)
-                                                .disabled(!has_track || is_radio)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.player.update(cx, |p, cx| p.next(cx));
+                                                    this.viz_tuning_open = !this.viz_tuning_open;
+                                                    cx.notify();
                                                     cx.stop_propagation();
                                                 })),
                                         ),
                                 ),
-                        )
-                        // Seek row — live radio has nothing to seek.
-                        .when(!is_radio, |this| {
-                            this.child(
-                                h_flex()
-                                    .w_full()
-                                    .gap_3()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(mini_time_now),
-                                    )
-                                    .map(|this| match (waveform_enabled, self.waveform.clone()) {
-                                        (true, Some(peaks)) => {
-                                            this.child(crate::ui::waveform_seek_bar(
-                                                &peaks,
-                                                seek_fraction,
-                                                22.,
-                                                cx.theme().primary,
-                                                cx.theme().muted_foreground.opacity(0.35),
-                                                self.player.clone(),
-                                            ))
-                                        }
-                                        _ => this
-                                            .child(div().flex_1().child(Slider::new(&self.seek))),
-                                    })
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(mini_time_total),
-                                    ),
-                            )
-                        })
-                        .when(is_radio, |this| {
-                            this.child(h_flex().w_full().justify_center().child(
-                                crate::ui::live_badge(
-                                    "mini-live",
-                                    cx.theme().primary,
-                                    Some(position),
-                                    cx,
-                                ),
-                            ))
-                        })
-                        // Scene picker.
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .justify_center()
-                                .pt_1()
-                                .border_t_1()
-                                .border_color(cx.theme().border.opacity(0.4))
-                                .child(mode_btn(VisualizerMode::Off, viz_mode))
-                                .child(mode_btn(VisualizerMode::Auto, viz_mode))
-                                .child(self.scene_menu(scene_trigger, viz_mode)),
                         ),
                 )
         });
@@ -1323,25 +1614,42 @@ impl Render for FullscreenPlayer {
                                                     .child(time_now),
                                             )
                                             .map(|this| {
-                                                match (waveform_enabled, self.waveform.clone()) {
-                                                    (true, Some(peaks)) => {
-                                                        this.child(crate::ui::waveform_seek_bar(
-                                                            &peaks,
-                                                            seek_fraction,
-                                                            34.,
-                                                            cx.theme().primary,
-                                                            cx.theme()
-                                                                .muted_foreground
-                                                                .opacity(0.35),
-                                                            self.player.clone(),
-                                                        ))
-                                                    }
-                                                    _ => this.child(
-                                                        div()
+                                                let bar =
+                                                    match (waveform_enabled, self.waveform.clone())
+                                                    {
+                                                        (true, Some(peaks)) => {
+                                                            crate::ui::waveform_seek_bar(
+                                                                &peaks,
+                                                                seek_fraction,
+                                                                34.,
+                                                                cx.theme().primary,
+                                                                cx.theme()
+                                                                    .muted_foreground
+                                                                    .opacity(0.35),
+                                                                self.player.clone(),
+                                                            )
+                                                        }
+                                                        _ => div()
                                                             .flex_1()
-                                                            .child(Slider::new(&self.seek)),
-                                                    ),
-                                                }
+                                                            .child(Slider::new(&self.seek))
+                                                            .into_any_element(),
+                                                    };
+                                                let view = cx.entity();
+                                                this.child(crate::ui::seek_hover_wrap(
+                                                    "fs-seek-hover",
+                                                    self.seek_hover,
+                                                    duration,
+                                                    bar,
+                                                    move |fraction, cx| {
+                                                        view.update(cx, |p: &mut Self, cx| {
+                                                            if p.seek_hover != fraction {
+                                                                p.seek_hover = fraction;
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    },
+                                                    cx,
+                                                ))
                                             })
                                             .child(
                                                 div()

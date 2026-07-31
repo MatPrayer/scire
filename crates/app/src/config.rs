@@ -98,6 +98,12 @@ pub struct Settings {
     /// Scene drawn by the fullscreen visualizer; Off hides it. Persisted so the
     /// overlay comes back the way it was left.
     pub visualizer: VisualizerMode,
+    /// Per-scene sensitivity/intensity knobs for the visualizer.
+    pub visualizer_tuning: VisualizerSettings,
+    /// Sidebar library switcher folded away; restored across sessions.
+    pub sidebar_libraries_collapsed: bool,
+    /// Sidebar playlist list folded away; restored across sessions.
+    pub sidebar_playlists_collapsed: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -237,6 +243,43 @@ impl VisualizerMode {
     ];
 }
 
+/// Tuning knobs for the fullscreen visualizer. All are multipliers around 1.0
+/// (or 0..1 mixes) so the defaults reproduce the untuned look exactly, and a
+/// value out of the UI's range still behaves sanely.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualizerSettings {
+    /// Gain on the analysed band levels before they are drawn. Quiet or
+    /// heavily compressed masters need more than 1.0 to move the geometry.
+    pub sensitivity: f32,
+    /// 0 = snap to the spectrum (twitchy), 1 = long attack and release
+    /// (floaty). 0.5 is the hand-tuned original.
+    pub smoothing: f32,
+    /// How far the audio deforms each scene: terrain height, tunnel radius,
+    /// sphere/orb inflation, retro shape size.
+    pub intensity: f32,
+    /// Rotation, drift and scroll speed multiplier.
+    pub motion: f32,
+    /// Auto mode's eagerness to switch scenes: >1 lowers the onset threshold,
+    /// <1 raises it so only the biggest drops count.
+    pub switch_sensitivity: f32,
+    /// Seconds Auto refuses to switch after a switch.
+    pub switch_hold: f32,
+}
+
+impl Default for VisualizerSettings {
+    fn default() -> Self {
+        Self {
+            sensitivity: 1.0,
+            smoothing: 0.5,
+            intensity: 1.0,
+            motion: 1.0,
+            switch_sensitivity: 1.0,
+            switch_hold: 9.0,
+        }
+    }
+}
+
 /// What happens when the play queue reaches its end.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -317,6 +360,9 @@ impl Default for Settings {
             local_music_dirs: Vec::new(),
             fullscreen_volume: false,
             visualizer: VisualizerMode::Off,
+            visualizer_tuning: VisualizerSettings::default(),
+            sidebar_libraries_collapsed: false,
+            sidebar_playlists_collapsed: false,
         }
     }
 }

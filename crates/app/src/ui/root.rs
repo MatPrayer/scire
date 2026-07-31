@@ -282,6 +282,11 @@ impl RootView {
         })
         .detach();
 
+        // Sidebar fold state is persisted, so restore it instead of reopening
+        // every section on each start.
+        let libraries_collapsed = session.read(cx).settings.sidebar_libraries_collapsed;
+        let playlists_collapsed = session.read(cx).settings.sidebar_playlists_collapsed;
+
         Self {
             session,
             player,
@@ -304,8 +309,8 @@ impl RootView {
             library_db,
             scan_started: false,
             last_libraries: Vec::new(),
-            libraries_collapsed: false,
-            playlists_collapsed: false,
+            libraries_collapsed,
+            playlists_collapsed,
             new_playlist_open: false,
             new_pl_name,
             new_pl_desc,
@@ -1078,10 +1083,20 @@ impl Render for RootView {
                                 }
                                 SidebarAction::ToggleLibrarySection => {
                                     root.libraries_collapsed = !root.libraries_collapsed;
+                                    let collapsed = root.libraries_collapsed;
+                                    root.session.update(cx, |session, _| {
+                                        session.settings.sidebar_libraries_collapsed = collapsed;
+                                        session.persist_settings();
+                                    });
                                     cx.notify();
                                 }
                                 SidebarAction::TogglePlaylistSection => {
                                     root.playlists_collapsed = !root.playlists_collapsed;
+                                    let collapsed = root.playlists_collapsed;
+                                    root.session.update(cx, |session, _| {
+                                        session.settings.sidebar_playlists_collapsed = collapsed;
+                                        session.persist_settings();
+                                    });
                                     cx.notify();
                                 }
                             });

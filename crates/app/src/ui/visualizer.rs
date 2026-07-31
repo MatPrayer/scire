@@ -19,7 +19,7 @@ use gpui::{
 };
 use playback::spectrum::{self, FFT_SIZE, SpectrumTap};
 
-use crate::config::VisualizerMode;
+use crate::config::{VisualizerMode, VisualizerSettings};
 
 /// Frequency bands the spectrum is reduced to. Also the horizontal resolution
 /// of the terrain and the angular resolution of the tunnel.
@@ -85,6 +85,10 @@ pub struct OnsetSwitcher {
     since: f32,
     /// Flux crossed the threshold and we are waiting for the hit itself.
     armed: Option<Armed>,
+    /// User tuning: >1 lowers the thresholds, <1 raises them.
+    sensitivity: f32,
+    /// User tuning: seconds to ignore onsets after a switch (`MIN_HOLD`).
+    min_hold: f32,
 }
 
 /// One frame of detection input.
@@ -159,7 +163,17 @@ impl OnsetSwitcher {
             bass_hist: VecDeque::with_capacity(FLUX_HIST),
             since: 0.,
             armed: None,
+            sensitivity: 1.,
+            min_hold: MIN_HOLD,
         }
+    }
+
+    /// Apply the user's tuning. Kept separate from `observe` so the detection
+    /// path stays a pure function of the audio and the tests can drive it
+    /// without carrying settings around.
+    fn tune(&mut self, sensitivity: f32, min_hold: f32) {
+        self.sensitivity = sensitivity.clamp(0.2, 4.);
+        self.min_hold = min_hold.clamp(1., MAX_HOLD);
     }
 
     /// Feed one frame; returns true when the scene should change now.
@@ -189,7 +203,7 @@ impl OnsetSwitcher {
         }
         // Silence still ages the scene toward MAX_HOLD, but must not trigger:
         // the statistics of near-zero flux make any blip look significant.
-        if self.since < MIN_HOLD || onset.energy < 0.02 || self.hist.len() < 30 {
+        if self.since < self.min_hold || onset.energy < 0.02 || self.hist.len() < 30 {
             self.armed = None;
             return false;
         }
@@ -201,8 +215,11 @@ impl OnsetSwitcher {
 
         match &mut self.armed {
             None => {
-                let arm_at = (mean + FLUX_SIGMAS * sd).max(mean * FLUX_RATIO);
-                if strength > arm_at && strength > FLUX_FLOOR {
+                // Sensitivity scales the whole threshold, floor included: a
+                // sigma-only scaling would leave the ratio and floor terms
+                // dominant and the slider would do nothing on steady tracks.
+                let arm_at = (mean + FLUX_SIGMAS * sd).max(mean * FLUX_RATIO) / self.sensitivity;
+                if strength > arm_at && strength > FLUX_FLOOR / self.sensitivity {
                     self.armed = Some(Armed {
                         waited: 0.,
                         peak_flux: strength,
@@ -225,7 +242,8 @@ impl OnsetSwitcher {
                 } else {
                     a.bass_frames = 0;
                 }
-                let hard = (mean + FLUX_SIGMAS_HARD * sd).max(mean * FLUX_RATIO_HARD);
+                let hard =
+                    (mean + FLUX_SIGMAS_HARD * sd).max(mean * FLUX_RATIO_HARD) / self.sensitivity;
                 let landed = a.bass_frames >= BASS_CONFIRM_FRAMES || a.peak_flux > hard;
                 if landed && a.falling >= 1 {
                     self.reset();
@@ -284,6 +302,12 @@ pub struct Visualizer {
     /// Unit icosphere for the Orb scene, built once and shared with each
     /// frame's paint callback.
     orb: Arc<OrbMesh>,
+    /// Tunnel's forward travel. Accumulated rather than derived from `spin`,
+    /// because the speed rides on the track's energy and multiplying a growing
+    /// clock by a changing rate would jump the rings whenever it changed.
+    tunnel_z: f32,
+    /// User tuning, refreshed from settings on every `tick`.
+    tuning: VisualizerSettings,
 }
 
 /// One mesh instance in the Retro scene.
@@ -553,6 +577,8 @@ impl Visualizer {
             rng: 0x2545_f491,
             flash: 0.,
             orb: Arc::new(OrbMesh::new(ORB_DETAIL)),
+            tunnel_z: 0.,
+            tuning: VisualizerSettings::default(),
         };
         // Spread the initial field through the depth range so the scene is
         // already populated the first time it is shown.
@@ -624,7 +650,8 @@ impl Visualizer {
 
     /// Read the newest samples, run the FFT, and advance the animation clocks.
     /// Call once per rendered frame, with the mode currently selected.
-    pub fn tick(&mut self, mode: VisualizerMode) {
+    pub fn tick(&mut self, mode: VisualizerMode, tuning: VisualizerSettings) {
+        self.tuning = tuning;
         let now = Instant::now();
         // Clamped: a frame delayed by a stall (or the overlay being reopened
         // after minutes) must not teleport the scene.
@@ -636,7 +663,8 @@ impl Visualizer {
     /// One step of `dt` seconds. Split out from `tick` so the decay, the scene
     /// clocks and the switching can be driven at a known rate in tests.
     fn advance(&mut self, mode: VisualizerMode, dt: f32) {
-        self.spin += dt;
+        let motion = self.tuning.motion.clamp(0.1, 3.);
+        self.spin += dt * motion;
 
         let head = self.tap.snapshot(&mut self.samples);
         if head == self.last_head {
@@ -649,10 +677,17 @@ impl Visualizer {
         self.last_head = head;
 
         // Fast attack, slow release: peaks land on the beat, decay reads as
-        // the note ringing out instead of flickering.
-        let attack = 1. - (-dt * 26.).exp();
-        let release = 1. - (-dt * 7.).exp();
+        // the note ringing out instead of flickering. The smoothing knob slides
+        // both rates; 0.5 reproduces the hand-tuned 26/7.
+        let smooth = self.tuning.smoothing.clamp(0., 1.);
+        let attack = 1. - (-dt * (40. - 28. * smooth)).exp();
+        let release = 1. - (-dt * (12. - 10. * smooth)).exp();
+        // Gain is applied to the drawn bands only, not to `raw`: the onset
+        // detector's thresholds are calibrated against the ungained flux, and
+        // scaling both sides of a ratio test would change nothing anyway.
+        let gain = self.tuning.sensitivity.clamp(0.2, 4.);
         for (out, &target) in self.bands.iter_mut().zip(self.raw.iter()) {
+            let target = (target * gain).min(1.);
             let k = if target > *out { attack } else { release };
             *out += (target - *out) * k;
         }
@@ -686,7 +721,7 @@ impl Visualizer {
 
         // Shapes fly at the camera, faster when the track is busy, and are
         // recycled from the back once they pass it.
-        let speed = 0.55 + 1.9 * self.energy();
+        let speed = (0.55 + 1.9 * self.energy()) * motion;
         for i in 0..self.shapes.len() {
             self.shapes[i].z -= speed * dt;
             for axis in 0..3 {
@@ -697,11 +732,18 @@ impl Visualizer {
             }
         }
 
+        // Tunnel travel: faster when the track is busy, so a drop reads as
+        // acceleration down the tube. Wrapped to one ring spacing in the paint
+        // pass, so this can grow without losing precision for hours.
+        self.tunnel_z += dt * (0.85 + 1.6 * self.energy()) * motion;
+
         self.fade_left = (self.fade_left - dt).max(0.);
         if self.fade_left == 0. {
             self.fading = None;
         }
 
+        self.switcher
+            .tune(self.tuning.switch_sensitivity, self.tuning.switch_hold);
         let want = match pinned_scene(mode) {
             Some(pinned) => pinned,
             None if mode == VisualizerMode::Auto => {
@@ -727,7 +769,7 @@ impl Visualizer {
             self.scene = want;
         }
 
-        self.row_accum += dt;
+        self.row_accum += dt * motion;
         while self.row_accum >= ROW_INTERVAL {
             self.row_accum -= ROW_INTERVAL;
             self.history.pop_back();
@@ -774,24 +816,27 @@ impl Visualizer {
         let t = 1. - self.fade_left / FADE;
         let outgoing = self.fading.map(|s| (s, 1. - t));
         let incoming = (t * 2.5).min(1.);
+        // How far the audio is allowed to deform each scene.
+        let power = self.tuning.intensity.clamp(0.1, 3.);
+        let tunnel_z = self.tunnel_z;
 
         canvas(
             |_, _, _| (),
             move |bounds, _, window, _| {
                 let mut draw = |scene: Scene, alpha: f32| match scene {
-                    Scene::Terrain => paint_terrain(bounds, &history, accent, alpha, window),
-                    Scene::Tunnel => {
-                        paint_tunnel(bounds, &bands, spin, energy, accent, alpha, window)
-                    }
+                    Scene::Terrain => paint_terrain(bounds, &history, power, accent, alpha, window),
+                    Scene::Tunnel => paint_tunnel(
+                        bounds, &bands, spin, tunnel_z, energy, power, accent, alpha, window,
+                    ),
                     Scene::Sphere => {
-                        paint_sphere(bounds, &bands, spin, energy, accent, alpha, window)
+                        paint_sphere(bounds, &bands, spin, energy, power, accent, alpha, window)
                     }
-                    Scene::Retro => {
-                        paint_retro(bounds, &bands, &shapes, flash, bass, accent, alpha, window)
-                    }
-                    Scene::Orb => {
-                        paint_orb(bounds, &orb, spin, bass, treble, accent, alpha, window)
-                    }
+                    Scene::Retro => paint_retro(
+                        bounds, &bands, &shapes, flash, bass, power, accent, alpha, window,
+                    ),
+                    Scene::Orb => paint_orb(
+                        bounds, &orb, spin, bass, treble, power, accent, alpha, window,
+                    ),
                 };
                 if let Some((prev, alpha)) = outgoing {
                     draw(prev, alpha);
@@ -854,24 +899,42 @@ fn depth_color(accent: Hsla, depth: f32, alpha: f32) -> Hsla {
     }
 }
 
+/// Terrain camera constants, shared with the geometry test below.
+const TERRAIN_ZOOM: f32 = 0.55;
+const TERRAIN_Z_NEAR: f32 = 1.7;
+const TERRAIN_Z_STEP: f32 = 0.28;
+/// Half-width of the nearest row, in world units.
+const TERRAIN_HALF_W: f32 = 2.0;
+/// Extra half-width per unit of depth. The projected half-span of a row tends
+/// to `TERRAIN_WIDEN * focal` as z grows, so this sets how far the far rows
+/// overhang the viewport; below ~0.95 they end inside it.
+const TERRAIN_WIDEN: f32 = 1.05;
+
+/// World half-width of the terrain row at depth `z`. Rows widen with depth
+/// instead of being a constant-width grid: a constant width shrinks on screen
+/// as 1/z, so the far rows would end well inside the viewport and the landscape
+/// would read as a floating carpet with visible corners. Widening cancels most
+/// of that divide, so every row runs off both edges of the window.
+fn terrain_row_half(z: f32) -> f32 {
+    TERRAIN_HALF_W + TERRAIN_WIDEN * (z - TERRAIN_Z_NEAR)
+}
+
 /// Scrolling spectrum landscape: frequency across x, time receding into z,
 /// level as height. Rows are drawn far to near, each filled below its ridge so
 /// it hides the rows behind it.
 fn paint_terrain(
     bounds: Bounds<Pixels>,
     history: &[Vec<f32>],
+    power: f32,
     accent: Hsla,
     alpha: f32,
     window: &mut gpui::Window,
 ) {
-    let focal = focal_of(bounds, 0.55);
-    // World units. The grid is wider than it is deep so the near row spans the
-    // viewport without the far rows collapsing to a point too quickly.
-    let half_w = 1.9;
+    let focal = focal_of(bounds, TERRAIN_ZOOM);
     let base_y = -0.5;
-    let height = 1.05;
-    let z_near = 1.7;
-    let z_step = 0.28;
+    let height = 1.05 * power;
+    let z_near = TERRAIN_Z_NEAR;
+    let z_step = TERRAIN_Z_STEP;
     // Rows are filled from their ridge down to well below the frame: an
     // exactly-baseline fill leaves slits of background between rows, which
     // breaks the illusion that they are a continuous surface.
@@ -880,7 +943,8 @@ fn paint_terrain(
     for (r, row) in history.iter().enumerate().rev() {
         let z = z_near + r as f32 * z_step;
         let depth = r as f32 / history.len().max(1) as f32;
-        let x_at = |b: usize| (b as f32 / (BANDS - 1) as f32 - 0.5) * 2. * half_w;
+        let row_half = terrain_row_half(z);
+        let x_at = |b: usize| (b as f32 / (BANDS - 1) as f32 - 0.5) * 2. * row_half;
 
         let mut ridge = Vec::with_capacity(BANDS);
         for (b, &v) in row.iter().enumerate() {
@@ -950,22 +1014,30 @@ fn paint_terrain(
 /// Rings receding to a vanishing point, each ring's radius modulated per angle
 /// by the spectrum. The whole tunnel drifts toward the viewer, with rings
 /// recycling from the back so the flight never restarts visibly.
+#[allow(clippy::too_many_arguments)]
 fn paint_tunnel(
     bounds: Bounds<Pixels>,
     bands: &[f32],
     spin: f32,
+    travel: f32,
     energy: f32,
+    power: f32,
     accent: Hsla,
     alpha: f32,
     window: &mut gpui::Window,
 ) {
-    const RINGS: usize = 18;
+    const RINGS: usize = 22;
     const SEGMENTS: usize = 96;
     let focal = focal_of(bounds, 0.7);
-    let z_near = 1.05;
-    let z_step = 0.5;
-    // Continuous forward drift; `fract` recycles the nearest ring to the back.
-    let drift = (spin * 0.75).fract();
+    // Near plane close to the camera and rings packed tighter than they are
+    // wide: the tube swallows the frame and the walls rush past instead of
+    // sitting in the middle of the window as a ribbed disc.
+    let z_near = 0.75;
+    let z_step = 0.52;
+    // Forward drift; `fract` recycles the nearest ring to the back. `travel`
+    // is accumulated per frame (see `Visualizer::tunnel_z`) so the speed can
+    // ride on the track without the ring positions jumping when it changes.
+    let drift = travel.fract();
 
     for i in (0..RINGS).rev() {
         let z = z_near + (i as f32 + drift) * z_step;
@@ -973,9 +1045,9 @@ fn paint_tunnel(
         // Rings turn as a whole, with only a slight lean per ring: twisting
         // hard with depth makes a single loud band spiral across the rings and
         // read as a stray diagonal streak rather than as a ridge in the tube.
-        let twist = spin * 0.3 + z * 0.06;
+        let twist = spin * 0.42 + z * 0.09;
 
-        let mut pb = PathBuilder::stroke(px(2.4 - 1.6 * depth));
+        let mut pb = PathBuilder::stroke(px(3.2 - 2.3 * depth));
         let mut first = None;
         for seg in 0..SEGMENTS {
             let a = seg as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
@@ -987,7 +1059,9 @@ fn paint_tunnel(
             // tips read as a stray radial line through the tunnel.
             let level =
                 (band_at(bands, t - 0.04) + 2. * band_at(bands, t) + band_at(bands, t + 0.04)) / 4.;
-            let radius = 0.5 * (1. + 0.5 * level);
+            // Deep radial modulation: the wall is meant to be pushed into
+            // ridges by the spectrum, not gently rippled.
+            let radius = 0.46 * (1. + 1.25 * level * power);
             let (sin, cos) = (a + twist).sin_cos();
             let Some(pt) = project(
                 P3 {
@@ -1017,7 +1091,10 @@ fn paint_tunnel(
         // those spurs line up into a stray radial streak.
         pb.close();
         if let Ok(path) = pb.build() {
-            let a = (1. - depth).powf(1.3) * (0.5 + 0.5 * energy) * alpha;
+            // Steep falloff: the far rings crowd into a few pixels around the
+            // vanishing point, and at a flat alpha they pile up into a moiré
+            // knot instead of reading as distance.
+            let a = (1. - depth).powf(1.7) * (0.5 + 0.5 * energy) * alpha;
             window.paint_path(path, depth_color(accent, depth, a));
         }
     }
@@ -1026,11 +1103,13 @@ fn paint_tunnel(
 /// Rotating point cloud on a Fibonacci sphere, each point pushed out along its
 /// normal by the band it belongs to. Points are quads sized by depth, which is
 /// both cheaper than paths and reads as a proper 3D cloud.
+#[allow(clippy::too_many_arguments)]
 fn paint_sphere(
     bounds: Bounds<Pixels>,
     bands: &[f32],
     spin: f32,
     energy: f32,
+    power: f32,
     accent: Hsla,
     alpha: f32,
     window: &mut gpui::Window,
@@ -1055,7 +1134,7 @@ fn paint_sphere(
         // point index instead puts the loud low end on one pole and the cloud
         // reads as lopsided rather than as a sphere.
         let band = band_at(bands, y.abs());
-        let radius = 0.75 * (1. + 0.55 * band);
+        let radius = 0.75 * (1. + 0.55 * band * power);
         let (px_, py_, pz_) = (x * radius, y * radius, z * radius);
 
         // Yaw about y, then pitch about x.
@@ -1101,6 +1180,7 @@ fn paint_retro(
     shapes: &[Shape],
     flash: f32,
     bass: f32,
+    power: f32,
     accent: Hsla,
     alpha: f32,
     window: &mut gpui::Window,
@@ -1160,7 +1240,7 @@ fn paint_retro(
 
     for shape in order {
         let level = bands[shape.band];
-        let size = shape.scale * (0.7 + 0.9 * level);
+        let size = shape.scale * (0.7 + 0.9 * level * power);
         // Meshes are opaque — flat-shaded hardware had no alpha to spare, and
         // fading them by distance instead of fogging them makes solids you can
         // see through. Alpha covers only the scene cross-fade and the dissolve
@@ -1301,6 +1381,7 @@ fn paint_orb(
     time: f32,
     bass: f32,
     treble: f32,
+    power: f32,
     accent: Hsla,
     alpha: f32,
     window: &mut gpui::Window,
@@ -1314,8 +1395,8 @@ fn paint_orb(
     let (sy, cy_) = ry.sin_cos();
     let (sz, cz_) = rz.sin_cos();
 
-    let radius = 0.58 * (1. + 0.42 * bass);
-    let rough = 0.10 + 0.62 * treble;
+    let radius = 0.58 * (1. + 0.42 * bass * power);
+    let rough = 0.10 + 0.62 * treble * power;
     // Noise drifts at a different rate per axis so the surface never repeats.
     let (dx, dy, dz) = (time * 0.25, time * 0.37, time * 0.44);
 
@@ -1706,6 +1787,67 @@ mod tests {
         assert_eq!(v.history.len(), ROWS);
         let pushed = v.history.iter().filter(|r| r[0] > 0.01).count();
         assert_eq!(pushed, 1, "expected one row, got {pushed}");
+    }
+
+    /// The point of widening the rows with depth: no row may end inside the
+    /// window, at any depth or aspect ratio, or the landscape reads as a
+    /// carpet with visible corners instead of ground running past the camera.
+    #[test]
+    fn every_terrain_row_runs_off_both_edges() {
+        for (w, h) in [(1280., 720.), (2560., 1440.), (900., 1400.)] {
+            let bounds = Bounds {
+                origin: point(px(0.), px(0.)),
+                size: gpui::size(px(w), px(h)),
+            };
+            let focal = focal_of(bounds, TERRAIN_ZOOM);
+            for r in 0..ROWS {
+                let z = TERRAIN_Z_NEAR + r as f32 * TERRAIN_Z_STEP;
+                let edge = terrain_row_half(z) * focal / z;
+                assert!(
+                    edge > w / 2.,
+                    "row {r} ends at {edge}px inside a {w}x{h} window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sensitivity_scales_the_drawn_bands() {
+        // Same quiet tone into both, one with the gain turned up.
+        let (tap_a, tap_b) = (SpectrumTap::new(), SpectrumTap::new());
+        let mut quiet = Visualizer::new(tap_a.clone());
+        let mut loud = Visualizer::new(tap_b.clone());
+        loud.tuning.sensitivity = 3.0;
+        let rate = tap_a.sample_rate() as f32;
+        let mut i = 0usize;
+        for _ in 0..30 {
+            for _ in 0..(rate as usize / 60) {
+                let s = 0.05 * (2. * std::f32::consts::PI * 440. * i as f32 / rate).sin();
+                tap_a.push_for_test(s);
+                tap_b.push_for_test(s);
+                i += 1;
+            }
+            quiet.advance(VisualizerMode::Terrain, 1. / 60.);
+            loud.advance(VisualizerMode::Terrain, 1. / 60.);
+        }
+        assert!(
+            loud.energy() > quiet.energy() * 1.5,
+            "gain did not reach the bands: {} vs {}",
+            loud.energy(),
+            quiet.energy()
+        );
+    }
+
+    #[test]
+    fn a_shorter_hold_lets_auto_switch_sooner() {
+        let mut sw = OnsetSwitcher::new();
+        sw.tune(1., 3.);
+        // Calm for longer than the tuned hold but well under MIN_HOLD.
+        assert!(!feed_calm(&mut sw, 4.));
+        assert!(
+            feed_hit(&mut sw, 0.5, 0.9),
+            "no switch after the tuned hold"
+        );
     }
 
     #[test]

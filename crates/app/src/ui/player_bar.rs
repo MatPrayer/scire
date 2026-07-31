@@ -45,6 +45,8 @@ pub struct PlayerBar {
     /// seek bar is enabled and the decode finished).
     waveform: Option<Vec<f32>>,
     waveform_for: Option<String>,
+    /// Fraction of the seek bar under the cursor, for the hover indicator.
+    seek_hover: Option<f32>,
     /// Hover styles can't underline text in gpui (text is shaped at layout,
     /// before hover state exists), so track hover ourselves and re-render.
     title_hovered: bool,
@@ -143,6 +145,7 @@ impl PlayerBar {
             vol_input_focused: false,
             waveform: None,
             waveform_for: None,
+            seek_hover: None,
             title_hovered: false,
             artist_hovered: None,
         }
@@ -656,20 +659,36 @@ impl Render for PlayerBar {
                                 .map(|this| {
                                     // Waveform seek bar when enabled and
                                     // decoded; slider otherwise.
-                                    match (waveform_enabled, self.waveform.clone()) {
-                                        (true, Some(peaks)) => {
-                                            this.child(crate::ui::waveform_seek_bar(
-                                                &peaks,
-                                                seek_fraction,
-                                                26.,
-                                                cx.theme().primary,
-                                                cx.theme().muted_foreground.opacity(0.35),
-                                                self.player.clone(),
-                                            ))
-                                        }
-                                        _ => this
-                                            .child(div().flex_1().child(Slider::new(&self.seek))),
-                                    }
+                                    let bar = match (waveform_enabled, self.waveform.clone()) {
+                                        (true, Some(peaks)) => crate::ui::waveform_seek_bar(
+                                            &peaks,
+                                            seek_fraction,
+                                            26.,
+                                            cx.theme().primary,
+                                            cx.theme().muted_foreground.opacity(0.35),
+                                            self.player.clone(),
+                                        ),
+                                        _ => div()
+                                            .flex_1()
+                                            .child(Slider::new(&self.seek))
+                                            .into_any_element(),
+                                    };
+                                    let view = cx.entity();
+                                    this.child(crate::ui::seek_hover_wrap(
+                                        "bar-seek-hover",
+                                        self.seek_hover,
+                                        duration,
+                                        bar,
+                                        move |fraction, cx| {
+                                            view.update(cx, |bar, cx| {
+                                                if bar.seek_hover != fraction {
+                                                    bar.seek_hover = fraction;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        },
+                                        cx,
+                                    ))
                                 })
                                 .child(
                                     div()

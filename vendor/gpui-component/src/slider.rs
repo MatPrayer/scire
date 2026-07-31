@@ -422,11 +422,11 @@ impl Slider {
         &self,
         start_pos: Pixels,
         is_start: bool,
-        bar_color: Background,
+        _bar_color: Background,
         thumb_color: Hsla,
         radius: Corners<Pixels>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> impl gpui::IntoElement {
         let entity_id = self.state.entity_id();
         let axis = self.axis;
@@ -436,6 +436,11 @@ impl Slider {
             return div().id(id);
         }
 
+        // The thumb is a 16px hit target with a smaller solid dot inside it.
+        // The upstream look (translucent ring + shadow_md around a 1px-inset
+        // dot) reads as a blurry halo at this size — two soft edges plus a
+        // shadow over a 14px circle make the dot look low-resolution — so the
+        // visible mark is a single crisply antialiased circle.
         div()
             .id(id)
             .absolute()
@@ -449,15 +454,11 @@ impl Slider {
             .items_center()
             .justify_center()
             .flex_shrink_0()
-            .corner_radii(radius)
-            .bg(bar_color.opacity(0.5))
-            .when(cx.theme().shadow, |this| this.shadow_md())
             .size_4()
-            .p(px(1.))
             .child(
                 div()
                     .flex_shrink_0()
-                    .size_full()
+                    .size(px(12.))
                     .corner_radii(radius)
                     .bg(thumb_color),
             )

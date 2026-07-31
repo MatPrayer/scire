@@ -302,6 +302,106 @@ pub fn stream_info_line(
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// Wraps a seek bar (slider or waveform) with a hover indicator: a marker line
+/// under the cursor and a bubble with the time it would seek to, so clicks can
+/// be aimed instead of guessed.
+///
+/// The hovered fraction lives in the caller's view state — gpui only re-renders
+/// on entity updates — so this reports it back through `on_hover` and takes the
+/// current value as `hovered`. Purely decorative overlay: no mouse handlers on
+/// the marker, so clicks and drags still reach the bar underneath.
+pub fn seek_hover_wrap(
+    id: &'static str,
+    hovered: Option<f32>,
+    total: Option<Duration>,
+    bar: gpui::AnyElement,
+    on_hover: impl Fn(Option<f32>, &mut App) + 'static,
+    cx: &App,
+) -> gpui::AnyElement {
+    use gpui::{MouseMoveEvent, canvas, relative};
+    use std::cell::Cell;
+
+    // Bounds captured at paint time: mouse-move events carry a window position
+    // and no element bounds, so the mapping back to a fraction needs them.
+    let bounds: Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>> = Rc::new(Cell::new(None));
+    let for_paint = bounds.clone();
+    let for_move = bounds.clone();
+    let on_hover = Rc::new(on_hover);
+    let on_move = on_hover.clone();
+    let on_leave = on_hover.clone();
+    // Foreground, not the accent: the accent is also the played-region colour,
+    // so an accent marker disappears on the left half of the bar.
+    let marker = cx.theme().foreground;
+
+    div()
+        .id(id)
+        .relative()
+        .flex()
+        .items_center()
+        .flex_1()
+        .child(
+            canvas(move |b, _, _| for_paint.set(Some(b)), |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+        )
+        .child(bar)
+        .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+            let next = for_move.get().and_then(|b| {
+                let w = f32::from(b.size.width);
+                if w <= 0. || !b.contains(&event.position) {
+                    return None;
+                }
+                Some(((f32::from(event.position.x) - f32::from(b.origin.x)) / w).clamp(0., 1.))
+            });
+            on_move(next, cx);
+        })
+        .on_hover(move |hovered: &bool, _, cx| {
+            if !*hovered {
+                on_leave(None, cx);
+            }
+        })
+        .when_some(hovered, |this, fraction| {
+            this.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(relative(fraction))
+                    .w(px(2.))
+                    .ml(-px(1.))
+                    .rounded_full()
+                    .bg(marker.opacity(0.85)),
+            )
+            .when_some(total, |this, total| {
+                // Zero-width flex box: the label overflows it symmetrically,
+                // which centres the bubble on the marker without a transform.
+                this.child(
+                    div()
+                        .absolute()
+                        .left(relative(fraction))
+                        .top(px(-26.))
+                        .w_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_md()
+                                .bg(cx.theme().popover)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .text_color(cx.theme().popover_foreground)
+                                .child(format_duration(seek_position(total, fraction))),
+                        ),
+                )
+            })
+        })
+        .into_any_element()
+}
+
 /// Continuous filled waveform seek bar: a symmetric amplitude envelope built
 /// as a single polygon per region (played / remaining) painted on a canvas.
 /// Click seeks the player to the fraction under the cursor.
