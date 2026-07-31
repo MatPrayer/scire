@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, KeyDownEvent, Render, ScrollHandle, Window,
-    deferred, div, img, prelude::*, px,
+    Context, Entity, EventEmitter, IntoElement, KeyDownEvent, Render, ScrollHandle, Window, div,
+    img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -577,28 +577,6 @@ impl SearchBar {
         rows
     }
 
-    fn render_dropdown(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        v_flex()
-            .id("search-dropdown")
-            // Swallow mouse events so clicks land on rows, not the page beneath.
-            .occlude()
-            .absolute()
-            .top(px(38.))
-            .right_0()
-            .w(px(360.))
-            .max_h(px(440.))
-            .overflow_y_scroll()
-            .p_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
-            .shadow_lg()
-            .children(self.result_rows(cx))
-            .into_any_element()
-    }
-
     /// Centered command-palette box: large input on top, scrollable results
     /// below. Arrow/Enter/Escape are handled in the capture phase so they
     /// drive selection instead of reaching the input or the root shortcuts.
@@ -681,29 +659,7 @@ impl Render for SearchBar {
             // The centered box only; root supplies the full-window backdrop.
             return self.render_palette(cx);
         }
-
-        let has_query = !self.input.read(cx).value().trim().is_empty();
-
-        h_flex()
-            .relative()
-            .w(px(280.))
-            .gap_1()
-            .items_center()
-            .child(div().flex_1().child(Input::new(&self.input).small()))
-            .when(has_query, |this| {
-                this.child(
-                    Button::new("search-clear")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::Close))
-                        .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))),
-                )
-            })
-            .when(self.open, |this| {
-                // Deferred so the dropdown paints above the page content
-                // rendered after this header row.
-                this.child(deferred(self.render_dropdown(cx)))
-            })
-            .into_any_element()
+        // ponytail: inline search bar removed. Only palette mode (Ctrl+K) remains.
+        div().into_any_element()
     }
 }

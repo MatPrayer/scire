@@ -388,6 +388,12 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_vi_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| s.settings.vi_mode = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_default_page(&mut self, page: DefaultPage, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.default_page = page);
@@ -990,6 +996,22 @@ impl Render for SettingsView {
                                                 .into_any_element()
                                         }),
                                     )),
+                            )
+                            .child(
+                                Switch::new("vi-mode")
+                                    .checked(self.session.read(cx).settings.vi_mode)
+                                    .label("Vi-style keyboard navigation")
+                                    .on_click(cx.listener(|this, &checked, _, cx| {
+                                        this.set_vi_mode(checked, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "j/k sidebar+grid, h/l history, : commands, / search, ? help",
+                                    ),
                             ),
                     )
                     // Streaming

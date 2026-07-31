@@ -235,7 +235,7 @@ pub struct AlbumsView {
     /// change can drop stale art and refetch at the new resolution.
     art_px: u32,
     /// Virtualized row scroll handle: only visible rows are built/uploaded.
-    scroll: UniformListScrollHandle,
+    pub scroll: UniformListScrollHandle,
     error: Option<String>,
 }
 

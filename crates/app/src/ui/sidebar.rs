@@ -53,6 +53,8 @@ pub struct SidebarModel {
     pub refreshing: bool,
     /// Which step that refresh is on, for the label and the progress bar.
     pub refresh_stage: RefreshStage,
+    /// Section highlighted by vi-mode keyboard cursor.
+    pub vi_selected_section: Option<NavSection>,
 }
 
 /// Thin progress track under the refresh row.
@@ -88,6 +90,7 @@ pub fn render_sidebar(
     let nav_item = |label: &'static str, icon: IconName, section: NavSection| {
         let on_action = on_action.clone();
         let is_active = model.active == Some(section);
+        let is_vi_sel = model.vi_selected_section == Some(section);
         h_flex()
             .id(SharedString::from(label))
             .px_3()
@@ -102,6 +105,9 @@ pub fn render_sidebar(
             })
             .when(!is_active, |s| s.text_color(cx.theme().muted_foreground))
             .hover(|s| s.bg(cx.theme().muted))
+            .when(is_vi_sel, |s| {
+                s.border_l_2().border_color(cx.theme().primary)
+            })
             .on_click(move |_, window, cx| on_action(SidebarAction::Select(section), window, cx))
             .child(Icon::new(icon).small())
             .child(label)

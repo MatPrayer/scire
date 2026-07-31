@@ -115,6 +115,8 @@ pub struct Settings {
     pub sidebar_libraries_collapsed: bool,
     /// Sidebar playlist list folded away; restored across sessions.
     pub sidebar_playlists_collapsed: bool,
+    /// Vi-style modal keyboard navigation.
+    pub vi_mode: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -391,6 +393,7 @@ impl Default for Settings {
             resume_playback: false,
             sidebar_libraries_collapsed: false,
             sidebar_playlists_collapsed: false,
+            vi_mode: false,
         }
     }
 }
