@@ -67,7 +67,7 @@ Log in with your Navidrome URL, username and password — or point **Settings �
 | **Browse** | Album grid with infinite scroll and sort (name / new / recent / frequent / random / starred) · artist index with bios and images · album and artist detail pages |
 | **Search** | Inline search bar (`/`) and a centered command palette (`Ctrl`/`Cmd`+`K`) with arrow-key navigation — songs, albums, artists via `search3` |
 | **Queue** | Shuffle · repeat (off / all / one) · reorder · play-next · clear · configurable end-of-queue behaviour · persisted across restarts · optional resume of the current track's position (**Settings → Playback → Resume where you left off**) |
-| **Playlists** | Create, rename, delete, add/remove tracks · local `.m3u`/`.m3u8` files imported as playlists |
+| **Playlists** | Create, rename, delete, add/remove tracks · local `.m3u`/`.m3u8` files imported as playlists · `:newpl` / `:pl add` from the vi-mode command bar |
 | **Favorites** | Star and 1–5 star ratings · dedicated starred view |
 | **Multi-library** | Sidebar checkbox selector · all selected libraries merged into one sorted view |
 | **Scrobbling** | Calls `/rest/scrobble` at ≥ 50% or 4 min · Navidrome forwards to ListenBrainz / Last.fm |
@@ -79,7 +79,7 @@ Log in with your Navidrome URL, username and password — or point **Settings �
 | **Waveform seek bar** | Per-track amplitude envelope (480 buckets, cached to disk) · click to seek · the next track's peaks are computed while the current one plays |
 | **OS media keys** | Media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS) |
 | **Artwork cache** | LRU-evicted disk cache (configurable cap) · HiDPI-aware resolution bump · album-scoped keys, so Navidrome's per-song cover ids don't re-download identical art |
-| **Navigation** | Mouse back/forward buttons · bracket keys · configurable default page |
+| **Navigation** | Mouse back/forward buttons · bracket keys · configurable default page · vi-mode navigation (below) |
 | **Local music** | Directory scanner (`lofty` tags + `folder.jpg` / embedded art) into a SQLite library · incremental mtime-based rescan · periodic background scan · album grid with cover art (cached, no re-query per frame) · album detail view with track listing, play/shuffle/queue per track · cover art in player bar + fullscreen player · engine reads local files via `SourceReader` |
 
 ## Keyboard Shortcuts
@@ -95,6 +95,24 @@ Log in with your Navidrome URL, username and password — or point **Settings �
 | <kbd>/</kbd> | Focus the inline search bar |
 | <kbd>Ctrl</kbd>+<kbd>K</kbd> / <kbd>Cmd</kbd>+<kbd>K</kbd> | Open the command palette |
 | <kbd>Esc</kbd> | Close fullscreen player · dismiss search · cancel |
+
+### Vi-mode navigation
+
+Enable **Vi-mode** in Settings to replace the shortcuts above with vim-style navigation. With it ON, the legacy shortcuts are disabled and the keys below take over; <kbd>i</kbd> returns to insert mode (keys pass through to text inputs) and <kbd>Esc</kbd> back to normal mode. The focused item is highlighted with a glow + border; <kbd>?</kbd> shows the full keymap in-app.
+
+| Key | Action |
+|-----|--------|
+| <kbd>j</kbd> / <kbd>k</kbd> | Move cursor down / up (sidebar, content list; player-bar volume) |
+| <kbd>Enter</kbd> | Open / play the focused item |
+| <kbd>h</kbd> / <kbd>l</kbd> | Navigate back / forward in history |
+| <kbd>[</kbd> / <kbd>]</kbd> | Cycle album filter tabs (All / New / Recent / Frequent / Random / Starred) |
+| <kbd>←</kbd> / <kbd>→</kbd> | Previous / next track |
+| <kbd>Space</kbd> | Play / pause |
+| <kbd>Ctrl</kbd>+<kbd>h</kbd> / <kbd>j</kbd> / <kbd>k</kbd> / <kbd>l</kbd> | Focus sidebar / player bar / content |
+| <kbd>i</kbd> | Insert mode |
+| <kbd>:</kbd> | Command mode — `:q` quit · `:help` · `:newpl <name>` · `:pl add <name>` · `:pl list` |
+| <kbd>/</kbd> | Search |
+| <kbd>?</kbd> | Toggle the in-app vi-mode help |
 
 ---
 

@@ -22,6 +22,7 @@ use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::{ConnectionStatus, Session};
+use crate::ui::{focus_glow, with_focus_animation};
 
 const PAGE_SIZE: u32 = 100;
 /// Load the next page when scrolled within this many pixels of the bottom.
@@ -237,6 +238,8 @@ pub struct AlbumsView {
     /// Virtualized row scroll handle: only visible rows are built/uploaded.
     pub scroll: UniformListScrollHandle,
     error: Option<String>,
+    /// Card index under the vi-mode cursor (None = cursor hidden).
+    vi_cursor: Option<usize>,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
@@ -264,6 +267,7 @@ impl AlbumsView {
             art_px,
             scroll: UniformListScrollHandle::new(),
             error: None,
+            vi_cursor: None,
         };
         this.seed_from_cache(active_tab, cx);
         this.load_more(active_tab, cx);
@@ -452,6 +456,77 @@ impl AlbumsView {
         }
     }
 
+    /// Number of grid columns at the current viewport width.
+    fn grid_cols(&self, cx: &App) -> usize {
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let width = f32::from(base.bounds().size.width);
+        let card_w = self.session.read(cx).settings.cover_size.px() + 12.;
+        let gap = 16.;
+        if width > 0. {
+            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
+        } else {
+            5
+        }
+    }
+
+    /// Move the vi-mode cursor by `delta` grid positions, clamping and
+    /// scrolling the focused card into view.
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+        let count = self
+            .tabs
+            .get(&self.active_tab)
+            .map(|t| t.albums.len())
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        let cols = self.grid_cols(cx).max(1);
+        self.scroll
+            .scroll_to_item(next / cols, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Open the album under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .vi_cursor
+            .and_then(|c| {
+                self.tabs
+                    .get(&self.active_tab)
+                    .and_then(|t| t.albums.get(c))
+            })
+            .map(|a| a.id.clone())
+        else {
+            return;
+        };
+        cx.emit(AlbumsEvent::OpenAlbum(id));
+    }
+
+    /// Cycle the filter tab (new/random/...) by `delta`.
+    pub fn vi_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let idx = TABS.iter().position(|t| *t == self.active_tab).unwrap_or(0);
+        let next = if delta > 0 {
+            (idx + 1) % TABS.len()
+        } else {
+            (idx + TABS.len() - 1) % TABS.len()
+        };
+        self.select_tab(TABS[next], cx);
+        cx.notify();
+    }
+
     /// Fetch the album's songs and act on them (play / shuffle / queue).
     fn queue_album(&mut self, album_id: String, mode: QueueMode, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
@@ -599,6 +674,7 @@ impl AlbumsView {
         index: usize,
         album: &Album,
         tile: f32,
+        focused: bool,
         cx: &App,
     ) -> gpui::AnyElement {
         let id = album.id.clone();
@@ -621,7 +697,7 @@ impl AlbumsView {
             .map(|p| (p.id.clone(), p.name.clone()))
             .collect();
 
-        v_flex()
+        let card = v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
             .group("acard")
             .w(px(tile + 12.))
@@ -631,7 +707,10 @@ impl AlbumsView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted))
+            .hover(|s| s.bg(cx.theme().muted).shadow(focus_glow(cx)))
+            .when(focused, |s| {
+                s.border_color(cx.theme().primary).shadow(focus_glow(cx))
+            })
             .on_click(move |_, _, cx: &mut App| {
                 open_view.update(cx, |_, cx| cx.emit(AlbumsEvent::OpenAlbum(id.clone())));
             })
@@ -753,8 +832,12 @@ impl AlbumsView {
                     );
                 }
                 menu
-            })
-            .into_any_element()
+            });
+        if focused {
+            with_focus_animation(format!("vi-focus-{index}"), card, cx).into_any_element()
+        } else {
+            card.into_any_element()
+        }
     }
 }
 
@@ -836,7 +919,11 @@ impl Render for AlbumsView {
                     let cards: Vec<_> = tab.albums[start..end]
                         .iter()
                         .enumerate()
-                        .map(|(j, album)| view.render_card(&entity, start + j, album, tile, cx))
+                        .map(|(j, album)| {
+                            let card_index = start + j;
+                            let focused = view.vi_cursor == Some(card_index);
+                            view.render_card(&entity, start + j, album, tile, focused, cx)
+                        })
                         .collect();
                     // Centered so the ragged last row's leftover space splits
                     // evenly — left/right gutters stay equal at any width.

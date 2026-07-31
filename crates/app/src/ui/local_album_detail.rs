@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, IntoElement, Render, ScrollHandle, Window, div, img, prelude::*, px};
+use gpui::{
+    Context, Entity, IntoElement, Render, ScrollAnchor, ScrollHandle, Window, div, img, prelude::*,
+    px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{
@@ -15,7 +18,7 @@ use crate::assets::{app_icon, icons};
 use crate::services::library_db::{AlbumRow, LibraryDb};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
-use crate::ui::format_duration;
+use crate::ui::{focus_glow, format_duration, with_focus_animation};
 
 pub struct LocalAlbumDetailView {
     db: Arc<LibraryDb>,
@@ -25,6 +28,9 @@ pub struct LocalAlbumDetailView {
     tracks: Vec<crate::services::library_db::TrackRow>,
     art_path: Option<PathBuf>,
     scroll: ScrollHandle,
+    focus_anchor: ScrollAnchor,
+    /// Track index under the vi-mode cursor (None = cursor hidden).
+    vi_cursor: Option<usize>,
 }
 
 impl LocalAlbumDetailView {
@@ -34,6 +40,7 @@ impl LocalAlbumDetailView {
         album_id: String,
         cx: &mut Context<Self>,
     ) -> Self {
+        let scroll = ScrollHandle::new();
         let mut view = Self {
             db,
             player,
@@ -41,7 +48,9 @@ impl LocalAlbumDetailView {
             album: None,
             tracks: Vec::new(),
             art_path: None,
-            scroll: ScrollHandle::new(),
+            scroll: scroll.clone(),
+            focus_anchor: ScrollAnchor::for_handle(scroll),
+            vi_cursor: None,
         };
         view.load(cx);
         view
@@ -181,6 +190,7 @@ impl Render for LocalAlbumDetailView {
             .enumerate()
             .map(|(i, track)| {
                 let is_playing = playing_id.as_deref() == Some(track.id.as_str());
+                let focused = self.vi_cursor == Some(i);
                 let track_no = track.track_no.map(|t| t.to_string()).unwrap_or_default();
                 let dur = track
                     .duration
@@ -189,7 +199,7 @@ impl Render for LocalAlbumDetailView {
                 let song_next = track.clone().into_song();
                 let song_enq = track.clone().into_song();
 
-                h_flex()
+                let row = h_flex()
                     .id(("local-track", i))
                     .group("trow")
                     .px_2()
@@ -203,6 +213,13 @@ impl Render for LocalAlbumDetailView {
                             .border_l_2()
                             .border_color(cx.theme().primary)
                             .text_color(cx.theme().primary)
+                    })
+                    .when(focused, |s| {
+                        s.bg(cx.theme().muted)
+                            .border_1()
+                            .border_color(cx.theme().primary)
+                            .shadow(focus_glow(cx))
+                            .anchor_scroll(Some(self.focus_anchor.clone()))
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -293,8 +310,12 @@ impl Render for LocalAlbumDetailView {
                                 }),
                             )
                         }
-                    })
-                    .into_any_element()
+                    });
+                if focused {
+                    with_focus_animation(format!("vi-focus-{i}"), row, cx).into_any_element()
+                } else {
+                    row.into_any_element()
+                }
             })
             .collect();
 
@@ -315,5 +336,38 @@ impl Render for LocalAlbumDetailView {
             )
             .child(v_flex().gap_0p5().children(rows))
             .into_any_element()
+    }
+}
+
+impl LocalAlbumDetailView {
+    /// Move the vi-mode cursor by `delta` tracks, clamping to the track list
+    /// and scrolling the focused row into view.
+    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.tracks.len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        self.focus_anchor.scroll_to(window, cx);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Play the track under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        if let Some(i) = self.vi_cursor {
+            self.play_from(i, cx);
+        }
     }
 }

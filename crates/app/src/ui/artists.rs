@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, SharedString, UniformListScrollHandle,
-    Window, div, img, prelude::*, px, uniform_list,
+    App, Context, Entity, EventEmitter, IntoElement, Render, SharedString,
+    UniformListScrollHandle, Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::link::Link;
@@ -19,7 +19,7 @@ use crate::services::library_db::LibraryDb;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
-use crate::ui::{strip_html, truncate_at_word};
+use crate::ui::{focus_glow, strip_html, truncate_at_word, with_focus_animation};
 
 const ART_SIZE: u32 = 320;
 
@@ -109,6 +109,8 @@ pub struct ArtistsView {
     scroll: UniformListScrollHandle,
     loading: bool,
     error: Option<String>,
+    /// Card index under the vi-mode cursor (None = cursor hidden).
+    vi_cursor: Option<usize>,
 }
 
 impl EventEmitter<ArtistsEvent> for ArtistsView {}
@@ -134,6 +136,7 @@ impl ArtistsView {
             scroll: UniformListScrollHandle::new(),
             loading: false,
             error: None,
+            vi_cursor: None,
         };
         this.seed_from_cache(cx);
         this.load(cx);
@@ -370,12 +373,13 @@ impl ArtistsView {
         entity: &Entity<Self>,
         card: &Card,
         tile: f32,
+        focused: bool,
         cx: &gpui::App,
     ) -> gpui::AnyElement {
         let art = self.art_paths.get(card.id.as_ref()).cloned();
         let id = card.id.clone();
         let view = entity.clone();
-        v_flex()
+        let card_el = v_flex()
             .id(card.id.clone())
             .w(px(tile + 12.))
             .p_1p5()
@@ -384,6 +388,11 @@ impl ArtistsView {
             .rounded_lg()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().muted))
+            .when(focused, |s| {
+                s.border_1()
+                    .border_color(cx.theme().primary)
+                    .shadow(focus_glow(cx))
+            })
             .on_click(move |_, _, cx: &mut gpui::App| {
                 let id = id.clone();
                 view.update(cx, |_, cx| {
@@ -435,8 +444,13 @@ impl ArtistsView {
                             .text_color(cx.theme().muted_foreground)
                             .child(card.albums.clone()),
                     ),
-            )
-            .into_any_element()
+            );
+        let card_el = if focused {
+            with_focus_animation(card.id.clone(), card_el, cx).into_any_element()
+        } else {
+            card_el.into_any_element()
+        };
+        card_el
     }
 }
 
@@ -481,7 +495,12 @@ impl Render for ArtistsView {
                     let end = ((row + 1) * cols).min(view.cards.len());
                     let cards: Vec<_> = view.cards[start..end]
                         .iter()
-                        .map(|card| view.render_card(&entity, card, tile, cx))
+                        .enumerate()
+                        .map(|(j, card)| {
+                            let card_index = start + j;
+                            let focused = view.vi_cursor == Some(card_index);
+                            view.render_card(&entity, card, tile, focused, cx)
+                        })
                         .collect();
                     h_flex()
                         .w_full()
@@ -537,6 +556,56 @@ impl Render for ArtistsView {
                 )
             })
             .child(grid)
+    }
+}
+
+impl ArtistsView {
+    /// Columns from the measured viewport width; falls back to a guess on the
+    /// very first frame (before layout), then self-corrects.
+    fn grid_cols(&self, cx: &App) -> usize {
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let width = f32::from(base.bounds().size.width);
+        let card_w = self.session.read(cx).settings.cover_size.px() + 12.;
+        let gap = 16.;
+        if width > 0. {
+            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
+        } else {
+            5
+        }
+    }
+
+    /// Move the vi-mode cursor by `delta` cards, clamping and scrolling the
+    /// focused card into view.
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.cards.len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        let cols = self.grid_cols(cx).max(1);
+        self.scroll
+            .scroll_to_item(next / cols, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Open the artist under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        let Some(card) = self.vi_cursor.and_then(|c| self.cards.get(c)) else {
+            return;
+        };
+        cx.emit(ArtistsEvent::OpenArtist(card.id.to_string()));
     }
 }
 

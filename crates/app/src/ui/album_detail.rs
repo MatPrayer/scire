@@ -3,7 +3,10 @@
 
 use std::path::PathBuf;
 
-use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
+use gpui::{
+    Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle, Window, div,
+    img, prelude::*, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -19,7 +22,10 @@ use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
-use crate::ui::{format_duration, strip_html, track_extras, truncate_at_word};
+use crate::ui::{
+    focus_glow, format_duration, strip_html, track_extras, truncate_at_word,
+    with_focus_animation,
+};
 
 const ART_SIZE: u32 = 600;
 
@@ -49,6 +55,10 @@ pub struct AlbumDetailView {
     show_full_art: bool,
     /// High-res cover for the lightbox (fetched lazily on first open).
     full_art_path: Option<PathBuf>,
+    scroll: ScrollHandle,
+    focus_anchor: ScrollAnchor,
+    /// Track index under the vi-mode cursor (None = cursor hidden).
+    vi_cursor: Option<usize>,
 }
 
 impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
@@ -83,6 +93,7 @@ impl AlbumDetailView {
         })
         .detach();
         let last_playing_id = player.read(cx).current_song().map(|s| s.id.clone());
+        let scroll = ScrollHandle::new();
         let mut this = Self {
             session,
             player,
@@ -96,6 +107,9 @@ impl AlbumDetailView {
             last_playing_id,
             show_full_art: false,
             full_art_path: None,
+            scroll: scroll.clone(),
+            focus_anchor: ScrollAnchor::for_handle(scroll),
+            vi_cursor: None,
         };
         this.load(cx);
         this
@@ -744,7 +758,7 @@ impl Render for AlbumDetailView {
                     .iter()
                     .map(|p| (p.id.clone(), p.name.clone()))
                     .collect();
-                h_flex()
+                let row = h_flex()
                     .id(("track", i))
                     .group("trow")
                     .px_2()
@@ -760,6 +774,13 @@ impl Render for AlbumDetailView {
                             .border_l_2()
                             .border_color(cx.theme().primary)
                             .text_color(cx.theme().primary)
+                    })
+                    .when(self.vi_cursor == Some(i), |s| {
+                        s.bg(cx.theme().muted)
+                            .border_1()
+                            .border_color(cx.theme().primary)
+                            .shadow(focus_glow(cx))
+                            .anchor_scroll(Some(self.focus_anchor.clone()))
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -926,8 +947,12 @@ impl Render for AlbumDetailView {
                             );
                         }
                         menu
-                    })
-                    .into_any_element()
+                    });
+                if self.vi_cursor == Some(i) {
+                    with_focus_animation(format!("vi-focus-{i}"), row, cx).into_any_element()
+                } else {
+                    row.into_any_element()
+                }
             })
             .collect();
 
@@ -1016,6 +1041,7 @@ impl Render for AlbumDetailView {
             .id("album-detail-scroll")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .p_4()
             .gap_4()
             // Header card matches the artist page framing.
@@ -1150,5 +1176,40 @@ mod tests {
         assert_eq!(fmt_khz(48000), "48 kHz");
         assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.00 GB");
+    }
+}
+
+impl AlbumDetailView {
+    /// Move the vi-mode cursor by `delta` tracks, clamping to the album's
+    /// track list and scrolling the focused row into view.
+    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(count) = self.album.as_ref().map(|a| a.song.len()) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        self.focus_anchor.scroll_to(window, cx);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Play the track under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        if let Some(i) = self.vi_cursor {
+            self.play_from(i, cx);
+        }
     }
 }

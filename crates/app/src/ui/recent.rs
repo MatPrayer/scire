@@ -13,7 +13,7 @@ use subsonic::{Song, SubsonicClient};
 use crate::services::artwork;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
-use crate::ui::format_duration;
+use crate::ui::{focus_glow, format_duration};
 
 const ART_SIZE: u32 = 200;
 /// Fixed row height — `uniform_list` requires every row to be the same size.
@@ -72,6 +72,8 @@ pub struct RecentView {
     art_paths: HashMap<String, PathBuf>, // album-scoped art key → cached path
     fetching: HashSet<String>,
     scroll: UniformListScrollHandle,
+    /// Song index under the vi-mode cursor (None = cursor hidden).
+    vi_cursor: Option<usize>,
 }
 
 impl RecentView {
@@ -90,6 +92,7 @@ impl RecentView {
             art_paths: HashMap::new(),
             fetching: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
+            vi_cursor: None,
         };
         this.refresh(cx);
         cx.observe(&this.player.clone(), |this, _, cx| {
@@ -163,7 +166,13 @@ impl RecentView {
         }
     }
 
-    fn render_row(&self, entity: &Entity<Self>, ix: usize, cx: &gpui::App) -> gpui::AnyElement {
+    fn render_row(
+        &self,
+        entity: &Entity<Self>,
+        ix: usize,
+        focused: bool,
+        cx: &gpui::App,
+    ) -> gpui::AnyElement {
         let row = &self.rows[ix];
         let art = row
             .art_key
@@ -180,6 +189,12 @@ impl RecentView {
             .rounded_lg()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().muted))
+            .when(focused, |s| {
+                s.bg(cx.theme().muted)
+                    .border_1()
+                    .border_color(cx.theme().primary)
+                    .shadow(focus_glow(cx))
+            })
             .on_click(move |_, _, cx: &mut gpui::App| {
                 view.update(cx, |this, cx| {
                     let Some(song) = this.songs.get(ix).cloned() else {
@@ -245,7 +260,7 @@ impl Render for RecentView {
         let list = uniform_list("recent-list", self.rows.len(), move |range, _window, cx| {
             let view = entity.read(cx);
             range
-                .map(|ix| view.render_row(&entity, ix, cx))
+                .map(|ix| view.render_row(&entity, ix, view.vi_cursor == Some(ix), cx))
                 .collect::<Vec<_>>()
         })
         .flex_1()
@@ -310,5 +325,44 @@ mod tests {
         assert!(rows[0].artist.is_empty());
         assert!(rows[0].album.is_empty());
         assert!(rows[0].duration.is_empty());
+    }
+}
+
+impl RecentView {
+    /// Move the vi-mode cursor by `delta` songs, clamping and scrolling the
+    /// focused row into view.
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.player.read(cx).recently_played.len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        self.scroll
+            .scroll_to_item(next, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Play the song under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.vi_cursor else {
+            return;
+        };
+        let songs = self.player.read(cx).recently_played.clone();
+        if let Some(song) = songs.get(i) {
+            self.player
+                .update(cx, |p, cx| p.play_queue(vec![song.clone()], 0, cx));
+        }
     }
 }

@@ -1,6 +1,9 @@
 //! Playlist page: rename, delete, play, remove songs.
 
-use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, prelude::*, px};
+use gpui::{
+    Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle, Window, div,
+    prelude::*, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
@@ -13,7 +16,7 @@ use crate::services::runtime;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
-use crate::ui::{format_duration, track_extras};
+use crate::ui::{focus_glow, format_duration, track_extras, with_focus_animation};
 
 pub enum PlaylistDetailEvent {
     /// Playlist was deleted — navigate away.
@@ -29,6 +32,10 @@ pub struct PlaylistDetailView {
     rename_input: Entity<InputState>,
     renaming: bool,
     error: Option<String>,
+    scroll: ScrollHandle,
+    focus_anchor: ScrollAnchor,
+    /// Song index under the vi-mode cursor (None = cursor hidden).
+    vi_cursor: Option<usize>,
 }
 
 impl EventEmitter<PlaylistDetailEvent> for PlaylistDetailView {}
@@ -59,6 +66,7 @@ impl PlaylistDetailView {
         // Re-render when the playing song changes so the highlight stays fresh.
         cx.observe(&player.clone(), |_, _, cx| cx.notify()).detach();
 
+        let scroll = ScrollHandle::new();
         let mut this = Self {
             session,
             player,
@@ -68,6 +76,9 @@ impl PlaylistDetailView {
             rename_input,
             renaming: false,
             error: None,
+            scroll: scroll.clone(),
+            focus_anchor: ScrollAnchor::for_handle(scroll),
+            vi_cursor: None,
         };
         this.load(cx);
         this
@@ -216,12 +227,13 @@ impl Render for PlaylistDetailView {
             .enumerate()
             .map(|(i, song)| {
                 let is_playing = playing_id.as_deref() == Some(song.id.as_str());
+                let focused = self.vi_cursor == Some(i);
                 let extras = track_extras(song, &info_prefs, true);
                 let dur = song
                     .duration
                     .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
                     .unwrap_or_default();
-                h_flex()
+                let row = h_flex()
                     .id(("pl-track", i))
                     .px_2()
                     .py_1()
@@ -236,6 +248,13 @@ impl Render for PlaylistDetailView {
                             .border_l_2()
                             .border_color(cx.theme().primary)
                             .text_color(cx.theme().primary)
+                    })
+                    .when(focused, |s| {
+                        s.bg(cx.theme().muted)
+                            .border_1()
+                            .border_color(cx.theme().primary)
+                            .shadow(focus_glow(cx))
+                            .anchor_scroll(Some(self.focus_anchor.clone()))
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -283,8 +302,12 @@ impl Render for PlaylistDetailView {
                                 });
                                 cx.stop_propagation();
                             })),
-                    )
-                    .into_any_element()
+                    );
+                if focused {
+                    with_focus_animation(format!("vi-focus-{i}"), row, cx).into_any_element()
+                } else {
+                    row.into_any_element()
+                }
             })
             .collect();
 
@@ -293,6 +316,7 @@ impl Render for PlaylistDetailView {
             .id("playlist-scroll")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .p_4()
             .gap_4()
             .child(header)
@@ -306,5 +330,40 @@ impl Render for PlaylistDetailView {
                 this.child(div().text_color(cx.theme().danger).text_sm().child(e))
             })
             .child(v_flex().gap_0p5().children(rows))
+    }
+}
+
+impl PlaylistDetailView {
+    /// Move the vi-mode cursor by `delta` songs, clamping to the playlist's
+    /// track list and scrolling the focused row into view.
+    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(count) = self.playlist.as_ref().map(|p| p.songs.len()) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        self.focus_anchor.scroll_to(window, cx);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Play the track under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        if let Some(i) = self.vi_cursor {
+            self.play_from(i, cx);
+        }
     }
 }

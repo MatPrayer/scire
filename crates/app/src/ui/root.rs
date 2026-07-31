@@ -43,6 +43,13 @@ use crate::ui::sidebar::{NavSection, SidebarAction, SidebarModel, render_sidebar
 const REFRESH_POLL: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, PartialEq)]
+enum FocusRegion {
+    Content,
+    Sidebar,
+    PlayerBar,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum KeyboardMode {
     Normal,
     Insert,
@@ -181,10 +188,12 @@ pub struct RootView {
     // -- Vi-mode state --
     vi_enabled: bool,
     mode: KeyboardMode,
+    focus_region: FocusRegion,
     cmd_input: Entity<InputState>,
     vi_selected: usize,
-    vi_content_index: usize,
     show_vi_help: bool,
+    /// Transient feedback for `:` commands, shown next to the mode indicator.
+    vi_status: Option<String>,
 
     // -- First-time setup wizard state --
     setup_enable_navidrome: bool,
@@ -320,7 +329,7 @@ impl RootView {
             }
 
             // Pick up vi-mode toggle from settings.
-            this.sync_vi_mode(session.read(cx));
+            this.sync_vi_mode(session.read(cx).settings.vi_mode, cx);
 
             let has_local = !session.read(cx).settings.local_music_dirs.is_empty();
             // Kick off the local scanner once. When server + local dirs are
@@ -424,10 +433,11 @@ impl RootView {
             search_bar,
             vi_enabled,
             mode: KeyboardMode::Normal,
+            focus_region: FocusRegion::Content,
             cmd_input,
             vi_selected: 0,
-            vi_content_index: 0,
             show_vi_help: false,
+            vi_status: None,
             content: None,
             section: None,
             active_playlist: None,
@@ -719,7 +729,7 @@ impl RootView {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        self.vi_content_index = 0;
+        self.vi_clear_cursors(cx);
         self.current_entry = Some(NavEntry::Section(section));
         self.section = Some(section);
         self.active_playlist = None;
@@ -968,10 +978,14 @@ impl RootView {
     // Vi-mode handling
     // ------------------------------------------------------------------
 
-    fn sync_vi_mode(&mut self, session: &Session) {
-        self.vi_enabled = session.settings.vi_mode;
+    fn sync_vi_mode(&mut self, vi_mode: bool, cx: &mut Context<Self>) {
+        let was = self.vi_enabled;
+        self.vi_enabled = vi_mode;
         if !self.vi_enabled {
             self.mode = KeyboardMode::Normal;
+            if was {
+                self.vi_clear_cursors(cx);
+            }
         }
     }
 
@@ -987,23 +1001,57 @@ impl RootView {
         };
     }
 
-    fn content_scroll_down(&mut self, cx: &mut Context<Self>) {
-        self.vi_content_index = self.vi_content_index.saturating_add(1);
-        if let Some(Content::Albums(v)) = &self.content {
-            v.update(cx, |v, _| {
-                v.scroll
-                    .scroll_to_item(self.vi_content_index, gpui::ScrollStrategy::Top);
-            });
+    fn content_vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.content {
+            Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::LocalAlbumDetail(v)) => {
+                v.update(cx, |v, cx| v.vi_move(delta, window, cx))
+            }
+            Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            _ => {}
         }
     }
 
-    fn content_scroll_up(&mut self, cx: &mut Context<Self>) {
-        self.vi_content_index = self.vi_content_index.saturating_sub(1);
+    /// Enter: open/play the focused item in the content region.
+    fn content_vi_activate(&mut self, cx: &mut Context<Self>) {
+        match &self.content {
+            Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            _ => {}
+        }
+    }
+
+    /// Cycle the album filter tab (`[`/`]`). No-op outside the album grid.
+    fn content_vi_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Some(Content::Albums(v)) = &self.content {
-            v.update(cx, |v, _| {
-                v.scroll
-                    .scroll_to_item(self.vi_content_index, gpui::ScrollStrategy::Top);
-            });
+            v.update(cx, |v, cx| v.vi_tab(delta, cx));
+        }
+    }
+
+    /// Forget the per-view vi cursor when the mode is turned off, so no
+    /// stale highlight survives a settings toggle.
+    fn vi_clear_cursors(&mut self, cx: &mut Context<Self>) {
+        match &self.content {
+            Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            _ => {}
         }
     }
 
@@ -1036,41 +1084,117 @@ impl RootView {
     ) {
         let key = event.keystroke.key.as_str();
         let ctrl = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
-        match key {
-            "j" => {
-                self.sidebar_select_next();
-                self.content_scroll_down(cx);
+        // Shift+/ → "?" help toggle (some layouts report "/" with shift)
+        if !ctrl && key == "/" && event.keystroke.modifiers.shift {
+            self.show_vi_help = !self.show_vi_help;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        match (ctrl, key) {
+            // Region switching (vim-window style)
+            (true, "h") => {
+                self.focus_region = FocusRegion::Sidebar;
                 cx.notify();
                 cx.stop_propagation();
             }
-            "k" => {
-                self.sidebar_select_prev();
-                self.content_scroll_up(cx);
+            (true, "j") => {
+                self.focus_region = FocusRegion::PlayerBar;
                 cx.notify();
                 cx.stop_propagation();
             }
-            "h" => {
+            (true, "k") | (true, "l") => {
+                self.focus_region = FocusRegion::Content;
+                cx.notify();
+                cx.stop_propagation();
+            }
+            // j/k dispatch by current region
+            (false, "j") => match self.focus_region {
+                FocusRegion::Sidebar => {
+                    self.sidebar_select_next();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                FocusRegion::Content => {
+                    self.content_vi_move(1, window, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                FocusRegion::PlayerBar => {
+                    let v = (self.player.read(cx).volume - 0.05).max(0.0);
+                    self.player.update(cx, |p, cx| p.set_volume(v, cx));
+                    cx.stop_propagation();
+                }
+            },
+            (false, "k") => match self.focus_region {
+                FocusRegion::Sidebar => {
+                    self.sidebar_select_prev();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                FocusRegion::Content => {
+                    self.content_vi_move(-1, window, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                FocusRegion::PlayerBar => {
+                    let v = (self.player.read(cx).volume + 0.05).min(1.0);
+                    self.player.update(cx, |p, cx| p.set_volume(v, cx));
+                    cx.stop_propagation();
+                }
+            },
+            // h/l nav back/forward (any region)
+            (false, "h") => {
                 self.nav_back(window, cx);
                 cx.stop_propagation();
             }
-            "l" => {
+            (false, "l") => {
                 self.nav_forward(window, cx);
                 cx.stop_propagation();
             }
-            "enter" => {
-                self.sidebar_activate(window, cx);
-                cx.stop_propagation();
-            }
-            "space" => {
+            // Enter dispatches by region
+            (false, "enter") => match self.focus_region {
+                FocusRegion::Sidebar => {
+                    self.sidebar_activate(window, cx);
+                    cx.stop_propagation();
+                }
+                FocusRegion::Content => {
+                    self.content_vi_activate(cx);
+                    cx.stop_propagation();
+                }
+                FocusRegion::PlayerBar => {
+                    self.player.update(cx, |p, cx| p.toggle_play(cx));
+                    cx.stop_propagation();
+                }
+            },
+            // Media keys
+            (false, "space") => {
                 self.player.update(cx, |p, cx| p.toggle_play(cx));
                 cx.stop_propagation();
             }
-            "i" => {
+            (false, "left") => {
+                self.player.update(cx, |p, cx| p.previous(cx));
+                cx.stop_propagation();
+            }
+            (false, "right") => {
+                self.player.update(cx, |p, cx| p.next(cx));
+                cx.stop_propagation();
+            }
+            // Album filter tabs (new/random/...) in the grid.
+            (false, "[") => {
+                self.content_vi_tab(-1, cx);
+                cx.stop_propagation();
+            }
+            (false, "]") => {
+                self.content_vi_tab(1, cx);
+                cx.stop_propagation();
+            }
+            (false, "i") => {
                 self.mode = KeyboardMode::Insert;
                 cx.notify();
                 cx.stop_propagation();
             }
-            ":" => {
+            (false, ":") => {
                 self.mode = KeyboardMode::Command;
                 self.cmd_input
                     .update(cx, |s, cx| s.set_value("", window, cx));
@@ -1078,17 +1202,17 @@ impl RootView {
                 cx.notify();
                 cx.stop_propagation();
             }
-            "/" => {
+            (false, "/") => {
                 self.search_bar
                     .update(cx, |sb, cx| sb.open_palette(window, cx));
                 cx.stop_propagation();
             }
-            "?" => {
+            (false, "?") => {
                 self.show_vi_help = !self.show_vi_help;
                 cx.notify();
                 cx.stop_propagation();
             }
-            "escape" => {
+            (false, "escape") => {
                 if self.show_vi_help {
                     self.show_vi_help = false;
                     cx.notify();
@@ -1105,38 +1229,6 @@ impl RootView {
                     self.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
                     cx.stop_propagation();
                 }
-            }
-            "[" => {
-                self.nav_back(window, cx);
-                cx.stop_propagation();
-            }
-            "]" => {
-                self.nav_forward(window, cx);
-                cx.stop_propagation();
-            }
-            "up" => {
-                self.player.update(cx, |p, cx| {
-                    p.set_volume((p.volume + 0.05).min(1.0), cx);
-                });
-                cx.stop_propagation();
-            }
-            "down" => {
-                self.player.update(cx, |p, cx| {
-                    p.set_volume((p.volume - 0.05).max(0.0), cx);
-                });
-                cx.stop_propagation();
-            }
-            "left" => {
-                self.player.update(cx, |p, cx| p.previous(cx));
-                cx.stop_propagation();
-            }
-            "right" => {
-                self.player.update(cx, |p, cx| p.next(cx));
-                cx.stop_propagation();
-            }
-            _ if ctrl && key == "[" => {
-                // Ctrl+[ as Esc alternative.
-                cx.stop_propagation();
             }
             _ => {}
         }
@@ -1200,18 +1292,94 @@ impl RootView {
 
     fn execute_command(&mut self, cx: &mut Context<Self>) {
         let cmd = self.cmd_input.read(cx).value().to_string();
-        let trimmed = cmd.trim().to_lowercase();
+        let trimmed = cmd.trim();
         self.mode = KeyboardMode::Normal;
         cx.notify();
-        match trimmed.as_str() {
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let cmd = parts.next().unwrap_or_default().to_lowercase();
+        let args: Vec<&str> = parts.collect();
+        match cmd.as_str() {
             "q" | "quit" => cx.quit(),
             "help" => {
-                tracing::info!(
-                    "vi help: j/k navigate sidebar, h/l back/forward, i insert, : command, Space play/pause"
-                );
+                self.show_vi_help = true;
             }
-            _ => {} // unknown command, dismiss silently
+            "newpl" | "newplaylist" => {
+                if !args.is_empty() {
+                    let name = args.join(" ");
+                    self.playlists
+                        .update(cx, |p, cx| p.create(name.clone(), None, Vec::new(), cx));
+                    self.set_vi_status(format!("Created playlist \"{name}\""), cx);
+                } else {
+                    self.set_vi_status("Usage: :newpl <name>".into(), cx);
+                }
+            }
+            "pl" | "playlist" => match args.first().copied() {
+                Some("add") if args.len() >= 2 => {
+                    let pl_name = args[1..].join(" ");
+                    let song = self.player.read(cx).current_song().map(|s| s.id.clone());
+                    let found = self
+                        .playlists
+                        .read(cx)
+                        .playlists
+                        .iter()
+                        .find(|p| p.name.eq_ignore_ascii_case(&pl_name))
+                        .cloned();
+                    match (song, found) {
+                        (Some(song_id), Some(pl)) => {
+                            self.playlists
+                                .update(cx, |p, cx| p.add_song(pl.id.clone(), song_id, cx));
+                            self.set_vi_status(
+                                format!("Added current song to \"{}\"", pl.name),
+                                cx,
+                            );
+                        }
+                        (None, _) => self.set_vi_status("No current song".into(), cx),
+                        (_, None) => {
+                            self.set_vi_status(format!("Playlist \"{pl_name}\" not found"), cx)
+                        }
+                    }
+                }
+                Some("list") => {
+                    let names: Vec<String> = self
+                        .playlists
+                        .read(cx)
+                        .playlists
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    self.set_vi_status(
+                        if names.is_empty() {
+                            "No playlists".into()
+                        } else {
+                            format!("Playlists: {}", names.join(", "))
+                        },
+                        cx,
+                    );
+                }
+                _ => self.set_vi_status("Usage: :pl add <name> | :pl list".into(), cx),
+            },
+            _ => {
+                self.set_vi_status(format!("Unknown command: {cmd}"), cx);
+            }
         }
+    }
+
+    fn set_vi_status(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.vi_status = Some(msg);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(4))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.vi_status = None;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_mode_indicator(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1309,15 +1477,29 @@ impl RootView {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
                     .child(div().text_lg().font_semibold().child("Vi-mode help"))
-                    .child(key("j / k".into(), "Navigate sidebar + scroll grid".into()))
+                    .child(key(
+                        "j / k".into(),
+                        "Scroll / navigate current region".into(),
+                    ))
+                    .child(key(
+                        "Ctrl+h/j/k/l".into(),
+                        "Focus sidebar / player / content".into(),
+                    ))
+                    .child(key("Enter".into(), "Open/play focused item".into()))
                     .child(key("h / l".into(), "Back / forward in history".into()))
-                    .child(key("Enter".into(), "Open selected sidebar section".into()))
                     .child(key("Space".into(), "Toggle play/pause".into()))
+                    .child(key("← / →".into(), "Previous / next track".into()))
+                    .child(key("[ / ]".into(), "Album tabs: new/random/…".into()))
                     .child(key("i".into(), "Insert mode (pass keys to input)".into()))
                     .child(key(":".into(), "Command mode (:q / :help)".into()))
+                    .child(key(":newpl <name>".into(), "Create playlist".into()))
+                    .child(key(
+                        ":pl add <name>".into(),
+                        "Add current song to playlist".into(),
+                    ))
+                    .child(key(":pl list".into(), "List playlists".into()))
                     .child(key("/".into(), "Search (Ctrl+K)".into()))
                     .child(key("? / Esc".into(), "Toggle help / Dismiss".into()))
-                    .child(key("Ctrl+[".into(), "Escape (alternative)".into()))
                     .child(
                         div()
                             .mt_2()
@@ -1630,12 +1812,16 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connected = self.session.read(cx).status == ConnectionStatus::Connected;
         let palette_open = self.search_bar.read(cx).is_palette();
-        let modal_open = self.new_playlist_open || self.show_fullscreen || palette_open
+        let modal_open = self.new_playlist_open
+            || self.show_fullscreen
+            || palette_open
             || self.mode == KeyboardMode::Command
             || (self.vi_enabled && self.show_vi_help);
         // Grab focus so key handlers fire immediately when the app is visible
         // and no text input has claimed it.
-        if connected && !modal_open && !self.focus_handle.contains_focused(window, cx) {
+        let grab_focus = self.mode != KeyboardMode::Insert;
+        if connected && !modal_open && grab_focus && !self.focus_handle.contains_focused(window, cx)
+        {
             window.focus(&self.focus_handle);
         }
 
@@ -1703,7 +1889,14 @@ impl Render for RootView {
             playlists_collapsed: self.playlists_collapsed,
             refreshing: self.refreshing,
             refresh_stage: self.refresh_stage,
-            vi_selected_section: if self.vi_enabled && self.mode == KeyboardMode::Normal {
+            vi_selected_section: if self.vi_enabled
+                && self.mode == KeyboardMode::Normal
+                && self.focus_region == FocusRegion::Sidebar
+            {
+                Some(NAV_ORDER[self.vi_selected])
+            } else {
+                None
+            },
                 Some(NAV_ORDER[self.vi_selected])
             } else {
                 None
@@ -1862,14 +2055,30 @@ impl Render for RootView {
                             .min_w_0()
                             .h_full()
                             .child(content)
-                            // Mode indicator (replaces the old inline search bar).
+                            // Mode indicator + transient command feedback
+                            // (replaces the old inline search bar).
                             .when(!palette_open && self.vi_enabled, |this| {
                                 this.child(
                                     div()
                                         .absolute()
                                         .top(px(14.))
                                         .right(px(16.))
-                                        .child(self.render_mode_indicator(cx)),
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(self.render_mode_indicator(cx))
+                                        .when_some(self.vi_status.clone(), |this, msg| {
+                                            this.child(
+                                                div()
+                                                    .text_xs()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .bg(cx.theme().muted)
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(msg),
+                                            )
+                                        }),
                                 )
                             }),
                     )

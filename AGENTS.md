@@ -33,6 +33,7 @@ cargo fmt --all
 - **UI separators**: hardcoded `hsla(0., 0., 0.5, 0.15)` — do NOT use `cx.theme().border` for dividers, row borders, card borders, sidebar borders, or the player-bar top border. Custom theme `border` may have zero alpha.
 - **`PlaybackError`**: single struct `PlaybackError(String)` — NOT a multi-variant enum.
 - **`engine.rs` double `map_err` on `prepare()`**: both needed — outer handles `JoinError`, inner handles `DecoderError`. Do NOT collapse into one.
+- **Vi-mode keyboard navigation**: when `settings.vi_mode` is ON, `root.rs` routes keys to `handle_vi_key` and the legacy no-vi shortcuts (space/arrows/`[`/`]` = play/prev/next/nav) are disabled. Every content view implements `vi_cursor: Option<usize>` + `vi_move(delta, window, cx)` / `vi_activate(cx)` / `vi_clear(cx)`; new Content variants must be added to `content_vi_move`/`content_vi_activate`/`content_vi_tab` + `vi_clear_cursors` in `root.rs`. `[`/`]` mean album filter tabs in vi mode, nav back/forward in no-vi mode. Focus highlight = `focus_glow` + `with_focus_animation` (`ui/mod.rs`); scroll-into-view via `ScrollAnchor` (nested rows) or `scroll_to_item(row, ScrollStrategy::Top)` (virtualized album grid — uniform_list has no FirstVisible).
 
 - **`library_db` thread safety**: `LibraryDb` wraps `rusqlite::Connection` in `Mutex`. All queries lock internally. Do NOT hold the lock across await points — keep DB access synchronous within `spawn_io` blocks.
 - **`sync_navidrome` truncate-and-resync**: deletes all navidrome rows before re-import. OK until 50k+ tracks.

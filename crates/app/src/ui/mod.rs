@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use directories::ProjectDirs;
 use gpui::{
-    App, Hsla, SharedString, Window, WindowBounds, WindowDecorations, WindowOptions, div, hsla,
-    prelude::*, px,
+    Animation, AnimationElement, AnimationExt as _, App, BoxShadow, ElementId, Hsla, IntoElement,
+    SharedString, Styled, Window, WindowBounds, WindowDecorations, WindowOptions, div,
+    ease_out_quint, hsla, point, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::TitleBar;
@@ -857,6 +858,41 @@ fn imported_theme_colors(theme: &ImportedThemeDefinition) -> ThemeConfigColors {
 /// 1px horizontal divider visible on any background.
 pub fn divider() -> gpui::Div {
     div().h(px(1.)).w_full().bg(hsla(0., 0., 0.5, 0.15))
+}
+
+/// Outer glow used by the vi-mode focus cursor and card hover highlight.
+pub fn focus_glow(cx: &App) -> Vec<BoxShadow> {
+    let c = cx.theme().primary;
+    vec![BoxShadow {
+        color: hsla(c.h, c.s, c.l, 0.45),
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(18.),
+        spread_radius: px(0.),
+    }]
+}
+
+/// Entry animation for a focused list item: the glow grows in over ~180ms
+/// each time the vi cursor lands on the item. The wrapper element id is
+/// per-item, so it mounts when focused and unmounts when the cursor moves —
+/// the animation replays on every jump.
+pub fn with_focus_animation<E: IntoElement + Styled + 'static>(
+    id: impl Into<SharedString>,
+    el: E,
+    cx: &App,
+) -> AnimationElement<E> {
+    let c = cx.theme().primary;
+    el.with_animation(
+        ElementId::Name(id.into()),
+        Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+        move |el, t| {
+            el.shadow(vec![BoxShadow {
+                color: hsla(c.h, c.s, c.l, 0.45 * t),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(18. * t),
+                spread_radius: px(0.),
+            }])
+        },
+    )
 }
 
 /// Window open options derived from the client-titlebar preference.

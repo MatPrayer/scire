@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle, SharedString, Window, div,
-    img, prelude::*, px,
+    Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle, SharedString,
+    Window, div, img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -18,6 +18,7 @@ use crate::assets::{app_icon, icons};
 use crate::services::library_db::{AlbumRow, LibraryDb};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
+use crate::ui::{focus_glow, with_focus_animation};
 
 /// How a context-menu action should enqueue an album's songs.
 #[derive(Clone, Copy)]
@@ -41,19 +42,27 @@ pub struct LocalMusicView {
     scroll: ScrollHandle,
     /// Last seen scan_version — reload albums only when it changes.
     scan_version: u64,
+    /// Album index under the vi-mode cursor (None = cursor hidden).
+    vi_cursor: Option<usize>,
+    /// Scrolls the focused card into view (works for wrapped grids, where
+    /// the cards are nested inside a flex-wrap container).
+    focus_anchor: ScrollAnchor,
 }
 
 impl EventEmitter<LocalMusicEvent> for LocalMusicView {}
 
 impl LocalMusicView {
     pub fn new(db: Arc<LibraryDb>, player: Entity<PlayerState>, cx: &mut Context<Self>) -> Self {
+        let scroll = ScrollHandle::new();
         let mut view = Self {
             db,
             player,
             albums: Vec::new(),
             art_paths: HashMap::new(),
-            scroll: ScrollHandle::new(),
+            scroll: scroll.clone(),
             scan_version: 0,
+            vi_cursor: None,
+            focus_anchor: ScrollAnchor::for_handle(scroll),
         };
         view.refresh(cx);
         view
@@ -91,13 +100,50 @@ impl LocalMusicView {
         });
     }
 
+    /// Move the vi-mode cursor by `delta` cards, clamping and scrolling the
+    /// focused card into view (via a ScrollAnchor, since the cards are nested
+    /// in a flex-wrap container and have no stable scroll child index).
+    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.albums.is_empty() {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(self.albums.len() - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        self.focus_anchor.scroll_to(window, cx);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Open the album under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .vi_cursor
+            .and_then(|c| self.albums.get(c))
+            .map(|a| a.id.clone())
+        else {
+            return;
+        };
+        cx.emit(LocalMusicEvent::OpenAlbum(id));
+    }
+
     fn render_card(
         &self,
         index: usize,
         album: &AlbumRow,
         tile: f32,
+        focused: bool,
         cx: &Context<Self>,
-    ) -> impl IntoElement + use<> {
+    ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = id.clone();
         let art = self.art_paths.get(&id).cloned();
@@ -107,7 +153,7 @@ impl LocalMusicView {
         let sc = album.song_count;
         let view = cx.entity();
 
-        v_flex()
+        let card = v_flex()
             .id(SharedString::from(format!("local-album-{}", album.id)))
             .group("lcard")
             .w(px(tile + 12.))
@@ -117,7 +163,12 @@ impl LocalMusicView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted))
+            .hover(|s| s.bg(cx.theme().muted).shadow(focus_glow(cx)))
+            .when(focused, |s| {
+                s.border_color(cx.theme().primary)
+                    .shadow(focus_glow(cx))
+                    .anchor_scroll(Some(self.focus_anchor.clone()))
+            })
             .on_click(cx.listener({
                 let click_id = id.clone();
                 move |_this, _, _, cx| {
@@ -193,7 +244,12 @@ impl LocalMusicView {
                     .item(PopupMenuItem::new("Shuffle").on_click(act(QueueMode::Shuffle)))
                     .item(PopupMenuItem::new("Play next").on_click(act(QueueMode::PlayNext)))
                     .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
-            })
+            });
+        if focused {
+            with_focus_animation(format!("vi-focus-{index}"), card, cx).into_any_element()
+        } else {
+            card.into_any_element()
+        }
     }
 }
 
@@ -225,7 +281,10 @@ impl Render for LocalMusicView {
             .albums
             .iter()
             .enumerate()
-            .map(|(i, a)| self.render_card(i, a, tile, cx).into_any_element())
+            .map(|(i, a)| {
+                let focused = self.vi_cursor == Some(i);
+                self.render_card(i, a, tile, focused, cx)
+            })
             .collect();
 
         v_flex()
