@@ -2,27 +2,110 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
+use gpui::{
+    Context, Entity, EventEmitter, IntoElement, Render, SharedString, UniformListScrollHandle,
+    Window, div, img, prelude::*, px, uniform_list,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::link::Link;
+use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, h_flex, v_flex};
 use subsonic::{Album, ArtistIndex, ArtistInfo2, ArtistWithAlbums, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
+use crate::services::library_db::LibraryDb;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
-use crate::state::session::Session;
+use crate::state::session::{ConnectionStatus, Session};
 
 const ART_SIZE: u32 = 320;
+
+/// Card text metrics — matched to the album grid so the two pages line up.
+/// Fixed height because the virtualized rows must all be the same size.
+const NAME_LINE_H: f32 = 20.;
+const META_LINE_H: f32 = 17.;
+const TEXT_BLOCK_H: f32 = NAME_LINE_H * 2. + META_LINE_H;
+/// Rows of covers fetched beyond the visible range, so scrolling doesn't
+/// chase the art. Also the pre-layout guess, before a viewport is measured.
+const ART_LOOKAHEAD_ROWS: usize = 4;
 
 pub enum ArtistsEvent {
     OpenArtist(String),
 }
 
+/// One card's pre-formatted contents. Built when the list changes rather than
+/// per frame: the index runs to thousands of entries and re-deriving the
+/// strings on every repaint is what made switching to this page hitch.
+struct Card {
+    id: SharedString,
+    name: SharedString,
+    albums: SharedString,
+    /// First character of the name, drawn in the empty circle when the artist
+    /// has no image.
+    initial: SharedString,
+}
+
+fn to_cards(artists: &[subsonic::Artist]) -> Vec<Card> {
+    artists
+        .iter()
+        .map(|artist| Card {
+            id: artist.id.clone().into(),
+            name: artist.name.clone().into(),
+            albums: artist
+                .album_count
+                .map(|n| {
+                    if n == 1 {
+                        "1 album".into()
+                    } else {
+                        format!("{n} albums")
+                    }
+                })
+                .unwrap_or_default()
+                .into(),
+            initial: artist
+                .name
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_default()
+                .into(),
+        })
+        .collect()
+}
+
+/// Flatten the server's index buckets into one alphabetical list. The grid has
+/// no letter headings, and `getArtists` already sorts within each bucket.
+fn flatten_index(index: Vec<ArtistIndex>) -> Vec<subsonic::Artist> {
+    let mut artists: Vec<subsonic::Artist> =
+        index.into_iter().flat_map(|bucket| bucket.artist).collect();
+    artists.sort_by_key(|a| a.name.to_lowercase());
+    artists
+}
+
 pub struct ArtistsView {
     session: Entity<Session>,
-    index: Vec<ArtistIndex>,
+    /// Last Navidrome sync's artists, painted while the request runs.
+    library_db: Arc<LibraryDb>,
+    artists: Vec<subsonic::Artist>,
+    cards: Vec<Card>,
+    /// `cards` is the cached copy, not the server's answer.
+    cached: bool,
+    art_paths: HashMap<String, PathBuf>,
+    /// In-flight cover downloads, kept so they're cancelled when this view is
+    /// dropped on navigation instead of starving the next page.
+    art_tasks: Vec<gpui::Task<()>>,
+    /// A coalesced repaint is scheduled; batches a burst of cover arrivals into
+    /// one re-render instead of one per completed download.
+    art_repaint_pending: bool,
+    /// Resolution thumbnails are currently fetched at, so a cover-size change
+    /// can drop stale art and refetch.
+    art_px: u32,
+    /// Card range whose covers were last requested; skips redoing the work on
+    /// every frame when the viewport hasn't moved.
+    art_range: Option<(usize, usize)>,
+    scroll: UniformListScrollHandle,
     loading: bool,
     error: Option<String>,
 }
@@ -30,15 +113,76 @@ pub struct ArtistsView {
 impl EventEmitter<ArtistsEvent> for ArtistsView {}
 
 impl ArtistsView {
-    pub fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<Session>,
+        library_db: Arc<LibraryDb>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let art_px = session.read(cx).settings.cover_size.art_px();
         let mut this = Self {
             session,
-            index: Vec::new(),
+            library_db,
+            artists: Vec::new(),
+            cards: Vec::new(),
+            cached: false,
+            art_paths: HashMap::new(),
+            art_tasks: Vec::new(),
+            art_repaint_pending: false,
+            art_px,
+            art_range: None,
+            scroll: UniformListScrollHandle::new(),
             loading: false,
             error: None,
         };
+        this.seed_from_cache(cx);
         this.load(cx);
         this
+    }
+
+    /// Fill the grid from the last Navidrome sync so it paints on the first
+    /// frame instead of after `getArtists` answers. Same shape and caveats as
+    /// the album grid's seed: gated on a *configured* server (not a connected
+    /// one) so it also covers the pre-connect wait, and skipped for a library
+    /// subset since the sync doesn't record which library a row came from.
+    fn seed_from_cache(&mut self, cx: &mut Context<Self>) {
+        if self.session.read(cx).settings.server.is_none()
+            || !self.session.read(cx).library_ids.is_empty()
+            || !self.artists.is_empty()
+        {
+            return;
+        }
+        let Ok(rows) = self.library_db.artists_by_source("navidrome") else {
+            return;
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let counts = self
+            .library_db
+            .album_counts_by_artist("navidrome")
+            .unwrap_or_default();
+        self.artists = rows
+            .into_iter()
+            .map(|row| subsonic::Artist {
+                album_count: counts.get(&row.id).map(|n| *n as u32),
+                // Ids are stored namespaced by the sync; strip it back off so a
+                // placeholder card opens the same artist the live list would,
+                // and so its cover survives the swap instead of re-downloading.
+                id: row
+                    .id
+                    .strip_prefix("navidrome:artist:")
+                    .unwrap_or(&row.id)
+                    .to_string(),
+                name: row.name,
+                cover_art: row.cover_art,
+                artist_image_url: None,
+                biography: None,
+                starred: None,
+            })
+            .collect();
+        self.cards = to_cards(&self.artists);
+        self.cached = true;
+        // Covers are fetched from `render`, driven by the viewport.
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -76,17 +220,22 @@ impl ArtistsView {
                         }
                     }
                 }
-                merged.sort_by(|a, b| a.name.cmp(&b.name));
-                for bucket in &mut merged {
-                    bucket.artist.sort_by(|a, b| a.name.cmp(&b.name));
-                }
                 Ok::<_, anyhow::Error>(merged)
             })
             .await;
             let _ = this.update(cx, |view, cx| {
                 view.loading = false;
                 match result {
-                    Ok(index) => view.index = index,
+                    Ok(index) => {
+                        view.artists = flatten_index(index);
+                        view.cards = to_cards(&view.artists);
+                        view.cached = false;
+                        // Covers follow from `render`; `getArtists` returns the
+                        // entire library in one response and fetching all of it
+                        // here would stat the disk thousands of times on the
+                        // main thread.
+                        view.art_range = None;
+                    }
                     Err(e) => view.error = Some(format!("{e:#}")),
                 }
                 cx.notify();
@@ -94,61 +243,279 @@ impl ArtistsView {
         })
         .detach();
     }
+
+    fn fetch_art(&mut self, artist: &subsonic::Artist, cx: &mut Context<Self>) {
+        if self.art_paths.contains_key(&artist.id) {
+            return;
+        }
+        let Some(cover_id) = artist.cover_art.clone() else {
+            return;
+        };
+        // Synchronous cache hit: show it immediately, no async round-trip.
+        if let Some(path) = artwork::cached(&cover_id, self.art_px) {
+            self.art_paths.insert(artist.id.clone(), path);
+            return;
+        }
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        let artist_id = artist.id.clone();
+        let art_px = self.art_px;
+        // Soft-cap the bag: the oldest entries are covers scrolled past long
+        // ago and already downloaded, so dropping their handles just frees
+        // memory.
+        if self.art_tasks.len() > 256 {
+            self.art_tasks.drain(0..128);
+        }
+        let task = cx.spawn(async move |this, cx| {
+            if let Ok(path) = artwork::fetch(client, cover_id, art_px).await {
+                let _ = this.update(cx, |view, cx| {
+                    view.art_paths.insert(artist_id, path);
+                    view.schedule_art_repaint(cx);
+                });
+            }
+        });
+        self.art_tasks.push(task);
+    }
+
+    /// Coalesce cover-arrival repaints: a fast scroll completes many downloads
+    /// in quick succession, and re-rendering the grid per completion is wasted
+    /// work.
+    fn schedule_art_repaint(&mut self, cx: &mut Context<Self>) {
+        if self.art_repaint_pending {
+            return;
+        }
+        self.art_repaint_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(80))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.art_repaint_pending = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Drop cached thumbnail paths and refetch at the current `art_px` (called
+    /// when the cover-size setting changes).
+    fn refetch_art(&mut self) {
+        self.art_paths.clear();
+        // Cancel in-flight downloads at the old resolution.
+        self.art_tasks.clear();
+        self.art_range = None;
+    }
+
+    /// Fetch covers for the rows on screen, plus a few past the edge.
+    ///
+    /// `getArtists` hands over the whole library at once, so fetching every
+    /// cover when the list lands would stat the disk once per artist on the
+    /// main thread and queue a download per miss. Driving it from the viewport
+    /// keeps the work proportional to what is actually on screen.
+    fn ensure_art_for_viewport(&mut self, row_count: usize, cols: usize, cx: &mut Context<Self>) {
+        if self.cards.is_empty() || cols == 0 || row_count == 0 {
+            return;
+        }
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let viewport = f32::from(base.bounds().size.height);
+        let content = f32::from(base.max_offset().height) + viewport;
+        let (first_row, last_row) = if viewport > 0. && content > 0. {
+            let row_h = content / row_count as f32;
+            let scrolled = f32::from(-base.offset().y).max(0.);
+            (
+                (scrolled / row_h).floor() as usize,
+                ((scrolled + viewport) / row_h).ceil() as usize,
+            )
+        } else {
+            // Pre-layout: no measured viewport yet, so cover a guessed screenful
+            // rather than nothing — the next frame corrects it.
+            (0, ART_LOOKAHEAD_ROWS)
+        };
+        let start = first_row.saturating_sub(ART_LOOKAHEAD_ROWS) * cols;
+        let end = ((last_row + 1 + ART_LOOKAHEAD_ROWS) * cols).min(self.cards.len());
+        if start >= end || self.art_range == Some((start, end)) {
+            return;
+        }
+        self.art_range = Some((start, end));
+        let window: Vec<subsonic::Artist> = self.artists[start..end].to_vec();
+        for artist in &window {
+            self.fetch_art(artist, cx);
+        }
+    }
+
+    fn render_card(
+        &self,
+        entity: &Entity<Self>,
+        card: &Card,
+        tile: f32,
+        cx: &gpui::App,
+    ) -> gpui::AnyElement {
+        let art = self.art_paths.get(card.id.as_ref()).cloned();
+        let id = card.id.clone();
+        let view = entity.clone();
+        v_flex()
+            .id(card.id.clone())
+            .w(px(tile + 12.))
+            .p_1p5()
+            .gap_1p5()
+            .items_center()
+            .rounded_lg()
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().muted))
+            .on_click(move |_, _, cx: &mut gpui::App| {
+                let id = id.clone();
+                view.update(cx, |_, cx| {
+                    cx.emit(ArtistsEvent::OpenArtist(id.to_string()))
+                });
+            })
+            .child(
+                // Round, unlike the album grid's square tiles — the shape is
+                // what tells the two pages apart at a glance.
+                div()
+                    .size(px(tile))
+                    .rounded_full()
+                    .bg(cx.theme().muted)
+                    .overflow_hidden()
+                    .shadow_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .map(|this| match art {
+                        Some(path) => this.child(img(path).size(px(tile)).rounded_full()),
+                        None => this.child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .text_size(px(tile * 0.34))
+                                .child(card.initial.clone()),
+                        ),
+                    }),
+            )
+            .child(
+                v_flex()
+                    .h(px(TEXT_BLOCK_H))
+                    .w_full()
+                    .gap_0()
+                    .items_center()
+                    .text_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .max_h(px(NAME_LINE_H * 2.))
+                            .overflow_hidden()
+                            .text_sm()
+                            .line_height(px(NAME_LINE_H))
+                            .child(card.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(px(META_LINE_H))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(card.albums.clone()),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for ArtistsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for bucket in &self.index {
-            rows.push(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .mt_2()
-                    .child(bucket.name.clone())
-                    .into_any_element(),
-            );
-            for artist in &bucket.artist {
-                let id = artist.id.clone();
-                let albums = artist
-                    .album_count
-                    .map(|n| format!("{n} albums"))
-                    .unwrap_or_default();
-                rows.push(
-                    h_flex()
-                        .id(gpui::SharedString::from(format!("artist-{}", artist.id)))
-                        .justify_between()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(cx.theme().muted))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(ArtistsEvent::OpenArtist(id.clone()));
-                        }))
-                        .child(div().child(artist.name.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(albums),
-                        )
-                        .into_any_element(),
-                );
-            }
+        // Pick up cover-size changes: refetch art at the new resolution.
+        let cover = self.session.read(cx).settings.cover_size;
+        let tile = cover.px();
+        if cover.art_px() != self.art_px {
+            self.art_px = cover.art_px();
+            self.refetch_art();
         }
+
+        // The connect is part of the wait: until it lands there is no client to
+        // fetch with, so `loading` is false while the grid is still stale.
+        let connecting = self.session.read(cx).status == ConnectionStatus::Connecting;
+        let loading = self.loading || connecting;
+        let showing_cache = self.cached && loading;
+
+        // Columns from the measured viewport width; falls back to a guess on
+        // the very first frame (before layout), then self-corrects.
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let width = f32::from(base.bounds().size.width);
+        let card_w = tile + 12.;
+        let gap = 16.;
+        let cols = if width > 0. {
+            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
+        } else {
+            5
+        };
+        let row_count = self.cards.len().div_ceil(cols);
+        self.ensure_art_for_viewport(row_count, cols, cx);
+
+        let entity = cx.entity();
+        // Virtualized over rows, like the album grid: only what's on screen is
+        // built and uploaded.
+        let grid = uniform_list("artists-grid", row_count, move |range, _window, cx| {
+            let view = entity.read(cx);
+            range
+                .map(|row| {
+                    let start = row * cols;
+                    let end = ((row + 1) * cols).min(view.cards.len());
+                    let cards: Vec<_> = view.cards[start..end]
+                        .iter()
+                        .map(|card| view.render_card(&entity, card, tile, cx))
+                        .collect();
+                    h_flex()
+                        .w_full()
+                        .gap_4()
+                        .justify_center()
+                        .pb_3()
+                        .children(cards)
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>()
+        })
+        .flex_1()
+        .px_4()
+        .track_scroll(self.scroll.clone());
 
         v_flex()
             .id("artists-scroll")
             .size_full()
-            .overflow_y_scroll()
-            .p_4()
-            .gap_1()
-            .child(div().text_lg().child("Artists"))
+            .pt_4()
+            .gap_3()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_4()
+                    .px_4()
+                    .child(div().text_lg().child("Artists"))
+                    .when(loading, |this| {
+                        this.child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(Spinner::new().xsmall().color(cx.theme().muted_foreground))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if showing_cache {
+                                            "Updating from server…"
+                                        } else {
+                                            "Loading…"
+                                        }),
+                                ),
+                        )
+                    }),
+            )
             .when_some(self.error.clone(), |this, e| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
+                this.child(
+                    div()
+                        .px_4()
+                        .text_color(cx.theme().danger)
+                        .text_sm()
+                        .child(e),
+                )
             })
-            .children(rows)
+            .child(grid)
     }
 }
 
@@ -731,5 +1098,65 @@ mod tests {
         };
         assert!(is_single_or_ep(&single));
         assert!(!is_single_or_ep(&album));
+    }
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    fn artist(name: &str) -> subsonic::Artist {
+        subsonic::Artist {
+            id: name.into(),
+            name: name.into(),
+            cover_art: None,
+            album_count: None,
+            artist_image_url: None,
+            biography: None,
+            starred: None,
+        }
+    }
+
+    #[test]
+    fn index_buckets_flatten_into_one_alphabetical_list() {
+        let index = vec![
+            ArtistIndex {
+                name: "B".into(),
+                artist: vec![artist("Burial"), artist("Boards")],
+            },
+            ArtistIndex {
+                name: "A".into(),
+                artist: vec![artist("aphex")],
+            },
+        ];
+        let names: Vec<_> = flatten_index(index).into_iter().map(|a| a.name).collect();
+        // Case-insensitive, and across buckets — the grid has no headings to
+        // fall back on, so a bucket arriving out of order must still sort in.
+        assert_eq!(names, ["aphex", "Boards", "Burial"]);
+    }
+
+    #[test]
+    fn album_count_is_pluralized_and_omitted_when_unknown() {
+        let mut one = artist("Aphex");
+        one.album_count = Some(1);
+        let mut many = artist("Autechre");
+        many.album_count = Some(12);
+        let cards = to_cards(&[one, many, artist("Unknown")]);
+        assert_eq!(cards[0].albums, "1 album");
+        assert_eq!(cards[1].albums, "12 albums");
+        assert!(cards[2].albums.is_empty());
+    }
+
+    #[test]
+    fn card_initial_is_uppercased_for_the_empty_circle() {
+        let cards = to_cards(&[artist("aphex twin"), artist("65daysofstatic")]);
+        assert_eq!(cards[0].initial, "A");
+        assert_eq!(cards[1].initial, "6");
+    }
+
+    #[test]
+    fn nameless_artist_yields_no_initial_instead_of_panicking() {
+        let cards = to_cards(&[artist("")]);
+        assert!(cards[0].initial.is_empty());
     }
 }

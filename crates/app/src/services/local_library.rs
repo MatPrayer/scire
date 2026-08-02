@@ -41,7 +41,8 @@ impl LocalScanner {
         self.progress.load(Ordering::Relaxed)
     }
 
-    /// Scan directories, populate DB. Synchronous — caller uses `spawn_io`.
+    /// Scan directories, populate DB. Synchronous and long-running — callers
+    /// must use `runtime::spawn_blocking_io`, never `spawn_io`.
     pub fn scan(&self, dirs: &[PathBuf]) -> Result<()> {
         self.status.store(SCANNING, Ordering::Relaxed);
         self.progress.store(0, Ordering::Relaxed);

@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -373,7 +374,7 @@ impl LibraryDb {
     pub fn albums_by_source(&self, source: &str) -> Result<Vec<AlbumRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, year, cover_art, song_count, duration
+            "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration
              FROM albums WHERE source = ?1
              ORDER BY title COLLATE NOCASE",
         )?;
@@ -383,10 +384,11 @@ impl LibraryDb {
                 source: row.get(1)?,
                 title: row.get(2)?,
                 artist: row.get(3)?,
-                year: row.get(4)?,
-                cover_art: row.get(5)?,
-                song_count: row.get(6)?,
-                duration: row.get(7)?,
+                artist_id: row.get(4)?,
+                year: row.get(5)?,
+                cover_art: row.get(6)?,
+                song_count: row.get(7)?,
+                duration: row.get(8)?,
             })
         })?;
         rows.collect()
@@ -428,6 +430,23 @@ impl LibraryDb {
                 name: row.get(2)?,
                 cover_art: row.get(3)?,
             })
+        })?;
+        rows.collect()
+    }
+
+    /// Album count per artist id, for a given source.
+    pub fn album_counts_by_artist(
+        &self,
+        source: &str,
+    ) -> Result<HashMap<String, i64>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT artist_id, COUNT(*)
+             FROM albums WHERE source = ?1 AND artist_id IS NOT NULL
+             GROUP BY artist_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         rows.collect()
     }
@@ -603,6 +622,7 @@ pub struct AlbumRow {
     pub source: String,
     pub title: String,
     pub artist: Option<String>,
+    pub artist_id: Option<String>,
     pub year: Option<i32>,
     pub cover_art: Option<String>,
     pub song_count: i64,

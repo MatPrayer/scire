@@ -12,6 +12,9 @@ use tokio::runtime::Runtime;
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
+        // Two workers is enough for the request traffic, but any *blocking*
+        // job (see `spawn_blocking_io`) must never land here — a worker that
+        // doesn't yield starves every other IO task behind it.
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -50,6 +53,32 @@ where
         match std::pin::Pin::new(&mut guard.0).await {
             Ok(result) => result,
             Err(e) => Err(anyhow::anyhow!("io task failed: {e}")),
+        }
+    }
+}
+
+/// Spawn a *blocking* closure on the runtime's blocking pool; await it from
+/// gpui like `spawn_io`.
+///
+/// Use this for CPU/filesystem work that never yields (the local library
+/// scanner, SQLite batches). Putting such work on `spawn_io` pins one of the
+/// two async workers for its whole duration, which stalls every HTTP request
+/// behind it — a long local scan would otherwise delay the album grid's first
+/// page until the scan finished.
+///
+/// Unlike `spawn_io` this cannot be aborted on drop (tokio can't interrupt a
+/// blocking thread); the closure runs to completion even if the awaiting gpui
+/// task is cancelled.
+pub fn spawn_blocking_io<T, F>(f: F) -> impl Future<Output = anyhow::Result<T>> + Send
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let handle = runtime().spawn_blocking(f);
+    async move {
+        match handle.await {
+            Ok(result) => result,
+            Err(e) => Err(anyhow::anyhow!("blocking io task failed: {e}")),
         }
     }
 }

@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{
     App, Context, Entity, EventEmitter, IntoElement, Render, UniformListScrollHandle, Window, div,
@@ -10,19 +11,25 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use subsonic::{Album, AlbumListType, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::config::AlbumSort;
+use crate::services::library_db::{AlbumRow, LibraryDb};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
-use crate::state::session::Session;
+use crate::state::session::{ConnectionStatus, Session};
 
 const PAGE_SIZE: u32 = 100;
 /// Load the next page when scrolled within this many pixels of the bottom.
 const LOAD_AHEAD_PX: f32 = 600.;
+/// How many cached placeholder cards get their cover looked up on seed.
+/// The cache list can run to thousands of rows and every lookup is a stat;
+/// the rest pick up art as the live pages overwrite them.
+const CACHE_ART_PREFETCH: usize = 300;
 
 /// Card text metrics. The line heights are explicit because gpui's default
 /// line box for these font sizes clips descenders; the block height is fixed
@@ -80,6 +87,12 @@ struct TabState {
     page: u32,
     /// Per-library exhaustion, indexed like the selection at fetch time.
     lib_exhausted: Vec<bool>,
+    /// `albums` still holds placeholders seeded from the last Navidrome sync;
+    /// live pages overwrite them from the front instead of appending.
+    cached: bool,
+    /// How many entries of `albums` came from the server (only meaningful
+    /// while `cached` — it's the write cursor for the overwrite).
+    live_len: usize,
 }
 
 /// Display order between two albums for a tab (mirrors the server's order
@@ -133,6 +146,60 @@ fn merge_ready(state: &mut TabState, tab: AlbumSort) -> Vec<Album> {
     out
 }
 
+/// Render a cached DB row as an `Album` placeholder.
+///
+/// The sync stores ids namespaced (`navidrome:album:<id>`); strip that back off
+/// so a placeholder card navigates and fetches art with the same id the live
+/// listing would use — that's also what lets the cover survive the swap instead
+/// of blanking and re-downloading.
+fn album_from_row(row: AlbumRow) -> Album {
+    let strip = |id: &str, prefix: &str| id.strip_prefix(prefix).unwrap_or(id).to_string();
+    Album {
+        id: strip(&row.id, "navidrome:album:"),
+        name: row.title,
+        artist: row.artist,
+        artist_id: row
+            .artist_id
+            .as_deref()
+            .map(|id| strip(id, "navidrome:artist:")),
+        cover_art: row.cover_art,
+        song_count: Some(row.song_count as u32),
+        duration: Some(row.duration as u32),
+        year: row.year,
+        // Not stored by the sync; the placeholder never needs them (the tabs
+        // that sort on these keys don't seed from cache — see `seed_from_cache`).
+        created: None,
+        genre: None,
+        starred: None,
+        user_rating: None,
+        play_count: None,
+    }
+}
+
+/// Merge a freshly-fetched page into a tab's display list.
+///
+/// Normally an append. While the tab still holds placeholders seeded from the
+/// last sync, the page *overwrites* them from the front instead: the row count
+/// stays put, so the scrollbar doesn't jump under the user while live pages
+/// stream in. Once the server's list ends, any cached tail (albums deleted
+/// server-side since the sync) is dropped.
+///
+/// `state.exhausted` must already be set for this page.
+fn apply_live_page(state: &mut TabState, page: &[Album]) {
+    if !state.cached {
+        state.albums.extend_from_slice(page);
+        return;
+    }
+    let start = state.live_len;
+    let end = (start + page.len()).min(state.albums.len());
+    state.albums.splice(start..end, page.iter().cloned());
+    state.live_len += page.len();
+    if state.exhausted {
+        state.albums.truncate(state.live_len);
+        state.cached = false;
+    }
+}
+
 pub enum AlbumsEvent {
     OpenAlbum(String),
     OpenArtist(String),
@@ -151,6 +218,8 @@ pub struct AlbumsView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
     playlists: Entity<PlaylistsState>,
+    /// Last Navidrome sync's albums, painted while the server request runs.
+    library_db: Arc<LibraryDb>,
     /// Albums for each filter tab, loaded independently and lazily.
     tabs: HashMap<AlbumSort, TabState>,
     art_paths: HashMap<String, PathBuf>,
@@ -176,6 +245,7 @@ impl AlbumsView {
         session: Entity<Session>,
         player: Entity<PlayerState>,
         playlists: Entity<PlaylistsState>,
+        library_db: Arc<LibraryDb>,
         cx: &mut Context<Self>,
     ) -> Self {
         let active_tab = session.read(cx).settings.album_sort;
@@ -184,6 +254,7 @@ impl AlbumsView {
             session,
             player,
             playlists,
+            library_db,
             tabs: HashMap::new(),
             art_paths: HashMap::new(),
             art_tasks: Vec::new(),
@@ -193,8 +264,48 @@ impl AlbumsView {
             scroll: UniformListScrollHandle::new(),
             error: None,
         };
+        this.seed_from_cache(active_tab, cx);
         this.load_more(active_tab, cx);
         this
+    }
+
+    /// Fill a tab with the last Navidrome sync's albums so the grid is
+    /// populated on the first frame instead of after the server answers.
+    ///
+    /// Alphabetical only: the synced rows carry no timestamps, play counts or
+    /// star state, so the other tabs' orderings can't be reproduced — and rows
+    /// under the wrong heading are worse than an empty grid. `albums_by_source`
+    /// already returns them in exactly this tab's order (`title COLLATE
+    /// NOCASE`), which is what makes the in-place overwrite line up.
+    fn seed_from_cache(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
+        // Gated on a *configured* server, not a connected one: this view is
+        // built once before the connect completes and again after, and the
+        // pre-connect pass is exactly the slow window worth filling.
+        if tab != AlbumSort::All || self.session.read(cx).settings.server.is_none() {
+            return;
+        }
+        // Only for "all libraries": the sync doesn't record which library a
+        // row came from, so a filtered selection can't be honoured here.
+        if !self.session.read(cx).library_ids.is_empty() {
+            return;
+        }
+        if self.tabs.get(&tab).is_some_and(|t| !t.albums.is_empty()) {
+            return;
+        }
+        let Ok(rows) = self.library_db.albums_by_source("navidrome") else {
+            return;
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let albums: Vec<Album> = rows.into_iter().map(album_from_row).collect();
+        let state = self.tabs.entry(tab).or_default();
+        state.cached = true;
+        state.live_len = 0;
+        state.albums = albums.clone();
+        for album in albums.iter().take(CACHE_ART_PREFETCH) {
+            self.fetch_art(album, cx);
+        }
     }
 
     fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
@@ -204,6 +315,7 @@ impl AlbumsView {
     fn select_tab(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
         self.active_tab = tab;
         if self.tabs.get(&tab).is_none_or(|t| t.albums.is_empty()) {
+            self.seed_from_cache(tab, cx);
             self.load_more(tab, cx);
         }
         self.session.update(cx, |session, _| {
@@ -282,7 +394,7 @@ impl AlbumsView {
                         }
                         state.exhausted = state.lib_exhausted.iter().all(|&e| e)
                             && state.buffers.iter().all(|b| b.is_empty());
-                        state.albums.extend(new_albums.iter().cloned());
+                        apply_live_page(state, &new_albums);
                     }
                     Err(e) => view.error = Some(format!("{e:#}")),
                 }
@@ -644,11 +756,18 @@ impl Render for AlbumsView {
             self.load_more(active, cx);
         }
 
-        let (album_count, loading) = self
+        let (album_count, fetching, cached) = self
             .tabs
             .get(&active)
-            .map(|t| (t.albums.len(), t.loading))
-            .unwrap_or((0, false));
+            .map(|t| (t.albums.len(), t.loading, t.cached))
+            .unwrap_or((0, false, false));
+        // The connect itself is part of the wait: before it lands there is no
+        // client to fetch with, so `loading` is false while the grid is still
+        // very much not up to date.
+        let connecting = self.session.read(cx).status == ConnectionStatus::Connecting;
+        let loading = fetching || connecting;
+        // Cards on screen are last sync's copy, not the server's answer yet.
+        let showing_cache = cached && loading;
 
         // Columns from the measured viewport width; falls back to a guess on
         // the very first frame (before layout), then self-corrects.
@@ -710,7 +829,28 @@ impl Render for AlbumsView {
                     .gap_4()
                     .px_4()
                     .child(div().text_lg().child("Albums"))
-                    .child(tabs),
+                    .child(tabs)
+                    // Spinner sits in the header rather than over the grid so
+                    // it's visible while cached cards are already filling the
+                    // page — otherwise a stale-but-complete grid looks final.
+                    .when(loading, |this| {
+                        this.child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(Spinner::new().xsmall().color(cx.theme().muted_foreground))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(if showing_cache {
+                                            "Updating from server…"
+                                        } else {
+                                            "Loading…"
+                                        }),
+                                ),
+                        )
+                    }),
             )
             .when_some(self.error.clone(), |this, e| {
                 this.child(
@@ -722,9 +862,11 @@ impl Render for AlbumsView {
                 )
             })
             .child(grid)
-            // Loading indicator while the next page streams in — floated over
-            // the grid's bottom edge so it doesn't shorten the scroll area.
-            .when(loading, |this| {
+            // Pagination indicator, floated over the grid's bottom edge so it
+            // doesn't shorten the scroll area. Suppressed while cached cards
+            // are showing — there the rows are already there and the header
+            // spinner is the honest signal.
+            .when(loading && !showing_cache, |this| {
                 this.child(
                     h_flex()
                         .absolute()
@@ -740,5 +882,112 @@ impl Render for AlbumsView {
                         ),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn album(id: &str) -> Album {
+        Album {
+            id: id.into(),
+            name: id.into(),
+            artist: None,
+            artist_id: None,
+            cover_art: None,
+            song_count: None,
+            duration: None,
+            created: None,
+            year: None,
+            genre: None,
+            starred: None,
+            user_rating: None,
+            play_count: None,
+        }
+    }
+
+    fn ids(state: &TabState) -> Vec<String> {
+        state.albums.iter().map(|a| a.id.clone()).collect()
+    }
+
+    fn seeded(n: usize) -> TabState {
+        TabState {
+            albums: (0..n).map(|i| album(&format!("c{i}"))).collect(),
+            cached: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uncached_pages_append() {
+        let mut state = TabState::default();
+        apply_live_page(&mut state, &[album("a"), album("b")]);
+        apply_live_page(&mut state, &[album("c")]);
+        assert_eq!(ids(&state), ["a", "b", "c"]);
+        assert!(!state.cached);
+    }
+
+    #[test]
+    fn live_pages_overwrite_cache_without_changing_row_count() {
+        let mut state = seeded(6);
+        apply_live_page(&mut state, &[album("l0"), album("l1")]);
+        // Same length: the scroll extent must not move mid-load.
+        assert_eq!(ids(&state), ["l0", "l1", "c2", "c3", "c4", "c5"]);
+        apply_live_page(&mut state, &[album("l2"), album("l3")]);
+        assert_eq!(ids(&state), ["l0", "l1", "l2", "l3", "c4", "c5"]);
+        assert!(state.cached);
+    }
+
+    #[test]
+    fn exhausted_page_drops_the_stale_cached_tail() {
+        let mut state = seeded(6);
+        state.exhausted = true;
+        apply_live_page(&mut state, &[album("l0"), album("l1")]);
+        assert_eq!(ids(&state), ["l0", "l1"]);
+        assert!(
+            !state.cached,
+            "cache is fully replaced once the server ends"
+        );
+    }
+
+    #[test]
+    fn live_list_longer_than_cache_grows_past_it() {
+        let mut state = seeded(2);
+        apply_live_page(&mut state, &[album("l0"), album("l1"), album("l2")]);
+        assert_eq!(ids(&state), ["l0", "l1", "l2"]);
+        // Subsequent pages append normally once past the cached tail.
+        apply_live_page(&mut state, &[album("l3")]);
+        assert_eq!(ids(&state), ["l0", "l1", "l2", "l3"]);
+    }
+
+    #[test]
+    fn empty_final_page_truncates_to_what_the_server_sent() {
+        let mut state = seeded(4);
+        apply_live_page(&mut state, &[album("l0")]);
+        state.exhausted = true;
+        apply_live_page(&mut state, &[]);
+        assert_eq!(ids(&state), ["l0"]);
+    }
+
+    #[test]
+    fn cached_rows_strip_the_sync_id_namespace() {
+        let row = AlbumRow {
+            id: "navidrome:album:42".into(),
+            source: "navidrome".into(),
+            title: "Kid A".into(),
+            artist: Some("Radiohead".into()),
+            artist_id: Some("navidrome:artist:7".into()),
+            year: Some(2000),
+            cover_art: Some("al-42".into()),
+            song_count: 10,
+            duration: 2000.0,
+        };
+        let a = album_from_row(row);
+        // Ids must match the live listing's, or the swap reloads every cover
+        // and the cards navigate to nothing.
+        assert_eq!(a.id, "42");
+        assert_eq!(a.artist_id.as_deref(), Some("7"));
+        assert_eq!(a.name, "Kid A");
     }
 }

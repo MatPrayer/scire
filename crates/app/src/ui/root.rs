@@ -86,8 +86,16 @@ pub struct RootView {
     playlists_collapsed: bool,
     /// Shared music library database.
     library_db: Arc<LibraryDb>,
+    /// The two heavy catalog views, kept alive across navigation. Rebuilding
+    /// them on every tab switch re-fetched the entire listing and dropped the
+    /// scroll position; they're dropped only when the data behind them changes
+    /// (connect/disconnect, library selection) — see `invalidate_catalog_views`.
+    albums_view: Option<Entity<AlbumsView>>,
+    artists_view: Option<Entity<ArtistsView>>,
+    recent_view: Option<Entity<RecentView>>,
     /// Whether initial local/navidrome sync has been triggered.
     scan_started: bool,
+    sync_started: bool,
     /// New-playlist dialog state.
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
@@ -201,12 +209,14 @@ impl RootView {
                 let client = session.read(cx).client.clone();
                 this.player.update(cx, |p, cx| p.set_client(client, cx));
                 this.content = None;
+                this.invalidate_catalog_views();
                 if connected {
                     this.last_libraries = libraries;
                 }
             } else if connected && libraries != this.last_libraries {
                 // Library selection changed: rebuild the current catalog view.
                 this.last_libraries = libraries;
+                this.invalidate_catalog_views();
                 if let Some(section) = this.section {
                     this.navigate(section, None, cx);
                 }
@@ -215,9 +225,9 @@ impl RootView {
             let has_local = !session.read(cx).settings.local_music_dirs.is_empty();
             let has_server = session.read(cx).settings.server.is_some();
             let lm = has_local && !has_server;
-            // Kick off local scanner (and Navidrome sync) once.
-            // When server + local dirs are both configured, local scan
-            // starts immediately without waiting for Navidrome connect.
+            // Kick off the local scanner once. When server + local dirs are
+            // both configured, the local scan starts immediately without
+            // waiting for the Navidrome connect.
             let should_scan = connected || has_local;
             if should_scan && !this.scan_started {
                 this.scan_started = true;
@@ -226,35 +236,52 @@ impl RootView {
                     let lib_db = this.library_db.clone();
                     cx.spawn(async move |this, cx| {
                         let scanner = Arc::new(LocalScanner::new(lib_db));
-                        let s = scanner.clone();
-                        let d = dirs.clone();
-                        let _ = runtime::spawn_io(async move { s.scan(&d) }).await;
-                        let _ = this.update(cx, |_, _| {});
-                        // Periodic background scan every 5 minutes.
                         loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                             let s = scanner.clone();
                             let d = dirs.clone();
-                            let _ = runtime::spawn_io(async move { s.scan(&d) }).await;
+                            // The scan is synchronous (walkdir + tag parse +
+                            // SQLite): it must go to the blocking pool, or it
+                            // holds an IO worker for its whole duration and
+                            // the first catalog request queues behind it.
+                            let _ = runtime::spawn_blocking_io(move || s.scan(&d)).await;
                             let _ = this.update(cx, |_, _| {});
+                            // Periodic background rescan every 5 minutes. Timed
+                            // on gpui's executor — this task has no tokio
+                            // reactor, so `tokio::time::sleep` would panic here.
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(300))
+                                .await;
                         }
                     })
                     .detach();
                 }
-                if session.read(cx).client.is_some() {
-                    let db = this.library_db.clone();
-                    let client = session.read(cx).client.clone();
-                    cx.spawn(async move |this, cx| {
-                        if let Some(client) = client {
-                            let _ = runtime::spawn_io(async move {
-                                navidrome_sync::sync_navidrome(db, &client, None).await
-                            })
-                            .await;
-                            let _ = this.update(cx, |_, _| {});
-                        }
+            }
+
+            // Navidrome sync is gated separately from the local scan: it needs
+            // a live client, and the scan flag flips on the pre-connect pass
+            // whenever local dirs are configured — sharing one flag meant the
+            // sync never ran at all for those users.
+            if connected
+                && !this.sync_started
+                && let Some(client) = session.read(cx).client.clone()
+            {
+                this.sync_started = true;
+                let db = this.library_db.clone();
+                cx.spawn(async move |this, cx| {
+                    // Deliberately held back: this is a full truncate-and-resync
+                    // (one getAlbum per album), so it must not compete with the
+                    // album grid's own first page. The grid renders the rows
+                    // this wrote on the *previous* run while it waits.
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(30))
+                        .await;
+                    let _ = runtime::spawn_io(async move {
+                        navidrome_sync::sync_navidrome(db, &client, None).await
                     })
-                    .detach();
-                }
+                    .await;
+                    let _ = this.update(cx, |_, _| {});
+                })
+                .detach();
             }
 
             // Show content when connected OR when we have a server/local-music
@@ -307,7 +334,11 @@ impl RootView {
             show_fullscreen: false,
             was_connected: false,
             library_db,
+            albums_view: None,
+            artists_view: None,
+            recent_view: None,
             scan_started: false,
+            sync_started: false,
             last_libraries: Vec::new(),
             libraries_collapsed,
             playlists_collapsed,
@@ -366,41 +397,64 @@ impl RootView {
         .detach();
     }
 
+    /// Drop the retained catalog views so the next visit rebuilds and refetches
+    /// them. Call whenever what they'd fetch changes — connect/disconnect or a
+    /// library-selection change — since they never reload on their own.
+    fn invalidate_catalog_views(&mut self) {
+        self.albums_view = None;
+        self.artists_view = None;
+        self.recent_view = None;
+    }
+
     fn navigate(
         &mut self,
         section: NavSection,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        let started = std::time::Instant::now();
         self.current_entry = Some(NavEntry::Section(section));
         self.section = Some(section);
         self.active_playlist = None;
         self.content = Some(match section {
-            NavSection::Albums => {
-                let view = cx.new(|cx| {
-                    AlbumsView::new(
-                        self.session.clone(),
-                        self.player.clone(),
-                        self.playlists.clone(),
-                        cx,
-                    )
-                });
-                cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
-                    AlbumsEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
-                    AlbumsEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
-                })
-                .detach();
-                Content::Albums(view)
-            }
-            NavSection::Artists => {
-                let view = cx.new(|cx| ArtistsView::new(self.session.clone(), cx));
-                cx.subscribe(&view, |this: &mut Self, _, event, cx| {
-                    let ArtistsEvent::OpenArtist(id) = event;
-                    this.open_artist(id.clone(), cx);
-                })
-                .detach();
-                Content::Artists(view)
-            }
+            // Reused across visits: subscribe only on first construction,
+            // otherwise every switch would stack another event handler.
+            NavSection::Albums => Content::Albums(match self.albums_view.clone() {
+                Some(view) => view,
+                None => {
+                    let view = cx.new(|cx| {
+                        AlbumsView::new(
+                            self.session.clone(),
+                            self.player.clone(),
+                            self.playlists.clone(),
+                            self.library_db.clone(),
+                            cx,
+                        )
+                    });
+                    cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
+                        AlbumsEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
+                        AlbumsEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+                    })
+                    .detach();
+                    self.albums_view = Some(view.clone());
+                    view
+                }
+            }),
+            NavSection::Artists => Content::Artists(match self.artists_view.clone() {
+                Some(view) => view,
+                None => {
+                    let view = cx.new(|cx| {
+                        ArtistsView::new(self.session.clone(), self.library_db.clone(), cx)
+                    });
+                    cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+                        let ArtistsEvent::OpenArtist(id) = event;
+                        this.open_artist(id.clone(), cx);
+                    })
+                    .detach();
+                    self.artists_view = Some(view.clone());
+                    view
+                }
+            }),
             NavSection::Favorites => {
                 let view =
                     cx.new(|cx| FavoritesView::new(self.session.clone(), self.player.clone(), cx));
@@ -411,9 +465,15 @@ impl RootView {
                 .detach();
                 Content::Favorites(view)
             }
-            NavSection::Recent => Content::Recent(
-                cx.new(|cx| RecentView::new(self.player.clone(), self.session.clone(), cx)),
-            ),
+            NavSection::Recent => Content::Recent(match self.recent_view.clone() {
+                Some(view) => view,
+                None => {
+                    let view =
+                        cx.new(|cx| RecentView::new(self.player.clone(), self.session.clone(), cx));
+                    self.recent_view = Some(view.clone());
+                    view
+                }
+            }),
             NavSection::Radio => {
                 let Some(window) = window else {
                     return; // radio's add-station form needs a window
@@ -444,6 +504,13 @@ impl RootView {
             }
         });
         cx.notify();
+        // Switching sections should cost nothing now that the catalog views are
+        // retained; log when it doesn't so a regression is visible in a normal
+        // run instead of only as a feeling.
+        let elapsed = started.elapsed();
+        if elapsed > std::time::Duration::from_millis(4) {
+            tracing::warn!("navigate to {section:?} took {elapsed:?}");
+        }
     }
 
     fn push_history(&mut self) {
