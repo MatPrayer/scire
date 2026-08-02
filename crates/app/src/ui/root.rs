@@ -412,7 +412,6 @@ impl RootView {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        let started = std::time::Instant::now();
         self.current_entry = Some(NavEntry::Section(section));
         self.section = Some(section);
         self.active_playlist = None;
@@ -504,13 +503,6 @@ impl RootView {
             }
         });
         cx.notify();
-        // Switching sections should cost nothing now that the catalog views are
-        // retained; log when it doesn't so a regression is visible in a normal
-        // run instead of only as a feeling.
-        let elapsed = started.elapsed();
-        if elapsed > std::time::Duration::from_millis(4) {
-            tracing::warn!("navigate to {section:?} took {elapsed:?}");
-        }
     }
 
     fn push_history(&mut self) {
