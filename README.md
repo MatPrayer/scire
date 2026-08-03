@@ -23,7 +23,7 @@ GPU-rendered UI, gapless audio, a real-time 3D visualizer, and no Electron in si
 |---|---|
 | **Gapless playback** | One audio sink across tracks, prefetched hand-over — no gap, no click |
 | **Two libraries, one app** | Navidrome over Subsonic, plus local files indexed into SQLite |
-| **Real-time 3D visualizer** | Five software-rendered scenes that switch on the beat |
+| **Real-time 3D visualizer** | Eight software-rendered scenes that switch on the beat |
 | **Waveform seek bar** | Per-track amplitude envelope, precomputed for the next track |
 | **Fully themable** | Light / Dark / system / custom JSON, with pywal16 support |
 
@@ -75,7 +75,7 @@ Log in with your Navidrome URL, username and password — or point **Settings �
 | **Transcoding** | Per-session format (mp3 / ogg / raw) and max bitrate |
 | **Theming** | Light / Dark / Follow-system / custom JSON · pywal16 template · cover-reactive accent colour · CJK font support |
 | **Fullscreen player** | Album art, track info, waveform seek bar, lyrics panel, queue panel, five background styles, optional volume slider |
-| **3D visualizer** | Five software-rendered scenes plus a music-timed Auto mode, with a floating mini player — [details below](#audio-visualizer) |
+| **3D visualizer** | Eight software-rendered scenes plus a music-timed Auto mode, with a floating mini player — [details below](#audio-visualizer) |
 | **Waveform seek bar** | Per-track amplitude envelope (480 buckets, cached to disk) · click to seek · the next track's peaks are computed while the current one plays |
 | **OS media keys** | Media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS) |
 | **Artwork cache** | LRU-evicted disk cache (configurable cap) · HiDPI-aware resolution bump · album-scoped keys, so Navidrome's per-song cover ids don't re-download identical art |
@@ -109,8 +109,11 @@ The fullscreen player can draw a 3D scene driven by the live audio. GPUI exposes
 | **Sphere** | Rotating Fibonacci point cloud displaced along its normals |
 | **Orb** | Wireframe icosphere — bass inflates it, treble roughens its surface |
 | **Retro** | PlayStation-era low-poly solids tumbling at the camera: flat shading, depth fog, quantised vertices |
+| **Scope** | Polar oscilloscope — the triggered waveform itself wrapped around a ring, with the previous frames trailing behind it |
+| **Bloom** | Kaleidoscope mandala — the spectrum folded into mirrored petals across counter-rotating layers |
+| **Warp** | Starfield drawn as streaks: speed reads as length, so a drop stretches the field into hyperspace |
 
-The mode cycles **Off → Auto → Terrain → Tunnel → Sphere → Retro → Orb** and is persisted.
+The mode cycles **Off → Auto → Terrain → Tunnel → Sphere → Retro → Orb → Scope → Bloom → Warp** and is persisted.
 
 In **Auto**, the scene changes with the music. A bass-weighted spectral-flux detector *arms* on a transient and *commits* only once the low end holds — so the cut lands on the drop rather than on the run-up into it. Scenes are picked at random excluding the last two, held for at least 9 s, and forced after 45 s so ambient tracks still move. Changes cross-fade over 220 ms.
 

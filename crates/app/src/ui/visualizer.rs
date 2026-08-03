@@ -43,15 +43,21 @@ pub enum Scene {
     Sphere,
     Retro,
     Orb,
+    Scope,
+    Bloom,
+    Warp,
 }
 
 impl Scene {
-    const ALL: [Scene; 5] = [
+    const ALL: [Scene; 8] = [
         Scene::Terrain,
         Scene::Tunnel,
         Scene::Sphere,
         Scene::Retro,
         Scene::Orb,
+        Scene::Scope,
+        Scene::Bloom,
+        Scene::Warp,
     ];
 }
 
@@ -64,6 +70,9 @@ fn pinned_scene(mode: VisualizerMode) -> Option<Scene> {
         VisualizerMode::Sphere => Some(Scene::Sphere),
         VisualizerMode::Retro => Some(Scene::Retro),
         VisualizerMode::Orb => Some(Scene::Orb),
+        VisualizerMode::Scope => Some(Scene::Scope),
+        VisualizerMode::Bloom => Some(Scene::Bloom),
+        VisualizerMode::Warp => Some(Scene::Warp),
         VisualizerMode::Off | VisualizerMode::Auto => None,
     }
 }
@@ -306,8 +315,34 @@ pub struct Visualizer {
     /// because the speed rides on the track's energy and multiplying a growing
     /// clock by a changing rate would jump the rings whenever it changed.
     tunnel_z: f32,
+    /// Scope scene: the last few triggered waveform traces, newest at the
+    /// front. The scene draws the older ones as fading trails, which is what
+    /// turns a flat line into a sense of motion.
+    scope: VecDeque<Vec<f32>>,
+    /// Warp scene: the star field, persistent across frames.
+    stars: Vec<Star>,
+    /// This frame's warp speed in world units per second. Kept here rather than
+    /// recomputed in the paint pass so the streak drawn behind each star is
+    /// exactly the distance it is about to travel.
+    warp_speed: f32,
     /// User tuning, refreshed from settings on every `tick`.
     tuning: VisualizerSettings,
+}
+
+/// One star in the Warp scene. Streak length comes from the shared
+/// `warp_speed`, so a star only needs where it is and what colours it.
+#[derive(Clone, Copy)]
+struct Star {
+    /// Position on the plane the field flies through, in world units.
+    x: f32,
+    y: f32,
+    /// Depth toward the camera.
+    z: f32,
+    /// Which band brightens this star, so the field twinkles with the music
+    /// rather than uniformly.
+    band: usize,
+    /// Hue offset from the accent.
+    hue: f32,
 }
 
 /// One mesh instance in the Retro scene.
@@ -555,6 +590,22 @@ const SHAPE_FAR: f32 = 7.5;
 /// Depth at which a shape has passed the camera and is recycled.
 const SHAPE_NEAR: f32 = 0.6;
 
+/// Points kept in one Scope trace. Enough to show a couple of cycles of a bass
+/// note without the ring turning into a solid band of ink.
+const SCOPE_POINTS: usize = 200;
+/// Traces kept for the Scope trails, including the live one.
+const SCOPE_TRAILS: usize = 7;
+/// Samples skipped between Scope points. `SCOPE_POINTS * SCOPE_STRIDE` samples
+/// — ~18ms at 44.1kHz — is the window the ring shows: long enough for a couple
+/// of cycles of a bass note, short enough that the shape is legible.
+const SCOPE_STRIDE: usize = 4;
+/// Stars in flight in the Warp scene.
+const STARS: usize = 260;
+/// Depth a recycled star re-enters at, and the one at which it has passed the
+/// camera. Deeper than the Retro field: streaks need room to stretch.
+const STAR_FAR: f32 = 11.;
+const STAR_NEAR: f32 = 0.28;
+
 impl Visualizer {
     pub fn new(tap: Arc<SpectrumTap>) -> Self {
         let mut viz = Self {
@@ -578,6 +629,9 @@ impl Visualizer {
             flash: 0.,
             orb: Arc::new(OrbMesh::new(ORB_DETAIL)),
             tunnel_z: 0.,
+            scope: VecDeque::from(vec![vec![0.; SCOPE_POINTS]; SCOPE_TRAILS]),
+            stars: Vec::new(),
+            warp_speed: 0.,
             tuning: VisualizerSettings::default(),
         };
         // Spread the initial field through the depth range so the scene is
@@ -586,6 +640,11 @@ impl Visualizer {
             let mut shape = viz.spawn_shape();
             shape.z = SHAPE_NEAR + (SHAPE_FAR - SHAPE_NEAR) * (i as f32 / SHAPES as f32);
             viz.shapes.push(shape);
+        }
+        for i in 0..STARS {
+            let mut star = viz.spawn_star();
+            star.z = STAR_NEAR + (STAR_FAR - STAR_NEAR) * (i as f32 / STARS as f32);
+            viz.stars.push(star);
         }
         viz
     }
@@ -648,6 +707,55 @@ impl Visualizer {
         }
     }
 
+    /// A star somewhere on the far plane. Placed by angle and radius rather
+    /// than in a box: a uniform square puts the densest part of the field in
+    /// the corners, where the streaks leave the frame immediately, and leaves
+    /// the middle — the only part the eye tracks — sparse.
+    fn spawn_star(&mut self) -> Star {
+        let (a, r, b, h) = (self.rand(), self.rand(), self.rand(), self.rand());
+        let angle = a * std::f32::consts::TAU;
+        // sqrt keeps the area density even; the floor keeps stars off the exact
+        // vanishing point, where the projection stretches them into needles.
+        let radius = 0.25 + 3.1 * r.sqrt();
+        Star {
+            x: angle.cos() * radius,
+            y: angle.sin() * radius,
+            z: STAR_FAR,
+            band: (b * BANDS as f32) as usize % BANDS,
+            hue: (h - 0.5) * 0.16,
+        }
+    }
+
+    /// One triggered waveform trace for the Scope scene, decimated from the
+    /// sample buffer.
+    ///
+    /// The trace starts at a rising zero crossing rather than at the head of
+    /// the buffer: without that trigger the waveform slides sideways by a
+    /// different amount every frame — the classic untriggered-oscilloscope
+    /// smear — and the ring never holds still long enough to read as a shape.
+    ///
+    /// Samples are taken directly at `SCOPE_STRIDE`, not reduced from buckets:
+    /// a peak-per-bucket reduction draws the signal's *envelope*, which is
+    /// steadier but is no longer a waveform — the ring stops crossing its own
+    /// baseline and the scene turns into a second spectrum display.
+    fn scope_trace(&self) -> Vec<f32> {
+        let window = SCOPE_POINTS * SCOPE_STRIDE;
+        // Only look for the trigger in the part of the buffer that still leaves
+        // a full window behind it.
+        let limit = self.samples.len().saturating_sub(window).max(1);
+        let start = (1..limit)
+            .find(|&i| self.samples[i - 1] <= 0. && self.samples[i] > 0.)
+            .unwrap_or(0);
+        (0..SCOPE_POINTS)
+            .map(|i| {
+                self.samples
+                    .get(start + i * SCOPE_STRIDE)
+                    .copied()
+                    .unwrap_or(0.)
+            })
+            .collect()
+    }
+
     /// Read the newest samples, run the FFT, and advance the animation clocks.
     /// Call once per rendered frame, with the mode currently selected.
     pub fn tick(&mut self, mode: VisualizerMode, tuning: VisualizerSettings) {
@@ -667,7 +775,8 @@ impl Visualizer {
         self.spin += dt * motion;
 
         let head = self.tap.snapshot(&mut self.samples);
-        if head == self.last_head {
+        let silent = head == self.last_head;
+        if silent {
             // Paused or starved: fall to silence rather than hold the last
             // frame, which would look frozen rather than quiet.
             self.raw.iter_mut().for_each(|b| *b = 0.);
@@ -736,6 +845,28 @@ impl Visualizer {
         // acceleration down the tube. Wrapped to one ring spacing in the paint
         // pass, so this can grow without losing precision for hours.
         self.tunnel_z += dt * (0.85 + 1.6 * self.energy()) * motion;
+
+        // Warp: the field accelerates with the track and is kicked by the beat
+        // flash, so a drop reads as the streaks stretching out rather than as
+        // the stars merely getting brighter.
+        self.warp_speed = (1.5 + 5.5 * self.energy() + 3.5 * self.flash) * motion;
+        for i in 0..self.stars.len() {
+            self.stars[i].z -= self.warp_speed * dt;
+            if self.stars[i].z <= STAR_NEAR {
+                self.stars[i] = self.spawn_star();
+            }
+        }
+
+        // Scope: one trace per frame, oldest dropped. Silence pushes a flat
+        // line rather than repeating the last trace, so the trails drain away
+        // instead of freezing mid-waveform.
+        let trace = if silent {
+            vec![0.; SCOPE_POINTS]
+        } else {
+            self.scope_trace()
+        };
+        self.scope.pop_back();
+        self.scope.push_front(trace);
 
         self.fade_left = (self.fade_left - dt).max(0.);
         if self.fade_left == 0. {
@@ -819,6 +950,12 @@ impl Visualizer {
         // How far the audio is allowed to deform each scene.
         let power = self.tuning.intensity.clamp(0.1, 3.);
         let tunnel_z = self.tunnel_z;
+        let scope: Vec<Vec<f32>> = self.scope.iter().cloned().collect();
+        let stars = self.stars.clone();
+        let warp_speed = self.warp_speed;
+        // The Scope draws the waveform itself, which never went through the
+        // band gain, so it has to apply the sensitivity knob on its own.
+        let gain = self.tuning.sensitivity.clamp(0.2, 4.);
 
         canvas(
             |_, _, _| (),
@@ -836,6 +973,15 @@ impl Visualizer {
                     ),
                     Scene::Orb => paint_orb(
                         bounds, &orb, spin, bass, treble, power, accent, alpha, window,
+                    ),
+                    Scene::Scope => paint_scope(
+                        bounds, &scope, spin, gain, bass, power, accent, alpha, window,
+                    ),
+                    Scene::Bloom => paint_bloom(
+                        bounds, &bands, spin, bass, flash, power, accent, alpha, window,
+                    ),
+                    Scene::Warp => paint_warp(
+                        bounds, &stars, &bands, warp_speed, flash, power, accent, alpha, window,
                     ),
                 };
                 if let Some((prev, alpha)) = outgoing {
@@ -1440,6 +1586,327 @@ fn paint_orb(
     }
 }
 
+/// Fraction of the Scope ring over which the waveform's displacement is faded
+/// in and out. The trace starts and ends at unrelated sample values, so without
+/// this the ring has a visible step where the buffer wraps.
+const SCOPE_SEAM: f32 = 0.06;
+
+/// Polar oscilloscope: the waveform wrapped around a ring, with the previous
+/// frames trailing behind it as fading echoes.
+///
+/// This is the only scene that draws the time domain — everything else works
+/// from the FFT — so a plucked string reads as a shape here rather than as a
+/// level. The trace is triggered on a zero crossing in `scope_trace`; without
+/// that the ring rotates by a random phase every frame.
+#[allow(clippy::too_many_arguments)]
+fn paint_scope(
+    bounds: Bounds<Pixels>,
+    scope: &[Vec<f32>],
+    spin: f32,
+    gain: f32,
+    bass: f32,
+    power: f32,
+    accent: Hsla,
+    alpha: f32,
+    window: &mut gpui::Window,
+) {
+    let w = f32::from(bounds.size.width);
+    let h = f32::from(bounds.size.height);
+    let cx = f32::from(bounds.origin.x) + w / 2.;
+    let cy = f32::from(bounds.origin.y) + h / 2.;
+    let base = w.min(h) * 0.28;
+    // The waveform is a signed displacement about the ring, so it needs room on
+    // both sides; deep enough that a loud passage nearly closes the middle.
+    let swing = base * 0.85 * power;
+
+    // Core: a disc breathing on the low end, so the ring has something to sit
+    // around and the middle of the frame is not a hole.
+    let core = base * (0.34 + 0.22 * bass);
+    let core_box = Bounds {
+        origin: point(px(cx - core), px(cy - core)),
+        size: gpui::size(px(core * 2.), px(core * 2.)),
+    };
+    window.paint_quad(
+        fill(
+            core_box,
+            Hsla {
+                a: (0.05 + 0.14 * bass) * alpha,
+                ..accent
+            },
+        )
+        .corner_radii(px(core)),
+    );
+
+    // Oldest first: the live trace has to land on top of its own history.
+    for (age, trace) in scope.iter().enumerate().rev() {
+        if trace.len() < 3 {
+            continue;
+        }
+        let fade = age as f32 / scope.len() as f32;
+        // Echoes drift outward as they fade, which is what makes the trail read
+        // as motion rather than as a blurred copy of the same ring.
+        let ring = base * (1. + 0.16 * fade);
+        let mut pb = PathBuilder::stroke(px(2.4 - 1.7 * fade));
+        let mut started = false;
+        for (i, &s) in trace.iter().enumerate() {
+            let u = i as f32 / trace.len() as f32;
+            // Taper both ends of the buffer to zero displacement so the ring
+            // closes on itself smoothly.
+            let seam = (u / SCOPE_SEAM).min((1. - u) / SCOPE_SEAM).clamp(0., 1.);
+            let a = u * std::f32::consts::TAU + spin * 0.18;
+            let r = ring + (s * gain).clamp(-1., 1.) * swing * seam;
+            let (sin, cos) = a.sin_cos();
+            let pt = point(px(cx + cos * r), px(cy - sin * r));
+            if started {
+                pb.line_to(pt);
+            } else {
+                pb.move_to(pt);
+                started = true;
+            }
+        }
+        if !started {
+            continue;
+        }
+        pb.close();
+        if let Ok(path) = pb.build() {
+            window.paint_path(
+                path,
+                Hsla {
+                    h: (accent.h + 0.05 * fade).rem_euclid(1.),
+                    s: accent.s,
+                    l: (accent.l * (1. - 0.3 * fade) + 0.12).clamp(0., 1.),
+                    a: (1. - fade).powf(1.6) * alpha,
+                },
+            );
+        }
+    }
+}
+
+/// Sectors the Bloom mandala is mirrored into.
+const BLOOM_SECTORS: usize = 8;
+/// Concentric layers, each rotating against the one outside it.
+const BLOOM_LAYERS: usize = 3;
+/// Outline resolution of one petal.
+const BLOOM_STEPS: usize = 24;
+
+/// Kaleidoscope mandala: the spectrum folded into mirrored petals that turn
+/// against each other.
+///
+/// Screen space, not projected — the whole point of a kaleidoscope is exact
+/// radial symmetry, and perspective would break it. Alternate sectors read the
+/// spectrum backwards, which is what makes neighbouring petals mirror instead
+/// of merely repeat.
+#[allow(clippy::too_many_arguments)]
+fn paint_bloom(
+    bounds: Bounds<Pixels>,
+    bands: &[f32],
+    spin: f32,
+    bass: f32,
+    flash: f32,
+    power: f32,
+    accent: Hsla,
+    alpha: f32,
+    window: &mut gpui::Window,
+) {
+    let w = f32::from(bounds.size.width);
+    let h = f32::from(bounds.size.height);
+    let cx = f32::from(bounds.origin.x) + w / 2.;
+    let cy = f32::from(bounds.origin.y) + h / 2.;
+    let outer = w.min(h) * 0.46;
+    let sector = std::f32::consts::TAU / BLOOM_SECTORS as f32;
+
+    for layer in 0..BLOOM_LAYERS {
+        let l = layer as f32 / BLOOM_LAYERS as f32;
+        let scale = 1. - 0.3 * l;
+        // Counter-rotation: layers turning the same way would lock into one
+        // rigid figure, and the interference between directions is what gives
+        // a kaleidoscope its shifting look.
+        let dir = if layer % 2 == 0 { 1. } else { -1.4 };
+        let rot = spin * 0.3 * dir + l * 0.7;
+        // Inner layers read the top of the spectrum, outer ones the bottom, so
+        // the mandala is not three copies of the same outline.
+        let band_lo = l * 0.35;
+
+        let mut pb = PathBuilder::fill();
+        let mut outline = PathBuilder::stroke(px(1.8 - 0.5 * l));
+        let mut started = false;
+        for s in 0..BLOOM_SECTORS {
+            // Mirrored pairs of sectors share one band, so the figure has a
+            // true mirror symmetry with `BLOOM_SECTORS / 2` petals. Reading the
+            // whole spectrum in every sector instead makes all eight petals
+            // identical, which is a cog, not a kaleidoscope.
+            let pair = (s / 2) as f32 / (BLOOM_SECTORS / 2) as f32;
+            let b = band_lo + pair * (1. - band_lo);
+            // Smoothed across neighbours: an isolated loud band would drive one
+            // petal on its own and the figure would lose its balance.
+            let amp =
+                (band_at(bands, b - 0.07) + 2. * band_at(bands, b) + band_at(bands, b + 0.07)) / 4.;
+            for step in 0..=BLOOM_STEPS {
+                let u = step as f32 / BLOOM_STEPS as f32;
+                // Mirror odd sectors.
+                let t = if s % 2 == 0 { u } else { 1. - u };
+                // Lobe window: the radius has to return to the inner circle at
+                // both edges of a sector, otherwise the petals merge into a
+                // lumpy ring with no shape to it.
+                //
+                // Clamped before the exponent: at u=1 the sine lands a hair
+                // below zero, and a negative base under a fractional power is
+                // NaN — which reaches lyon as a non-finite point and aborts.
+                let lobe = (u * std::f32::consts::PI).sin().max(0.).powf(0.65);
+                // The petal's *length* comes from its band, its *shape* from
+                // the lobe; the spectrum only ripples the edge. Shaping the
+                // outline point by point instead traces every peak of a spiky
+                // spectrum and the mandala comes out as a sea urchin.
+                let level = 0.78 * amp + 0.22 * band_at(bands, band_lo + t * (1. - band_lo));
+                // Inner radius well off the centre: with the petals starting
+                // near the middle, all three layers pile up into one solid
+                // blob and the symmetry — the only thing to look at here — is
+                // buried under it.
+                let r =
+                    outer * scale * (0.34 + 0.1 * bass + 0.58 * (level * power).min(1.4) * lobe);
+                let a = rot + (s as f32 + u) * sector;
+                let (sin, cos) = a.sin_cos();
+                let pt = point(px(cx + cos * r), px(cy - sin * r));
+                if started {
+                    pb.line_to(pt);
+                    outline.line_to(pt);
+                } else {
+                    pb.move_to(pt);
+                    outline.move_to(pt);
+                    started = true;
+                }
+            }
+        }
+        if !started {
+            continue;
+        }
+        pb.close();
+        outline.close();
+        let hue = (accent.h + 0.07 * l + 0.05 * flash).rem_euclid(1.);
+        if let Ok(path) = pb.build() {
+            window.paint_path(
+                path,
+                Hsla {
+                    h: hue,
+                    s: (accent.s * (0.75 + 0.25 * l)).clamp(0., 1.),
+                    l: (accent.l * (0.55 + 0.45 * l) + 0.06 * flash).clamp(0., 1.),
+                    // Layers are stacked, so each has to stay translucent for
+                    // the ones behind it to show through as a second colour.
+                    a: (0.22 - 0.04 * l + 0.16 * flash) * alpha,
+                },
+            );
+        }
+        // Lit edge over the translucent body: without it the overlapping
+        // layers read as one wash and no single petal has a shape.
+        if let Ok(path) = outline.build() {
+            window.paint_path(
+                path,
+                Hsla {
+                    h: hue,
+                    s: accent.s,
+                    l: (accent.l + 0.25 - 0.1 * l).min(0.92),
+                    a: (0.65 - 0.15 * l) * alpha,
+                },
+            );
+        }
+    }
+
+    // Spokes on the beat: a thin star along the sector boundaries, gone within
+    // a few frames. This is the only part of the scene that moves on the kick
+    // rather than with the spectrum.
+    if flash > 0.02 {
+        let mut pb = PathBuilder::stroke(px(1.4));
+        for s in 0..BLOOM_SECTORS {
+            let a = spin * 0.3 + s as f32 * sector;
+            let (sin, cos) = a.sin_cos();
+            let inner = outer * 0.22;
+            let reach = outer * (0.55 + 0.45 * flash);
+            pb.move_to(point(px(cx + cos * inner), px(cy - sin * inner)));
+            pb.line_to(point(px(cx + cos * reach), px(cy - sin * reach)));
+        }
+        if let Ok(path) = pb.build() {
+            window.paint_path(
+                path,
+                Hsla {
+                    l: (accent.l + 0.25).min(0.95),
+                    a: flash * 0.5 * alpha,
+                    ..accent
+                },
+            );
+        }
+    }
+}
+
+/// Seconds of travel a warp streak represents. Fixed rather than the frame's
+/// `dt`, so the streaks do not shorten when the frame rate rises.
+const WARP_STREAK: f32 = 0.075;
+
+/// Starfield streaking past the camera, accelerating with the track.
+///
+/// Each star is drawn as the segment it is about to travel, so speed shows up
+/// as length: at rest the field is a still sky, and a drop stretches it into
+/// the hyperspace look.
+#[allow(clippy::too_many_arguments)]
+fn paint_warp(
+    bounds: Bounds<Pixels>,
+    stars: &[Star],
+    bands: &[f32],
+    speed: f32,
+    flash: f32,
+    power: f32,
+    accent: Hsla,
+    alpha: f32,
+    window: &mut gpui::Window,
+) {
+    let focal = focal_of(bounds, 0.75);
+    let trail = speed * WARP_STREAK * power;
+
+    // Far first: near streaks are wider and brighter and have to sit on top.
+    let mut order: Vec<&Star> = stars.iter().collect();
+    order.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap_or(std::cmp::Ordering::Equal));
+
+    for star in order {
+        let head = P3 {
+            x: star.x,
+            y: star.y,
+            z: star.z,
+        };
+        let tail = P3 {
+            x: star.x,
+            y: star.y,
+            z: star.z + trail,
+        };
+        let (Some(a), Some(b)) = (project(head, bounds, focal), project(tail, bounds, focal))
+        else {
+            continue;
+        };
+        let depth = ((star.z - STAR_NEAR) / (STAR_FAR - STAR_NEAR)).clamp(0., 1.);
+        let level = bands.get(star.band).copied().unwrap_or(0.);
+        let width = (0.9 + 2.6 * (1. - depth) + 1.6 * level).min(4.5);
+        let mut pb = PathBuilder::stroke(px(width));
+        pb.move_to(b);
+        pb.line_to(a);
+        if let Ok(path) = pb.build() {
+            window.paint_path(
+                path,
+                Hsla {
+                    h: (accent.h + star.hue + 0.06 * flash).rem_euclid(1.),
+                    s: (accent.s * (0.5 + 0.5 * depth)).clamp(0., 1.),
+                    l: (0.45 + 0.4 * (1. - depth) + 0.25 * level).min(0.95),
+                    // Fade in from the far plane so recycled stars appear out
+                    // of the distance instead of popping into existence.
+                    a: (1. - depth).powf(0.7) * (0.35 + 0.65 * level.min(1.)) * alpha,
+                },
+            );
+        }
+    }
+
+    // No glow at the vanishing point. A disc is the only round shape available
+    // without a radial gradient, and at the centre of a converging field it
+    // reads as a solid ball parked in front of the camera rather than as
+    // light. The streaks already point at where they came from.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,6 +2063,62 @@ mod tests {
         assert!(
             after_terrain.windows(2).any(|w| w[0] != w[1]),
             "always leaves Terrain for the same scene: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn scope_trace_is_triggered_on_a_rising_zero_crossing() {
+        let mut v = Visualizer::new(SpectrumTap::new());
+        // A sine offset by a quarter cycle: the buffer starts at its peak, so
+        // an untriggered trace would too.
+        let period = 128.;
+        for (i, s) in v.samples.iter_mut().enumerate() {
+            *s = (i as f32 / period * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2).sin();
+        }
+        let trace = v.scope_trace();
+        assert_eq!(trace.len(), SCOPE_POINTS);
+        assert!(
+            trace[0].abs() < 0.2,
+            "trace should start near a zero crossing, got {}",
+            trace[0]
+        );
+        assert!(
+            trace.iter().any(|s| *s > 0.8) && trace.iter().any(|s| *s < -0.8),
+            "the trace should swing both sides of the baseline, not trace an envelope"
+        );
+    }
+
+    #[test]
+    fn silence_drains_the_scope_trails() {
+        let mut v = Visualizer::new(SpectrumTap::new());
+        v.samples.iter_mut().for_each(|s| *s = 0.7);
+        // Nothing feeds the tap, so every frame reads as starved.
+        for _ in 0..SCOPE_TRAILS + 2 {
+            v.advance(VisualizerMode::Scope, 1. / 60.);
+        }
+        assert!(
+            v.scope.iter().all(|t| t.iter().all(|s| *s == 0.)),
+            "a starved tap should flatten the trails, not hold the last trace"
+        );
+    }
+
+    #[test]
+    fn warp_recycles_stars_that_pass_the_camera() {
+        let mut v = Visualizer::new(SpectrumTap::new());
+        // Long enough for the slowest star to cross the whole depth range.
+        for _ in 0..600 {
+            v.advance(VisualizerMode::Warp, 1. / 60.);
+        }
+        assert_eq!(v.stars.len(), STARS);
+        assert!(
+            v.stars
+                .iter()
+                .all(|s| s.z > STAR_NEAR && s.z <= STAR_FAR + 0.001),
+            "a star escaped the depth range instead of being recycled"
+        );
+        assert!(
+            v.stars.iter().any(|s| s.z < STAR_FAR * 0.5),
+            "the field bunched at the far plane instead of spreading out"
         );
     }
 

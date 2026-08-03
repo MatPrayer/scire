@@ -188,6 +188,13 @@ pub enum VisualizerMode {
     Retro,
     /// Wireframe icosphere: bass inflates it, treble roughens its surface.
     Orb,
+    /// Polar oscilloscope: the waveform itself wrapped around a ring, with the
+    /// previous frames trailing behind it.
+    Scope,
+    /// Kaleidoscope mandala: the spectrum mirrored into rotating petals.
+    Bloom,
+    /// Starfield streaking past the camera, accelerating with the track.
+    Warp,
 }
 
 impl VisualizerMode {
@@ -202,7 +209,10 @@ impl VisualizerMode {
             Self::Tunnel => Self::Sphere,
             Self::Sphere => Self::Retro,
             Self::Retro => Self::Orb,
-            Self::Orb => Self::Off,
+            Self::Orb => Self::Scope,
+            Self::Scope => Self::Bloom,
+            Self::Bloom => Self::Warp,
+            Self::Warp => Self::Off,
         }
     }
 
@@ -217,6 +227,9 @@ impl VisualizerMode {
             Self::Sphere => "Sphere",
             Self::Retro => "Retro",
             Self::Orb => "Orb",
+            Self::Scope => "Scope",
+            Self::Bloom => "Bloom",
+            Self::Warp => "Warp",
         }
     }
 
@@ -234,12 +247,15 @@ impl VisualizerMode {
     }
 
     /// The scenes, i.e. everything except the two behaviours (`Off`, `Auto`).
-    pub const SCENES: [VisualizerMode; 5] = [
+    pub const SCENES: [VisualizerMode; 8] = [
         VisualizerMode::Terrain,
         VisualizerMode::Tunnel,
         VisualizerMode::Sphere,
         VisualizerMode::Retro,
         VisualizerMode::Orb,
+        VisualizerMode::Scope,
+        VisualizerMode::Bloom,
+        VisualizerMode::Warp,
     ];
 }
 
