@@ -140,20 +140,30 @@ impl ArtistsView {
     }
 
     /// Fill the grid from the last Navidrome sync so it paints on the first
-    /// frame instead of after `getArtists` answers. Same shape and caveats as
-    /// the album grid's seed: gated on a *configured* server (not a connected
-    /// one) so it also covers the pre-connect wait, and skipped for a library
-    /// subset since the sync doesn't record which library a row came from.
+    /// frame instead of after `getArtists` answers. Same shape as the album
+    /// grid's seed: gated on a *configured* server (not a connected one) so it
+    /// also covers the pre-connect wait, and filtered by the sync's recorded
+    /// library provenance so a subset selection shows only its own artists.
     fn seed_from_cache(&mut self, cx: &mut Context<Self>) {
-        if self.session.read(cx).settings.server.is_none()
-            || !self.session.read(cx).library_ids.is_empty()
-            || !self.artists.is_empty()
-        {
+        if self.session.read(cx).settings.server.is_none() || !self.artists.is_empty() {
             return;
         }
         let Ok(rows) = self.library_db.artists_by_source("navidrome") else {
             return;
         };
+        // Rows from a sync that predates the provenance column carry no library
+        // id; with a subset selected they're skipped rather than guessed at.
+        let libraries = self.session.read(cx).library_ids.clone();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|row| {
+                libraries.is_empty()
+                    || row
+                        .library_id
+                        .as_ref()
+                        .is_some_and(|id| libraries.contains(id))
+            })
+            .collect();
         if rows.is_empty() {
             return;
         }
@@ -183,6 +193,16 @@ impl ArtistsView {
         self.cards = to_cards(&self.artists);
         self.cached = true;
         // Covers are fetched from `render`, driven by the viewport.
+    }
+
+    /// A client exists now. This view is built during the pre-connect window,
+    /// where `load` had nothing to fetch with and bailed — without this it
+    /// would keep showing the seeded cache for the rest of the session.
+    pub fn client_ready(&mut self, cx: &mut Context<Self>) {
+        if self.cached || self.artists.is_empty() {
+            self.load(cx);
+        }
+        cx.notify();
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {

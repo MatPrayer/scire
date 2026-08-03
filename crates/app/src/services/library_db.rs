@@ -93,6 +93,25 @@ CREATE TABLE IF NOT EXISTS config (
 INSERT INTO _schema_version (version) VALUES (1);
 ";
 
+/// Catalog columns the album/artist grids need to paint a *sorted, filtered*
+/// cache before the server answers.
+///
+/// `created`/`play_count`/`starred_at` are the sort keys of the New, Frequent
+/// and Starred tabs — without them a cached row can only be placed under
+/// "All", which is why the seed used to be alphabetical-only. `library_id`
+/// records which music folder a row was synced from, so a user browsing a
+/// subset of their libraries isn't shown rows from the others.
+///
+/// `starred_at` rather than the existing `starred` column: that one is INTEGER
+/// and the API's value is an ISO timestamp, which a STRICT table rejects.
+const SCHEMA_V3: &str = "
+ALTER TABLE albums ADD COLUMN created TEXT;
+ALTER TABLE albums ADD COLUMN play_count INTEGER;
+ALTER TABLE albums ADD COLUMN starred_at TEXT;
+ALTER TABLE albums ADD COLUMN library_id TEXT;
+ALTER TABLE artists ADD COLUMN library_id TEXT;
+";
+
 // ---------------------------------------------------------------------------
 // LibraryDb
 // ---------------------------------------------------------------------------
@@ -158,6 +177,10 @@ impl LibraryDb {
         if version < 2 {
             conn.execute_batch(SCHEMA_V2)?;
             conn.execute("INSERT INTO _schema_version (version) VALUES (2)", [])?;
+        }
+        if version < 3 {
+            conn.execute_batch(SCHEMA_V3)?;
+            conn.execute("INSERT INTO _schema_version (version) VALUES (3)", [])?;
         }
         Ok(())
     }
@@ -345,36 +368,40 @@ impl LibraryDb {
     // ------------------------------------------------------------------
 
     /// Insert or replace an album row.
-    #[allow(clippy::too_many_arguments)]
-    pub fn upsert_album(
-        &self,
-        id: &str,
-        source: &str,
-        title: &str,
-        artist: Option<&str>,
-        artist_id: Option<&str>,
-        year: Option<i32>,
-        cover_art: Option<&str>,
-        song_count: i64,
-        duration: f64,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn upsert_album(&self, album: &AlbumRow) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO albums
-             (id, source, title, artist, artist_id, year, cover_art, song_count, duration)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+             (id, source, title, artist, artist_id, year, cover_art, song_count, duration,
+              created, play_count, starred_at, library_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             rusqlite::params![
-                id, source, title, artist, artist_id, year, cover_art, song_count, duration
+                album.id,
+                album.source,
+                album.title,
+                album.artist,
+                album.artist_id,
+                album.year,
+                album.cover_art,
+                album.song_count,
+                album.duration,
+                album.created,
+                album.play_count,
+                album.starred,
+                album.library_id,
             ],
         )?;
         Ok(())
     }
 
-    /// List all albums for a given source.
+    /// List all albums for a given source, alphabetically. Tabs that sort on
+    /// another key re-sort in memory — the whole point of carrying `created`,
+    /// `play_count` and `starred` on the row.
     pub fn albums_by_source(&self, source: &str) -> Result<Vec<AlbumRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration
+            "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
+                    created, play_count, starred_at, library_id
              FROM albums WHERE source = ?1
              ORDER BY title COLLATE NOCASE",
         )?;
@@ -389,6 +416,10 @@ impl LibraryDb {
                 cover_art: row.get(6)?,
                 song_count: row.get(7)?,
                 duration: row.get(8)?,
+                created: row.get(9)?,
+                play_count: row.get(10)?,
+                starred: row.get(11)?,
+                library_id: row.get(12)?,
             })
         })?;
         rows.collect()
@@ -405,12 +436,13 @@ impl LibraryDb {
         source: &str,
         name: &str,
         cover_art: Option<&str>,
+        library_id: Option<&str>,
     ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO artists (id, source, name, cover_art)
-             VALUES (?1,?2,?3,?4)",
-            rusqlite::params![id, source, name, cover_art],
+            "INSERT OR REPLACE INTO artists (id, source, name, cover_art, library_id)
+             VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![id, source, name, cover_art, library_id],
         )?;
         Ok(())
     }
@@ -419,7 +451,7 @@ impl LibraryDb {
     pub fn artists_by_source(&self, source: &str) -> Result<Vec<ArtistRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, name, cover_art
+            "SELECT id, source, name, cover_art, library_id
              FROM artists WHERE source = ?1
              ORDER BY name COLLATE NOCASE",
         )?;
@@ -429,6 +461,7 @@ impl LibraryDb {
                 source: row.get(1)?,
                 name: row.get(2)?,
                 cover_art: row.get(3)?,
+                library_id: row.get(4)?,
             })
         })?;
         rows.collect()
@@ -627,6 +660,36 @@ pub struct AlbumRow {
     pub cover_art: Option<String>,
     pub song_count: i64,
     pub duration: f64,
+    /// Sort keys mirrored from the API so a cached row can be placed under the
+    /// New / Frequent / Starred tabs, not just the alphabetical one.
+    pub created: Option<String>,
+    pub play_count: Option<i64>,
+    pub starred: Option<String>,
+    /// Music folder this row was synced from; `None` when the server exposes
+    /// only one library (or the folder list was unavailable).
+    pub library_id: Option<String>,
+}
+
+impl AlbumRow {
+    /// A row with only the columns every caller sets; the catalog sort keys
+    /// default to absent, which is what a local-file album has.
+    pub fn new(id: &str, source: &str, title: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            source: source.to_string(),
+            title: title.to_string(),
+            artist: None,
+            artist_id: None,
+            year: None,
+            cover_art: None,
+            song_count: 0,
+            duration: 0.0,
+            created: None,
+            play_count: None,
+            starred: None,
+            library_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -635,6 +698,8 @@ pub struct ArtistRow {
     pub source: String,
     pub name: String,
     pub cover_art: Option<String>,
+    /// Music folder this row was synced from; see [`AlbumRow::library_id`].
+    pub library_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -677,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_2() {
+    fn schema_version_is_3() {
         let db = test_db();
         let conn = db.conn.lock().unwrap();
         let version: i32 = conn
@@ -685,7 +750,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -862,30 +927,16 @@ mod tests {
     #[test]
     fn upsert_album_and_list() {
         let db = test_db();
-        db.upsert_album(
-            "alb1",
-            "local",
-            "Test Album",
-            Some("Artist"),
-            None,
-            Some(2024),
-            None,
-            12,
-            3600.0,
-        )
-        .unwrap();
-        db.upsert_album(
-            "alb2",
-            "local",
-            "Another Album",
-            None,
-            None,
-            None,
-            None,
-            8,
-            2400.0,
-        )
-        .unwrap();
+        let mut a1 = AlbumRow::new("alb1", "local", "Test Album");
+        a1.artist = Some("Artist".into());
+        a1.year = Some(2024);
+        a1.song_count = 12;
+        a1.duration = 3600.0;
+        db.upsert_album(&a1).unwrap();
+        let mut a2 = AlbumRow::new("alb2", "local", "Another Album");
+        a2.song_count = 8;
+        a2.duration = 2400.0;
+        db.upsert_album(&a2).unwrap();
         let albums = db.albums_by_source("local").unwrap();
         assert_eq!(albums.len(), 2);
         // Ordered by title COLLATE NOCASE
@@ -894,10 +945,41 @@ mod tests {
     }
 
     #[test]
+    fn album_catalog_columns_round_trip() {
+        // The grids seed their New/Frequent/Starred tabs and honour a library
+        // subset entirely from these four columns.
+        let db = test_db();
+        let mut row = AlbumRow::new("alb1", "navidrome", "Kid A");
+        row.created = Some("2000-10-02T00:00:00Z".into());
+        row.play_count = Some(41);
+        row.starred = Some("2024-05-01T12:00:00Z".into());
+        row.library_id = Some("2".into());
+        db.upsert_album(&row).unwrap();
+
+        let back = db.albums_by_source("navidrome").unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].created.as_deref(), Some("2000-10-02T00:00:00Z"));
+        assert_eq!(back[0].play_count, Some(41));
+        assert_eq!(back[0].starred.as_deref(), Some("2024-05-01T12:00:00Z"));
+        assert_eq!(back[0].library_id.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn artist_records_its_library() {
+        let db = test_db();
+        db.upsert_artist("art1", "navidrome", "Radiohead", None, Some("2"))
+            .unwrap();
+        let back = db.artists_by_source("navidrome").unwrap();
+        assert_eq!(back[0].library_id.as_deref(), Some("2"));
+    }
+
+    #[test]
     fn upsert_artist_and_list() {
         let db = test_db();
-        db.upsert_artist("art1", "local", "Artist A", None).unwrap();
-        db.upsert_artist("art2", "local", "Artist B", None).unwrap();
+        db.upsert_artist("art1", "local", "Artist A", None, None)
+            .unwrap();
+        db.upsert_artist("art2", "local", "Artist B", None, None)
+            .unwrap();
         let artists = db.artists_by_source("local").unwrap();
         assert_eq!(artists.len(), 2);
     }

@@ -166,13 +166,14 @@ fn album_from_row(row: AlbumRow) -> Album {
         song_count: Some(row.song_count as u32),
         duration: Some(row.duration as u32),
         year: row.year,
-        // Not stored by the sync; the placeholder never needs them (the tabs
-        // that sort on these keys don't seed from cache — see `seed_from_cache`).
-        created: None,
+        // Mirrored by the sync so the placeholder can be sorted the way the
+        // tab that shows it sorts — see `seed_from_cache`.
+        created: row.created,
+        starred: row.starred,
+        play_count: row.play_count.map(|c| c as u64),
+        // Not stored by the sync; nothing on a card reads them.
         genre: None,
-        starred: None,
         user_rating: None,
-        play_count: None,
     }
 }
 
@@ -272,21 +273,22 @@ impl AlbumsView {
     /// Fill a tab with the last Navidrome sync's albums so the grid is
     /// populated on the first frame instead of after the server answers.
     ///
-    /// Alphabetical only: the synced rows carry no timestamps, play counts or
-    /// star state, so the other tabs' orderings can't be reproduced — and rows
-    /// under the wrong heading are worse than an empty grid. `albums_by_source`
-    /// already returns them in exactly this tab's order (`title COLLATE
-    /// NOCASE`), which is what makes the in-place overwrite line up.
+    /// The sync mirrors each tab's sort key onto the row (`created`,
+    /// `play_count`, `starred`) and records which library it came from, so the
+    /// seed can reproduce the tab's ordering and honour a library subset. Rows
+    /// are re-sorted with the same `album_cmp` the live merge uses, which is
+    /// what makes the in-place overwrite line up.
     fn seed_from_cache(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
-        // Gated on a *configured* server, not a connected one: this view is
-        // built once before the connect completes and again after, and the
-        // pre-connect pass is exactly the slow window worth filling.
-        if tab != AlbumSort::All || self.session.read(cx).settings.server.is_none() {
+        // Recent is "recently played" and Random has no order at all — neither
+        // key exists in the DB, and rows under a heading that doesn't describe
+        // them are worse than an empty grid.
+        if matches!(tab, AlbumSort::Recent | AlbumSort::Random) {
             return;
         }
-        // Only for "all libraries": the sync doesn't record which library a
-        // row came from, so a filtered selection can't be honoured here.
-        if !self.session.read(cx).library_ids.is_empty() {
+        // Gated on a *configured* server, not a connected one: this view is
+        // built during the pre-connect wait, which is exactly the slow window
+        // worth filling.
+        if self.session.read(cx).settings.server.is_none() {
             return;
         }
         if self.tabs.get(&tab).is_some_and(|t| !t.albums.is_empty()) {
@@ -295,10 +297,32 @@ impl AlbumsView {
         let Ok(rows) = self.library_db.albums_by_source("navidrome") else {
             return;
         };
-        if rows.is_empty() {
+        // Rows synced before the provenance column existed carry no library id;
+        // with a subset selected they're skipped rather than guessed at, and
+        // the next sync fills them in.
+        let libraries = self.session.read(cx).library_ids.clone();
+        let mut albums: Vec<Album> = rows
+            .into_iter()
+            .filter(|row| {
+                libraries.is_empty()
+                    || row
+                        .library_id
+                        .as_ref()
+                        .is_some_and(|id| libraries.contains(id))
+            })
+            .map(album_from_row)
+            .collect();
+        if tab == AlbumSort::Starred {
+            albums.retain(|a| a.starred.is_some());
+        }
+        // `albums_by_source` already returns `title COLLATE NOCASE`, which is
+        // the All tab's order.
+        if tab != AlbumSort::All {
+            albums.sort_by(|a, b| album_cmp(tab, a, b));
+        }
+        if albums.is_empty() {
             return;
         }
-        let albums: Vec<Album> = rows.into_iter().map(album_from_row).collect();
         let state = self.tabs.entry(tab).or_default();
         state.cached = true;
         state.live_len = 0;
@@ -310,6 +334,17 @@ impl AlbumsView {
 
     fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
         self.session.read(cx).client.clone()
+    }
+
+    /// A client exists now. This view is built during the pre-connect window,
+    /// where `load_more` had nothing to fetch with and bailed — without this it
+    /// would keep showing the seeded cache until the user scrolled.
+    pub fn client_ready(&mut self, cx: &mut Context<Self>) {
+        let tab = self.active_tab;
+        if self.tabs.get(&tab).is_none_or(|t| t.page == 0) {
+            self.load_more(tab, cx);
+        }
+        cx.notify();
     }
 
     fn select_tab(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
@@ -768,6 +803,13 @@ impl Render for AlbumsView {
         let loading = fetching || connecting;
         // Cards on screen are last sync's copy, not the server's answer yet.
         let showing_cache = cached && loading;
+        // Exactly one progress indicator at a time: the header carries the
+        // first/refresh load (it stays visible while cached cards already fill
+        // the page, where a stale-but-complete grid would otherwise look
+        // final), the floating one carries pagination further down the list,
+        // where the header has scrolled out of reach.
+        let paginating = loading && !showing_cache && album_count > 0;
+        let header_loading = loading && !paginating;
 
         // Columns from the measured viewport width; falls back to a guess on
         // the very first frame (before layout), then self-corrects.
@@ -833,7 +875,7 @@ impl Render for AlbumsView {
                     // Spinner sits in the header rather than over the grid so
                     // it's visible while cached cards are already filling the
                     // page — otherwise a stale-but-complete grid looks final.
-                    .when(loading, |this| {
+                    .when(header_loading, |this| {
                         this.child(
                             h_flex()
                                 .items_center()
@@ -863,10 +905,10 @@ impl Render for AlbumsView {
             })
             .child(grid)
             // Pagination indicator, floated over the grid's bottom edge so it
-            // doesn't shorten the scroll area. Suppressed while cached cards
-            // are showing — there the rows are already there and the header
-            // spinner is the honest signal.
-            .when(loading && !showing_cache, |this| {
+            // doesn't shorten the scroll area. Only for further pages: on the
+            // first load and while cached cards are showing, the header spinner
+            // is the single signal.
+            .when(paginating, |this| {
                 this.child(
                     h_flex()
                         .absolute()
@@ -982,6 +1024,10 @@ mod tests {
             cover_art: Some("al-42".into()),
             song_count: 10,
             duration: 2000.0,
+            created: Some("2024-01-01T00:00:00Z".into()),
+            play_count: Some(3),
+            starred: None,
+            library_id: Some("1".into()),
         };
         let a = album_from_row(row);
         // Ids must match the live listing's, or the swap reloads every cover

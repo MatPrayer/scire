@@ -12,7 +12,7 @@ use lofty::Accessor;
 use lofty::AudioFile;
 use lofty::TaggedFileExt;
 
-use crate::services::library_db::LibraryDb;
+use crate::services::library_db::{AlbumRow, LibraryDb};
 
 pub const IDLE: u8 = 0;
 pub const SCANNING: u8 = 1;
@@ -181,19 +181,18 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
     let artist_key = format!("local:artist:{}", artist.as_deref().unwrap_or("Unknown"));
 
     if let Some(ref name) = artist {
-        let _ = db.upsert_artist(&artist_key, "local", name, cover.as_deref());
+        let _ = db.upsert_artist(&artist_key, "local", name, cover.as_deref(), None);
     }
-    let _ = db.upsert_album(
+    let mut album_row = AlbumRow::new(
         &album_key,
         "local",
         album_name.as_deref().unwrap_or("Unknown"),
-        artist.as_deref(),
-        Some(&artist_key),
-        year.map(|y| y as i32),
-        cover.as_deref(),
-        0,
-        0.0,
     );
+    album_row.artist = artist.clone();
+    album_row.artist_id = Some(artist_key.clone());
+    album_row.year = year.map(|y| y as i32);
+    album_row.cover_art = cover.clone();
+    let _ = db.upsert_album(&album_row);
     let _ = db.upsert_track(
         &id,
         "local",

@@ -208,10 +208,16 @@ impl RootView {
                 this.was_connected = connected;
                 let client = session.read(cx).client.clone();
                 this.player.update(cx, |p, cx| p.set_client(client, cx));
-                this.content = None;
-                this.invalidate_catalog_views();
                 if connected {
                     this.last_libraries = libraries;
+                    // The catalog views were built before the connect and are
+                    // already painting the cached listing; hand them the client
+                    // instead of rebuilding. A rebuild would blank their covers
+                    // and reset the scroll a second after the window appeared.
+                    this.resume_catalog_views(cx);
+                } else {
+                    this.content = None;
+                    this.invalidate_catalog_views();
                 }
             } else if connected && libraries != this.last_libraries {
                 // Library selection changed: rebuild the current catalog view.
@@ -223,8 +229,6 @@ impl RootView {
             }
 
             let has_local = !session.read(cx).settings.local_music_dirs.is_empty();
-            let has_server = session.read(cx).settings.server.is_some();
-            let lm = has_local && !has_server;
             // Kick off the local scanner once. When server + local dirs are
             // both configured, the local scan starts immediately without
             // waiting for the Navidrome connect.
@@ -284,30 +288,21 @@ impl RootView {
                 .detach();
             }
 
-            // Show content when connected OR when we have a server/local-music
-            // configured (so the sidebar isn't empty during connecting).
-            let configured = has_server || has_local;
-            let navigable = connected || lm || configured;
-            if navigable && this.content.is_none() {
-                let start = if lm {
-                    NavSection::LocalMusic
-                } else {
-                    match session.read(cx).settings.default_page {
-                        DefaultPage::Albums => NavSection::Albums,
-                        DefaultPage::Artists => NavSection::Artists,
-                        DefaultPage::Favorites => NavSection::Favorites,
-                        DefaultPage::Recent => NavSection::Recent,
-                        DefaultPage::Radio => NavSection::Radio,
-                    }
-                };
-                this.navigate(start, None, cx);
-            }
+            this.open_default_page(None, cx);
 
             // Pick up theme switches (e.g. to/from Adaptive) from Settings.
             this.maybe_update_adaptive_accent(cx);
             cx.notify();
         })
         .detach();
+
+        // Paint the start page on the first frame. The session observer would
+        // also open it, but it only fires when the connect resolves — which is
+        // a network round-trip away, and until then the window sat empty even
+        // though the cached catalog was right there to draw.
+        cx.defer_in(window, |this: &mut Self, window, cx| {
+            this.open_default_page(Some(window), cx);
+        });
 
         // Sidebar fold state is persisted, so restore it instead of reopening
         // every section on each start.
@@ -404,6 +399,48 @@ impl RootView {
         self.albums_view = None;
         self.artists_view = None;
         self.recent_view = None;
+    }
+
+    /// Tell the retained catalog views a client exists now. They fetch once at
+    /// construction and never again on their own, so a view built during the
+    /// pre-connect window would otherwise sit on its cached rows forever.
+    fn resume_catalog_views(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.albums_view.clone() {
+            view.update(cx, |v, cx| v.client_ready(cx));
+        }
+        if let Some(view) = self.artists_view.clone() {
+            view.update(cx, |v, cx| v.client_ready(cx));
+        }
+    }
+
+    /// Open the configured start page if nothing is showing yet.
+    ///
+    /// Called once at construction *and* from the session observer: the connect
+    /// is async, so waiting for the observer to fire left the window empty for
+    /// as long as the ping took. Gated on a configured server or local dirs —
+    /// with neither, `render` shows the setup wizard instead.
+    fn open_default_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.content.is_some() {
+            return;
+        }
+        let s = self.session.read(cx);
+        let has_local = !s.settings.local_music_dirs.is_empty();
+        let has_server = s.settings.server.is_some();
+        if !has_local && !has_server {
+            return;
+        }
+        let start = if has_local && !has_server {
+            NavSection::LocalMusic
+        } else {
+            match s.settings.default_page {
+                DefaultPage::Albums => NavSection::Albums,
+                DefaultPage::Artists => NavSection::Artists,
+                DefaultPage::Favorites => NavSection::Favorites,
+                DefaultPage::Recent => NavSection::Recent,
+                DefaultPage::Radio => NavSection::Radio,
+            }
+        };
+        self.navigate(start, window, cx);
     }
 
     fn navigate(
