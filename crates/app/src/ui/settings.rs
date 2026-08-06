@@ -113,6 +113,15 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_resume_playback(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.resume_playback = enabled);
+        self.player
+            .update(cx, |p, cx| p.set_resume_playback(enabled, cx));
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_default_shuffle(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.default_shuffle = enabled);
@@ -311,6 +320,7 @@ impl Render for SettingsView {
             )
         };
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
+        let resume_playback = self.session.read(cx).settings.resume_playback;
         let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
         let replay_gain = self.session.read(cx).settings.replay_gain;
         let rg_btn = |label: &'static str, mode: ReplayGainMode, active: bool| {
@@ -529,6 +539,14 @@ impl Render for SettingsView {
                                             .label("Scrobble plays to server")
                                             .on_click(cx.listener(|this, &checked, _, cx| {
                                                 this.set_scrobble(checked, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Switch::new("resume-playback")
+                                            .checked(resume_playback)
+                                            .label("Resume where you left off")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_resume_playback(checked, cx);
                                             })),
                                     )
                                     .child(

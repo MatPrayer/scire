@@ -64,6 +64,16 @@ pub struct PlayerState {
     waveform_enabled: bool,
     /// Song id whose peaks were last prewarmed, so the work fires once.
     waveform_prewarmed_for: Option<String>,
+    /// Remember the playback position across runs (from Settings).
+    resume_enabled: bool,
+    /// Position restored at startup with the song id it belongs to, waiting for
+    /// that track to actually be playing. Seeking a stream that has not opened
+    /// yet does nothing, so the seek is deferred to its first `Playing` event —
+    /// and the id is kept because the user may skip before ever pressing play.
+    pending_resume: Option<(String, Duration)>,
+    /// Whole seconds last written to the resume file, so the position events
+    /// (several a second) only touch the disk when the value moved.
+    resume_written_secs: u64,
 }
 
 impl PlayerState {
@@ -149,6 +159,9 @@ impl PlayerState {
             engine_has_track: false,
             waveform_enabled: false,
             waveform_prewarmed_for: None,
+            resume_enabled: false,
+            pending_resume: None,
+            resume_written_secs: 0,
         }
     }
 
@@ -441,6 +454,10 @@ impl PlayerState {
         self.player.stop();
         self.engine_has_track = false;
         self.playing = false;
+        // Nothing is playing any more, so there is no position to come back to.
+        self.pending_resume = None;
+        self.resume_written_secs = 0;
+        clear_resume();
         self.position = Duration::ZERO;
         self.duration = None;
         self.clear_radio();
@@ -770,6 +787,47 @@ impl PlayerState {
         cx.notify();
     }
 
+    /// Remember the position within the current track across runs (Settings).
+    /// Turning it off drops whatever was already saved, so a later launch with
+    /// it back on doesn't resume a track from a session two days ago.
+    pub fn set_resume_playback(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.resume_enabled = enabled;
+        if enabled {
+            self.persist_resume(true);
+        } else {
+            self.pending_resume = None;
+            clear_resume();
+        }
+        cx.notify();
+    }
+
+    /// Write the current track + position to the resume file. Throttled to once
+    /// per whole second unless `force`d: `Event::Position` fires several times a
+    /// second and each save is a file write.
+    fn persist_resume(&mut self, force: bool) {
+        if !self.resume_enabled || self.is_radio() {
+            return;
+        }
+        let Some(song_id) = self.current_song().map(|s| s.id.clone()) else {
+            return;
+        };
+        let secs = self.position.as_secs();
+        if !force && secs == self.resume_written_secs {
+            return;
+        }
+        self.resume_written_secs = secs;
+        // Right at the start of a track there is nothing worth resuming, and
+        // the file would only make the next launch seek to zero.
+        if self.position < RESUME_MIN {
+            clear_resume();
+            return;
+        }
+        persist_resume_state(&ResumeState {
+            song_id,
+            position_secs: self.position.as_secs_f64(),
+        });
+    }
+
     fn stream_url(&self, song: &Song) -> Result<String, String> {
         let client = self.client.as_ref().ok_or("not connected")?;
         client
@@ -804,7 +862,14 @@ impl PlayerState {
             }
         };
 
-        self.position = Duration::ZERO;
+        // A pending resume belongs to one track; starting anything else (the
+        // user skipped before pressing play) drops it and begins at zero.
+        let resume = resume_for(self.pending_resume.as_ref(), &song_id);
+        if resume.is_none() {
+            self.pending_resume = None;
+        }
+        self.position = resume.unwrap_or(Duration::ZERO);
+        self.resume_written_secs = self.position.as_secs();
         self.duration = duration;
         self.last_error = None;
         // Apply this track's ReplayGain before playback opens so the engine
@@ -887,6 +952,10 @@ impl PlayerState {
                 self.position = pos;
                 let action = self.scrobble.on_position(pos, self.duration);
                 self.fire_scrobble(action, cx);
+                // Saved as playback goes rather than only on quit: a crash or a
+                // SIGKILL never gets to run a shutdown hook, and this costs one
+                // small write a second.
+                self.persist_resume(false);
             }
             Event::DurationKnown(d) => {
                 self.duration = Some(d);
@@ -894,6 +963,15 @@ impl PlayerState {
             Event::Playing => {
                 self.playing = true;
                 self.buffering = false;
+                // The restored position is applied here, not in `start_current`:
+                // the engine can only seek a source it has actually opened.
+                if let Some((id, pos)) = self.pending_resume.clone()
+                    && self.current_song().is_some_and(|s| s.id == id)
+                {
+                    self.pending_resume = None;
+                    self.position = pos;
+                    self.player.seek(pos);
+                }
                 if let Some(c) = &mut self.media_controls {
                     let _ = c.set_playback(MediaPlayback::Playing {
                         progress: Some(MediaPosition(self.position)),
@@ -902,6 +980,9 @@ impl PlayerState {
             }
             Event::Paused => {
                 self.playing = false;
+                // Pausing is the likeliest thing to precede a quit; don't wait
+                // for the throttle window to come round.
+                self.persist_resume(true);
                 if let Some(c) = &mut self.media_controls {
                     let _ = c.set_playback(MediaPlayback::Paused {
                         progress: Some(MediaPosition(self.position)),
@@ -1010,6 +1091,24 @@ pub fn init(settings: &Settings, cx: &mut gpui::App) -> Entity<PlayerState> {
             }
         }
         state.scrobble_enabled = settings.scrobble_enabled;
+        state.resume_enabled = settings.resume_playback;
+        // Restore the saved position, but only for the track the restored queue
+        // is actually sitting on — the queue file and the resume file are
+        // written at different moments and can disagree.
+        if state.resume_enabled
+            && let Some(saved) = load_resume()
+            && state
+                .queue
+                .current_song()
+                .is_some_and(|s| s.id == saved.song_id)
+        {
+            let pos = Duration::from_secs_f64(saved.position_secs.max(0.0));
+            // Shown in the player bar right away, so the restored track reads
+            // as paused mid-way instead of at 0:00 until playback starts.
+            state.position = pos;
+            state.resume_written_secs = pos.as_secs();
+            state.pending_resume = Some((saved.song_id, pos));
+        }
         state
     })
 }
@@ -1058,6 +1157,57 @@ fn persist_queue(queue: &Queue) {
     }
 }
 
+// ---- playback-position persistence (Settings::resume_playback) ----
+
+/// Below this the track has barely started; resuming it is indistinguishable
+/// from playing it from the top, so nothing is stored.
+const RESUME_MIN: Duration = Duration::from_secs(5);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResumeState {
+    song_id: String,
+    position_secs: f64,
+}
+
+fn load_resume() -> Option<ResumeState> {
+    read_resume_at(&crate::config::resume_path().ok()?)
+}
+
+fn read_resume_at(path: &std::path::Path) -> Option<ResumeState> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let state: ResumeState = serde_json::from_str(&text).ok()?;
+    // A non-finite position would panic `Duration::from_secs_f64`.
+    state.position_secs.is_finite().then_some(state)
+}
+
+fn persist_resume_state(state: &ResumeState) {
+    let Ok(path) = crate::config::resume_path() else {
+        return;
+    };
+    write_resume_at(&path, state);
+}
+
+fn write_resume_at(path: &std::path::Path, state: &ResumeState) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(state) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Position to start `song_id` at, given whatever resume is pending. A resume
+/// is only ever applied to the track it was saved for.
+fn resume_for(pending: Option<&(String, Duration)>, song_id: &str) -> Option<Duration> {
+    pending.filter(|(id, _)| id == song_id).map(|(_, pos)| *pos)
+}
+
+fn clear_resume() {
+    if let Ok(path) = crate::config::resume_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 // ---- recently-played helpers ----
 
 fn load_recent() -> Vec<Song> {
@@ -1086,5 +1236,54 @@ fn persist_recent(list: &[Song]) {
     }
     if let Ok(json) = serde_json::to_string(list) {
         let _ = std::fs::write(path, json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{ResumeState, read_resume_at, resume_for, write_resume_at};
+
+    #[test]
+    fn resume_state_round_trips_through_the_file() {
+        let dir = std::env::temp_dir().join("scire-resume-roundtrip");
+        let path = dir.join("resume.json");
+        let _ = std::fs::remove_file(&path);
+        write_resume_at(
+            &path,
+            &ResumeState {
+                song_id: "song-1".into(),
+                position_secs: 91.5,
+            },
+        );
+        let back = read_resume_at(&path).unwrap();
+        assert_eq!(back.song_id, "song-1");
+        assert!((back.position_secs - 91.5).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_or_broken_resume_file_is_ignored() {
+        let dir = std::env::temp_dir().join("scire-resume-broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope.json");
+        assert!(read_resume_at(&missing).is_none());
+        // A NaN position would panic Duration::from_secs_f64 downstream.
+        let nan = dir.join("nan.json");
+        std::fs::write(&nan, r#"{"song_id":"s","position_secs":null}"#).unwrap();
+        assert!(read_resume_at(&nan).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_applies_only_to_the_track_it_was_saved_for() {
+        let pending = ("song-1".to_string(), Duration::from_secs(42));
+        assert_eq!(
+            resume_for(Some(&pending), "song-1"),
+            Some(Duration::from_secs(42))
+        );
+        assert_eq!(resume_for(Some(&pending), "song-2"), None);
+        assert_eq!(resume_for(None, "song-1"), None);
     }
 }

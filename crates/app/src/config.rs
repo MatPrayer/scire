@@ -35,6 +35,13 @@ pub fn queue_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("queue.json"))
 }
 
+/// Where the current track's playback position is parked between runs (see
+/// `Settings::resume_playback`). Separate from the queue file because it is
+/// rewritten every few seconds while the queue only changes on edits.
+pub fn resume_path() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("resume.json"))
+}
+
 #[allow(dead_code)]
 pub fn library_db_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("music.db"))
@@ -100,6 +107,10 @@ pub struct Settings {
     pub visualizer: VisualizerMode,
     /// Per-scene sensitivity/intensity knobs for the visualizer.
     pub visualizer_tuning: VisualizerSettings,
+    /// Remember where the current track was when the app closed and pick it up
+    /// there on the next launch. The queue is always restored; this adds the
+    /// position within its current track.
+    pub resume_playback: bool,
     /// Sidebar library switcher folded away; restored across sessions.
     pub sidebar_libraries_collapsed: bool,
     /// Sidebar playlist list folded away; restored across sessions.
@@ -377,6 +388,7 @@ impl Default for Settings {
             fullscreen_volume: false,
             visualizer: VisualizerMode::Off,
             visualizer_tuning: VisualizerSettings::default(),
+            resume_playback: false,
             sidebar_libraries_collapsed: false,
             sidebar_playlists_collapsed: false,
         }

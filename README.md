@@ -66,7 +66,7 @@ Log in with your Navidrome URL, username and password — or point **Settings �
 | **Formats** | Everything Symphonia decodes — FLAC, MP3, AAC/M4A, ALAC, Vorbis, WAV, AIFF and more (rodio is built with `symphonia-all`) |
 | **Browse** | Album grid with infinite scroll and sort (name / new / recent / frequent / random / starred) · artist index with bios and images · album and artist detail pages |
 | **Search** | Inline search bar (`/`) and a centered command palette (`Ctrl`/`Cmd`+`K`) with arrow-key navigation — songs, albums, artists via `search3` |
-| **Queue** | Shuffle · repeat (off / all / one) · reorder · play-next · clear · configurable end-of-queue behaviour · persisted across restarts |
+| **Queue** | Shuffle · repeat (off / all / one) · reorder · play-next · clear · configurable end-of-queue behaviour · persisted across restarts · optional resume of the current track's position (**Settings → Playback → Resume where you left off**) |
 | **Playlists** | Create, rename, delete, add/remove tracks · local `.m3u`/`.m3u8` files imported as playlists |
 | **Favorites** | Star and 1–5 star ratings · dedicated starred view |
 | **Multi-library** | Sidebar checkbox selector · all selected libraries merged into one sorted view |
@@ -385,6 +385,7 @@ Settings live in the platform config directory, caches in the platform cache dir
 | Artwork cache | `$CACHE_DIR/artwork/` | JPEG / PNG |
 | Waveform peaks | `$CACHE_DIR/waveform/` | JSON |
 | Queue snapshot | `$CACHE_DIR/queue.json` | JSON |
+| Playback position | `$CACHE_DIR/resume.json` | JSON, only while "Resume where you left off" is on |
 | Recently played | `$CACHE_DIR/recently_played.json` | JSON |
 | Local / synced music library | `$CACHE_DIR/music.db` | SQLite |
 
