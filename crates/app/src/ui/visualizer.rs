@@ -975,13 +975,14 @@ impl Visualizer {
                         bounds, &orb, spin, bass, treble, power, accent, alpha, window,
                     ),
                     Scene::Scope => paint_scope(
-                        bounds, &scope, spin, gain, bass, power, accent, alpha, window,
+                        bounds, &scope, spin, gain, bass, flash, power, accent, alpha, window,
                     ),
                     Scene::Bloom => paint_bloom(
                         bounds, &bands, spin, bass, flash, power, accent, alpha, window,
                     ),
                     Scene::Warp => paint_warp(
-                        bounds, &stars, &bands, warp_speed, flash, power, accent, alpha, window,
+                        bounds, &stars, &bands, spin, warp_speed, flash, power, accent, alpha,
+                        window,
                     ),
                 };
                 if let Some((prev, alpha)) = outgoing {
@@ -1590,6 +1591,51 @@ fn paint_orb(
 /// in and out. The trace starts and ends at unrelated sample values, so without
 /// this the ring has a visible step where the buffer wraps.
 const SCOPE_SEAM: f32 = 0.06;
+/// Fraction of *this trace's own peak* past which a stretch is redrawn
+/// brighter. A real scope's phosphor blooms where the beam swings hardest; this
+/// is the cheap equivalent.
+///
+/// Relative rather than absolute: at any fixed threshold a loud passage puts
+/// nearly the whole waveform over it, every point is drawn hot, and the effect
+/// disappears exactly when it should be strongest — the crests have to be
+/// picked out against the rest of the *same* trace.
+const SCOPE_HOT_REL: f32 = 0.7;
+/// Floor under the relative threshold. Without it a near-silent trace still has
+/// a peak, and its noise crests would glow as brightly as a snare.
+const SCOPE_HOT_FLOOR: f32 = 0.15;
+/// Resolution of the baseline circle. Low — it is a reference line, not
+/// geometry, and at this radius the eye cannot tell 64 segments from 200.
+const SCOPE_BASELINE_STEPS: usize = 64;
+
+/// Index ranges of the trace swinging within `SCOPE_HOT_REL` of its own peak.
+///
+/// Each run is padded by one point on both sides so the overlay meets the base
+/// stroke instead of floating as a detached arc. Returned as ranges rather than
+/// drawn per point because `paint_path` takes a single colour: to have part of
+/// a trace glow, that part has to be its own path.
+fn hot_runs(trace: &[f32], gain: f32) -> Vec<(usize, usize)> {
+    let peak = trace
+        .iter()
+        .fold(0f32, |acc, &s| acc.max((s * gain).abs().min(1.)));
+    let threshold = (peak * SCOPE_HOT_REL).max(SCOPE_HOT_FLOOR);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for i in 0..trace.len() {
+        let hot = (trace[i] * gain).abs() >= threshold;
+        match (hot, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                runs.push((s.saturating_sub(1), (i).min(trace.len() - 1)));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s.saturating_sub(1), trace.len() - 1));
+    }
+    runs
+}
 
 /// Polar oscilloscope: the waveform wrapped around a ring, with the previous
 /// frames trailing behind it as fading echoes.
@@ -1605,6 +1651,7 @@ fn paint_scope(
     spin: f32,
     gain: f32,
     bass: f32,
+    flash: f32,
     power: f32,
     accent: Hsla,
     alpha: f32,
@@ -1614,7 +1661,10 @@ fn paint_scope(
     let h = f32::from(bounds.size.height);
     let cx = f32::from(bounds.origin.x) + w / 2.;
     let cy = f32::from(bounds.origin.y) + h / 2.;
-    let base = w.min(h) * 0.28;
+    // The ring itself jumps on the beat. Everything else here is driven by the
+    // waveform, which carries no sense of *tempo* on its own — a steady tone
+    // and a kick drum draw the same size of ring.
+    let base = w.min(h) * 0.28 * (1. + 0.05 * flash);
     // The waveform is a signed displacement about the ring, so it needs room on
     // both sides; deep enough that a loud passage nearly closes the middle.
     let swing = base * 0.85 * power;
@@ -1636,6 +1686,33 @@ fn paint_scope(
         )
         .corner_radii(px(core)),
     );
+
+    // Baseline: the zero-displacement circle the trace swings about. An
+    // oscilloscope without one shows a shape with nothing to read it against —
+    // during a quiet passage the ring shrinks to almost this circle, and the
+    // eye needs to see that it is *near* zero rather than merely small.
+    {
+        let mut pb = PathBuilder::stroke(px(1.));
+        for i in 0..=SCOPE_BASELINE_STEPS {
+            let a = i as f32 / SCOPE_BASELINE_STEPS as f32 * std::f32::consts::TAU + spin * 0.18;
+            let (sin, cos) = a.sin_cos();
+            let pt = point(px(cx + cos * base), px(cy - sin * base));
+            if i == 0 {
+                pb.move_to(pt);
+            } else {
+                pb.line_to(pt);
+            }
+        }
+        if let Ok(path) = pb.build() {
+            window.paint_path(
+                path,
+                Hsla {
+                    a: (0.10 + 0.10 * flash) * alpha,
+                    ..accent
+                },
+            );
+        }
+    }
 
     // Oldest first: the live trace has to land on top of its own history.
     for (age, trace) in scope.iter().enumerate().rev() {
@@ -1679,13 +1756,57 @@ fn paint_scope(
                 },
             );
         }
+
+        // Phosphor bloom, live trace only: the stretches that swing hardest are
+        // redrawn thicker and near-white. Without it every part of the trace
+        // carries the same weight and a transient is indistinguishable from a
+        // sustained tone at the same level.
+        if age != 0 {
+            continue;
+        }
+        for (from, to) in hot_runs(trace, gain) {
+            if to <= from {
+                continue;
+            }
+            let mut hot = PathBuilder::stroke(px(4.2));
+            for i in from..=to {
+                let u = i as f32 / trace.len() as f32;
+                let seam = (u / SCOPE_SEAM).min((1. - u) / SCOPE_SEAM).clamp(0., 1.);
+                let a = u * std::f32::consts::TAU + spin * 0.18;
+                let r = ring + (trace[i] * gain).clamp(-1., 1.) * swing * seam;
+                let (sin, cos) = a.sin_cos();
+                let pt = point(px(cx + cos * r), px(cy - sin * r));
+                if i == from {
+                    hot.move_to(pt);
+                } else {
+                    hot.line_to(pt);
+                }
+            }
+            if let Ok(path) = hot.build() {
+                window.paint_path(
+                    path,
+                    Hsla {
+                        h: accent.h,
+                        s: (accent.s * 0.6).clamp(0., 1.),
+                        l: (accent.l + 0.42).min(0.97),
+                        a: (0.5 + 0.4 * flash) * alpha,
+                    },
+                );
+            }
+        }
     }
 }
 
-/// Sectors the Bloom mandala is mirrored into.
-const BLOOM_SECTORS: usize = 8;
+/// Sectors each Bloom layer is mirrored into, outermost first. All even, since
+/// the mirroring pairs sectors up.
+///
+/// Deliberately *different* per layer: three layers sharing one petal count
+/// line up into a single rigid figure no matter how they rotate, and the
+/// interference between symmetries that don't divide each other is the thing
+/// that reads as a kaleidoscope rather than as a gear.
+const BLOOM_LAYER_SECTORS: [usize; 3] = [12, 8, 6];
 /// Concentric layers, each rotating against the one outside it.
-const BLOOM_LAYERS: usize = 3;
+const BLOOM_LAYERS: usize = BLOOM_LAYER_SECTORS.len();
 /// Outline resolution of one petal.
 const BLOOM_STEPS: usize = 24;
 
@@ -1713,9 +1834,39 @@ fn paint_bloom(
     let cx = f32::from(bounds.origin.x) + w / 2.;
     let cy = f32::from(bounds.origin.y) + h / 2.;
     let outer = w.min(h) * 0.46;
-    let sector = std::f32::consts::TAU / BLOOM_SECTORS as f32;
+
+    // Spokes on the beat: a thin star along the sector boundaries, gone within
+    // a few frames. The only part of the scene that moves on the kick rather
+    // than with the spectrum. Aligned to the outer layer, whose petals they
+    // pass between, and drawn *under* everything: on top they read as scratches
+    // ruled across the figure, and they must not reach past the petals or the
+    // mandala grows spikes on every beat.
+    if flash > 0.02 {
+        let mut pb = PathBuilder::stroke(px(1.4));
+        let sector = std::f32::consts::TAU / BLOOM_LAYER_SECTORS[0] as f32;
+        for s in 0..BLOOM_LAYER_SECTORS[0] {
+            let a = spin * 0.3 + s as f32 * sector;
+            let (sin, cos) = a.sin_cos();
+            let inner = outer * 0.22;
+            let reach = outer * (0.5 + 0.32 * flash);
+            pb.move_to(point(px(cx + cos * inner), px(cy - sin * inner)));
+            pb.line_to(point(px(cx + cos * reach), px(cy - sin * reach)));
+        }
+        if let Ok(path) = pb.build() {
+            window.paint_path(
+                path,
+                Hsla {
+                    l: (accent.l + 0.25).min(0.95),
+                    a: flash * 0.5 * alpha,
+                    ..accent
+                },
+            );
+        }
+    }
 
     for layer in 0..BLOOM_LAYERS {
+        let sectors = BLOOM_LAYER_SECTORS[layer];
+        let sector = std::f32::consts::TAU / sectors as f32;
         let l = layer as f32 / BLOOM_LAYERS as f32;
         let scale = 1. - 0.3 * l;
         // Counter-rotation: layers turning the same way would lock into one
@@ -1730,12 +1881,12 @@ fn paint_bloom(
         let mut pb = PathBuilder::fill();
         let mut outline = PathBuilder::stroke(px(1.8 - 0.5 * l));
         let mut started = false;
-        for s in 0..BLOOM_SECTORS {
+        for s in 0..sectors {
             // Mirrored pairs of sectors share one band, so the figure has a
-            // true mirror symmetry with `BLOOM_SECTORS / 2` petals. Reading the
-            // whole spectrum in every sector instead makes all eight petals
-            // identical, which is a cog, not a kaleidoscope.
-            let pair = (s / 2) as f32 / (BLOOM_SECTORS / 2) as f32;
+            // true mirror symmetry with `sectors / 2` petals. Reading the whole
+            // spectrum in every sector instead makes all the petals identical,
+            // which is a cog, not a kaleidoscope.
+            let pair = (s / 2) as f32 / (sectors / 2) as f32;
             let b = band_lo + pair * (1. - band_lo);
             // Smoothed across neighbours: an isolated loud band would drive one
             // petal on its own and the figure would lose its balance.
@@ -1811,25 +1962,46 @@ fn paint_bloom(
         }
     }
 
-    // Spokes on the beat: a thin star along the sector boundaries, gone within
-    // a few frames. This is the only part of the scene that moves on the kick
-    // rather than with the spectrum.
-    if flash > 0.02 {
-        let mut pb = PathBuilder::stroke(px(1.4));
-        for s in 0..BLOOM_SECTORS {
-            let a = spin * 0.3 + s as f32 * sector;
+    // Hub: the petals all start well off the centre (they have to, or the
+    // layers pile into a blob), which leaves a hole exactly where the eye goes
+    // first. A disc on the low end and a ring at the petals' inner radius close
+    // it and tie the three symmetries to a common centre.
+    {
+        let hub = outer * (0.13 + 0.10 * bass);
+        window.paint_quad(
+            fill(
+                Bounds {
+                    origin: point(px(cx - hub), px(cy - hub)),
+                    size: gpui::size(px(hub * 2.), px(hub * 2.)),
+                },
+                Hsla {
+                    l: (accent.l + 0.15 + 0.2 * flash).min(0.95),
+                    a: (0.30 + 0.35 * flash) * alpha,
+                    ..accent
+                },
+            )
+            .corner_radii(px(hub)),
+        );
+        // Innermost layer's inner radius — where its petals spring from.
+        let inner_scale = 1. - 0.3 * ((BLOOM_LAYERS - 1) as f32 / BLOOM_LAYERS as f32);
+        let rim = outer * inner_scale * (0.34 + 0.1 * bass);
+        let mut pb = PathBuilder::stroke(px(1.2));
+        for i in 0..=SCOPE_BASELINE_STEPS {
+            let a = i as f32 / SCOPE_BASELINE_STEPS as f32 * std::f32::consts::TAU;
             let (sin, cos) = a.sin_cos();
-            let inner = outer * 0.22;
-            let reach = outer * (0.55 + 0.45 * flash);
-            pb.move_to(point(px(cx + cos * inner), px(cy - sin * inner)));
-            pb.line_to(point(px(cx + cos * reach), px(cy - sin * reach)));
+            let pt = point(px(cx + cos * rim), px(cy - sin * rim));
+            if i == 0 {
+                pb.move_to(pt);
+            } else {
+                pb.line_to(pt);
+            }
         }
         if let Ok(path) = pb.build() {
             window.paint_path(
                 path,
                 Hsla {
-                    l: (accent.l + 0.25).min(0.95),
-                    a: flash * 0.5 * alpha,
+                    l: (accent.l + 0.2).min(0.92),
+                    a: (0.25 + 0.3 * flash) * alpha,
                     ..accent
                 },
             );
@@ -1840,6 +2012,15 @@ fn paint_bloom(
 /// Seconds of travel a warp streak represents. Fixed rather than the frame's
 /// `dt`, so the streaks do not shorten when the frame rate rises.
 const WARP_STREAK: f32 = 0.075;
+/// Radians of field roll per unit of `spin`. Slow on purpose: a starfield that
+/// only grows outward reads as a still image being zoomed, and it takes very
+/// little rotation to turn that back into flight. Too much and it becomes a
+/// spin, which is a different scene.
+const WARP_ROLL: f32 = 0.09;
+/// World units over which a star fades out as it reaches the camera. Without
+/// it every streak vanishes mid-frame at the near plane — a pop in the busiest,
+/// brightest part of the field.
+const WARP_NEAR_FADE: f32 = 0.7;
 
 /// Starfield streaking past the camera, accelerating with the track.
 ///
@@ -1851,6 +2032,7 @@ fn paint_warp(
     bounds: Bounds<Pixels>,
     stars: &[Star],
     bands: &[f32],
+    spin: f32,
     speed: f32,
     flash: f32,
     power: f32,
@@ -1860,20 +2042,21 @@ fn paint_warp(
 ) {
     let focal = focal_of(bounds, 0.75);
     let trail = speed * WARP_STREAK * power;
+    // Rigid roll of the whole field: applied to the star's plane position, so
+    // head and tail turn together and a streak still points at the vanishing
+    // point instead of shearing into an arc.
+    let (rs, rc) = (spin * WARP_ROLL).sin_cos();
 
     // Far first: near streaks are wider and brighter and have to sit on top.
     let mut order: Vec<&Star> = stars.iter().collect();
     order.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap_or(std::cmp::Ordering::Equal));
 
     for star in order {
-        let head = P3 {
-            x: star.x,
-            y: star.y,
-            z: star.z,
-        };
+        let (x, y) = (star.x * rc - star.y * rs, star.x * rs + star.y * rc);
+        let head = P3 { x, y, z: star.z };
         let tail = P3 {
-            x: star.x,
-            y: star.y,
+            x,
+            y,
             z: star.z + trail,
         };
         let (Some(a), Some(b)) = (project(head, bounds, focal), project(tail, bounds, focal))
@@ -1881,6 +2064,7 @@ fn paint_warp(
             continue;
         };
         let depth = ((star.z - STAR_NEAR) / (STAR_FAR - STAR_NEAR)).clamp(0., 1.);
+        let near_fade = ((star.z - STAR_NEAR) / WARP_NEAR_FADE).clamp(0., 1.);
         let level = bands.get(star.band).copied().unwrap_or(0.);
         let width = (0.9 + 2.6 * (1. - depth) + 1.6 * level).min(4.5);
         let mut pb = PathBuilder::stroke(px(width));
@@ -1894,8 +2078,9 @@ fn paint_warp(
                     s: (accent.s * (0.5 + 0.5 * depth)).clamp(0., 1.),
                     l: (0.45 + 0.4 * (1. - depth) + 0.25 * level).min(0.95),
                     // Fade in from the far plane so recycled stars appear out
-                    // of the distance instead of popping into existence.
-                    a: (1. - depth).powf(0.7) * (0.35 + 0.65 * level.min(1.)) * alpha,
+                    // of the distance instead of popping into existence, and
+                    // out again at the near plane where they are recycled.
+                    a: (1. - depth).powf(0.7) * near_fade * (0.35 + 0.65 * level.min(1.)) * alpha,
                 },
             );
         }
@@ -1935,6 +2120,34 @@ mod tests {
         );
         assert!(!VisualizerMode::Off.is_on());
         assert!(VisualizerMode::Tunnel.is_on());
+    }
+
+    #[test]
+    fn hot_runs_cover_the_loud_stretches_and_nothing_else() {
+        // Two excursions past the threshold with quiet either side.
+        let trace = vec![0., 0.1, 0.5, 0.6, 0.1, 0., -0.05, -0.7, -0.2];
+        let runs = hot_runs(&trace, 1.);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        // Padded by one point on each side so the overlay meets the base line.
+        assert_eq!(runs[0], (1, 4));
+        assert_eq!(runs[1], (6, 8));
+        // A trace that never swings hard has nothing to bloom.
+        assert!(hot_runs(&[0., 0.05, -0.05, 0.], 1.).is_empty());
+        // Gain is the sensitivity knob: turning it up makes the same trace hot.
+        assert!(!hot_runs(&[0., 0.2, 0.], 4.).is_empty());
+    }
+
+    #[test]
+    fn bloom_layers_can_be_mirrored() {
+        // The petal pairing halves the sector count; an odd one would leave a
+        // sector reading a band past the end of the spectrum.
+        for n in BLOOM_LAYER_SECTORS {
+            assert!(n % 2 == 0 && n >= 4, "unmirrorable sector count {n}");
+        }
+        // Layers sharing a count (or dividing each other evenly) lock into one
+        // rigid figure — the interference is the scene.
+        assert_ne!(BLOOM_LAYER_SECTORS[0], BLOOM_LAYER_SECTORS[1]);
+        assert_ne!(BLOOM_LAYER_SECTORS[1], BLOOM_LAYER_SECTORS[2]);
     }
 
     /// Steady, unremarkable input: flux jitters around a low level, with a
