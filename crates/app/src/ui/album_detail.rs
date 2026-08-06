@@ -5,21 +5,26 @@ use std::path::PathBuf;
 
 use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Window, div, img, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::popover::Popover;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
 };
-use subsonic::{AlbumWithSongs, Song, SubsonicClient};
+use subsonic::{AlbumInfo2, AlbumWithSongs, Song, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
-use crate::ui::{format_duration, track_extras};
+use crate::ui::{format_duration, strip_html, track_extras, truncate_at_word};
 
 const ART_SIZE: u32 = 600;
+
+/// Collapsed album-notes length, matching the artist page's bio preview.
+const NOTES_PREVIEW_CHARS: usize = 400;
 
 pub enum AlbumDetailEvent {
     OpenArtist(String),
@@ -31,6 +36,10 @@ pub struct AlbumDetailView {
     playlists: Entity<PlaylistsState>,
     album_id: String,
     album: Option<AlbumWithSongs>,
+    /// getAlbumInfo2 payload: description + external ids. Fetched once.
+    info: Option<AlbumInfo2>,
+    /// Album description expanded past its preview length.
+    notes_expanded: bool,
     art_path: Option<PathBuf>,
     error: Option<String>,
     /// Last observed playing-song id; used to refresh play counts when a track
@@ -80,6 +89,8 @@ impl AlbumDetailView {
             playlists,
             album_id,
             album: None,
+            info: None,
+            notes_expanded: false,
             art_path: None,
             error: None,
             last_playing_id,
@@ -136,6 +147,38 @@ impl AlbumDetailView {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+        self.load_info(cx);
+    }
+
+    /// Album description + external ids. `load` re-runs whenever playback moves
+    /// in or out of this album (to refresh play counts), so this is gated on the
+    /// info being absent — the notes never change under us.
+    fn load_info(&mut self, cx: &mut Context<Self>) {
+        if self.info.is_some() {
+            return;
+        }
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        let id = self.album_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .get_album_info2(&id)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            // A server without the metadata agent answers with an empty element
+            // rather than an error; either way there is simply nothing to show.
+            if let Ok(info) = result {
+                let _ = this.update(cx, |view, cx| {
+                    view.info = Some(info);
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
@@ -321,6 +364,156 @@ impl AlbumDetailView {
     }
 }
 
+/// Technical summary of the album's files, as short chip strings: formats,
+/// bitrate, sample rate / bit depth, channels, total size. Everything here is
+/// OpenSubsonic-only except the bitrate, so vanilla servers yield fewer chips
+/// and no empty placeholders.
+fn quality_chips(songs: &[Song]) -> Vec<String> {
+    let mut chips = Vec::new();
+
+    let mut formats: Vec<String> = Vec::new();
+    for song in songs {
+        // `suffix` is the file extension; fall back to the MIME subtype, which
+        // is what servers that omit it still give us ("audio/flac" → FLAC).
+        let raw = song.suffix.as_deref().or_else(|| {
+            song.content_type
+                .as_deref()
+                .and_then(|c| c.rsplit('/').next())
+        });
+        if let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) {
+            let fmt = raw.to_uppercase();
+            if !formats.contains(&fmt) {
+                formats.push(fmt);
+            }
+        }
+    }
+    if !formats.is_empty() {
+        chips.push(formats.join(" / "));
+    }
+
+    // Ranges, not averages: a mixed-source album should say so.
+    let bitrates: Vec<u32> = songs
+        .iter()
+        .filter_map(|s| s.bit_rate)
+        .filter(|&b| b > 0)
+        .collect();
+    if let (Some(&lo), Some(&hi)) = (bitrates.iter().min(), bitrates.iter().max()) {
+        chips.push(if lo == hi {
+            format!("{lo} kbps")
+        } else {
+            format!("{lo}–{hi} kbps")
+        });
+    }
+
+    let rate = songs
+        .iter()
+        .filter_map(|s| s.sampling_rate)
+        .filter(|&r| r > 0)
+        .max();
+    let depth = songs
+        .iter()
+        .filter_map(|s| s.bit_depth)
+        .filter(|&d| d > 0)
+        .max();
+    match (rate, depth) {
+        (Some(r), Some(d)) => chips.push(format!("{} · {d} bit", fmt_khz(r))),
+        (Some(r), None) => chips.push(fmt_khz(r)),
+        (None, Some(d)) => chips.push(format!("{d} bit")),
+        (None, None) => {}
+    }
+
+    if let Some(ch) = songs
+        .iter()
+        .filter_map(|s| s.channel_count)
+        .filter(|&c| c > 0)
+        .max()
+    {
+        chips.push(match ch {
+            1 => "Mono".to_string(),
+            2 => "Stereo".to_string(),
+            n => format!("{n} ch"),
+        });
+    }
+
+    let total: u64 = songs.iter().filter_map(|s| s.size).sum();
+    if total > 0 {
+        chips.push(fmt_bytes(total));
+    }
+    chips
+}
+
+/// ReplayGain summary line, or `None` when no track carries the tags. Album
+/// gain is one value for the whole album, so the first track that has it wins;
+/// track gains are shown as the range they span.
+fn replaygain_line(songs: &[Song]) -> Option<String> {
+    let gains: Vec<&subsonic::ReplayGain> = songs
+        .iter()
+        .filter_map(|s| s.replay_gain.as_ref())
+        .collect();
+    if gains.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(album_gain) = gains.iter().find_map(|g| g.album_gain) {
+        parts.push(format!("album {album_gain:+.2} dB"));
+    }
+    if let Some(peak) = gains
+        .iter()
+        .filter_map(|g| g.album_peak)
+        .fold(None, |acc: Option<f32>, p| {
+            Some(acc.map_or(p, |a| a.max(p)))
+        })
+    {
+        parts.push(format!("peak {peak:.2}"));
+    }
+    let track_gains: Vec<f32> = gains.iter().filter_map(|g| g.track_gain).collect();
+    if let (Some(lo), Some(hi)) = (
+        track_gains
+            .iter()
+            .copied()
+            .fold(None, |a: Option<f32>, g| Some(a.map_or(g, |a| a.min(g)))),
+        track_gains
+            .iter()
+            .copied()
+            .fold(None, |a: Option<f32>, g| Some(a.map_or(g, |a| a.max(g)))),
+    ) {
+        parts.push(if (hi - lo).abs() < 0.005 {
+            format!("tracks {lo:+.2} dB")
+        } else {
+            format!("tracks {lo:+.2} … {hi:+.2} dB")
+        });
+    }
+    (!parts.is_empty()).then(|| format!("ReplayGain: {}", parts.join(" · ")))
+}
+
+/// `44100` → `44.1 kHz`, dropping a trailing `.0`.
+fn fmt_khz(hz: u32) -> String {
+    let khz = hz as f32 / 1000.0;
+    if (khz - khz.round()).abs() < 0.05 {
+        format!("{} kHz", khz.round() as u32)
+    } else {
+        format!("{khz:.1} kHz")
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1024.0 {
+        format!("{:.2} GB", mb / 1024.0)
+    } else if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{mb:.1} MB")
+    }
+}
+
+/// Server timestamps are ISO-8601 (`2019-03-08T21:12:44Z`); only the date is
+/// worth showing, and anything unexpected is passed through untouched.
+fn fmt_added(created: &str) -> String {
+    created.split('T').next().unwrap_or(created).to_string()
+}
+
 impl Render for AlbumDetailView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
@@ -351,6 +544,50 @@ impl Render for AlbumDetailView {
                 None => ("…".into(), String::new(), None, String::new()),
             };
             let has_songs = self.album.as_ref().is_some_and(|a| !a.song.is_empty());
+
+            // Chips: genre / added date first (album-level), then the file
+            // facts derived from the tracks.
+            let mut chips: Vec<String> = Vec::new();
+            if let Some(a) = &self.album {
+                if let Some(genre) = a
+                    .album
+                    .genre
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                {
+                    chips.push(genre.to_string());
+                }
+                let discs = a
+                    .song
+                    .iter()
+                    .filter_map(|s| s.disc_number)
+                    .max()
+                    .unwrap_or(0);
+                if discs > 1 {
+                    chips.push(format!("{discs} discs"));
+                }
+                chips.extend(quality_chips(&a.song));
+                if let Some(created) = a.album.created.as_deref().filter(|c| !c.is_empty()) {
+                    chips.push(format!("Added {}", fmt_added(created)));
+                }
+            }
+            let chip_row = h_flex().gap_1p5().flex_wrap().children(
+                chips
+                    .into_iter()
+                    .map(|text| {
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(cx.theme().muted)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(text)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let replaygain = self.album.as_ref().and_then(|a| replaygain_line(&a.song));
 
             let rating_stars = h_flex().gap_0p5().children((1..=5u8).map(|r| {
                 div()
@@ -432,6 +669,15 @@ impl Render for AlbumDetailView {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(meta),
                         )
+                        .child(chip_row)
+                        .when_some(replaygain, |this, line| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(line),
+                            )
+                        })
                         .child(rating_stars)
                         .child(
                             h_flex()
@@ -685,6 +931,87 @@ impl Render for AlbumDetailView {
             })
             .collect();
 
+        // Description + external links (getAlbumInfo2). Collapsed by truncating
+        // the string: gpui's line_clamp can't do it (see the artist bio).
+        let notes = self
+            .info
+            .as_ref()
+            .and_then(|i| i.notes.as_deref())
+            .map(strip_html)
+            .filter(|n| !n.is_empty());
+        let notes_long = notes
+            .as_ref()
+            .is_some_and(|n| n.chars().count() > NOTES_PREVIEW_CHARS);
+        let notes_text = notes.map(|n| {
+            if self.notes_expanded || !notes_long {
+                n
+            } else {
+                truncate_at_word(&n, NOTES_PREVIEW_CHARS)
+            }
+        });
+        let musicbrainz_url = self
+            .info
+            .as_ref()
+            .and_then(|i| i.music_brainz_id.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("https://musicbrainz.org/release/{id}"));
+        let lastfm_url = self
+            .info
+            .as_ref()
+            .and_then(|i| i.last_fm_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string);
+        let has_links = musicbrainz_url.is_some() || lastfm_url.is_some();
+        let notes_expanded = self.notes_expanded;
+        let about = (notes_text.is_some() || has_links).then(|| {
+            v_flex()
+                .rounded_2xl()
+                .p_4()
+                .gap_2()
+                .bg(cx.theme().sidebar)
+                // Header only when there is prose under it: servers without a
+                // metadata agent return links alone, and an "About" heading
+                // over a bare Last.fm link reads like something failed to load.
+                .when_some(notes_text, |this, text| {
+                    this.child(div().text_sm().font_medium().child("About"))
+                        .child(div().text_sm().child(text))
+                })
+                .when(notes_long, |this| {
+                    this.child(
+                        h_flex().child(
+                            Button::new("notes-toggle")
+                                .ghost()
+                                .xsmall()
+                                .label(if notes_expanded { "Less" } else { "More" })
+                                .icon(Icon::new(if notes_expanded {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.notes_expanded = !this.notes_expanded;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                })
+                .when(has_links, |this| {
+                    this.child(
+                        h_flex()
+                            .gap_3()
+                            .text_sm()
+                            .when_some(musicbrainz_url, |this, url| {
+                                this.child(Link::new("al-mb-link").href(url).child("MusicBrainz"))
+                            })
+                            .when_some(lastfm_url, |this, url| {
+                                this.child(Link::new("al-lastfm-link").href(url).child("Last.fm"))
+                            }),
+                    )
+                })
+        });
+
         let scroll = v_flex()
             .id("album-detail-scroll")
             .size_full()
@@ -700,6 +1027,7 @@ impl Render for AlbumDetailView {
                     .bg(cx.theme().sidebar)
                     .child(header),
             )
+            .children(about)
             .when_some(self.error.clone(), |this, e| {
                 this.child(div().text_color(cx.theme().danger).text_sm().child(e))
             })
@@ -737,5 +1065,90 @@ impl Render for AlbumDetailView {
                         ),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fmt_bytes, fmt_khz, quality_chips, replaygain_line};
+    use subsonic::Song;
+
+    /// Songs carry ~20 fields; building them from JSON keeps the cases readable
+    /// and exercises the same deserialization the client uses.
+    fn song(json: &str) -> Song {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn quality_chips_summarize_uniform_album() {
+        let songs = vec![
+            song(
+                r#"{"id":"1","title":"a","suffix":"flac","bitRate":1004,"samplingRate":44100,
+                    "bitDepth":16,"channelCount":2,"size":31457280}"#,
+            ),
+            song(
+                r#"{"id":"2","title":"b","suffix":"flac","bitRate":1004,"samplingRate":44100,
+                    "bitDepth":16,"channelCount":2,"size":31457280}"#,
+            ),
+        ];
+        assert_eq!(
+            quality_chips(&songs),
+            vec![
+                "FLAC".to_string(),
+                "1004 kbps".into(),
+                "44.1 kHz · 16 bit".into(),
+                "Stereo".into(),
+                "60 MB".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn quality_chips_show_ranges_for_mixed_sources() {
+        let songs = vec![
+            song(r#"{"id":"1","title":"a","suffix":"flac","bitRate":1004,"samplingRate":96000}"#),
+            song(r#"{"id":"2","title":"b","contentType":"audio/mpeg","bitRate":320}"#),
+        ];
+        let chips = quality_chips(&songs);
+        assert_eq!(chips[0], "FLAC / MPEG");
+        assert_eq!(chips[1], "320–1004 kbps");
+        assert_eq!(chips[2], "96 kHz");
+    }
+
+    #[test]
+    fn quality_chips_empty_without_opensubsonic_fields() {
+        let songs = vec![song(r#"{"id":"1","title":"a"}"#)];
+        assert!(quality_chips(&songs).is_empty());
+    }
+
+    #[test]
+    fn replaygain_line_reports_album_gain_peak_and_track_range() {
+        let songs = vec![
+            song(
+                r#"{"id":"1","title":"a","replayGain":{"albumGain":-8.3,"albumPeak":0.98,
+                    "trackGain":-9.1}}"#,
+            ),
+            song(
+                r#"{"id":"2","title":"b","replayGain":{"albumGain":-8.3,"albumPeak":0.99,
+                    "trackGain":-7.2}}"#,
+            ),
+        ];
+        assert_eq!(
+            replaygain_line(&songs).unwrap(),
+            "ReplayGain: album -8.30 dB · peak 0.99 · tracks -9.10 … -7.20 dB"
+        );
+    }
+
+    #[test]
+    fn replaygain_line_absent_without_tags() {
+        assert!(replaygain_line(&[song(r#"{"id":"1","title":"a"}"#)]).is_none());
+    }
+
+    #[test]
+    fn khz_and_bytes_formatting() {
+        assert_eq!(fmt_khz(44100), "44.1 kHz");
+        assert_eq!(fmt_khz(48000), "48 kHz");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.00 GB");
     }
 }

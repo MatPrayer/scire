@@ -66,6 +66,27 @@ struct ArtistInfo2Wrapper {
     info: ArtistInfo2,
 }
 
+/// Album metadata from getAlbumInfo2 (ID3). Same agent-sourced shape as
+/// [`ArtistInfo2`]: Navidrome fills `notes` from Last.fm when configured, and
+/// leaves it out entirely otherwise.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumInfo2 {
+    /// Album description. May contain HTML, like `ArtistInfo2::biography`.
+    pub notes: Option<String>,
+    pub music_brainz_id: Option<String>,
+    pub last_fm_url: Option<String>,
+    pub small_image_url: Option<String>,
+    pub medium_image_url: Option<String>,
+    pub large_image_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumInfo2Wrapper {
+    #[serde(rename = "albumInfo", default)]
+    info: AlbumInfo2,
+}
+
 impl SubsonicClient {
     /// All artists (ID3), grouped by index letter.
     pub async fn get_artists(
@@ -95,6 +116,15 @@ impl SubsonicClient {
     /// Artist biography and image URLs (ID3, OpenSubsonic getArtistInfo2).
     pub async fn get_artist_info2(&self, id: &str) -> Result<ArtistInfo2, Error> {
         let w: ArtistInfo2Wrapper = self.get("getArtistInfo2", &[("id", id)]).await?;
+        Ok(w.info)
+    }
+
+    /// Album notes and external ids (ID3, getAlbumInfo2).
+    ///
+    /// The response element is `albumInfo` (not `albumInfo2`) even for the
+    /// ID3 variant of the call — that asymmetry is in the Subsonic spec.
+    pub async fn get_album_info2(&self, id: &str) -> Result<AlbumInfo2, Error> {
+        let w: AlbumInfo2Wrapper = self.get("getAlbumInfo2", &[("id", id)]).await?;
         Ok(w.info)
     }
 

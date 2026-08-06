@@ -236,6 +236,38 @@ async fn get_artist_info2_parses_bio_and_images() {
 }
 
 #[tokio::test]
+async fn get_album_info2_parses_notes_from_album_info_element() {
+    let server = MockServer::start().await;
+    // The ID3 call answers under `albumInfo`, not `albumInfo2`.
+    Mock::given(path("/rest/getAlbumInfo2"))
+        .and(query_param("id", "al-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""albumInfo":{"notes":"Recorded in <b>1973</b>.","musicBrainzId":"mbid-al","lastFmUrl":"https://last.fm/al","largeImageUrl":"https://img/l.jpg"}"#,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let info = client(&server.uri()).get_album_info2("al-1").await.unwrap();
+    assert_eq!(info.notes.as_deref(), Some("Recorded in <b>1973</b>."));
+    assert_eq!(info.music_brainz_id.as_deref(), Some("mbid-al"));
+    assert_eq!(info.last_fm_url.as_deref(), Some("https://last.fm/al"));
+}
+
+#[tokio::test]
+async fn get_album_info2_missing_element_defaults() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getAlbumInfo2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(r#""dummy":1"#)))
+        .mount(&server)
+        .await;
+
+    let info = client(&server.uri()).get_album_info2("al-2").await.unwrap();
+    assert!(info.notes.is_none());
+    assert!(info.music_brainz_id.is_none());
+}
+
+#[tokio::test]
 async fn get_artist_info2_missing_fields_default() {
     let server = MockServer::start().await;
     Mock::given(path("/rest/getArtistInfo2"))

@@ -19,6 +19,7 @@ use crate::services::library_db::LibraryDb;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
+use crate::ui::{strip_html, truncate_at_word};
 
 const ART_SIZE: u32 = 320;
 
@@ -1022,41 +1023,6 @@ impl Render for ArtistDetailView {
 
 /// Collapsed-bio length; roughly four lines at typical window widths.
 const BIO_PREVIEW_CHARS: usize = 400;
-
-/// Cut `text` down to at most `max_chars`, backing up to the last word
-/// boundary, with a trailing ellipsis.
-fn truncate_at_word(text: &str, max_chars: usize) -> String {
-    let byte_cut = text
-        .char_indices()
-        .nth(max_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    let head = &text[..byte_cut];
-    let cut = head.rfind(char::is_whitespace).unwrap_or(byte_cut);
-    format!("{} …", head[..cut].trim_end())
-}
-
-/// Strip HTML tags and decode the handful of entities Last.fm bios use
-/// (Navidrome forwards agent bios verbatim, tags included).
-fn strip_html(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut in_tag = false;
-    for ch in value.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            c if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .trim()
-        .to_string()
-}
 
 fn is_single_or_ep(album: &Album) -> bool {
     let name = album.name.to_lowercase();

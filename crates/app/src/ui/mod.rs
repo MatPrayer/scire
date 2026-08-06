@@ -59,6 +59,41 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Cut `text` down to at most `max_chars`, backing up to the last word
+/// boundary, with a trailing ellipsis.
+pub fn truncate_at_word(text: &str, max_chars: usize) -> String {
+    let byte_cut = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let head = &text[..byte_cut];
+    let cut = head.rfind(char::is_whitespace).unwrap_or(byte_cut);
+    format!("{} …", head[..cut].trim_end())
+}
+
+/// Strip HTML tags and decode the handful of entities Last.fm text uses
+/// (Navidrome forwards agent bios and album notes verbatim, tags included).
+pub fn strip_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .trim()
+        .to_string()
+}
+
 /// Extra track-row fields selected in settings, joined for display next to
 /// the song title. `include_album` is false on album pages where the album
 /// name is redundant.
@@ -584,24 +619,58 @@ pub fn apply_adaptive_accent(cx: &mut App, accent: Hsla) {
     cx.refresh_windows();
 }
 
-/// Derive a vivid UI accent hue from cover-art bytes. Each pixel is weighted by
-/// how colourful it is (saturation², peaking at mid lightness); the weighted
-/// circular-mean hue becomes the accent, with S/L pinned so it reads cleanly on
-/// a dark background. Returns `None` for greyscale covers (no usable hue).
+/// Derive a UI accent from cover-art bytes. Only a decode failure yields
+/// `None`: every cover that renders must also recolour the UI, or the accent
+/// silently keeps belonging to the *previous* album.
+///
+/// Three passes, first hit wins:
+/// 1. vivid — pixels weighted by saturation², peaking at mid lightness;
+/// 2. relaxed — any tint at all, no lightness penalty. Near-black and
+///    near-white covers (a dark photo, a white sleeve with a faint logo) fail
+///    the first pass entirely, and they are exactly the covers users noticed
+///    the accent sticking on;
+/// 3. neutral — a genuinely monochrome cover has no hue to find, so the accent
+///    is built from its overall lightness instead: still a visible change, and
+///    still legible against the dark base.
 pub fn accent_from_cover_bytes(bytes: &[u8]) -> Option<Hsla> {
     let img = image::load_from_memory(bytes).ok()?.into_rgb8();
+    let pixels: Vec<(f32, f32, f32)> = img
+        .pixels()
+        .map(|p| {
+            rgb_to_hsl(
+                p[0] as f32 / 255.0,
+                p[1] as f32 / 255.0,
+                p[2] as f32 / 255.0,
+            )
+        })
+        .collect();
+    if pixels.is_empty() {
+        return None;
+    }
+    Some(
+        dominant_hue(&pixels, 0.12, true)
+            .or_else(|| dominant_hue(&pixels, 0.03, false))
+            .unwrap_or_else(|| {
+                let mean_l = pixels.iter().map(|(_, _, l)| *l).sum::<f32>() / pixels.len() as f32;
+                neutral_accent(mean_l)
+            }),
+    )
+}
+
+/// Weighted circular mean of the hues of the pixels above `min_sat`, with S/L
+/// pinned so the result reads cleanly on a dark background. `favour_mid`
+/// discounts near-black/near-white pixels — worth doing when there is colour to
+/// spare, worth skipping when there is barely any.
+fn dominant_hue(pixels: &[(f32, f32, f32)], min_sat: f32, favour_mid: bool) -> Option<Hsla> {
     let (mut sin, mut cos, mut wsum, mut ssum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for p in img.pixels() {
-        let (h, s, l) = rgb_to_hsl(
-            p[0] as f32 / 255.0,
-            p[1] as f32 / 255.0,
-            p[2] as f32 / 255.0,
-        );
-        if s < 0.12 {
-            continue; // near-grey: no meaningful hue
+    for &(h, s, l) in pixels {
+        if s < min_sat {
+            continue;
         }
-        // Favour saturated, mid-lightness pixels; discount near-black/near-white.
-        let w = s * s * (1.0 - (2.0 * l - 1.0).powi(2));
+        let mut w = s * s;
+        if favour_mid {
+            w *= 1.0 - (2.0 * l - 1.0).powi(2);
+        }
         let ang = h * std::f32::consts::TAU;
         sin += w * ang.sin();
         cos += w * ang.cos();
@@ -612,6 +681,8 @@ pub fn accent_from_cover_bytes(bytes: &[u8]) -> Option<Hsla> {
         return None;
     }
     let hue = sin.atan2(cos) / std::f32::consts::TAU;
+    // Faint tints get pushed up to a usable saturation: the point is a visible
+    // accent, not a faithful sample of a nearly grey cover.
     let sat = (ssum / wsum * 1.2).clamp(0.5, 0.85);
     Some(Hsla {
         h: hue.rem_euclid(1.0),
@@ -619,6 +690,22 @@ pub fn accent_from_cover_bytes(bytes: &[u8]) -> Option<Hsla> {
         l: 0.55,
         a: 1.0,
     })
+}
+
+/// Accent for a cover with no hue at all. Greys can't be tinted without
+/// inventing a colour, so the lightness of the artwork drives the lightness of
+/// the accent instead: bright sleeves get a near-white accent, black ones a
+/// dim slate, and either is clearly different from the colour left over from
+/// the last album.
+fn neutral_accent(mean_l: f32) -> Hsla {
+    Hsla {
+        h: 0.0,
+        s: 0.0,
+        // Kept off both extremes: pure white loses the hover/active states,
+        // pure black disappears into the surface behind it.
+        l: (0.30 + mean_l * 0.55).clamp(0.30, 0.85),
+        a: 1.0,
+    }
 }
 
 /// Pick black or white text for legibility on the given accent fill.
@@ -774,4 +861,64 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
         window.request_decorations(WindowDecorations::Server);
     }
     window.set_window_title("Scirè");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accent_from_cover_bytes, strip_html, truncate_at_word};
+
+    /// A `w`×1 PNG of one solid colour, in the encoded form the cache holds.
+    fn png(r: u8, g: u8, b: u8) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([r, g, b]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn vivid_cover_keeps_its_hue() {
+        let accent = accent_from_cover_bytes(&png(220, 40, 40)).unwrap();
+        // Red sits at either end of the hue circle.
+        assert!(accent.h < 0.05 || accent.h > 0.95, "hue was {}", accent.h);
+        assert!(accent.s >= 0.5);
+    }
+
+    #[test]
+    fn near_black_cover_still_yields_an_accent() {
+        // Fails the vivid pass (the mid-lightness weight is ~0) but has a tint.
+        let accent = accent_from_cover_bytes(&png(14, 6, 22)).unwrap();
+        assert!(accent.s >= 0.5, "expected a usable saturation");
+    }
+
+    #[test]
+    fn monochrome_covers_track_their_lightness() {
+        let black = accent_from_cover_bytes(&png(0, 0, 0)).unwrap();
+        let white = accent_from_cover_bytes(&png(255, 255, 255)).unwrap();
+        assert_eq!(black.s, 0.0);
+        assert_eq!(white.s, 0.0);
+        // The two must not land on the same accent, or switching between a
+        // black and a white sleeve would leave the UI unchanged.
+        assert!(white.l > black.l + 0.2, "{} vs {}", white.l, black.l);
+        assert!(black.l >= 0.30 && white.l <= 0.85);
+    }
+
+    #[test]
+    fn undecodable_bytes_have_no_accent() {
+        assert!(accent_from_cover_bytes(b"not an image").is_none());
+    }
+
+    #[test]
+    fn strip_html_drops_tags_and_entities() {
+        assert_eq!(
+            strip_html("<p>Rock &amp; roll <a href=\"x\">more</a></p>"),
+            "Rock & roll more"
+        );
+    }
+
+    #[test]
+    fn truncate_at_word_backs_up_to_a_boundary() {
+        assert_eq!(truncate_at_word("one two three", 9), "one two …");
+    }
 }

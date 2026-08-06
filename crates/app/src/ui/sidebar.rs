@@ -31,6 +31,8 @@ pub enum SidebarAction {
     ToggleLibrarySection,
     /// Collapse/expand the playlist list.
     TogglePlaylistSection,
+    /// Rescan local dirs and resync the server catalog now.
+    RefreshLibrary,
 }
 
 pub struct SidebarModel {
@@ -45,6 +47,8 @@ pub struct SidebarModel {
     pub libraries_collapsed: bool,
     /// Playlist list folded away (header stays clickable).
     pub playlists_collapsed: bool,
+    /// A library refresh is running; the row reports it and refuses re-entry.
+    pub refreshing: bool,
 }
 
 pub fn render_sidebar(
@@ -279,6 +283,36 @@ pub fn render_sidebar(
                 .children(playlist_items),
         )
         .child(div().px_3().child(super::divider()))
+        // Manual catalog refresh: the local scan and the server sync otherwise
+        // only run on their own schedule, so newly added music needed a restart.
+        .child({
+            let on_refresh = on_action.clone();
+            let refreshing = model.refreshing;
+            h_flex()
+                .id("sidebar-refresh")
+                .px_3()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .rounded_lg()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .when(!refreshing, |s| {
+                    s.cursor_pointer().hover(|s| s.bg(cx.theme().muted))
+                })
+                .when(refreshing, |s| s.opacity(0.6))
+                .on_click(move |_, window, cx| {
+                    if !refreshing {
+                        on_refresh(SidebarAction::RefreshLibrary, window, cx);
+                    }
+                })
+                .child(crate::assets::app_icon(crate::assets::icons::REFRESH).small())
+                .child(if refreshing {
+                    "Refreshing…"
+                } else {
+                    "Refresh library"
+                })
+        })
         .child(nav_item(
             "Settings",
             IconName::Settings,

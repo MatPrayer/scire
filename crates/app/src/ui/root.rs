@@ -96,6 +96,8 @@ pub struct RootView {
     /// Whether initial local/navidrome sync has been triggered.
     scan_started: bool,
     sync_started: bool,
+    /// A manual library refresh is in flight (sidebar row is disabled).
+    refreshing: bool,
     /// New-playlist dialog state.
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
@@ -334,6 +336,7 @@ impl RootView {
             recent_view: None,
             scan_started: false,
             sync_started: false,
+            refreshing: false,
             last_libraries: Vec::new(),
             libraries_collapsed,
             playlists_collapsed,
@@ -353,6 +356,60 @@ impl RootView {
         }
     }
 
+    /// Rescan the local directories and resync the server catalog on demand.
+    ///
+    /// The background schedules (5 min local rescan, one Navidrome resync per
+    /// session) are the only thing that ever refreshed the DB, so music added
+    /// after launch needed a restart to appear. Runs both halves in sequence —
+    /// the scan is blocking work and the sync issues one `getAlbum` per album,
+    /// and letting them overlap starves the two IO workers.
+    fn refresh_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
+        cx.notify();
+        let dirs: Vec<PathBuf> = self.session.read(cx).settings.local_music_dirs.clone();
+        let client = self.session.read(cx).client.clone();
+        let db = self.library_db.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if !dirs.is_empty() {
+                let scanner = Arc::new(LocalScanner::new(db.clone()));
+                let _ = runtime::spawn_blocking_io(move || scanner.scan(&dirs)).await;
+            }
+            if let Some(client) = client {
+                let _ = runtime::spawn_io(async move {
+                    navidrome_sync::sync_navidrome(db, &client, None).await
+                })
+                .await;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.refreshing = false;
+                // The catalog views hold the rows they were built from and
+                // never reload on their own; drop them so the next visit
+                // re-seeds from what the refresh just wrote.
+                let on_catalog_page = matches!(
+                    this.content,
+                    Some(
+                        Content::Albums(_)
+                            | Content::Artists(_)
+                            | Content::Recent(_)
+                            | Content::LocalMusic(_)
+                    )
+                );
+                this.invalidate_catalog_views();
+                // Redraw the current page only if it is one of those listings —
+                // a detail page the user opened meanwhile must not be replaced
+                // by a grid because a background refresh finished.
+                if on_catalog_page && let Some(section) = this.section {
+                    this.navigate(section, Some(window), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// When the Adaptive theme is active, derive the accent colour from the
     /// current track's cover art and recolour the interactive surfaces. Cheap
     /// no-op for other themes or when the cover hasn't changed.
@@ -361,13 +418,40 @@ impl RootView {
             self.adaptive_cover = None;
             return;
         }
+        let song = self.player.read(cx).current_song().cloned();
+        // Local tracks carry a cache hash instead of a server cover id, and no
+        // client to fetch from — resolve those straight off disk, or the accent
+        // would keep whatever the last streamed album left behind.
+        if let Some(song) = song.as_ref()
+            && song.local_path.is_some()
+        {
+            let path = song
+                .cover_art
+                .as_deref()
+                .and_then(crate::services::local_library::local_art_path)
+                .filter(|p| p.exists());
+            let key = song.cover_art.clone();
+            if key == self.adaptive_cover {
+                return;
+            }
+            self.adaptive_cover = key;
+            let Some(path) = path else { return };
+            cx.spawn(async move |this, cx| {
+                let accent = runtime::spawn_blocking_io(move || {
+                    let bytes = std::fs::read(&path)?;
+                    crate::ui::accent_from_cover_bytes(&bytes)
+                        .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
+                })
+                .await;
+                Self::apply_or_retry(this, accent, cx).await;
+            })
+            .detach();
+            return;
+        }
+
         // Album-scoped key: per-song cover ids would re-extract the accent (and
         // recolour the whole UI) on every track of the same album.
-        let cover = self
-            .player
-            .read(cx)
-            .current_song()
-            .and_then(artwork::song_cover);
+        let cover = song.as_ref().and_then(artwork::song_cover);
         let key = cover.as_ref().map(|(_, key)| key.clone());
         if key == self.adaptive_cover {
             return;
@@ -377,19 +461,35 @@ impl RootView {
         let Some(client) = self.session.read(cx).client.clone() else {
             return;
         };
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let accent = runtime::spawn_io(async move {
                 let path = artwork::fetch_as(client, cover_id, key, 64).await?;
                 let bytes = std::fs::read(&path)?;
                 crate::ui::accent_from_cover_bytes(&bytes)
-                    .ok_or_else(|| anyhow::anyhow!("cover has no usable accent hue"))
+                    .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
             })
             .await;
-            if let Ok(accent) = accent {
-                let _ = cx.update(|cx| crate::ui::apply_adaptive_accent(cx, accent));
-            }
+            Self::apply_or_retry(this, accent, cx).await;
         })
         .detach();
+    }
+
+    /// Apply an extracted accent, or clear the remembered cover key so the next
+    /// player notify retries. Without the reset a single failed fetch pinned the
+    /// UI to the previous album's colour until the track changed again.
+    async fn apply_or_retry(
+        this: gpui::WeakEntity<Self>,
+        accent: anyhow::Result<gpui::Hsla>,
+        cx: &mut gpui::AsyncApp,
+    ) {
+        match accent {
+            Ok(accent) => {
+                let _ = cx.update(|cx| crate::ui::apply_adaptive_accent(cx, accent));
+            }
+            Err(_) => {
+                let _ = this.update(cx, |view, _| view.adaptive_cover = None);
+            }
+        }
     }
 
     /// Drop the retained catalog views so the next visit rebuilds and refetches
@@ -1055,6 +1155,7 @@ impl Render for RootView {
             selected_libraries: self.session.read(cx).library_ids.clone(),
             libraries_collapsed: self.libraries_collapsed,
             playlists_collapsed: self.playlists_collapsed,
+            refreshing: self.refreshing,
         };
 
         let this = cx.entity();
@@ -1185,6 +1286,9 @@ impl Render for RootView {
                                         session.persist_settings();
                                     });
                                     cx.notify();
+                                }
+                                SidebarAction::RefreshLibrary => {
+                                    root.refresh_library(window, cx);
                                 }
                                 SidebarAction::TogglePlaylistSection => {
                                     root.playlists_collapsed = !root.playlists_collapsed;
