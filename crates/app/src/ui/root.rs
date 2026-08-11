@@ -1897,10 +1897,6 @@ impl Render for RootView {
             } else {
                 None
             },
-                Some(NAV_ORDER[self.vi_selected])
-            } else {
-                None
-            },
         };
 
         let this = cx.entity();

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, IntoElement, Render, SharedString,
-    UniformListScrollHandle, Window, div, img, prelude::*, px, uniform_list,
+    App, Context, Entity, EventEmitter, IntoElement, Render, SharedString, UniformListScrollHandle,
+    Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::link::Link;

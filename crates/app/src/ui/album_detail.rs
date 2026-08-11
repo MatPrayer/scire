@@ -23,8 +23,7 @@ use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
 use crate::ui::{
-    focus_glow, format_duration, strip_html, track_extras, truncate_at_word,
-    with_focus_animation,
+    focus_glow, format_duration, strip_html, track_extras, truncate_at_word, with_focus_animation,
 };
 
 const ART_SIZE: u32 = 600;
@@ -1094,6 +1093,41 @@ impl Render for AlbumDetailView {
     }
 }
 
+impl AlbumDetailView {
+    /// Move the vi-mode cursor by `delta` tracks, clamping to the album's
+    /// track list and scrolling the focused row into view.
+    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(count) = self.album.as_ref().map(|a| a.song.len()) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        self.focus_anchor.scroll_to(window, cx);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Play the track under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        if let Some(i) = self.vi_cursor {
+            self.play_from(i, cx);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{fmt_bytes, fmt_khz, quality_chips, replaygain_line};
@@ -1176,40 +1210,5 @@ mod tests {
         assert_eq!(fmt_khz(48000), "48 kHz");
         assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.00 GB");
-    }
-}
-
-impl AlbumDetailView {
-    /// Move the vi-mode cursor by `delta` tracks, clamping to the album's
-    /// track list and scrolling the focused row into view.
-    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(count) = self.album.as_ref().map(|a| a.song.len()) else {
-            return;
-        };
-        if count == 0 {
-            return;
-        }
-        let cur = self.vi_cursor.unwrap_or(0);
-        let next = if delta > 0 {
-            (cur + delta as usize).min(count - 1)
-        } else {
-            cur.saturating_sub(delta.unsigned_abs())
-        };
-        self.vi_cursor = Some(next);
-        self.focus_anchor.scroll_to(window, cx);
-        cx.notify();
-    }
-
-    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
-        if self.vi_cursor.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Play the track under the vi-mode cursor.
-    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
-        if let Some(i) = self.vi_cursor {
-            self.play_from(i, cx);
-        }
     }
 }

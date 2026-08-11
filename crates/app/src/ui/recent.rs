@@ -286,6 +286,44 @@ impl Render for RecentView {
     }
 }
 
+impl RecentView {
+    /// Move the vi-mode cursor by `delta` songs, clamping and scrolling the
+    /// focused row into view.
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.player.read(cx).recently_played.len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        self.scroll.scroll_to_item(next, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Play the song under the vi-mode cursor.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.vi_cursor else {
+            return;
+        };
+        let songs = self.player.read(cx).recently_played.clone();
+        if let Some(song) = songs.get(i) {
+            self.player
+                .update(cx, |p, cx| p.play_queue(vec![song.clone()], 0, cx));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,44 +363,5 @@ mod tests {
         assert!(rows[0].artist.is_empty());
         assert!(rows[0].album.is_empty());
         assert!(rows[0].duration.is_empty());
-    }
-}
-
-impl RecentView {
-    /// Move the vi-mode cursor by `delta` songs, clamping and scrolling the
-    /// focused row into view.
-    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.player.read(cx).recently_played.len();
-        if count == 0 {
-            return;
-        }
-        let cur = self.vi_cursor.unwrap_or(0);
-        let next = if delta > 0 {
-            (cur + delta as usize).min(count - 1)
-        } else {
-            cur.saturating_sub(delta.unsigned_abs())
-        };
-        self.vi_cursor = Some(next);
-        self.scroll
-            .scroll_to_item(next, gpui::ScrollStrategy::Top);
-        cx.notify();
-    }
-
-    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
-        if self.vi_cursor.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Play the song under the vi-mode cursor.
-    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
-        let Some(i) = self.vi_cursor else {
-            return;
-        };
-        let songs = self.player.read(cx).recently_played.clone();
-        if let Some(song) = songs.get(i) {
-            self.player
-                .update(cx, |p, cx| p.play_queue(vec![song.clone()], 0, cx));
-        }
     }
 }
