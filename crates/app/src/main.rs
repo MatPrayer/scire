@@ -7,9 +7,45 @@ mod ui;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Application, Bounds, WindowBounds, px, size};
+use gpui::{
+    App, AppContext as _, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBounds, actions,
+    px, size,
+};
 use gpui_component::Root;
 use services::library_db::LibraryDb;
+
+actions!(scire, [Quit, CloseWindow]);
+
+/// Quit / close-window keys and the macOS menu bar. gpui binds nothing by
+/// itself: without this, cmd-q and cmd-w are dead keys.
+fn init_app_keys(cx: &mut App) {
+    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.on_action(|_: &CloseWindow, cx: &mut App| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
+    });
+    cx.bind_keys([
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-w", CloseWindow, None),
+    ]);
+    cx.set_menus(vec![Menu {
+        name: "Scirè".into(),
+        items: vec![
+            MenuItem::action("Close Window", CloseWindow),
+            MenuItem::separator(),
+            MenuItem::action("Quit Scirè", Quit),
+        ],
+    }]);
+    // Single-window app with no way to reopen one, so the last window closing
+    // (cmd-w or the traffic light) has to end the process, not orphan it.
+    cx.on_window_closed(|cx| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -23,6 +59,7 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
+            init_app_keys(cx);
 
             cx.text_system()
                 .add_fonts(vec![

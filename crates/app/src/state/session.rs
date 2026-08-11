@@ -48,17 +48,33 @@ impl Session {
 
     /// Reconnect using stored credentials (keyring, falling back to any
     /// plaintext field in settings).
+    ///
+    /// The keyring read runs on the blocking pool, never inline. On macOS the
+    /// login keychain puts an authorisation dialog in front of the read
+    /// whenever the running binary is not the one the item's ACL trusts — and
+    /// this is called from `Session::new`, i.e. before `cx.open_window`, so
+    /// doing it inline meant the user answered that dialog with no window
+    /// behind it. Off the main thread the app paints first and the prompt (if
+    /// any) arrives over a live UI.
     fn connect_saved(&mut self, server: ServerConfig, cx: &mut Context<Self>) {
-        let password = config::load_password(&server.url, &server.username)
-            .ok()
-            .or(server.password_plaintext.clone());
-        match password {
-            Some(pw) => self.connect(server.url, server.username, pw, false, cx),
-            None => {
-                self.status =
-                    ConnectionStatus::Failed("stored password not found; log in again".into());
-            }
-        }
+        self.status = ConnectionStatus::Connecting;
+        cx.spawn(async move |this, cx| {
+            let stored = {
+                let url = server.url.clone();
+                let username = server.username.clone();
+                runtime::spawn_blocking_io(move || config::load_password(&url, &username)).await
+            };
+            let password = stored.ok().or(server.password_plaintext.clone());
+            let _ = this.update(cx, |session, cx| match password {
+                Some(pw) => session.connect(server.url, server.username, pw, false, cx),
+                None => {
+                    session.status =
+                        ConnectionStatus::Failed("stored password not found; log in again".into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Validate credentials via `ping`, then persist them on success.
