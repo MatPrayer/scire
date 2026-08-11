@@ -112,6 +112,20 @@ ALTER TABLE albums ADD COLUMN library_id TEXT;
 ALTER TABLE artists ADD COLUMN library_id TEXT;
 ";
 
+/// Indexes for the two columns everything filters on.
+///
+/// `tracks.album_id` is the one that mattered: `album_fingerprints` counts an
+/// album's tracks with a correlated subquery, and unindexed that was a full
+/// scan of the track table *per album* — 1126 albums over 12k tracks cost ~2.3s,
+/// which was most of an incremental sync that issues no requests at all.
+/// `tracks_by_album` (album detail view) reads the same index.
+const SCHEMA_V4: &str = "
+CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_source ON tracks(source);
+CREATE INDEX IF NOT EXISTS idx_albums_source ON albums(source);
+CREATE INDEX IF NOT EXISTS idx_artists_source ON artists(source);
+";
+
 // ---------------------------------------------------------------------------
 // LibraryDb
 // ---------------------------------------------------------------------------
@@ -181,6 +195,10 @@ impl LibraryDb {
         if version < 3 {
             conn.execute_batch(SCHEMA_V3)?;
             conn.execute("INSERT INTO _schema_version (version) VALUES (3)", [])?;
+        }
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
+            conn.execute("INSERT INTO _schema_version (version) VALUES (4)", [])?;
         }
         Ok(())
     }
@@ -394,6 +412,56 @@ impl LibraryDb {
         Ok(())
     }
 
+    /// Upsert many albums and their artists in one transaction.
+    ///
+    /// SQLite autocommits every statement, so a thousand single upserts is a
+    /// thousand commits — that alone was ~3s of an otherwise ~1s incremental
+    /// sync. `artists` is `(id, name, library_id)`, deduplicated by the caller.
+    pub fn upsert_catalog(
+        &self,
+        source: &str,
+        albums: &[AlbumRow],
+        artists: &[(String, String, Option<String>)],
+    ) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO artists (id, source, name, cover_art, library_id)
+                 VALUES (?1,?2,?3,NULL,?4)",
+            )?;
+            for (id, name, library_id) in artists {
+                stmt.execute(rusqlite::params![id, source, name, library_id])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO albums
+                 (id, source, title, artist, artist_id, year, cover_art, song_count, duration,
+                  created, play_count, starred_at, library_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            )?;
+            for album in albums {
+                stmt.execute(rusqlite::params![
+                    album.id,
+                    album.source,
+                    album.title,
+                    album.artist,
+                    album.artist_id,
+                    album.year,
+                    album.cover_art,
+                    album.song_count,
+                    album.duration,
+                    album.created,
+                    album.play_count,
+                    album.starred,
+                    album.library_id,
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// List all albums for a given source, alphabetically. Tabs that sort on
     /// another key re-sort in memory — the whole point of carrying `created`,
     /// `play_count` and `starred` on the row.
@@ -423,6 +491,71 @@ impl LibraryDb {
             })
         })?;
         rows.collect()
+    }
+
+    /// What the cache already holds for every album of `source`, keyed by id.
+    ///
+    /// This is what makes an incremental sync possible: the listing endpoint
+    /// hands back each album's `songCount`/`duration` for free, so comparing
+    /// them against these tells us which albums need their tracks re-fetched
+    /// without issuing a single extra request. `track_rows` is counted rather
+    /// than trusted from `song_count` because a sync interrupted partway
+    /// through leaves album rows whose tracks never landed, and those must be
+    /// picked up again rather than looking complete.
+    pub fn album_fingerprints(
+        &self,
+        source: &str,
+    ) -> Result<HashMap<String, AlbumFingerprint>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.song_count, a.duration,
+                    (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id)
+             FROM albums a WHERE a.source = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                AlbumFingerprint {
+                    song_count: row.get(1)?,
+                    duration: row.get(2)?,
+                    track_rows: row.get(3)?,
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Drop one album's tracks, leaving the album row in place.
+    pub fn delete_tracks_for_album(&self, album_id: &str) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM tracks WHERE album_id = ?1",
+            rusqlite::params![album_id],
+        )
+    }
+
+    /// Drop one album and the tracks hanging off it.
+    pub fn delete_album_with_tracks(&self, album_id: &str) -> Result<(), rusqlite::Error> {
+        self.delete_tracks_for_album(album_id)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM albums WHERE id = ?1",
+            rusqlite::params![album_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove artists of `source` that no album points at any more.
+    ///
+    /// An incremental sync deletes albums one at a time and can't tell whether
+    /// the artist behind one still has other records; this sweeps up afterwards.
+    pub fn prune_orphan_artists(&self, source: &str) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM artists WHERE source = ?1 AND id NOT IN
+                 (SELECT artist_id FROM albums WHERE artist_id IS NOT NULL)",
+            rusqlite::params![source],
+        )
     }
 
     // ------------------------------------------------------------------
@@ -649,6 +782,16 @@ impl TrackRow {
     }
 }
 
+/// What a sync compares a listed album against to decide whether its tracks
+/// still need fetching. See `LibraryDb::album_fingerprints`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlbumFingerprint {
+    pub song_count: i64,
+    pub duration: f64,
+    /// Track rows actually present, which is not always `song_count`.
+    pub track_rows: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AlbumRow {
     pub id: String,
@@ -742,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_3() {
+    fn schema_version_is_4() {
         let db = test_db();
         let conn = db.conn.lock().unwrap();
         let version: i32 = conn
@@ -750,7 +893,24 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn the_album_id_index_exists() {
+        // `album_fingerprints` counts tracks per album; without this index that
+        // is a full scan of the track table per album.
+        let db = test_db();
+        let conn = db.conn.lock().unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_tracks_album'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

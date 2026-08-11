@@ -16,6 +16,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod visualizer;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -34,6 +35,36 @@ use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref};
 fn settings_theme_path() -> Option<PathBuf> {
     let dirs = ProjectDirs::from("", "", "scire")?;
     Some(dirs.config_dir().join("theme.json"))
+}
+
+/// Await `work` while calling `tick` every `interval`.
+///
+/// The long-running library jobs report progress by writing into atomics — they
+/// run on the IO runtime and have no handle on any view — so something has to
+/// sample them and repaint. `work` goes to gpui's background executor and sets a
+/// flag when it lands, rather than being selected over, which keeps this to the
+/// crates already in the tree. The ticker is gpui's timer and not `tokio::time`:
+/// gpui tasks have no reactor in scope and `sleep` panics there.
+pub async fn poll_until_done<T: Send + 'static>(
+    cx: &mut gpui::AsyncApp,
+    interval: Duration,
+    work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+    mut tick: impl FnMut(&mut gpui::AsyncApp),
+) -> anyhow::Result<T> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    let task = cx.background_spawn(async move {
+        let result = work.await;
+        flag.store(true, Ordering::SeqCst);
+        result
+    });
+    while !done.load(Ordering::SeqCst) {
+        cx.background_executor().timer(interval).await;
+        tick(cx);
+    }
+    task.await
 }
 
 /// Seek position for a `fraction` [0,1] of `total`, guarding against NaN /

@@ -2,15 +2,18 @@
 //! (sidebar | content | optional queue panel / player bar).
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    NavigationDirection, Render, SharedString, Window, div, prelude::*, px,
+    AsyncWindowContext, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    MouseButton, NavigationDirection, Render, SharedString, WeakEntity, Window, div, prelude::*,
+    px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, StyledExt as _, TitleBar, h_flex, v_flex};
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::{DefaultPage, ThemePref};
 use crate::services::{
@@ -36,6 +39,9 @@ use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 use crate::ui::settings::SettingsView;
 use crate::ui::sidebar::{NavSection, SidebarAction, SidebarModel, render_sidebar};
 
+/// How often a running refresh resamples its workers' progress counters.
+const REFRESH_POLL: Duration = Duration::from_millis(400);
+
 #[derive(Clone)]
 enum NavEntry {
     Section(NavSection),
@@ -57,6 +63,52 @@ enum Content {
     Settings(Entity<SettingsView>),
     Recent(Entity<RecentView>),
     LocalMusic(Entity<LocalMusicView>),
+}
+
+/// Where a manual library refresh has got to.
+///
+/// The steps have different shapes — a disk walk with an open-ended file count,
+/// a listing pass with nothing to count at all, and a per-album fetch with a
+/// real denominator — so the sidebar needs to know which one it is looking at
+/// rather than just "busy".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefreshStage {
+    #[default]
+    Idle,
+    /// Walking the local music directories; carries files seen so far.
+    LocalScan(usize),
+    /// Fetching the album listing and diffing it against the cache. Usually
+    /// over in a second or two, and the only stage a refresh that finds nothing
+    /// new ever reaches.
+    Comparing,
+    /// Fetching tracks for the albums that changed; `(done, total)`.
+    Import(usize, usize),
+}
+
+impl RefreshStage {
+    /// Fraction complete, or `None` for the stages with no known total — those
+    /// get an indeterminate bar instead of a lying one.
+    pub fn fraction(self) -> Option<f32> {
+        match self {
+            RefreshStage::Import(done, total) if total > 0 => {
+                Some((done as f32 / total as f32).clamp(0.0, 1.0))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            RefreshStage::Idle => "Refreshing…".into(),
+            RefreshStage::LocalScan(0) => "Scanning local files…".into(),
+            RefreshStage::LocalScan(n) => format!("Scanning local files… {n}"),
+            RefreshStage::Comparing => "Checking for new music…".into(),
+            // Zero albums to fetch means the listing found nothing new, so this
+            // stage passes straight through without ever showing a count.
+            RefreshStage::Import(_, 0) => "Checking for new music…".into(),
+            RefreshStage::Import(done, total) => format!("Fetching {done}/{total} albums"),
+        }
+    }
 }
 
 pub struct RootView {
@@ -98,6 +150,8 @@ pub struct RootView {
     sync_started: bool,
     /// A manual library refresh is in flight (sidebar row is disabled).
     refreshing: bool,
+    /// What that refresh is doing right now, for the sidebar's progress bar.
+    refresh_stage: RefreshStage,
     /// New-playlist dialog state.
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
@@ -274,15 +328,24 @@ impl RootView {
                 this.sync_started = true;
                 let db = this.library_db.clone();
                 cx.spawn(async move |this, cx| {
-                    // Deliberately held back: this is a full truncate-and-resync
-                    // (one getAlbum per album), so it must not compete with the
-                    // album grid's own first page. The grid renders the rows
-                    // this wrote on the *previous* run while it waits.
+                    // Held back so it doesn't compete with the album grid's own
+                    // first page. The grid renders the rows this wrote on the
+                    // *previous* run while it waits. Incremental, so on a
+                    // settled library it costs the listing and nothing else —
+                    // the first run against an empty cache is the expensive one.
                     cx.background_executor()
                         .timer(std::time::Duration::from_secs(30))
                         .await;
+                    let progress = Arc::new(navidrome_sync::SyncProgress::default());
                     let _ = runtime::spawn_io(async move {
-                        navidrome_sync::sync_navidrome(db, &client, None).await
+                        navidrome_sync::sync_navidrome(
+                            db,
+                            &client,
+                            None,
+                            progress,
+                            navidrome_sync::SyncMode::Incremental,
+                        )
+                        .await
                     })
                     .await;
                     let _ = this.update(cx, |_, _| {});
@@ -337,6 +400,7 @@ impl RootView {
             scan_started: false,
             sync_started: false,
             refreshing: false,
+            refresh_stage: RefreshStage::Idle,
             last_libraries: Vec::new(),
             libraries_collapsed,
             playlists_collapsed,
@@ -356,18 +420,27 @@ impl RootView {
         }
     }
 
-    /// Rescan the local directories and resync the server catalog on demand.
+    /// Rescan everything on demand: the server's own media scan, the local
+    /// directories, then the catalog re-import.
     ///
     /// The background schedules (5 min local rescan, one Navidrome resync per
     /// session) are the only thing that ever refreshed the DB, so music added
-    /// after launch needed a restart to appear. Runs both halves in sequence —
-    /// the scan is blocking work and the sync issues one `getAlbum` per album,
-    /// and letting them overlap starves the two IO workers.
+    /// after launch needed a restart to appear.
+    ///
+    /// This deliberately does *not* ask the server to rescan its disk. That is
+    /// the slow, occasional operation and it lives in Settings; refreshing the
+    /// local cache against what the server already knows is the fast, frequent
+    /// one, and pairing them made every refresh cost a full server walk.
+    ///
+    /// The steps run in sequence — the local scan is blocking work and the
+    /// import issues one `getAlbum` per changed album, and letting them overlap
+    /// starves the two IO workers.
     fn refresh_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.refreshing {
             return;
         }
         self.refreshing = true;
+        self.refresh_stage = RefreshStage::Idle;
         cx.notify();
         let dirs: Vec<PathBuf> = self.session.read(cx).settings.local_music_dirs.clone();
         let client = self.session.read(cx).client.clone();
@@ -375,16 +448,45 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             if !dirs.is_empty() {
                 let scanner = Arc::new(LocalScanner::new(db.clone()));
-                let _ = runtime::spawn_blocking_io(move || scanner.scan(&dirs)).await;
+                let watched = scanner.clone();
+                let scan = runtime::spawn_blocking_io(move || scanner.scan(&dirs));
+                Self::drive_progress(&this, cx, scan, move || {
+                    RefreshStage::LocalScan(watched.progress())
+                })
+                .await;
             }
             if let Some(client) = client {
-                let _ = runtime::spawn_io(async move {
-                    navidrome_sync::sync_navidrome(db, &client, None).await
+                let _ = this.update(cx, |this, cx| {
+                    this.refresh_stage = RefreshStage::Comparing;
+                    cx.notify();
+                });
+                let progress = Arc::new(navidrome_sync::SyncProgress::default());
+                let watched = progress.clone();
+                let sync = runtime::spawn_io(async move {
+                    navidrome_sync::sync_navidrome(
+                        db,
+                        &client,
+                        None,
+                        progress,
+                        navidrome_sync::SyncMode::Incremental,
+                    )
+                    .await
+                });
+                Self::drive_progress(&this, cx, sync, move || {
+                    let (done, total) = watched.snapshot();
+                    // `total` is 0 until the listing pass finishes; showing
+                    // "0/0 albums" for that stretch reads as broken.
+                    if total == 0 {
+                        RefreshStage::Comparing
+                    } else {
+                        RefreshStage::Import(done, total)
+                    }
                 })
                 .await;
             }
             let _ = this.update_in(cx, |this, window, cx| {
                 this.refreshing = false;
+                this.refresh_stage = RefreshStage::Idle;
                 // The catalog views hold the rows they were built from and
                 // never reload on their own; drop them so the next visit
                 // re-seeds from what the refresh just wrote.
@@ -408,6 +510,29 @@ impl RootView {
             });
         })
         .detach();
+    }
+
+    /// Await `work` while republishing `stage()` into the sidebar a few times a
+    /// second.
+    async fn drive_progress<T: Send + 'static>(
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncWindowContext,
+        work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+        stage: impl Fn() -> RefreshStage,
+    ) {
+        let result = crate::ui::poll_until_done(cx, REFRESH_POLL, work, |cx| {
+            let stage = stage();
+            let _ = this.update(cx, |this, cx| {
+                if this.refresh_stage != stage {
+                    this.refresh_stage = stage;
+                    cx.notify();
+                }
+            });
+        })
+        .await;
+        if let Err(e) = result {
+            tracing::warn!("library refresh step failed: {e}");
+        }
     }
 
     /// When the Adaptive theme is active, derive the accent colour from the
@@ -634,7 +759,13 @@ impl RootView {
                     return;
                 };
                 let view = cx.new(|cx| {
-                    SettingsView::new(self.session.clone(), self.player.clone(), window, cx)
+                    SettingsView::new(
+                        self.session.clone(),
+                        self.player.clone(),
+                        self.library_db.clone(),
+                        window,
+                        cx,
+                    )
                 });
                 Content::Settings(view)
             }
@@ -1156,6 +1287,7 @@ impl Render for RootView {
             libraries_collapsed: self.libraries_collapsed,
             playlists_collapsed: self.playlists_collapsed,
             refreshing: self.refreshing,
+            refresh_stage: self.refresh_stage,
         };
 
         let this = cx.entity();
@@ -1357,5 +1489,45 @@ impl Render for RootView {
                 )
             })
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefreshStage;
+
+    #[test]
+    fn only_the_import_stage_has_a_fraction() {
+        // The others count upward against no known total, so a bar drawn for
+        // them could only be guessing.
+        assert_eq!(RefreshStage::Idle.fraction(), None);
+        assert_eq!(RefreshStage::Comparing.fraction(), None);
+        assert_eq!(RefreshStage::LocalScan(120).fraction(), None);
+        assert_eq!(RefreshStage::Import(1, 4).fraction(), Some(0.25));
+    }
+
+    #[test]
+    fn import_fraction_survives_a_zero_or_overshooting_total() {
+        // `total` is 0 for the whole listing pass, and `done` can reach it
+        // exactly — neither may produce NaN or a bar wider than its track.
+        assert_eq!(RefreshStage::Import(0, 0).fraction(), None);
+        assert_eq!(RefreshStage::Import(7, 0).fraction(), None);
+        assert_eq!(RefreshStage::Import(9, 4).fraction(), Some(1.0));
+    }
+
+    #[test]
+    fn labels_drop_a_zero_count_instead_of_showing_it() {
+        assert_eq!(RefreshStage::LocalScan(0).label(), "Scanning local files…");
+        assert_eq!(
+            RefreshStage::LocalScan(42).label(),
+            "Scanning local files… 42"
+        );
+        // A refresh that finds nothing new never leaves this wording.
+        assert_eq!(RefreshStage::Comparing.label(), "Checking for new music…");
+        assert_eq!(
+            RefreshStage::Import(0, 0).label(),
+            "Checking for new music…"
+        );
+        assert_eq!(RefreshStage::Import(3, 10).label(), "Fetching 3/10 albums");
     }
 }

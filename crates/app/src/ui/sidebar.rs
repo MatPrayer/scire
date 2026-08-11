@@ -1,6 +1,8 @@
 //! Left navigation rail: library switcher + sections + playlists.
 
-use gpui::{App, IntoElement, SharedString, Window, div, hsla, prelude::*, px};
+use gpui::{App, IntoElement, SharedString, Window, div, hsla, prelude::*, px, relative};
+
+use crate::ui::root::RefreshStage;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -49,6 +51,33 @@ pub struct SidebarModel {
     pub playlists_collapsed: bool,
     /// A library refresh is running; the row reports it and refuses re-entry.
     pub refreshing: bool,
+    /// Which step that refresh is on, for the label and the progress bar.
+    pub refresh_stage: RefreshStage,
+}
+
+/// Thin progress track under the refresh row.
+///
+/// Only the catalog import knows how much is left; the server scan and the
+/// disk walk report a rising count against no total at all. Those get a dim
+/// track with no fill rather than a bar creeping toward a made-up finish —
+/// the count in the label is the real signal, and a fake bar that stalls at
+/// 90% is worse than no bar.
+fn refresh_bar(stage: RefreshStage, cx: &App) -> impl IntoElement {
+    let track = cx.theme().muted;
+    div()
+        .w_full()
+        .h(px(3.))
+        .rounded_full()
+        .bg(track)
+        .when_some(stage.fraction(), |s, fraction| {
+            s.child(
+                div()
+                    .h_full()
+                    .w(relative(fraction))
+                    .rounded_full()
+                    .bg(cx.theme().primary),
+            )
+        })
 }
 
 pub fn render_sidebar(
@@ -288,30 +317,38 @@ pub fn render_sidebar(
         .child({
             let on_refresh = on_action.clone();
             let refreshing = model.refreshing;
-            h_flex()
+            let stage = model.refresh_stage;
+            v_flex()
                 .id("sidebar-refresh")
                 .px_3()
                 .py_1p5()
-                .gap_2()
-                .items_center()
+                .gap_1()
                 .rounded_lg()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .when(!refreshing, |s| {
                     s.cursor_pointer().hover(|s| s.bg(cx.theme().muted))
                 })
-                .when(refreshing, |s| s.opacity(0.6))
                 .on_click(move |_, window, cx| {
                     if !refreshing {
                         on_refresh(SidebarAction::RefreshLibrary, window, cx);
                     }
                 })
-                .child(crate::assets::app_icon(crate::assets::icons::REFRESH).small())
-                .child(if refreshing {
-                    "Refreshing…"
-                } else {
-                    "Refresh library"
-                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .when(refreshing, |s| s.opacity(0.6))
+                        .child(crate::assets::app_icon(crate::assets::icons::REFRESH).small())
+                        .child(if refreshing {
+                            SharedString::from(stage.label())
+                        } else {
+                            SharedString::from("Refresh library")
+                        }),
+                )
+                // A refresh is minutes of work on a big library. Without a bar
+                // the row read as hung, which is exactly what it looked like.
+                .when(refreshing, |s| s.child(refresh_bar(stage, cx)))
         })
         .child(nav_item(
             "Settings",

@@ -1,15 +1,22 @@
 //! Settings: window chrome, theme, playback, streaming, storage, account.
 
-use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
+use gpui::{App, Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::switch::Switch;
-use gpui_component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+};
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::config::{
     CoverSize, DefaultPage, FullscreenBackground, QueueEndBehavior, ReplayGainMode, ThemePref,
 };
-use crate::services::artwork;
+use crate::services::library_db::LibraryDb;
+use crate::services::{artwork, navidrome_sync, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
@@ -41,16 +48,101 @@ const COVER_SIZES: &[(&str, CoverSize)] = &[
     ("Extra large", CoverSize::ExtraLarge),
 ];
 
+/// How often the two library maintenance jobs republish their progress.
+const LIBRARY_TASK_POLL: Duration = Duration::from_millis(500);
+
+/// State of one of the maintenance jobs in the Library section.
+///
+/// Both are long, both can fail in ways the user needs told about (a server
+/// rescan is admin-only on Navidrome), and neither has a meaningful total — so
+/// they report a status line rather than a bar.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum TaskState {
+    #[default]
+    Idle,
+    Running(String),
+    Done(String),
+    Failed(String),
+}
+
+impl TaskState {
+    fn is_running(&self) -> bool {
+        matches!(self, TaskState::Running(_))
+    }
+
+    fn message(&self) -> Option<&str> {
+        match self {
+            TaskState::Idle => None,
+            TaskState::Running(m) | TaskState::Done(m) | TaskState::Failed(m) => Some(m),
+        }
+    }
+}
+
 pub struct SettingsView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
     dir_input: Entity<InputState>,
+    library_db: Arc<LibraryDb>,
+    server_scan: TaskState,
+    rebuild: TaskState,
+}
+
+/// One maintenance job: description, its button, and whatever it last reported.
+///
+/// Stacked rather than description-left / button-right: every other setting in
+/// this pane puts its explanation above its controls, and a flex-1 text column
+/// beside a button left the two on different baselines.
+fn library_task_row(
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    state: &TaskState,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &Context<SettingsView>,
+) -> impl IntoElement {
+    let running = state.is_running();
+    let message = state.message().map(|m| m.to_string());
+    let failed = matches!(state, TaskState::Failed(_));
+    v_flex()
+        .gap_1p5()
+        .items_start()
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(description),
+        )
+        // Wrapped so the button keeps its natural width: a bare child of a
+        // column stretches to the full row.
+        .child(
+            h_flex().child(
+                Button::new(id)
+                    .outline()
+                    .small()
+                    .label(label)
+                    .disabled(running)
+                    .on_click(on_click),
+            ),
+        )
+        .when_some(message, |this, message| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(if failed {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(message),
+            )
+        })
 }
 
 impl SettingsView {
     pub fn new(
         session: Entity<Session>,
         player: Entity<PlayerState>,
+        library_db: Arc<LibraryDb>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -60,7 +152,116 @@ impl SettingsView {
             session,
             player,
             dir_input,
+            library_db,
+            server_scan: TaskState::default(),
+            rebuild: TaskState::default(),
         }
+    }
+
+    /// Ask Navidrome to walk its music directories.
+    ///
+    /// Kept out of the sidebar's Refresh: this is the server reading every file
+    /// it owns, which is minutes of work and only needed when files have
+    /// actually been added to disk. Refresh reconciles against what the server
+    /// already knows and is the one to reach for otherwise.
+    fn scan_server(&mut self, cx: &mut Context<Self>) {
+        if self.server_scan.is_running() {
+            return;
+        }
+        let Some(client) = self.session.read(cx).client.clone() else {
+            self.server_scan = TaskState::Failed("Not connected to a server".into());
+            cx.notify();
+            return;
+        };
+        self.server_scan = TaskState::Running("Starting scan…".into());
+        cx.notify();
+
+        let files = Arc::new(AtomicU64::new(0));
+        let watched = files.clone();
+        cx.spawn(async move |this, cx| {
+            let work =
+                runtime::spawn_io(
+                    async move { navidrome_sync::run_server_scan(&client, files).await },
+                );
+            let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, work, |cx| {
+                let seen = watched.load(Ordering::Relaxed);
+                let _ = this.update(cx, |this, cx| {
+                    this.server_scan = TaskState::Running(if seen == 0 {
+                        "Scanning…".into()
+                    } else {
+                        format!("Scanning… {seen} files")
+                    });
+                    cx.notify();
+                });
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.server_scan = match result {
+                    Ok(count) => TaskState::Done(format!(
+                        "Server scan finished ({count} files). Refresh to pick up new albums."
+                    )),
+                    // Most often error 50: Navidrome only lets admins start a
+                    // scan. Say what happened rather than failing silently.
+                    Err(e) => TaskState::Failed(format!("Scan failed: {e}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Throw away the cached catalog and re-import every album from scratch.
+    ///
+    /// The escape hatch behind the incremental refresh: that one re-fetches an
+    /// album's tracks when the listing's track count or duration moves, so an
+    /// album re-tagged without either changing is the case it cannot see.
+    fn rebuild_cache(&mut self, cx: &mut Context<Self>) {
+        if self.rebuild.is_running() {
+            return;
+        }
+        let Some(client) = self.session.read(cx).client.clone() else {
+            self.rebuild = TaskState::Failed("Not connected to a server".into());
+            cx.notify();
+            return;
+        };
+        self.rebuild = TaskState::Running("Reading catalog…".into());
+        cx.notify();
+
+        let db = self.library_db.clone();
+        let progress = Arc::new(navidrome_sync::SyncProgress::default());
+        let watched = progress.clone();
+        cx.spawn(async move |this, cx| {
+            let work = runtime::spawn_io(async move {
+                navidrome_sync::sync_navidrome(
+                    db,
+                    &client,
+                    None,
+                    progress,
+                    navidrome_sync::SyncMode::Full,
+                )
+                .await
+            });
+            let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, work, |cx| {
+                let (done, total) = watched.snapshot();
+                let _ = this.update(cx, |this, cx| {
+                    this.rebuild = TaskState::Running(if total == 0 {
+                        "Reading catalog…".into()
+                    } else {
+                        format!("Importing {done}/{total} albums")
+                    });
+                    cx.notify();
+                });
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.rebuild = match result {
+                    Ok(()) => TaskState::Done("Library cache rebuilt.".into()),
+                    Err(e) => TaskState::Failed(format!("Rebuild failed: {e}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn persist(&self, cx: &Context<Self>) {
@@ -840,6 +1041,48 @@ impl Render for SettingsView {
                                         },
                                     ))),
                             ),
+                    )
+                    // Library maintenance. The everyday refresh lives in the
+                    // sidebar; these two are the slow, occasional jobs.
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .p_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+                            .bg(cx.theme().sidebar)
+                            .child(div().text_sm().font_medium().child("Library"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "Refresh in the sidebar picks up albums the server already \
+                                         knows about. These two are slower and rarely needed.",
+                                    ),
+                            )
+                            .child(library_task_row(
+                                "scan-server",
+                                "Scan server library",
+                                "Have the server re-read its music folders. Needed after adding \
+                                 files to the server itself. Requires an admin account.",
+                                &self.server_scan,
+                                cx.listener(|this, _, _, cx| this.scan_server(cx)),
+                                cx,
+                            ))
+                            // Two description-then-button blocks in a row read
+                            // as one paragraph without something between them.
+                            .child(crate::ui::divider())
+                            .child(library_task_row(
+                                "rebuild-cache",
+                                "Rebuild local cache",
+                                "Re-import every album from the server. Fixes a cache that has \
+                                 drifted, e.g. after re-tagging music in place.",
+                                &self.rebuild,
+                                cx.listener(|this, _, _, cx| this.rebuild_cache(cx)),
+                                cx,
+                            )),
                     )
                     // Local Music
                     .child(

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use lofty::Accessor;
@@ -17,6 +17,15 @@ use crate::services::library_db::{AlbumRow, LibraryDb};
 pub const IDLE: u8 = 0;
 pub const SCANNING: u8 = 1;
 pub const DONE: u8 = 2;
+
+/// Set while *any* scanner is walking the disk.
+///
+/// The 5-minute background rescan and the sidebar's manual refresh each build
+/// their own `LocalScanner`, so a per-instance flag doesn't see the other one:
+/// a manual refresh landing on a background tick had two walks competing for
+/// the same SQLite write lock, and each one's `cleanup_stale_entries` ran
+/// against a half-filled `seen` set.
+static SCAN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Local music directory scanner.
 pub struct LocalScanner {
@@ -41,9 +50,21 @@ impl LocalScanner {
         self.progress.load(Ordering::Relaxed)
     }
 
+    /// Whether any scanner is currently walking the disk.
+    pub fn scan_in_flight() -> bool {
+        SCAN_IN_FLIGHT.load(Ordering::Relaxed)
+    }
+
     /// Scan directories, populate DB. Synchronous and long-running — callers
     /// must use `runtime::spawn_blocking_io`, never `spawn_io`.
+    ///
+    /// A no-op while another scan is walking the same directories.
     pub fn scan(&self, dirs: &[PathBuf]) -> Result<()> {
+        if SCAN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+            tracing::debug!("local scan already running; skipping");
+            return Ok(());
+        }
+        let _guard = ScanGuard;
         self.status.store(SCANNING, Ordering::Relaxed);
         self.progress.store(0, Ordering::Relaxed);
         let exts = [
@@ -68,6 +89,17 @@ impl LocalScanner {
         self.db.bump_scan_version();
         self.status.store(DONE, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+/// Clears `SCAN_IN_FLIGHT` however `scan` leaves — including on the `?` that
+/// an unreadable directory can raise, which would otherwise wedge the flag on
+/// and silence every later scan for the rest of the session.
+struct ScanGuard;
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        SCAN_IN_FLIGHT.store(false, Ordering::SeqCst);
     }
 }
 
@@ -353,18 +385,24 @@ pub fn local_art_path(hash: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    /// `SCAN_IN_FLIGHT` is process-global, so two scanning tests running at once
+    /// would have one of them skip its scan and report IDLE. They also shared
+    /// one temp directory, which each `test_scanner` wipes on entry.
+    static SCAN_TESTS: Mutex<()> = Mutex::new(());
 
     fn test_db() -> Arc<LibraryDb> {
         Arc::new(LibraryDb::open_in_memory().unwrap())
     }
 
-    fn test_scanner() -> (LocalScanner, PathBuf) {
+    fn test_scanner() -> (LocalScanner, PathBuf, MutexGuard<'static, ()>) {
+        let guard = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("scire-local-lib-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let scanner = LocalScanner::new(test_db());
-        (scanner, dir)
+        (scanner, dir, guard)
     }
 
     fn cleanup(dir: &Path) {
@@ -373,7 +411,7 @@ mod tests {
 
     #[test]
     fn scan_empty_dir() {
-        let (scanner, dir) = test_scanner();
+        let (scanner, dir, _guard) = test_scanner();
         scanner.scan(std::slice::from_ref(&dir)).unwrap();
         assert_eq!(scanner.status(), DONE);
         assert_eq!(scanner.progress(), 0);
@@ -382,7 +420,7 @@ mod tests {
 
     #[test]
     fn scan_skips_dot_dirs() {
-        let (scanner, dir) = test_scanner();
+        let (scanner, dir, _guard) = test_scanner();
         let dotdir = dir.join(".hidden");
         std::fs::create_dir_all(&dotdir).unwrap();
         let f = dotdir.join("song.flac");
@@ -394,11 +432,37 @@ mod tests {
 
     #[test]
     fn scan_nonexistent_dir_skips_gracefully() {
+        // Holds the same lock as the other scanning tests: `scan` is a no-op
+        // while another one holds `SCAN_IN_FLIGHT`, and the status would then
+        // never leave IDLE.
+        let _guard = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let scanner = LocalScanner::new(test_db());
         scanner
             .scan(&[PathBuf::from("/nonexistent_path_xyz")])
             .unwrap();
         assert_eq!(scanner.status(), DONE);
+    }
+
+    #[test]
+    fn a_second_scan_is_skipped_while_one_is_in_flight() {
+        let _guard = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        SCAN_IN_FLIGHT.store(true, Ordering::SeqCst);
+        let scanner = LocalScanner::new(test_db());
+        let result = scanner.scan(&[PathBuf::from("/nonexistent_path_xyz")]);
+        SCAN_IN_FLIGHT.store(false, Ordering::SeqCst);
+        // Skipped, not failed — the caller's refresh carries on to the import.
+        assert!(result.is_ok());
+        assert_eq!(scanner.status(), IDLE);
+    }
+
+    #[test]
+    fn the_in_flight_flag_clears_after_a_scan() {
+        let _guard = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let scanner = LocalScanner::new(test_db());
+        scanner
+            .scan(&[PathBuf::from("/nonexistent_path_xyz")])
+            .unwrap();
+        assert!(!LocalScanner::scan_in_flight());
     }
 
     #[test]
