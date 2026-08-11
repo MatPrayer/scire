@@ -282,3 +282,51 @@ async fn get_artist_info2_missing_fields_default() {
     assert!(info.biography.is_none());
     assert!(info.image_url().is_none());
 }
+
+#[tokio::test]
+async fn start_scan_parses_scan_status() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/startScan"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(ok_body(r#""scanStatus":{"scanning":true,"count":1234}"#)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let status = client(&server.uri()).start_scan().await.unwrap();
+    assert!(status.scanning);
+    assert_eq!(status.count, Some(1234));
+}
+
+#[tokio::test]
+async fn get_scan_status_parses_idle_without_count() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getScanStatus"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(ok_body(r#""scanStatus":{"scanning":false}"#)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let status = client(&server.uri()).get_scan_status().await.unwrap();
+    assert!(!status.scanning);
+    assert!(status.count.is_none());
+}
+
+#[tokio::test]
+async fn start_scan_maps_not_authorized_error() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/startScan"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":50,"message":"forbidden"}}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let err = client(&server.uri()).start_scan().await.unwrap_err();
+    assert!(matches!(err, Error::Api { .. }));
+}
