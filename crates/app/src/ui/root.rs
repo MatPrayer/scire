@@ -9,8 +9,8 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
-    h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
+    v_flex,
 };
 
 use std::future::Future;
@@ -1626,6 +1626,7 @@ impl RootView {
 
     fn render_setup(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let client_titlebar = self.session.read(cx).settings.client_titlebar;
+        let minimal_titlebar = self.session.read(cx).settings.minimal_titlebar;
         let field = |label: &'static str, input: &Entity<InputState>| {
             v_flex()
                 .gap_1()
@@ -1791,14 +1792,7 @@ impl RootView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .when(client_titlebar, |this| {
-                this.child(
-                    TitleBar::new().child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Scirè"),
-                    ),
-                )
+                this.child(crate::ui::title_bar(minimal_titlebar, cx))
             })
             .child(
                 div()
@@ -1963,6 +1957,7 @@ impl Render for RootView {
         let fullscreen = self.fullscreen.clone();
         let show_fullscreen = self.show_fullscreen;
         let client_titlebar = self.session.read(cx).settings.client_titlebar;
+        let minimal_titlebar = self.session.read(cx).settings.minimal_titlebar;
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
 
         v_flex()
@@ -2048,14 +2043,7 @@ impl Render for RootView {
                 }
             }))
             .when(client_titlebar, |this| {
-                this.child(
-                    TitleBar::new().child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Scirè"),
-                    ),
-                )
+                this.child(crate::ui::title_bar(minimal_titlebar, cx))
             })
             .child(
                 h_flex()

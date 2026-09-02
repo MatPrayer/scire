@@ -24,7 +24,7 @@ use std::time::Duration;
 use directories::ProjectDirs;
 use gpui::{
     Animation, AnimationElement, AnimationExt as _, App, BoxShadow, ElementId, Hsla, IntoElement,
-    SharedString, Styled, Window, WindowBounds, WindowDecorations, WindowOptions, div,
+    Pixels, SharedString, Styled, Window, WindowBounds, WindowDecorations, WindowOptions, div,
     ease_out_quint, hsla, point, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
@@ -974,6 +974,33 @@ pub fn with_focus_animation<E: IntoElement + Styled + 'static>(
             }])
         },
     )
+}
+
+/// Height of the minimal title bar. macOS's traffic lights are 12px tall and
+/// `TitleBar::title_bar_options` puts them at (9, 9), so 30px is the shortest
+/// bar that still leaves them evenly inset. gpui-component's own bar is 34px
+/// and carries a label the minimal one drops.
+pub const MINIMAL_TITLE_BAR_HEIGHT: Pixels = px(30.);
+
+/// The in-app title bar. `minimal` strips it to the window controls: no app
+/// name, no bottom rule, the app background rather than the title-bar tint,
+/// and the shorter height above — on macOS that reads as the traffic lights
+/// floating on the app itself. Dragging and double-click zoom still work,
+/// since both live on the bar element either way.
+pub fn title_bar(minimal: bool, cx: &App) -> TitleBar {
+    if minimal {
+        TitleBar::new()
+            .h(MINIMAL_TITLE_BAR_HEIGHT)
+            .bg(cx.theme().background)
+            .border_b_0()
+    } else {
+        TitleBar::new().child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Scirè"),
+        )
+    }
 }
 
 /// Window open options derived from the client-titlebar preference.

@@ -63,6 +63,12 @@ pub struct Settings {
     pub theme: ThemePref,
     /// Draw the in-app title bar (gpui-component `TitleBar`). When false, use native WM chrome.
     pub client_titlebar: bool,
+    /// Strip the in-app title bar down to the window controls: no app name, no
+    /// separator, the app background instead of the title-bar tint, and only
+    /// tall enough to hold macOS's traffic lights. Ignored when
+    /// `client_titlebar` is off, since the WM draws the bar then.
+    #[serde(default)]
+    pub minimal_titlebar: bool,
     /// Forward now-playing / scrobble submissions to the server.
     pub scrobble_enabled: bool,
     /// Default shuffle state for new sessions.
@@ -386,6 +392,7 @@ impl Default for Settings {
             transcoding: Transcoding::default(),
             theme: ThemePref::default(),
             client_titlebar: true,
+            minimal_titlebar: false,
             scrobble_enabled: true,
             default_shuffle: false,
             default_repeat: RepeatMode::Off,

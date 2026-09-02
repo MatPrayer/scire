@@ -305,6 +305,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_minimal_titlebar(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.minimal_titlebar = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_scrobble(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.scrobble_enabled = enabled);
@@ -529,6 +536,7 @@ impl Render for SettingsView {
             format,
             bitrate,
             client_titlebar,
+            minimal_titlebar,
             scrobble_enabled,
             default_shuffle,
             default_repeat,
@@ -541,6 +549,7 @@ impl Render for SettingsView {
                 s.transcoding.format.clone(),
                 s.transcoding.max_bit_rate,
                 s.client_titlebar,
+                s.minimal_titlebar,
                 s.scrobble_enabled,
                 s.default_shuffle,
                 s.default_repeat,
@@ -674,6 +683,25 @@ impl Render for SettingsView {
                                     .child(
                                         "Disable to use your desktop environment's native window \
                                          decorations (recommended on some Linux setups).",
+                                    ),
+                            )
+                            .child(
+                                Switch::new("minimal-titlebar")
+                                    .checked(minimal_titlebar)
+                                    .disabled(!client_titlebar)
+                                    .label("Minimal title bar")
+                                    .on_click(cx.listener(|this, &checked, _, cx| {
+                                        this.set_minimal_titlebar(checked, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "Drops the app name and the separator and paints the bar \
+                                         in the window background, leaving only the window \
+                                         controls. Needs the in-app title bar.",
                                     ),
                             )
                             .child(
