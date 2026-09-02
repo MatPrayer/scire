@@ -1921,18 +1921,18 @@ impl Render for RootView {
                 cx.listener(|this, _, window, cx| this.nav_forward(window, cx)),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                // Ctrl+K (Cmd+K) always opens the command palette.
-                if event.keystroke.key == "k"
-                    && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
-                {
-                    this.search_bar
-                        .update(cx, |sb, cx| sb.open_palette(window, cx));
-                    cx.stop_propagation();
-                    return;
-                }
                 if this.vi_enabled {
                     this.handle_vi_key(event, window, cx, false);
                 } else {
+                    // Ctrl+K (Cmd+K) opens the command palette (vi-mode excluded).
+                    if event.keystroke.key == "k"
+                        && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+                    {
+                        this.search_bar
+                            .update(cx, |sb, cx| sb.open_palette(window, cx));
+                        cx.stop_propagation();
+                        return;
+                    }
                     let focused = window.focused(cx);
                     let is_text_input = focused.is_some_and(|focus| focus != this.focus_handle);
                     match event.keystroke.key.as_str() {
