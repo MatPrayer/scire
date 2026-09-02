@@ -388,6 +388,7 @@ impl ArtistsView {
             .rounded_lg()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().muted))
+            .active(|s| s.opacity(0.8))
             .when(focused, |s| {
                 s.border_1()
                     .border_color(cx.theme().primary)
@@ -906,6 +907,7 @@ impl Render for ArtistDetailView {
                     .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().muted))
+                    .active(|s| s.opacity(0.8))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(ArtistDetailEvent::OpenAlbum(id.clone()));
                     }))

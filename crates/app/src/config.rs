@@ -117,6 +117,10 @@ pub struct Settings {
     pub sidebar_playlists_collapsed: bool,
     /// Vi-style modal keyboard navigation.
     pub vi_mode: bool,
+    /// Disable non-essential UI animations (tab transitions, hover effects, panel slides).
+    /// Useful on lower-end GPUs or for users sensitive to motion.
+    #[serde(default)]
+    pub reduced_motion: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -394,6 +398,7 @@ impl Default for Settings {
             sidebar_libraries_collapsed: false,
             sidebar_playlists_collapsed: false,
             vi_mode: false,
+            reduced_motion: false,
         }
     }
 }

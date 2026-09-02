@@ -164,6 +164,7 @@ impl LocalMusicView {
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().muted).shadow(focus_glow(cx)))
+            .active(|s| s.opacity(0.8))
             .when(focused, |s| {
                 s.border_color(cx.theme().primary)
                     .shadow(focus_glow(cx))

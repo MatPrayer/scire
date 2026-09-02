@@ -2,9 +2,9 @@
 //! (sidebar | content | optional queue panel / player bar).
 
 use gpui::{
-    AsyncWindowContext, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, NavigationDirection, Render, SharedString, WeakEntity, Window, div, prelude::*,
-    px,
+    Animation, AnimationExt as _, AsyncWindowContext, Context, ElementId, Entity, FocusHandle,
+    Focusable, IntoElement, KeyDownEvent, MouseButton, NavigationDirection, Render, SharedString,
+    WeakEntity, Window, div, ease_out_quint, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -2042,6 +2042,7 @@ impl Render for RootView {
                                 }
                             });
                         },
+                        self.session.read(cx).settings.reduced_motion,
                         cx,
                     ))
                     .child(
@@ -2078,7 +2079,16 @@ impl Render for RootView {
                                 )
                             }),
                     )
-                    .when(self.show_queue, |this| this.child(self.queue_panel.clone())),
+                    .when(self.show_queue, |this| {
+                        this.child(
+                            div().child(self.queue_panel.clone()).with_animation(
+                                ElementId::Name("queue-slide-in".into()),
+                                Animation::new(std::time::Duration::from_millis(200))
+                                    .with_easing(ease_out_quint()),
+                                |this, t| this.opacity(t),
+                            ),
+                        )
+                    }),
             )
             .child(self.player_bar.clone())
             // Fullscreen overlay — rendered last so it sits on top.
