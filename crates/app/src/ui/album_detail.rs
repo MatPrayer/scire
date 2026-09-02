@@ -2,6 +2,7 @@
 //! queue and playlist actions.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{
     Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle, Window, div,
@@ -15,9 +16,10 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
     v_flex,
 };
-use subsonic::{AlbumInfo2, AlbumWithSongs, Song, SubsonicClient};
+use subsonic::{Album, AlbumInfo2, AlbumWithSongs, Song, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
+use crate::services::library_db::LibraryDb;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
@@ -67,6 +69,7 @@ impl AlbumDetailView {
         session: Entity<Session>,
         player: Entity<PlayerState>,
         playlists: Entity<PlaylistsState>,
+        db: Arc<LibraryDb>,
         album_id: String,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -110,8 +113,60 @@ impl AlbumDetailView {
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
         };
+        this.seed_from_cache(&db, cx);
         this.load(cx);
         this
+    }
+
+    /// Paint the header and track list from the last sync's rows before the
+    /// server answers.
+    ///
+    /// `getAlbum` is a full round trip, and the cover cannot even start
+    /// downloading until it lands — the cover id lives in that response. On a
+    /// remote server that is most of a second of empty page. The cache holds
+    /// everything the page needs except the per-file quality fields, so it is
+    /// drawn immediately and `load` overwrites it in place.
+    fn seed_from_cache(&mut self, db: &LibraryDb, cx: &mut Context<Self>) {
+        let Ok(Some(row)) = db.album_by_id("navidrome", &self.album_id) else {
+            return;
+        };
+        let songs: Vec<Song> = db
+            .tracks_by_album(&self.album_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.into_song())
+            .collect();
+        // An album row whose tracks never landed (a sync interrupted between
+        // phases) would seed an empty track list, which reads as a broken
+        // page rather than a loading one.
+        if songs.is_empty() {
+            return;
+        }
+        let cover = row.cover_art.clone();
+        self.album = Some(AlbumWithSongs {
+            album: Album {
+                id: row.id,
+                name: row.title,
+                artist: row.artist,
+                artist_id: row.artist_id,
+                cover_art: row.cover_art,
+                song_count: Some(songs.len() as u32),
+                duration: Some(row.duration as u32),
+                created: row.created,
+                year: row.year,
+                genre: None,
+                starred: row.starred,
+                user_rating: None,
+                play_count: row.play_count.map(|c| c as u64),
+            },
+            song: songs,
+        });
+        if let Some(cover) = cover {
+            // Straight off disk when the grid already downloaded this cover,
+            // so the header art is there on the first frame.
+            self.art_path = artwork::cached(&cover, ART_SIZE);
+            self.fetch_art(cover, cx);
+        }
     }
 
     /// Open the full-resolution cover lightbox, fetching a large version once.
@@ -151,7 +206,14 @@ impl AlbumDetailView {
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(album) => {
-                        if let Some(cover) = album.album.cover_art.clone() {
+                        // The seed already started this download when the
+                        // cover id matches, which it does unless the album's
+                        // art changed on the server since the last sync.
+                        let seeded_cover =
+                            view.album.as_ref().and_then(|a| a.album.cover_art.clone());
+                        if let Some(cover) = album.album.cover_art.clone()
+                            && Some(&cover) != seeded_cover.as_ref()
+                        {
                             view.fetch_art(cover, cx);
                         }
                         view.album = Some(album);

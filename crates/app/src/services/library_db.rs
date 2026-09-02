@@ -493,6 +493,39 @@ impl LibraryDb {
         rows.collect()
     }
 
+    /// One album row by id, or `None` when the cache has never seen it.
+    ///
+    /// `source` is matched as well as the id. Ids are the table's primary key
+    /// on their own, so this is a guard rather than a namespace — it keeps a
+    /// locally-scanned album from standing in for a server one on the strength
+    /// of a shared id.
+    pub fn album_by_id(&self, source: &str, id: &str) -> Result<Option<AlbumRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
+                    created, play_count, starred_at, library_id
+             FROM albums WHERE source = ?1 AND id = ?2",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![source, id], |row| {
+            Ok(AlbumRow {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                title: row.get(2)?,
+                artist: row.get(3)?,
+                artist_id: row.get(4)?,
+                year: row.get(5)?,
+                cover_art: row.get(6)?,
+                song_count: row.get(7)?,
+                duration: row.get(8)?,
+                created: row.get(9)?,
+                play_count: row.get(10)?,
+                starred: row.get(11)?,
+                library_id: row.get(12)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
     /// What the cache already holds for every album of `source`, keyed by id.
     ///
     /// This is what makes an incremental sync possible: the listing endpoint
@@ -1102,6 +1135,26 @@ mod tests {
         // Ordered by title COLLATE NOCASE
         assert_eq!(albums[0].title, "Another Album");
         assert_eq!(albums[1].title, "Test Album");
+    }
+
+    #[test]
+    fn album_by_id_is_scoped_to_its_source() {
+        // The album detail page seeds itself with this. `id` is the table's
+        // primary key on its own, so the source is a guard rather than a
+        // namespace: a row that belongs to the local library must not seed the
+        // server page just because the ids collide.
+        let db = test_db();
+        let mut server = AlbumRow::new("alb1", "navidrome", "Server Album");
+        server.cover_art = Some("al-1".into());
+        db.upsert_album(&server).unwrap();
+        db.upsert_album(&AlbumRow::new("alb2", "local", "Local Album"))
+            .unwrap();
+
+        let found = db.album_by_id("navidrome", "alb1").unwrap().unwrap();
+        assert_eq!(found.title, "Server Album");
+        assert_eq!(found.cover_art.as_deref(), Some("al-1"));
+        assert!(db.album_by_id("navidrome", "alb2").unwrap().is_none());
+        assert!(db.album_by_id("navidrome", "nope").unwrap().is_none());
     }
 
     #[test]

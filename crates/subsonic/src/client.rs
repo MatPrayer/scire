@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::Url;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -50,7 +52,14 @@ impl SubsonicClient {
             url.set_path(&format!("{}/", url.path()));
         }
         Ok(Self {
-            http: reqwest::Client::new(),
+            // Keep pooled connections well past reqwest's 90s default: album
+            // pages are two or three requests each and a cold connection pays
+            // the TLS handshake again (~90ms against a remote server), which
+            // is most of what a page load costs.
+            http: reqwest::Client::builder()
+                .pool_idle_timeout(Duration::from_secs(300))
+                .tcp_keepalive(Duration::from_secs(60))
+                .build()?,
             base_url: url,
             credentials,
         })

@@ -927,6 +927,7 @@ impl RootView {
                 self.session.clone(),
                 self.player.clone(),
                 self.playlists.clone(),
+                self.library_db.clone(),
                 id,
                 cx,
             )
