@@ -72,6 +72,11 @@ fi
 SIGN_ID="${CODESIGN_ID:-}"
 if [[ -z "$SIGN_ID" ]]; then
 	SIGN_ID="$("$HERE/signing-identity.sh" --print 2>/dev/null || true)"
+	# The signing keychain locks on logout/reboot, and codesign then puts up a
+	# password dialog for it. That dialog asks for the *keychain's* password,
+	# not the account password, so it cannot be answered by hand without
+	# knowing it — unlock non-interactively instead.
+	[[ -n "$SIGN_ID" ]] && "$HERE/signing-identity.sh" --unlock >/dev/null
 fi
 if [[ -z "$SIGN_ID" ]]; then
 	SIGN_ID="-"

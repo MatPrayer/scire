@@ -5,6 +5,7 @@
 #
 #   packaging/macos/signing-identity.sh          # create if missing
 #   packaging/macos/signing-identity.sh --print  # print the identity name only
+#   packaging/macos/signing-identity.sh --unlock # unlock the keychain for codesign
 #   packaging/macos/signing-identity.sh --remove # delete the keychain again
 #
 # Why this exists
@@ -56,6 +57,11 @@ case "${1:-}" in
 	echo "$IDENTITY"
 	exit 0
 	;;
+--unlock)
+	have_identity || { echo "error: identity '$IDENTITY' not found — run $0 first" >&2; exit 1; }
+	security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+	exit 0
+	;;
 --remove)
 	security delete-keychain "$KEYCHAIN" 2>/dev/null || true
 	echo "removed $KEYCHAIN_NAME"
@@ -101,7 +107,12 @@ security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
 # Anything below this point failing would leave a keychain with no usable
 # identity in it, which the next run would not recreate.
 trap 'rm -rf "$TMP"; security delete-keychain "$KEYCHAIN" 2>/dev/null || true' EXIT
-security set-keychain-settings -lut 21600 "$KEYCHAIN"
+# No -l (lock on sleep) and no -u/-t (inactivity timeout): a keychain holding
+# nothing but a local signing key does not need either, and both make codesign
+# prompt for the keychain password after a lid close or an idle hour — a prompt
+# that is *not* answerable with the account password, which is the confusing
+# part. It still locks on logout/reboot, which is why bundle.sh unlocks first.
+security set-keychain-settings "$KEYCHAIN"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 security import "$TMP/identity.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
 # Without this codesign is prompted for on every single signing run.
