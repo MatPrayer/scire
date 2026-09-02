@@ -32,6 +32,12 @@ pub struct TrackSource {
     /// Consumer-side identity (song id), echoed back in `TrackEnded::started`
     /// so a gapless hand-over can be matched to the right queue entry.
     pub id: Option<String>,
+    /// This is a live stream (internet radio), not a library file. Only these
+    /// ask the server for ICY metadata: the header is a request to interleave
+    /// title blocks into the audio, and a server that honours it on a library
+    /// file answers without a `Content-Length`, which costs the decoder the
+    /// ability to seek — fatal for an m4a whose index sits at the end.
+    pub live: bool,
 }
 
 /// Commands accepted by the engine.
@@ -103,6 +109,10 @@ pub enum Event {
     Paused,
     /// Unrecoverable failure for the current track.
     Failed(String),
+    /// The track prepared to play *after* the current one could not be opened.
+    /// Playback of the current track is unaffected; the gapless hand-over will
+    /// not happen and starting that track will fail the same way.
+    PrefetchFailed { id: Option<String>, error: String },
     /// Audio output was opened; reports the OS output device name.
     OutputOpened { device: Option<String> },
     /// The source that just started is a live stream, and this is what it says

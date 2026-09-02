@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::source::{self, EndSignal, SourceReader};
+use crate::source::{self, EndSignal, Hint, Opened, SourceReader};
 use crate::spectrum::{SpectrumTap, Tap};
 use crate::{Command, Event, PlaybackError, TrackSource};
 
@@ -79,7 +79,7 @@ async fn control_loop(
     let mut prefetch: Option<JoinHandle<()>> = None;
     let mut prefetch_gen: u64 = 0;
     let (prep_tx, mut prep_rx) =
-        mpsc::unbounded_channel::<(u64, Result<Prepared, PlaybackError>)>();
+        mpsc::unbounded_channel::<(u64, Option<String>, Result<Prepared, PlaybackError>)>();
     // Track-exhaustion signals from appended sources.
     let (end_tx, mut end_rx) = mpsc::unbounded_channel::<u64>();
     let mut serials: u64 = 0;
@@ -264,7 +264,7 @@ async fn control_loop(
                     }
                 }
             }
-            Some((generation, result)) = prep_rx.recv() => {
+            Some((generation, id, result)) = prep_rx.recv() => {
                 if generation == prefetch_gen {
                     prefetch = None;
                     match result {
@@ -280,7 +280,17 @@ async fn control_loop(
                                 &tap,
                             );
                         }
-                        Err(e) => tracing::warn!("prefetch failed: {e}"),
+                        // The next track is already known to be unplayable.
+                        // Reporting it now lets the consumer say so while the
+                        // current track is still running, instead of the queue
+                        // stopping dead on a hand-over that never comes.
+                        Err(e) => {
+                            tracing::warn!("prefetch failed: {e}");
+                            let _ = event_tx.send(Event::PrefetchFailed {
+                                id,
+                                error: e.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -406,16 +416,17 @@ fn start_prefetch(
     prefetch: &mut Option<JoinHandle<()>>,
     generation: &mut u64,
     pending: &mut Option<Prepared>,
-    prep_tx: &mpsc::UnboundedSender<(u64, Result<Prepared, PlaybackError>)>,
+    prep_tx: &mpsc::UnboundedSender<(u64, Option<String>, Result<Prepared, PlaybackError>)>,
     event_tx: &mpsc::UnboundedSender<Event>,
 ) {
     drop_prefetch(prefetch, generation, pending);
     let generation = *generation;
     let tx = prep_tx.clone();
     let event_tx = event_tx.clone();
+    let id = track.id.clone();
     *prefetch = Some(tokio::spawn(async move {
         let result = prepare(track, &event_tx).await;
-        let _ = tx.send((generation, result));
+        let _ = tx.send((generation, id, result));
     }));
 }
 
@@ -505,16 +516,17 @@ async fn prepare(
     event_tx: &mpsc::UnboundedSender<Event>,
 ) -> Result<Prepared, PlaybackError> {
     if let Some(path) = track.path.clone() {
-        let (reader, byte_len) = source::open_local(&path).await?;
-        return build(track, reader, byte_len, None).await;
+        let opened = source::open_local(&path).await?;
+        return build(track, opened).await;
     }
 
+    let live = track.live;
     let candidates = source::stream_candidates(&track.url).await;
     let mut last = None;
     for url in &candidates {
         let attempt = async {
-            let (reader, byte_len, station) = source::open(url, event_tx).await?;
-            build(track.clone(), reader, byte_len, station).await
+            let opened = source::open(url, live, event_tx).await?;
+            build(track.clone(), opened).await
         };
         match attempt.await {
             Ok(prepared) => return Ok(prepared),
@@ -530,12 +542,18 @@ async fn prepare(
 }
 
 /// Build a decoder over an opened source.
-async fn build(
-    track: TrackSource,
-    reader: SourceReader,
-    byte_len: Option<u64>,
-    station: Option<crate::icy::StationInfo>,
-) -> Result<Prepared, PlaybackError> {
+async fn build(track: TrackSource, opened: Opened) -> Result<Prepared, PlaybackError> {
+    let Opened {
+        reader,
+        byte_len,
+        station,
+        hint,
+    } = opened;
+    // Kept for the failure message: what the source claimed to be decides how a
+    // "format not recognized" should be read.
+    let described = hint.clone();
+    let seekable = byte_len.is_some();
+
     // Decoder construction reads from the (blocking) stream reader; do it off
     // the async thread. byte_len enables seeking + duration calculation.
     let decoder = tokio::time::timeout(
@@ -546,9 +564,19 @@ async fn build(
             // moves forward, which costs seconds of startup on a radio stream.
             let mut builder = rodio::Decoder::builder()
                 .with_data(reader)
-                .with_seekable(byte_len.is_some());
+                .with_seekable(seekable);
             if let Some(len) = byte_len {
                 builder = builder.with_byte_len(len);
+            }
+            // Tell the decoder what the source claims to be. symphonia 0.5.5
+            // takes the hint as `_hint` and identifies the format from marker
+            // bytes regardless, so this buys nothing today — it is passed
+            // because this is the one place that knows, and the hint is what
+            // the failure message below is built from.
+            match &hint {
+                Some(Hint::MimeType(mime)) => builder = builder.with_mime_type(mime),
+                Some(Hint::Extension(ext)) => builder = builder.with_hint(ext),
+                None => {}
             }
             builder.build()
         }),
@@ -556,7 +584,7 @@ async fn build(
     .await
     .map_err(|_| PlaybackError("timed out identifying the stream".into()))?
     .map_err(|e| PlaybackError(e.to_string()))?
-    .map_err(|e| PlaybackError(e.to_string()))?;
+    .map_err(|e| decoder_failure(e, described.as_ref(), seekable))?;
     let decoded_duration = rodio::Source::total_duration(&decoder);
     Ok(Prepared {
         track,
@@ -564,6 +592,54 @@ async fn build(
         decoded_duration,
         station,
     })
+}
+
+/// Turn a rodio decoder failure into something that names a cause.
+///
+/// rodio collapses every `Unsupported` symphonia raises — missing `moov` atom,
+/// more than one sample entry, an ALAC magic cookie it does not know — into a
+/// single `UnrecognizedFormat` whose text is "the format of the data has not
+/// been recognized". For an MP4/M4A that is almost always one specific thing:
+/// the file's index sits *after* the audio, and the decoder could not seek back
+/// to it. That happens when the response carried no `Content-Length`, or when
+/// the server answered a ranged request with the whole file.
+fn decoder_failure(
+    err: rodio::decoder::DecoderError,
+    hint: Option<&Hint>,
+    seekable: bool,
+) -> PlaybackError {
+    tracing::warn!(?hint, seekable, "decoder rejected the source: {err}");
+    use rodio::decoder::DecoderError;
+    let message = match &err {
+        DecoderError::UnrecognizedFormat if is_mp4(hint) && !seekable => {
+            "unreadable m4a: the server sent no length, so the file's index \
+             (stored after the audio) could not be reached"
+                .to_string()
+        }
+        DecoderError::UnrecognizedFormat if is_mp4(hint) => {
+            "unreadable m4a: the file's index could not be read — the server \
+             may not honour ranged requests"
+                .to_string()
+        }
+        DecoderError::IoError(inner) => format!("stream read failed: {inner}"),
+        _ => err.to_string(),
+    };
+    PlaybackError(message)
+}
+
+/// Whether the source claims to be an ISO base-media file (MP4/M4A), the
+/// container ALAC and AAC arrive in.
+fn is_mp4(hint: Option<&Hint>) -> bool {
+    match hint {
+        Some(Hint::MimeType(mime)) => matches!(
+            mime.as_str(),
+            "audio/mp4" | "audio/m4a" | "audio/x-m4a" | "video/mp4" | "audio/mp4a-latm"
+        ),
+        Some(Hint::Extension(ext)) => {
+            matches!(ext.as_str(), "m4a" | "m4b" | "m4p" | "mp4" | "mov")
+        }
+        None => false,
+    }
 }
 
 /// Open the HTTP source, build a decoder, and start a new player on the
@@ -628,5 +704,50 @@ fn resolved_device_name(selected: &Option<String>) -> Option<String> {
     match selected {
         Some(name) => Some(name.clone()),
         None => default_output_device_name(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rodio::decoder::DecoderError;
+
+    #[test]
+    fn mp4_containers_are_recognized_from_either_hint() {
+        assert!(is_mp4(Some(&Hint::MimeType("audio/mp4".into()))));
+        assert!(is_mp4(Some(&Hint::MimeType("audio/x-m4a".into()))));
+        assert!(is_mp4(Some(&Hint::Extension("m4a".into()))));
+        assert!(!is_mp4(Some(&Hint::MimeType("audio/flac".into()))));
+        assert!(!is_mp4(Some(&Hint::Extension("flac".into()))));
+        assert!(!is_mp4(None));
+    }
+
+    #[test]
+    fn unseekable_m4a_failure_names_the_missing_length() {
+        let hint = Hint::MimeType("audio/mp4".into());
+        let err = decoder_failure(DecoderError::UnrecognizedFormat, Some(&hint), false);
+        assert!(err.0.contains("no length"), "{}", err.0);
+    }
+
+    #[test]
+    fn seekable_m4a_failure_points_at_ranged_requests() {
+        let hint = Hint::Extension("m4a".into());
+        let err = decoder_failure(DecoderError::UnrecognizedFormat, Some(&hint), true);
+        assert!(err.0.contains("ranged requests"), "{}", err.0);
+    }
+
+    #[test]
+    fn non_mp4_failure_keeps_the_decoder_wording() {
+        let hint = Hint::MimeType("audio/flac".into());
+        let err = decoder_failure(DecoderError::UnrecognizedFormat, Some(&hint), true);
+        assert_eq!(err.0, DecoderError::UnrecognizedFormat.to_string());
+    }
+
+    #[test]
+    fn io_failure_carries_the_underlying_reason() {
+        // rodio's Display for IoError drops the payload; the reason is the
+        // whole value of the message.
+        let err = decoder_failure(DecoderError::IoError("connection reset".into()), None, true);
+        assert!(err.0.contains("connection reset"), "{}", err.0);
     }
 }

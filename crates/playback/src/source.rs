@@ -64,6 +64,27 @@ const PREFETCH_LIVE: u64 = 32 * 1024;
 /// Cap on fetching a playlist before giving up and trying the URL as a stream.
 const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// An opened source, ready to be handed to the decoder.
+pub(crate) struct Opened {
+    pub(crate) reader: SourceReader,
+    /// Byte length, when the source has one. `None` means a live stream, and
+    /// also means the decoder cannot seek — see `TrackSource::live`.
+    pub(crate) byte_len: Option<u64>,
+    /// Set when the source turned out to be a live radio stream.
+    pub(crate) station: Option<StationInfo>,
+    /// What the source says it is: a MIME type for HTTP, a file extension for
+    /// a local file. Handed to the decoder as a probe hint, and used to explain
+    /// a failure in terms of the container.
+    pub(crate) hint: Option<Hint>,
+}
+
+/// A format hint for the decoder, in whichever form the source could give it.
+#[derive(Debug, Clone)]
+pub(crate) enum Hint {
+    MimeType(String),
+    Extension(String),
+}
+
 /// Streams worth trying for `url`, in order. Usually just the URL itself; a
 /// playlist expands to everything it lists, because stations routinely offer
 /// the same programme in several formats and the first is not always one this
@@ -86,10 +107,11 @@ pub(crate) async fn stream_candidates(url: &str) -> Vec<String> {
 /// means a live stream (no `Content-Length`).
 pub(crate) async fn open(
     url: &str,
+    live: bool,
     event_tx: &mpsc::UnboundedSender<Event>,
-) -> Result<(SourceReader, Option<u64>, Option<StationInfo>), PlaybackError> {
+) -> Result<Opened, PlaybackError> {
     let stream = HttpStream::new(
-        icy_client().clone(),
+        if live { icy_client() } else { plain_client() }.clone(),
         url.parse()
             .map_err(|e| PlaybackError(format!("bad url: {e}")))?,
     )
@@ -110,6 +132,11 @@ pub(crate) async fn open(
             )));
         }
     }
+
+    let content_type = stream
+        .content_type()
+        .as_ref()
+        .map(|ct| format!("{}/{}", ct.r#type, ct.subtype).to_ascii_lowercase());
 
     let content_length = stream.content_length();
     let settings = Settings::default().prefetch_bytes(match content_length {
@@ -134,12 +161,26 @@ pub(crate) async fn open(
         Some(metaint) => SourceReader::Icy(IcyStrip::new(reader, metaint, event_tx.clone())),
         None => SourceReader::Http(reader),
     };
-    Ok((reader, content_length, station))
+    Ok(Opened {
+        reader,
+        byte_len: content_length,
+        station,
+        hint: content_type.map(Hint::MimeType),
+    })
 }
 
-/// Shared client that asks every server for ICY metadata. Servers that do not
-/// speak ICY ignore the header, so it costs nothing to send it always — and
-/// there is no way to know a URL is a radio station before opening it.
+/// Shared client for library files: no ICY request header. Asking a music
+/// server to interleave now-playing titles into a file it is serving is at
+/// best pointless, and a server that takes the request seriously answers
+/// without a `Content-Length` — which makes the source unseekable and breaks
+/// every m4a whose `moov` index sits after the audio.
+fn plain_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(Client::new)
+}
+
+/// Shared client that asks for ICY metadata, used for live streams only. A
+/// station that does not speak ICY ignores the header.
 fn icy_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -214,11 +255,19 @@ async fn resolve_playlist(url: &str) -> Vec<String> {
 
 /// Open a local file, returning a `SourceReader::Local`. The byte length is
 /// always known for local files.
-pub(crate) async fn open_local(path: &Path) -> Result<(SourceReader, Option<u64>), PlaybackError> {
+pub(crate) async fn open_local(path: &Path) -> Result<Opened, PlaybackError> {
     let file =
         std::fs::File::open(path).map_err(|e| PlaybackError(format!("open local file: {e}")))?;
     let len = file.metadata().ok().map(|m| m.len());
-    Ok((SourceReader::Local(file), len))
+    Ok(Opened {
+        reader: SourceReader::Local(file),
+        byte_len: len,
+        station: None,
+        hint: path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| Hint::Extension(e.to_ascii_lowercase())),
+    })
 }
 
 /// Wraps a decoder so the engine learns the exact sample at which it runs out.

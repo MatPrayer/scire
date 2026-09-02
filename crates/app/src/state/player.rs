@@ -18,6 +18,12 @@ use crate::state::scrobble::{ScrobbleAction, ScrobbleTracker};
 /// Cover size fetched for the player bar / OS media controls.
 const ART_SIZE: u32 = 300;
 
+/// How many tracks in a row may fail to start before playback gives up.
+/// A single unplayable file is worth skipping past; five in a row is the
+/// server, the network or the credentials, and stepping through the rest of
+/// the queue would only repeat the same failed request per track.
+const MAX_FAILED_STREAK: usize = 5;
+
 pub struct PlayerState {
     player: Player,
     pub queue: Queue,
@@ -27,6 +33,11 @@ pub struct PlayerState {
     pub buffering: bool,
     pub volume: f32,
     pub last_error: Option<String>,
+    /// Tracks that failed to start back to back, without one playing in
+    /// between. A single unplayable file is skipped; a run of them is the
+    /// server or the network being gone, and walking the whole queue into it
+    /// would be a hundred pointless requests.
+    failed_streak: usize,
     client: Option<SubsonicClient>,
     scrobble: ScrobbleTracker,
     scrobble_enabled: bool,
@@ -141,6 +152,7 @@ impl PlayerState {
             buffering: false,
             volume,
             last_error: None,
+            failed_streak: 0,
             client: None,
             scrobble: ScrobbleTracker::default(),
             scrobble_enabled: true,
@@ -299,12 +311,14 @@ impl PlayerState {
         self.position = Duration::ZERO;
         self.duration = None;
         self.last_error = None;
+        self.failed_streak = 0;
         self.buffering = true;
         self.player.play(TrackSource {
             url: stream_url,
             duration_hint: None,
             path: None,
             id: None,
+            live: true,
         });
         // Radio has no queue song behind it: drop the last track's cover.
         self.refresh_current_art(cx);
@@ -872,6 +886,7 @@ impl PlayerState {
         self.resume_written_secs = self.position.as_secs();
         self.duration = duration;
         self.last_error = None;
+        self.failed_streak = 0;
         // Apply this track's ReplayGain before playback opens so the engine
         // starts the sink at the normalized volume.
         self.recompute_gain();
@@ -880,6 +895,7 @@ impl PlayerState {
             duration_hint: duration,
             path,
             id: Some(song_id.clone()),
+            live: false,
         });
         self.engine_has_track = true;
         push_recent(&mut self.recently_played, song_clone);
@@ -914,6 +930,7 @@ impl PlayerState {
                 duration_hint: duration,
                 path,
                 id: Some(song.id.clone()),
+                live: false,
             })
         });
         match next {
@@ -963,6 +980,7 @@ impl PlayerState {
             Event::Playing => {
                 self.playing = true;
                 self.buffering = false;
+                self.failed_streak = 0;
                 // The restored position is applied here, not in `start_current`:
                 // the engine can only seek a source it has actually opened.
                 if let Some((id, pos)) = self.pending_resume.clone()
@@ -1041,7 +1059,28 @@ impl PlayerState {
                 self.playing = false;
                 self.buffering = false;
                 self.engine_has_track = false;
+                let streak = self.failed_streak + 1;
+                tracing::warn!("playback failed: {msg}");
+                // One unplayable file must not end the session: move on to the
+                // next track. `start_current` is also the user-intent entry
+                // point, so it clears both the streak and `last_error` — they
+                // are re-applied after, leaving this skip counted and its
+                // reason on screen until the track after it starts.
+                if streak < MAX_FAILED_STREAK
+                    && let Some(pos) = self.queue.next_pos()
+                {
+                    self.queue.advance_to(pos);
+                    self.start_current(cx);
+                }
+                self.failed_streak = streak;
                 self.last_error = Some(msg);
+            }
+            Event::PrefetchFailed { id, error } => {
+                tracing::warn!(?id, "next track could not be prepared: {error}");
+                // The gapless hand-over will not happen and starting that track
+                // will fail the same way, so say so now rather than letting the
+                // queue walk into it silently.
+                self.last_error = Some(format!("Next track unavailable: {error}"));
             }
             Event::OutputOpened { device } => {
                 self.output_device = device;
