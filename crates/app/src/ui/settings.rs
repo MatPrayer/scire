@@ -444,6 +444,20 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_adaptive_from_page(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.adaptive_from_page = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_adaptive_page_gradient(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.adaptive_page_gradient = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_show_nav_buttons(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.show_nav_buttons = enabled);
@@ -543,6 +557,8 @@ impl Render for SettingsView {
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
         let hover_glow = self.session.read(cx).settings.hover_glow;
+        let adaptive_from_page = self.session.read(cx).settings.adaptive_from_page;
+        let adaptive_page_gradient = self.session.read(cx).settings.adaptive_page_gradient;
         let resume_playback = self.session.read(cx).settings.resume_playback;
         let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
         let replay_gain = self.session.read(cx).settings.replay_gain;
@@ -711,6 +727,40 @@ impl Render for SettingsView {
                                         ThemePref::Custom,
                                         theme == ThemePref::Custom,
                                     )),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Switch::new("adaptive-from-page")
+                                            .checked(adaptive_from_page)
+                                            .disabled(theme != ThemePref::Adaptive)
+                                            .label("Album pages tint from their own cover")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_adaptive_from_page(checked, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                "An album page takes its colour from the album \
+                                                 you're looking at. The sidebar, player and \
+                                                 fullscreen keep the playing track's.",
+                                            ),
+                                    )
+                                    .child(
+                                        Switch::new("adaptive-page-gradient")
+                                            .checked(adaptive_page_gradient)
+                                            .disabled(
+                                                theme != ThemePref::Adaptive || !adaptive_from_page,
+                                            )
+                                            .label("Wash the album header in that colour")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_adaptive_page_gradient(checked, cx);
+                                            })),
+                                    ),
                             )
                             .child(
                                 v_flex()

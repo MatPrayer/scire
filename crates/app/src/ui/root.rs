@@ -596,6 +596,11 @@ impl RootView {
     /// When the Adaptive theme is active, derive the accent colour from the
     /// current track's cover art and recolour the interactive surfaces. Cheap
     /// no-op for other themes or when the cover hasn't changed.
+    ///
+    /// This is always the *playing* track: the app's chrome — sidebar, player
+    /// bar, sliders, fullscreen overlay — belongs to playback. An album page
+    /// showing a different album tints itself locally instead
+    /// (`Settings::adaptive_from_page`, handled in `album_detail.rs`).
     fn maybe_update_adaptive_accent(&mut self, cx: &mut Context<Self>) {
         if self.session.read(cx).settings.theme != ThemePref::Adaptive {
             self.adaptive_cover = None;
@@ -619,16 +624,7 @@ impl RootView {
             }
             self.adaptive_cover = key;
             let Some(path) = path else { return };
-            cx.spawn(async move |this, cx| {
-                let accent = runtime::spawn_blocking_io(move || {
-                    let bytes = std::fs::read(&path)?;
-                    crate::ui::accent_from_cover_bytes(&bytes)
-                        .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
-                })
-                .await;
-                Self::apply_or_retry(this, accent, cx).await;
-            })
-            .detach();
+            self.accent_from_file(path, cx);
             return;
         }
 
@@ -647,6 +643,21 @@ impl RootView {
         cx.spawn(async move |this, cx| {
             let accent = runtime::spawn_io(async move {
                 let path = artwork::fetch_as(client, cover_id, key, 64).await?;
+                let bytes = std::fs::read(&path)?;
+                crate::ui::accent_from_cover_bytes(&bytes)
+                    .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
+            })
+            .await;
+            Self::apply_or_retry(this, accent, cx).await;
+        })
+        .detach();
+    }
+
+    /// Extract an accent from a cover already on disk. The read and the decode
+    /// both block, so they go to the blocking pool.
+    fn accent_from_file(&self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let accent = runtime::spawn_blocking_io(move || {
                 let bytes = std::fs::read(&path)?;
                 crate::ui::accent_from_cover_bytes(&bytes)
                     .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
@@ -945,7 +956,13 @@ impl RootView {
         self.push_history();
         self.current_entry = Some(NavEntry::LocalAlbum(id.clone()));
         let view = cx.new(|cx| {
-            LocalAlbumDetailView::new(self.library_db.clone(), self.player.clone(), id, cx)
+            LocalAlbumDetailView::new(
+                self.library_db.clone(),
+                self.player.clone(),
+                self.session.clone(),
+                id,
+                cx,
+            )
         });
         self.content = Some(Content::LocalAlbumDetail(view));
         cx.notify();

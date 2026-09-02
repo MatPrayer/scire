@@ -15,7 +15,7 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, h_flex, v_flex};
 
 use crate::assets::{app_icon, icons};
-use crate::services::library_db::{AlbumRow, LibraryDb};
+use crate::services::library_db::{AlbumRow, LibraryDb, LibraryStats};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
@@ -49,6 +49,9 @@ pub struct LocalMusicView {
     /// Scrolls the focused card into view (works for wrapped grids, where
     /// the cards are nested inside a flex-wrap container).
     focus_anchor: ScrollAnchor,
+    /// Catalog totals shown in the header; recomputed with `refresh`, so a
+    /// finished scan updates them along with the grid.
+    stats: LibraryStats,
 }
 
 impl EventEmitter<LocalMusicEvent> for LocalMusicView {}
@@ -71,6 +74,7 @@ impl LocalMusicView {
             scan_version: 0,
             vi_cursor: None,
             focus_anchor: ScrollAnchor::for_handle(scroll),
+            stats: LibraryStats::default(),
         };
         view.refresh(cx);
         view
@@ -79,6 +83,9 @@ impl LocalMusicView {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.albums = self.db.albums_by_source("local").unwrap_or_default();
         self.scan_version = self.db.scan_version();
+        // Local rows carry no library provenance — the folder list is the
+        // whole local library, so there is no subset to filter to.
+        self.stats = self.db.library_stats("local", &[]).unwrap_or_default();
         // Pre-populate art paths for covers already cached on disk.
         for a in &self.albums {
             if !self.art_paths.contains_key(&a.id)
@@ -314,7 +321,21 @@ impl Render for LocalMusicView {
                 h_flex()
                     .items_center()
                     .gap_4()
-                    .child(div().child(format!("Local Music  ({})", self.albums.len()))),
+                    .child(div().child("Local Music"))
+                    .child(div().flex_1())
+                    // Nothing to summarise until a sync has written rows —
+                    // zeros next to a grid full of live cards read as a bug.
+                    .when(self.stats.albums > 0, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(crate::ui::library_summary(
+                                    (self.stats.albums, "album"),
+                                    &self.stats,
+                                )),
+                        )
+                    }),
             )
             .child(
                 h_flex()

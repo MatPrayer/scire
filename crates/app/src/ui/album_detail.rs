@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use gpui::{
     Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle, Window, div,
-    img, prelude::*, px,
+    img, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::link::Link;
@@ -19,6 +19,7 @@ use gpui_component::{
 use subsonic::{Album, AlbumInfo2, AlbumWithSongs, Song, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
+use crate::config::ThemePref;
 use crate::services::library_db::LibraryDb;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
@@ -60,6 +61,12 @@ pub struct AlbumDetailView {
     focus_anchor: ScrollAnchor,
     /// Track index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
+    /// Accent extracted from *this album's* cover, for the page's own tint
+    /// under `Settings::adaptive_from_page`. The app's chrome keeps the playing
+    /// track's accent; only this page carries the album's.
+    accent: Option<gpui::Hsla>,
+    /// Cover the accent was extracted from, so a repaint doesn't re-decode it.
+    accent_for: Option<PathBuf>,
 }
 
 impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
@@ -112,6 +119,8 @@ impl AlbumDetailView {
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
+            accent: None,
+            accent_for: None,
         };
         this.seed_from_cache(&db, cx);
         this.load(cx);
@@ -165,6 +174,7 @@ impl AlbumDetailView {
             // Straight off disk when the grid already downloaded this cover,
             // so the header art is there on the first frame.
             self.art_path = artwork::cached(&cover, ART_SIZE);
+            self.refresh_accent(cx);
             self.fetch_art(cover, cx);
         }
     }
@@ -266,9 +276,64 @@ impl AlbumDetailView {
             if let Ok(path) = artwork::fetch(client, cover_id, ART_SIZE).await {
                 let _ = this.update(cx, |view, cx| {
                     view.art_path = Some(path);
+                    view.refresh_accent(cx);
                     cx.notify();
                 });
             }
+        })
+        .detach();
+    }
+
+    /// The accent this page paints itself with, or `None` when it should use
+    /// the theme's (every theme but Adaptive, the setting off, or the cover not
+    /// decoded yet).
+    fn page_accent(&self, cx: &Context<Self>) -> Option<gpui::Hsla> {
+        let settings = &self.session.read(cx).settings;
+        if settings.theme != ThemePref::Adaptive || !settings.adaptive_from_page {
+            return None;
+        }
+        self.accent
+    }
+
+    /// The album's colour for the header wash, or `None` when the page carries
+    /// no accent or the gradient is switched off (it is by default — the
+    /// accented controls are the quiet half of the feature).
+    fn header_tint(&self, cx: &Context<Self>) -> Option<gpui::Hsla> {
+        self.page_accent(cx)
+            .filter(|_| self.session.read(cx).settings.adaptive_page_gradient)
+    }
+
+    /// Extract the page's accent from the cover now on disk. Keyed on the path,
+    /// so the repeated `load`s this page does (playback entering or leaving the
+    /// album) don't re-decode the same image.
+    fn refresh_accent(&mut self, cx: &mut Context<Self>) {
+        let settings = &self.session.read(cx).settings;
+        if settings.theme != ThemePref::Adaptive || !settings.adaptive_from_page {
+            return;
+        }
+        let Some(path) = self.art_path.clone() else {
+            return;
+        };
+        if self.accent_for.as_ref() == Some(&path) {
+            return;
+        }
+        self.accent_for = Some(path.clone());
+        cx.spawn(async move |this, cx| {
+            let accent = runtime::spawn_blocking_io(move || {
+                let bytes = std::fs::read(&path)?;
+                crate::ui::accent_from_cover_bytes(&bytes)
+                    .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
+            })
+            .await;
+            let _ = this.update(cx, |view, cx| match accent {
+                Ok(accent) => {
+                    view.accent = Some(accent);
+                    cx.notify();
+                }
+                // Undecodable cover: forget the key so a later repaint retries
+                // rather than pinning the page to no accent at all.
+                Err(_) => view.accent_for = None,
+            });
         })
         .detach();
     }
@@ -592,6 +657,15 @@ fn fmt_added(created: &str) -> String {
 impl Render for AlbumDetailView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
+        // This album's own colour, when the page is set to carry one. The
+        // playing-track highlight below deliberately keeps the theme's accent:
+        // it marks playback, which is what the rest of the app is coloured by.
+        // Extraction is kicked off from here as well as from the cover fetch,
+        // so turning the setting on tints the page already open instead of
+        // waiting for the next visit; it no-ops once the cover has been read.
+        self.refresh_accent(cx);
+        let page_accent = self.page_accent(cx);
+        let header_tint = self.header_tint(cx);
 
         let (album_starred, album_rating) = self
             .album
@@ -758,16 +832,19 @@ impl Render for AlbumDetailView {
                             h_flex()
                                 .gap_2()
                                 .mt_1()
-                                .child(
-                                    Button::new("album-play")
-                                        .primary()
+                                .child({
+                                    let play = Button::new("album-play")
                                         .icon(app_icon(icons::PLAY))
                                         .label("Play")
                                         .disabled(!has_songs)
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.play_from(0, cx)),
-                                        ),
-                                )
+                                        );
+                                    match page_accent {
+                                        Some(a) => play.custom(crate::ui::accent_button(a, cx)),
+                                        None => play.primary(),
+                                    }
+                                })
                                 .child(
                                     Button::new("album-shuffle")
                                         .ghost()
@@ -1111,7 +1188,17 @@ impl Render for AlbumDetailView {
                     .rounded_2xl()
                     .p_4()
                     .gap_4()
-                    .bg(cx.theme().sidebar)
+                    // The album's colour washes across the header card and
+                    // fades back into the normal surface, so the page reads as
+                    // this album's without the track list losing contrast.
+                    .map(|this| match header_tint {
+                        Some(accent) => this.bg(linear_gradient(
+                            160.,
+                            linear_color_stop(crate::ui::page_tint(accent), 0.),
+                            linear_color_stop(cx.theme().sidebar, 0.85),
+                        )),
+                        None => this.bg(cx.theme().sidebar),
+                    })
                     .child(header),
             )
             .children(about)

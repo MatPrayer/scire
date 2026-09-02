@@ -32,6 +32,7 @@ use gpui_component::TitleBar;
 use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeRegistry};
 
 use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref};
+use crate::services::library_db::LibraryStats;
 
 fn settings_theme_path() -> Option<PathBuf> {
     let dirs = ProjectDirs::from("", "", "scire")?;
@@ -89,6 +90,59 @@ pub fn format_duration(d: Duration) -> String {
     } else {
         format!("{m}:{s:02}")
     }
+}
+
+/// Thousands-separated integer, for the library header's counts.
+pub fn format_count(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Total playtime as days/hours, for the library header.
+///
+/// A whole library is days long, so the unit pair slides down with the size
+/// rather than printing "0d 0h" for a handful of albums.
+pub fn format_playtime(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let (d, h, m) = (total / 86_400, (total % 86_400) / 3600, (total % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// One-line library summary for a catalog page header: the count of whatever
+/// that page lists, then the totals behind it.
+///
+/// `primary` is `(count, singular noun)` — the albums page counts albums, the
+/// artists page artists — so the number next to the noun always matches what
+/// the grid below is showing.
+pub fn library_summary(primary: (i64, &str), stats: &LibraryStats) -> String {
+    let noun = if primary.0 == 1 {
+        primary.1.to_string()
+    } else {
+        format!("{}s", primary.1)
+    };
+    let tracks = if stats.tracks == 1 { "track" } else { "tracks" };
+    format!(
+        "{} {noun} · {} {tracks} · {}",
+        format_count(primary.0),
+        format_count(stats.tracks),
+        format_playtime(stats.duration_secs),
+    )
 }
 
 /// Cut `text` down to at most `max_chars`, backing up to the last word
@@ -632,6 +686,32 @@ pub fn player_tint(pref: ThemePref, cx: &App) -> Hsla {
     }
 }
 
+/// Button styling that matches the theme's primary button but on a colour of
+/// the caller's choosing.
+///
+/// The theme is a single global, so a page that wants its own accent (the album
+/// detail page under `Settings::adaptive_from_page`) cannot scope one — it
+/// paints its own accent surfaces instead, and this keeps them looking like the
+/// primary buttons everywhere else.
+pub fn accent_button(accent: Hsla, cx: &App) -> gpui_component::button::ButtonCustomVariant {
+    gpui_component::button::ButtonCustomVariant::new(cx)
+        .color(accent)
+        .foreground(accent_foreground(accent))
+        .hover(lighten(accent, 0.06))
+        .active(darken(accent, 0.06))
+}
+
+/// The wash a page tints its header with when it carries its own accent:
+/// darkened and slightly desaturated, the same treatment `player_tint` gives
+/// the bottom bar, so the two never read as competing designs.
+pub fn page_tint(accent: Hsla) -> Hsla {
+    Hsla {
+        l: (accent.l * 0.4).clamp(0.0, 1.0),
+        s: accent.s * 0.85,
+        ..accent
+    }
+}
+
 /// Recolour only the interactive accent surfaces — primary buttons, sliders,
 /// progress/seek bar, focus ring, text selection — from a single cover-derived
 /// hue. Backgrounds, text and muted surfaces are left untouched so the UI stays
@@ -933,7 +1013,26 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
 
 #[cfg(test)]
 mod tests {
-    use super::{accent_from_cover_bytes, strip_html, truncate_at_word};
+    use super::{
+        accent_from_cover_bytes, format_count, format_playtime, strip_html, truncate_at_word,
+    };
+
+    #[test]
+    fn counts_get_thousands_separators() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(12_345), "12,345");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn playtime_drops_to_the_units_it_has() {
+        assert_eq!(format_playtime(0.0), "0m");
+        assert_eq!(format_playtime(90.0), "1m");
+        assert_eq!(format_playtime(3600.0 * 5.5), "5h 30m");
+        assert_eq!(format_playtime(86_400.0 * 34.0 + 3600.0 * 5.0), "34d 5h");
+    }
 
     /// A `w`×1 PNG of one solid colour, in the encoded form the cache holds.
     fn png(r: u8, g: u8, b: u8) -> Vec<u8> {

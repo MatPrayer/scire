@@ -123,6 +123,15 @@ pub struct Settings {
     /// Draw the back/forward history buttons above the content area. The
     /// mouse's navigation buttons and the `[`/`]` keys work either way.
     pub show_nav_buttons: bool,
+    /// Under the Adaptive theme, let an album page tint itself from its own
+    /// cover. Only that page: the app's chrome — sidebar, player bar, sliders,
+    /// fullscreen — always follows the playing track, since a single global
+    /// theme is what colours them. Ignored by the other themes.
+    pub adaptive_from_page: bool,
+    /// Wash the album page's header card with that album's colour. Off by
+    /// default — the accent surfaces alone are the quiet version of
+    /// `adaptive_from_page`, and the gradient is the loud one.
+    pub adaptive_page_gradient: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -402,6 +411,8 @@ impl Default for Settings {
             vi_mode: false,
             hover_glow: false,
             show_nav_buttons: true,
+            adaptive_from_page: false,
+            adaptive_page_gradient: false,
         }
     }
 }

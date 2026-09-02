@@ -650,6 +650,66 @@ impl LibraryDb {
         rows.collect()
     }
 
+    /// Catalog totals for the library header: album/artist counts, track count
+    /// and total playtime.
+    ///
+    /// Counts and playtime come from the **album** rows (`song_count`,
+    /// `duration`) rather than the track table: the listing carries them for
+    /// every album, while the tracks themselves are only fetched for albums
+    /// that changed — a library synced incrementally has album rows whose
+    /// tracks were never pulled, and counting those would report a fraction of
+    /// the library. The local scanner recomputes both columns from the files it
+    /// walked, so the same two columns are right for either source.
+    ///
+    /// `library_ids` empty = every music folder. Rows synced before the
+    /// provenance column existed carry no library id and are left out of a
+    /// subset, matching what the grids show.
+    pub fn library_stats(
+        &self,
+        source: &str,
+        library_ids: &[String],
+    ) -> Result<LibraryStats, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&source];
+        let filter = if library_ids.is_empty() {
+            String::new()
+        } else {
+            for id in library_ids {
+                params.push(id);
+            }
+            let holes = (2..2 + library_ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" AND library_id IN ({holes})")
+        };
+        let (albums, tracks, duration_secs) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(song_count), 0), COALESCE(SUM(duration), 0.0)
+                 FROM albums WHERE source = ?1{filter}"
+            ),
+            params.as_slice(),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            },
+        )?;
+        let artists = conn.query_row(
+            &format!("SELECT COUNT(*) FROM artists WHERE source = ?1{filter}"),
+            params.as_slice(),
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(LibraryStats {
+            albums,
+            artists,
+            tracks,
+            duration_secs,
+        })
+    }
+
     // ------------------------------------------------------------------
     // Config queries
     // ------------------------------------------------------------------
@@ -823,6 +883,16 @@ pub struct AlbumFingerprint {
     pub duration: f64,
     /// Track rows actually present, which is not always `song_count`.
     pub track_rows: i64,
+}
+
+/// Catalog totals for one source (and optionally one library subset).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LibraryStats {
+    pub albums: i64,
+    pub artists: i64,
+    pub tracks: i64,
+    /// Total playtime of every album counted, in seconds.
+    pub duration_secs: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1135,6 +1205,52 @@ mod tests {
         // Ordered by title COLLATE NOCASE
         assert_eq!(albums[0].title, "Another Album");
         assert_eq!(albums[1].title, "Test Album");
+    }
+
+    #[test]
+    fn library_stats_totals_and_library_filter() {
+        let db = test_db();
+        let mut a1 = AlbumRow::new("alb1", "navidrome", "One");
+        a1.song_count = 10;
+        a1.duration = 3600.0;
+        a1.library_id = Some("1".into());
+        db.upsert_album(&a1).unwrap();
+        let mut a2 = AlbumRow::new("alb2", "navidrome", "Two");
+        a2.song_count = 5;
+        a2.duration = 1800.0;
+        a2.library_id = Some("2".into());
+        db.upsert_album(&a2).unwrap();
+        // Pre-v3 row: no provenance, so a subset leaves it out.
+        let mut a3 = AlbumRow::new("alb3", "navidrome", "Three");
+        a3.song_count = 7;
+        a3.duration = 900.0;
+        db.upsert_album(&a3).unwrap();
+        // Another source's rows never count towards these totals.
+        let mut local = AlbumRow::new("alb4", "local", "Four");
+        local.song_count = 3;
+        local.duration = 600.0;
+        db.upsert_album(&local).unwrap();
+        db.upsert_artist("ar1", "navidrome", "A", None, Some("1"))
+            .unwrap();
+        db.upsert_artist("ar2", "navidrome", "B", None, Some("2"))
+            .unwrap();
+        db.upsert_artist("ar3", "local", "C", None, None).unwrap();
+
+        let all = db.library_stats("navidrome", &[]).unwrap();
+        assert_eq!((all.albums, all.artists, all.tracks), (3, 2, 22));
+        assert_eq!(all.duration_secs, 6300.0);
+
+        let one = db.library_stats("navidrome", &["1".to_string()]).unwrap();
+        assert_eq!((one.albums, one.artists, one.tracks), (1, 1, 10));
+        assert_eq!(one.duration_secs, 3600.0);
+
+        let both = db
+            .library_stats("navidrome", &["1".to_string(), "2".to_string()])
+            .unwrap();
+        assert_eq!((both.albums, both.artists, both.tracks), (2, 2, 15));
+
+        let local = db.library_stats("local", &[]).unwrap();
+        assert_eq!((local.albums, local.artists, local.tracks), (1, 1, 3));
     }
 
     #[test]

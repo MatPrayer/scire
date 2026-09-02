@@ -15,7 +15,7 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, 
 use subsonic::{Album, ArtistIndex, ArtistInfo2, ArtistWithAlbums, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
-use crate::services::library_db::LibraryDb;
+use crate::services::library_db::{LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
@@ -111,6 +111,8 @@ pub struct ArtistsView {
     error: Option<String>,
     /// Card index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
+    /// Catalog totals shown in the header, for the selected libraries.
+    stats: LibraryStats,
 }
 
 impl EventEmitter<ArtistsEvent> for ArtistsView {}
@@ -137,7 +139,9 @@ impl ArtistsView {
             loading: false,
             error: None,
             vi_cursor: None,
+            stats: LibraryStats::default(),
         };
+        this.refresh_stats(cx);
         this.seed_from_cache(cx);
         this.load(cx);
         this
@@ -202,7 +206,16 @@ impl ArtistsView {
     /// A client exists now. This view is built during the pre-connect window,
     /// where `load` had nothing to fetch with and bailed — without this it
     /// would keep showing the seeded cache for the rest of the session.
+    /// Re-read the header totals from the cache; see `AlbumsView::refresh_stats`.
+    fn refresh_stats(&mut self, cx: &mut Context<Self>) {
+        let libraries = self.session.read(cx).library_ids.clone();
+        if let Ok(stats) = self.library_db.library_stats("navidrome", &libraries) {
+            self.stats = stats;
+        }
+    }
+
     pub fn client_ready(&mut self, cx: &mut Context<Self>) {
+        self.refresh_stats(cx);
         if self.cached || self.artists.is_empty() {
             self.load(cx);
         }
@@ -543,6 +556,20 @@ impl Render for ArtistsView {
                                             "Loading…"
                                         }),
                                 ),
+                        )
+                    })
+                    .child(div().flex_1())
+                    // Nothing to summarise until a sync has written rows —
+                    // zeros next to a grid full of live cards read as a bug.
+                    .when(self.stats.albums > 0, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(crate::ui::library_summary(
+                                    (self.stats.artists, "artist"),
+                                    &self.stats,
+                                )),
                         )
                     }),
             )

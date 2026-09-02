@@ -17,7 +17,7 @@ use subsonic::{Album, AlbumListType, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::config::AlbumSort;
-use crate::services::library_db::{AlbumRow, LibraryDb};
+use crate::services::library_db::{AlbumRow, LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
@@ -240,6 +240,8 @@ pub struct AlbumsView {
     error: Option<String>,
     /// Card index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
+    /// Catalog totals shown in the header, for the selected libraries.
+    stats: LibraryStats,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
@@ -268,7 +270,9 @@ impl AlbumsView {
             scroll: UniformListScrollHandle::new(),
             error: None,
             vi_cursor: None,
+            stats: LibraryStats::default(),
         };
+        this.refresh_stats(cx);
         this.seed_from_cache(active_tab, cx);
         this.load_more(active_tab, cx);
         this
@@ -343,7 +347,18 @@ impl AlbumsView {
     /// A client exists now. This view is built during the pre-connect window,
     /// where `load_more` had nothing to fetch with and bailed — without this it
     /// would keep showing the seeded cache until the user scrolled.
+    /// Re-read the header totals from the cache. Cheap — two aggregates over
+    /// the album/artist tables — so it runs wherever the cache may have moved
+    /// under the view, rather than being recomputed per frame.
+    fn refresh_stats(&mut self, cx: &mut Context<Self>) {
+        let libraries = self.session.read(cx).library_ids.clone();
+        if let Ok(stats) = self.library_db.library_stats("navidrome", &libraries) {
+            self.stats = stats;
+        }
+    }
+
     pub fn client_ready(&mut self, cx: &mut Context<Self>) {
+        self.refresh_stats(cx);
         let tab = self.active_tab;
         if self.tabs.get(&tab).is_none_or(|t| t.page == 0) {
             self.load_more(tab, cx);
@@ -986,6 +1001,22 @@ impl Render for AlbumsView {
                                             "Loading…"
                                         }),
                                 ),
+                        )
+                    })
+                    // Totals ride the right edge; the spinner keeps its place
+                    // beside the tabs so it reads as part of the listing.
+                    .child(div().flex_1())
+                    // Nothing to summarise until a sync has written rows —
+                    // zeros next to a grid full of live cards read as a bug.
+                    .when(self.stats.albums > 0, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(crate::ui::library_summary(
+                                    (self.stats.albums, "album"),
+                                    &self.stats,
+                                )),
                         )
                     }),
             )
