@@ -6,9 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Context, ElementId, Entity, EventEmitter, IntoElement,
-    Render, UniformListScrollHandle, Window, div, ease_out_quint, img, prelude::*, px, relative,
-    uniform_list,
+    App, Context, Entity, EventEmitter, IntoElement, Render, UniformListScrollHandle, Window, div,
+    img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -243,8 +242,6 @@ pub struct AlbumsView {
     vi_cursor: Option<usize>,
     /// Catalog totals shown in the header, for the selected libraries.
     stats: LibraryStats,
-    /// Previous active tab index for animated indicator.
-    prev_tab_idx: usize,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
@@ -274,7 +271,6 @@ impl AlbumsView {
             error: None,
             vi_cursor: None,
             stats: LibraryStats::default(),
-            prev_tab_idx: 0,
         };
         this.refresh_stats(cx);
         this.seed_from_cache(active_tab, cx);
@@ -371,7 +367,6 @@ impl AlbumsView {
     }
 
     fn select_tab(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
-        self.prev_tab_idx = TABS.iter().position(|&t| t == self.active_tab).unwrap_or(0);
         self.active_tab = tab;
         if self.tabs.get(&tab).is_none_or(|t| t.albums.is_empty()) {
             self.seed_from_cache(tab, cx);
@@ -886,49 +881,18 @@ impl Render for AlbumsView {
             self.refetch_art(cx);
         }
 
-        let active_idx = TABS.iter().position(|&t| t == active).unwrap_or(0);
-        let prev_idx = self.prev_tab_idx.min(TABS.len() - 1);
-        let tab_count = TABS.len();
-        let tab_w = 1.0 / tab_count as f32;
-        let reduced_motion = self.session.read(cx).settings.reduced_motion;
-
-        let indicator = div()
-            .id("album-tab-indicator")
-            .absolute()
-            .bottom_0()
-            .h(px(2.))
-            .bg(cx.theme().primary)
-            .rounded_full()
-            .w(relative(tab_w))
-            .left(relative(active_idx as f32 * tab_w))
-            .with_animation(
-                ElementId::Name("album-tab-indicator".into()),
-                Animation::new(std::time::Duration::from_millis(150)).with_easing(ease_out_quint()),
-                move |this, t| {
-                    if !reduced_motion {
-                        let start = prev_idx as f32 * tab_w;
-                        let end = active_idx as f32 * tab_w;
-                        let pos = start + (end - start) * t;
-                        this.left(relative(pos))
-                    } else {
-                        this
-                    }
-                },
-            )
-            .into_any_element();
-
-        let tabs = h_flex()
-            .gap_1()
-            .relative()
-            .children(TABS.iter().map(|&tab| {
-                Button::new(tab_label(tab))
-                    .ghost()
-                    .xsmall()
-                    .label(tab_label(tab))
-                    .when(active == tab, |b: Button| b.primary())
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
-            }))
-            .child(indicator);
+        // The filled primary button is the whole selection marker. An
+        // underline used to ride under the strip as well, but it was placed in
+        // even fractions of the row while the buttons are label-width, so it
+        // never lined up with the tab it marked.
+        let tabs = h_flex().gap_1().children(TABS.iter().map(|&tab| {
+            Button::new(tab_label(tab))
+                .ghost()
+                .xsmall()
+                .label(tab_label(tab))
+                .when(active == tab, |b: Button| b.primary())
+                .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
+        }));
 
         // If the loaded content doesn't fill the viewport (no scrollbar yet),
         // keep fetching until it does or the list is exhausted.
