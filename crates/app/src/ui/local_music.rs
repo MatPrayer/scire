@@ -187,6 +187,7 @@ impl LocalMusicView {
                     s
                 }
             })
+            .active(|s| s.opacity(0.8))
             .when(focused, |s| {
                 s.border_color(cx.theme().primary)
                     .shadow(focus_glow(cx))

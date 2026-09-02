@@ -1,6 +1,9 @@
 //! Left navigation rail: library switcher + sections + playlists.
 
-use gpui::{App, IntoElement, SharedString, Window, div, hsla, prelude::*, px, relative};
+use gpui::{
+    Animation, AnimationExt as _, App, ElementId, IntoElement, SharedString, Window, div,
+    ease_out_quint, hsla, prelude::*, px, relative,
+};
 
 use crate::ui::root::RefreshStage;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -85,6 +88,7 @@ fn refresh_bar(stage: RefreshStage, cx: &App) -> impl IntoElement {
 pub fn render_sidebar(
     model: SidebarModel,
     on_action: impl Fn(SidebarAction, &mut Window, &mut App) + Clone + 'static,
+    reduced_motion: bool,
     cx: &App,
 ) -> impl IntoElement {
     let nav_item = |label: &'static str, icon: IconName, section: NavSection| {
@@ -111,6 +115,16 @@ pub fn render_sidebar(
             .on_click(move |_, window, cx| on_action(SidebarAction::Select(section), window, cx))
             .child(Icon::new(icon).small())
             .child(label)
+            .with_animation(
+                ElementId::Name(format!("sidebar-nav-{}", label).into()),
+                Animation::new(std::time::Duration::from_millis(if reduced_motion {
+                    0
+                } else {
+                    150
+                }))
+                .with_easing(ease_out_quint()),
+                |this, _t| this,
+            )
     };
 
     // Library switcher (only when the user can access more than one).

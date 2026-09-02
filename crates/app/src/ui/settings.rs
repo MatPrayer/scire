@@ -394,6 +394,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_reduced_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.reduced_motion = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_default_page(&mut self, page: DefaultPage, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.default_page = page);
@@ -1104,6 +1111,14 @@ impl Render for SettingsView {
                                     .label("Vi-style keyboard navigation")
                                     .on_click(cx.listener(|this, &checked, _, cx| {
                                         this.set_vi_mode(checked, cx);
+                                    })),
+                            )
+                            .child(
+                                Switch::new("reduced-motion")
+                                    .checked(self.session.read(cx).settings.reduced_motion)
+                                    .label("Reduce motion")
+                                    .on_click(cx.listener(|this, &checked, _, cx| {
+                                        this.set_reduced_motion(checked, cx);
                                     })),
                             )
                             .child(

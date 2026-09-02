@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, KeyDownEvent, Render, ScrollHandle, Window, div,
-    img, prelude::*, px,
+    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement,
+    KeyDownEvent, Render, ScrollHandle, Window, div, ease_out_quint, img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -649,6 +649,11 @@ impl SearchBar {
                         .child("Type to search artists, albums and songs…"),
                 )
             })
+            .with_animation(
+                ElementId::Name("search-palette-anim".into()),
+                Animation::new(std::time::Duration::from_millis(150)).with_easing(ease_out_quint()),
+                |this, t| this.opacity(t),
+            )
             .into_any_element()
     }
 }

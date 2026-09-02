@@ -2,9 +2,9 @@
 //! (sidebar | content | optional queue panel / player bar).
 
 use gpui::{
-    AsyncWindowContext, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, NavigationDirection, Render, SharedString, WeakEntity, Window, div, prelude::*,
-    px,
+    Animation, AnimationExt as _, AsyncWindowContext, Context, ElementId, Entity, FocusHandle,
+    Focusable, IntoElement, KeyDownEvent, MouseButton, NavigationDirection, Render, SharedString,
+    WeakEntity, Window, div, ease_out_quint, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -1982,18 +1982,18 @@ impl Render for RootView {
                 cx.listener(|this, _, window, cx| this.nav_forward(window, cx)),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                // Ctrl+K (Cmd+K) always opens the command palette.
-                if event.keystroke.key == "k"
-                    && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
-                {
-                    this.search_bar
-                        .update(cx, |sb, cx| sb.open_palette(window, cx));
-                    cx.stop_propagation();
-                    return;
-                }
                 if this.vi_enabled {
                     this.handle_vi_key(event, window, cx, false);
                 } else {
+                    // Ctrl+K (Cmd+K) opens the command palette (vi-mode excluded).
+                    if event.keystroke.key == "k"
+                        && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+                    {
+                        this.search_bar
+                            .update(cx, |sb, cx| sb.open_palette(window, cx));
+                        cx.stop_propagation();
+                        return;
+                    }
                     let focused = window.focused(cx);
                     let is_text_input = focused.is_some_and(|focus| focus != this.focus_handle);
                     match event.keystroke.key.as_str() {
@@ -2103,6 +2103,7 @@ impl Render for RootView {
                                 }
                             });
                         },
+                        self.session.read(cx).settings.reduced_motion,
                         cx,
                     ))
                     .child(
@@ -2150,7 +2151,16 @@ impl Render for RootView {
                                 )
                             }),
                     )
-                    .when(self.show_queue, |this| this.child(self.queue_panel.clone())),
+                    .when(self.show_queue, |this| {
+                        this.child(
+                            div().child(self.queue_panel.clone()).with_animation(
+                                ElementId::Name("queue-slide-in".into()),
+                                Animation::new(std::time::Duration::from_millis(200))
+                                    .with_easing(ease_out_quint()),
+                                |this, t| this.opacity(t),
+                            ),
+                        )
+                    }),
             )
             .child(self.player_bar.clone())
             // Fullscreen overlay — rendered last so it sits on top.

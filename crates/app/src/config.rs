@@ -132,6 +132,10 @@ pub struct Settings {
     /// default — the accent surfaces alone are the quiet version of
     /// `adaptive_from_page`, and the gradient is the loud one.
     pub adaptive_page_gradient: bool,
+    /// Disable non-essential UI animations (tab transitions, hover effects, panel slides).
+    /// Useful on lower-end GPUs or for users sensitive to motion.
+    #[serde(default)]
+    pub reduced_motion: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -413,6 +417,7 @@ impl Default for Settings {
             show_nav_buttons: true,
             adaptive_from_page: false,
             adaptive_page_gradient: false,
+            reduced_motion: false,
         }
     }
 }
