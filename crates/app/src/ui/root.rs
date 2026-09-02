@@ -185,8 +185,17 @@ pub struct RootView {
     new_pl_name: Entity<InputState>,
     new_pl_desc: Entity<InputState>,
     /// Art key (album-scoped) whose colour the Adaptive theme accent was last
-    /// derived from, to avoid re-extracting on every player tick.
-    adaptive_cover: Option<String>,
+    /// derived from, to avoid re-extracting on every player tick. The outer
+    /// `None` means nothing has been resolved yet and the next tick should try
+    /// again — distinct from `Some(None)`, a track that genuinely has no cover.
+    /// Collapsing the two made a coverless track (a local file with no art, a
+    /// radio stream) match the initial state and short-circuit forever, so the
+    /// accent was never applied at all.
+    adaptive_cover: Option<Option<String>>,
+    /// The accent last extracted and applied. Kept because `Theme::change`
+    /// resets every colour to the mode's defaults, and nothing re-derives the
+    /// accent afterwards — see `restore_adaptive_accent`.
+    adaptive_accent: Option<gpui::Hsla>,
     focus_handle: FocusHandle,
     // -- Vi-mode state --
     vi_enabled: bool,
@@ -417,6 +426,11 @@ impl RootView {
         // though the cached catalog was right there to draw.
         cx.defer_in(window, |this: &mut Self, window, cx| {
             this.open_default_page(Some(window), cx);
+            // Same reason: the queue is restored inside the player's own
+            // constructor, before this view exists, so no notify ever reaches
+            // the observer above and the restored track's accent was missing
+            // until the user touched playback.
+            this.maybe_update_adaptive_accent(cx);
         });
 
         // Sidebar fold state is persisted, so restore it instead of reopening
@@ -466,6 +480,7 @@ impl RootView {
             new_pl_name,
             new_pl_desc,
             adaptive_cover: None,
+            adaptive_accent: None,
             focus_handle: cx.focus_handle(),
             setup_enable_navidrome: true,
             setup_server_url: setup_url,
@@ -604,8 +619,12 @@ impl RootView {
     fn maybe_update_adaptive_accent(&mut self, cx: &mut Context<Self>) {
         if self.session.read(cx).settings.theme != ThemePref::Adaptive {
             self.adaptive_cover = None;
+            self.adaptive_accent = None;
             return;
         }
+        // Before any of the short-circuits below, since every one of them would
+        // otherwise leave a wiped theme wiped.
+        self.restore_adaptive_accent(cx);
         let song = self.player.read(cx).current_song().cloned();
         // Local tracks carry a cache hash instead of a server cover id, and no
         // client to fetch from — resolve those straight off disk, or the accent
@@ -619,10 +638,13 @@ impl RootView {
                 .and_then(crate::services::local_library::local_art_path)
                 .filter(|p| p.exists());
             let key = song.cover_art.clone();
-            if key == self.adaptive_cover {
+            if self.adaptive_cover.as_ref() == Some(&key) {
                 return;
             }
-            self.adaptive_cover = key;
+            self.adaptive_cover = Some(key);
+            // No art on disk: the accent restored above stays. Dropping to the
+            // theme default would repaint the whole UI stock near-white, which
+            // reads as the feature having broken.
             let Some(path) = path else { return };
             self.accent_from_file(path, cx);
             return;
@@ -632,12 +654,17 @@ impl RootView {
         // recolour the whole UI) on every track of the same album.
         let cover = song.as_ref().and_then(artwork::song_cover);
         let key = cover.as_ref().map(|(_, key)| key.clone());
-        if key == self.adaptive_cover {
+        if self.adaptive_cover.as_ref() == Some(&key) {
             return;
         }
-        self.adaptive_cover = key;
+        self.adaptive_cover = Some(key);
+        // Nothing playing, or a track with no cover: keep the last accent.
         let Some((cover_id, key)) = cover else { return };
         let Some(client) = self.session.read(cx).client.clone() else {
+            // Pre-connect. Leave the key unresolved or the session observer's
+            // pass once the client lands would short-circuit on it and the
+            // accent would never be derived for the restored track.
+            self.adaptive_cover = None;
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -668,6 +695,21 @@ impl RootView {
         .detach();
     }
 
+    /// Put the last extracted accent back if the global theme has drifted off
+    /// it. `Theme::change` — which every theme re-apply goes through, including
+    /// picking Adaptive in Settings — resets *every* colour to the mode's
+    /// defaults, and nothing else re-derives the accent: the UI sat on the
+    /// stock near-white primary until the playing track changed. Comparing
+    /// against the stored accent keeps this a no-op (and skips the window
+    /// refresh) on the ticks where nothing was wiped.
+    fn restore_adaptive_accent(&self, cx: &mut Context<Self>) {
+        if let Some(accent) = self.adaptive_accent
+            && cx.theme().primary != accent
+        {
+            crate::ui::apply_adaptive_accent(cx, accent);
+        }
+    }
+
     /// Apply an extracted accent, or clear the remembered cover key so the next
     /// player notify retries. Without the reset a single failed fetch pinned the
     /// UI to the previous album's colour until the track changed again.
@@ -678,6 +720,7 @@ impl RootView {
     ) {
         match accent {
             Ok(accent) => {
+                let _ = this.update(cx, |view, _| view.adaptive_accent = Some(accent));
                 let _ = cx.update(|cx| crate::ui::apply_adaptive_accent(cx, accent));
             }
             Err(_) => {

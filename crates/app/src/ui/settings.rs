@@ -269,7 +269,14 @@ impl SettingsView {
     }
 
     fn set_theme(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
-        self.session.update(cx, |s, _| s.settings.theme = pref);
+        // Notifying the session is what tells the root view to re-derive the
+        // Adaptive accent: `apply_theme` below resets every colour to the
+        // mode's defaults, and a silent update left the accent wiped until the
+        // playing track changed — indefinitely, if playback was paused.
+        self.session.update(cx, |s, cx| {
+            s.settings.theme = pref;
+            cx.notify();
+        });
         self.persist(cx);
         apply_theme(pref, window, cx);
         cx.notify();
