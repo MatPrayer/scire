@@ -860,7 +860,8 @@ pub fn divider() -> gpui::Div {
     div().h(px(1.)).w_full().bg(hsla(0., 0., 0.5, 0.15))
 }
 
-/// Outer glow used by the vi-mode focus cursor and card hover highlight.
+/// Outer glow used by the vi-mode focus cursor, and by the card hover
+/// highlight when `Settings::hover_glow` is on (off by default).
 pub fn focus_glow(cx: &App) -> Vec<BoxShadow> {
     let c = cx.theme().primary;
     vec![BoxShadow {

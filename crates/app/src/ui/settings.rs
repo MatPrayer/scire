@@ -437,6 +437,20 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_hover_glow(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.hover_glow = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_show_nav_buttons(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.show_nav_buttons = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_replay_gain(&mut self, mode: ReplayGainMode, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.replay_gain = mode);
@@ -527,6 +541,8 @@ impl Render for SettingsView {
             )
         };
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
+        let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
+        let hover_glow = self.session.read(cx).settings.hover_glow;
         let resume_playback = self.session.read(cx).settings.resume_playback;
         let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
         let replay_gain = self.session.read(cx).settings.replay_gain;
@@ -636,6 +652,24 @@ impl Render for SettingsView {
                                         "Disable to use your desktop environment's native window \
                                          decorations (recommended on some Linux setups).",
                                     ),
+                            )
+                            .child(
+                                Switch::new("show-nav-buttons")
+                                    .checked(show_nav_buttons)
+                                    .label("Back / forward buttons")
+                                    .on_click(cx.listener(|this, &checked, _, cx| {
+                                        this.set_show_nav_buttons(checked, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "Hiding them keeps history navigation on the mouse's \
+                                         side buttons and the keyboard ([ / ] normally, h / l \
+                                         in vi mode).",
+                                    ),
                             ),
                     )
                     // Appearance
@@ -724,6 +758,23 @@ impl Render for SettingsView {
                                             .on_click(cx.listener(|this, &checked, _, cx| {
                                                 this.set_fullscreen_volume(checked, cx);
                                             })),
+                                    )
+                                    .child(
+                                        Switch::new("hover-glow")
+                                            .checked(hover_glow)
+                                            .label("Glow album cards on hover")
+                                            .on_click(cx.listener(|this, &checked, _, cx| {
+                                                this.set_hover_glow(checked, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                "The vi-mode focus cursor keeps its glow either \
+                                                 way.",
+                                            ),
                                     ),
                             ),
                     )

@@ -679,6 +679,7 @@ impl AlbumsView {
     ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = album.id.clone();
+        let hover_glow = self.session.read(cx).settings.hover_glow;
         let art = self.art_paths.get(&album.id).cloned();
         let name = album.name.clone();
         let artist = album.artist.clone().unwrap_or_default();
@@ -707,7 +708,14 @@ impl AlbumsView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted).shadow(focus_glow(cx)))
+            .hover(|s| {
+                let s = s.bg(cx.theme().muted);
+                if hover_glow {
+                    s.shadow(focus_glow(cx))
+                } else {
+                    s
+                }
+            })
             .when(focused, |s| {
                 s.border_color(cx.theme().primary).shadow(focus_glow(cx))
             })

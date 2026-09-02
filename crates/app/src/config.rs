@@ -117,6 +117,12 @@ pub struct Settings {
     pub sidebar_playlists_collapsed: bool,
     /// Vi-style modal keyboard navigation.
     pub vi_mode: bool,
+    /// Draw the outer glow on album cards under the mouse. The vi-mode focus
+    /// cursor keeps its glow either way.
+    pub hover_glow: bool,
+    /// Draw the back/forward history buttons above the content area. The
+    /// mouse's navigation buttons and the `[`/`]` keys work either way.
+    pub show_nav_buttons: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -394,6 +400,8 @@ impl Default for Settings {
             sidebar_libraries_collapsed: false,
             sidebar_playlists_collapsed: false,
             vi_mode: false,
+            hover_glow: false,
+            show_nav_buttons: true,
         }
     }
 }

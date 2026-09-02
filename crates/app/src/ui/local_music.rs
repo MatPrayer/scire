@@ -18,6 +18,7 @@ use crate::assets::{app_icon, icons};
 use crate::services::library_db::{AlbumRow, LibraryDb};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
+use crate::state::session::Session;
 use crate::ui::{focus_glow, with_focus_animation};
 
 /// How a context-menu action should enqueue an album's songs.
@@ -37,6 +38,7 @@ pub enum LocalMusicEvent {
 pub struct LocalMusicView {
     db: Arc<LibraryDb>,
     player: Entity<PlayerState>,
+    session: Entity<Session>,
     albums: Vec<AlbumRow>,
     art_paths: HashMap<String, PathBuf>,
     scroll: ScrollHandle,
@@ -52,11 +54,17 @@ pub struct LocalMusicView {
 impl EventEmitter<LocalMusicEvent> for LocalMusicView {}
 
 impl LocalMusicView {
-    pub fn new(db: Arc<LibraryDb>, player: Entity<PlayerState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        db: Arc<LibraryDb>,
+        player: Entity<PlayerState>,
+        session: Entity<Session>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let scroll = ScrollHandle::new();
         let mut view = Self {
             db,
             player,
+            session,
             albums: Vec::new(),
             art_paths: HashMap::new(),
             scroll: scroll.clone(),
@@ -146,6 +154,7 @@ impl LocalMusicView {
     ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = id.clone();
+        let hover_glow = self.session.read(cx).settings.hover_glow;
         let art = self.art_paths.get(&id).cloned();
         let name = album.title.clone();
         let artist = album.artist.clone().unwrap_or_default();
@@ -163,7 +172,14 @@ impl LocalMusicView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted).shadow(focus_glow(cx)))
+            .hover(|s| {
+                let s = s.bg(cx.theme().muted);
+                if hover_glow {
+                    s.shadow(focus_glow(cx))
+                } else {
+                    s
+                }
+            })
             .when(focused, |s| {
                 s.border_color(cx.theme().primary)
                     .shadow(focus_glow(cx))

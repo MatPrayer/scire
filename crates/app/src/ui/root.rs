@@ -8,7 +8,10 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{ActiveTheme as _, StyledExt as _, TitleBar, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
+    h_flex, v_flex,
+};
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -801,7 +804,12 @@ impl RootView {
             }
             NavSection::LocalMusic => {
                 let view = cx.new(|cx| {
-                    LocalMusicView::new(self.library_db.clone(), self.player.clone(), cx)
+                    LocalMusicView::new(
+                        self.library_db.clone(),
+                        self.player.clone(),
+                        self.session.clone(),
+                        cx,
+                    )
                 });
                 cx.subscribe(&view, |this: &mut Self, _, event, cx| {
                     let LocalMusicEvent::OpenAlbum(id) = event;
@@ -862,6 +870,40 @@ impl RootView {
             self.history.push(current);
         }
         self.restore_entry(next, window, cx);
+    }
+
+    /// Back/forward history buttons drawn above the content area.
+    ///
+    /// Purely a second way in to `nav_back`/`nav_forward` — the mouse's
+    /// navigation buttons and the `[`/`]` keys stay wired whether or not this
+    /// row is shown, so hiding it costs no navigation.
+    fn render_nav_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_back = !self.history.is_empty();
+        let can_forward = !self.forward_stack.is_empty();
+        h_flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .pt_2()
+            .child(
+                Button::new("nav-back")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::ArrowLeft))
+                    .tooltip("Back")
+                    .disabled(!can_back)
+                    .on_click(cx.listener(|this, _, window, cx| this.nav_back(window, cx))),
+            )
+            .child(
+                Button::new("nav-forward")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::ArrowRight))
+                    .tooltip("Forward")
+                    .disabled(!can_forward)
+                    .on_click(cx.listener(|this, _, window, cx| this.nav_forward(window, cx))),
+            )
     }
 
     fn restore_entry(&mut self, entry: NavEntry, window: &mut Window, cx: &mut Context<Self>) {
@@ -1903,6 +1945,7 @@ impl Render for RootView {
         let fullscreen = self.fullscreen.clone();
         let show_fullscreen = self.show_fullscreen;
         let client_titlebar = self.session.read(cx).settings.client_titlebar;
+        let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
 
         v_flex()
             .size_full()
@@ -2050,7 +2093,18 @@ impl Render for RootView {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(content)
+                            .child(
+                                // The nav row sits above the page rather than
+                                // floating over it: every content view draws
+                                // its own header in the top-left corner, so an
+                                // overlay would land on one.
+                                v_flex()
+                                    .size_full()
+                                    .when(show_nav_buttons, |this| {
+                                        this.child(self.render_nav_buttons(cx))
+                                    })
+                                    .child(div().flex_1().min_h_0().child(content)),
+                            )
                             // Mode indicator + transient command feedback
                             // (replaces the old inline search bar).
                             .when(!palette_open && self.vi_enabled, |this| {
