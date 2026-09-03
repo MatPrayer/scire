@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="packaging/macos/scire.svg" alt="Scirè" width="96" />
+<img src="packaging/macos/scire.svg" alt="Scirè" width="320" />
 
 # Scirè
 
