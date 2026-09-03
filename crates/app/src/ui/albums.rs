@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -31,6 +32,9 @@ const LOAD_AHEAD_PX: f32 = 600.;
 /// The cache list can run to thousands of rows and every lookup is a stat;
 /// the rest pick up art as the live pages overwrite them.
 const CACHE_ART_PREFETCH: usize = 300;
+
+/// Column guess for the very first frame, before anything has been laid out.
+const FALLBACK_COLS: usize = 5;
 
 /// Card text metrics. The line heights are explicit because gpui's default
 /// line box for these font sizes clips descenders; the block height is fixed
@@ -242,6 +246,12 @@ pub struct AlbumsView {
     vi_cursor: Option<usize>,
     /// Catalog totals shown in the header, for the selected libraries.
     stats: LibraryStats,
+    /// Tracks the grid's width against the window's, so the column count
+    /// follows a resize on the same frame instead of one behind it.
+    live_width: crate::ui::LiveWidth,
+    /// Playlist ids/names for the cards' context menu, shared by every card
+    /// instead of collected per card per frame.
+    menu_playlists: Rc<Vec<(String, String)>>,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
@@ -271,6 +281,8 @@ impl AlbumsView {
             error: None,
             vi_cursor: None,
             stats: LibraryStats::default(),
+            live_width: crate::ui::LiveWidth::default(),
+            menu_playlists: Rc::new(Vec::new()),
         };
         this.refresh_stats(cx);
         this.seed_from_cache(active_tab, cx);
@@ -471,22 +483,37 @@ impl AlbumsView {
         }
     }
 
-    /// Number of grid columns at the current viewport width.
-    fn grid_cols(&self, cx: &App) -> usize {
-        let base = self.scroll.0.borrow().base_handle.clone();
-        let width = f32::from(base.bounds().size.width);
-        let card_w = self.session.read(cx).settings.cover_size.px() + 12.;
-        let gap = 16.;
-        if width > 0. {
-            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
-        } else {
-            5
+    /// Refresh the shared context-menu playlist list when it has actually
+    /// changed. One comparison pass per frame replaces a clone of the whole
+    /// list per visible card per frame.
+    fn sync_menu_playlists(&mut self, cx: &App) {
+        let playlists = &self.playlists.read(cx).playlists;
+        let unchanged = playlists.len() == self.menu_playlists.len()
+            && playlists
+                .iter()
+                .zip(self.menu_playlists.iter())
+                .all(|(p, (id, name))| &p.id == id && &p.name == name);
+        if !unchanged {
+            self.menu_playlists = Rc::new(
+                playlists
+                    .iter()
+                    .map(|p| (p.id.clone(), p.name.clone()))
+                    .collect(),
+            );
         }
+    }
+
+    /// Number of grid columns at the current window width.
+    fn grid_cols(&mut self, window: &Window, cx: &App) -> usize {
+        let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
+        let width = self.live_width.resolve(measured, window);
+        let tile = self.session.read(cx).settings.cover_size.px();
+        crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS)
     }
 
     /// Move the vi-mode cursor by `delta` grid positions, clamping and
     /// scrolling the focused card into view.
-    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let count = self
             .tabs
             .get(&self.active_tab)
@@ -502,7 +529,7 @@ impl AlbumsView {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        let cols = self.grid_cols(cx).max(1);
+        let cols = self.grid_cols(window, cx).max(1);
         self.scroll
             .scroll_to_item(next / cols, gpui::ScrollStrategy::Top);
         cx.notify();
@@ -705,13 +732,11 @@ impl AlbumsView {
         let view = entity.clone();
         let open_view = entity.clone();
         let play_view = entity.clone();
-        let menu_pl_list: Vec<(String, String)> = self
-            .playlists
-            .read(cx)
-            .playlists
-            .iter()
-            .map(|p| (p.id.clone(), p.name.clone()))
-            .collect();
+        // Shared, not rebuilt per card: the "Save to playlist" submenu needs the
+        // whole list, and cloning every name into every visible card on every
+        // frame is a resize's worth of allocations for a menu that is usually
+        // closed.
+        let menu_pl_list = self.menu_playlists.clone();
 
         let card = v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
@@ -833,7 +858,7 @@ impl AlbumsView {
                             return sub.item(PopupMenuItem::new("No playlists yet").disabled(true));
                         }
                         let mut sub = sub;
-                        for (pid, pname) in &pl_list {
+                        for (pid, pname) in pl_list.iter() {
                             let view = pl_view.clone();
                             let pid = pid.clone();
                             let album = pl_album.clone();
@@ -870,8 +895,9 @@ impl AlbumsView {
 }
 
 impl Render for AlbumsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_tab;
+        self.sync_menu_playlists(cx);
 
         // Pick up cover-size changes: refetch art at the new resolution.
         let cover = self.session.read(cx).settings.cover_size;
@@ -926,16 +952,12 @@ impl Render for AlbumsView {
         let paginating = loading && !showing_cache && album_count > 0;
         let header_loading = loading && !paginating;
 
-        // Columns from the measured viewport width; falls back to a guess on
-        // the very first frame (before layout), then self-corrects.
-        let width = f32::from(base.bounds().size.width);
-        let card_w = tile + 12.;
-        let gap = 16.;
-        let cols = if width > 0. {
-            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
-        } else {
-            5
-        };
+        // Columns from this frame's window width; falls back to a guess on the
+        // very first frame (before anything is laid out), then self-corrects.
+        let width = self
+            .live_width
+            .resolve(f32::from(base.bounds().size.width), window);
+        let cols = crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS);
         let row_count = album_count.div_ceil(cols);
 
         let entity = cx.entity();

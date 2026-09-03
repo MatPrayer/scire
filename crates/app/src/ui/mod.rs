@@ -145,6 +145,58 @@ pub fn library_summary(primary: (i64, &str), stats: &LibraryStats) -> String {
     )
 }
 
+/// Gap between grid cards, and the padding a card adds around its cover.
+/// Shared by the album and artist grids so the two pages line up column for
+/// column at every width.
+pub const GRID_GAP: f32 = 16.;
+pub const CARD_PADDING: f32 = 12.;
+
+/// Columns that fit in `width` for a cover `tile` px wide. Zero width means
+/// nothing has been laid out yet — the caller's guess stands.
+pub fn grid_columns(width: f32, tile: f32) -> Option<usize> {
+    if width <= 0. {
+        return None;
+    }
+    let card = tile + CARD_PADDING;
+    Some((((width + GRID_GAP) / (card + GRID_GAP)).floor() as usize).max(1))
+}
+
+/// Frame-accurate width for a layout that reflows with the window.
+///
+/// A `ScrollHandle`'s bounds are last frame's layout, so a grid whose column
+/// count comes from them reflows one frame behind the window: drag the edge and
+/// the cards visibly trail the cursor. `Window::viewport_size` is this frame's,
+/// but it covers the whole window rather than the grid. The chrome around the
+/// grid (sidebar, padding, an open panel) keeps its width while the window
+/// changes, so the difference between the two is stable — remember it from the
+/// measured frame and subtract it from the current viewport.
+///
+/// Chrome that *does* change width (a panel opening) is picked up on the next
+/// frame, exactly as the measured width alone would have been.
+#[derive(Default)]
+pub struct LiveWidth {
+    /// Viewport width at the frame the last measurement was laid out in.
+    viewport: f32,
+    /// That viewport minus the measured element width.
+    chrome: f32,
+}
+
+impl LiveWidth {
+    /// Feed the element's width as measured last frame, get its width for this
+    /// one. Zero until the first measurement lands.
+    pub fn resolve(&mut self, measured: f32, window: &Window) -> f32 {
+        let viewport = f32::from(window.viewport_size().width);
+        if measured > 0. && self.viewport > 0. {
+            self.chrome = (self.viewport - measured).max(0.);
+        }
+        self.viewport = viewport;
+        if measured <= 0. {
+            return 0.;
+        }
+        (viewport - self.chrome).max(0.)
+    }
+}
+
 /// Cut `text` down to at most `max_chars`, backing up to the last word
 /// boundary, with a trailing ellipsis.
 pub fn truncate_at_word(text: &str, max_chars: usize) -> String {
@@ -1041,8 +1093,22 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_from_cover_bytes, format_count, format_playtime, strip_html, truncate_at_word,
+        accent_from_cover_bytes, format_count, format_playtime, grid_columns, strip_html,
+        truncate_at_word,
     };
+
+    #[test]
+    fn grid_columns_fit_the_cards_and_their_gaps() {
+        // 168px cover + 12px card padding = 180 wide, 16 between.
+        assert_eq!(grid_columns(180., 168.), Some(1));
+        // One more card needs its gap too: 180 + 16 + 180.
+        assert_eq!(grid_columns(375., 168.), Some(1));
+        assert_eq!(grid_columns(376., 168.), Some(2));
+        // Never zero, however narrow.
+        assert_eq!(grid_columns(20., 168.), Some(1));
+        // Nothing laid out yet — the caller's guess stands.
+        assert_eq!(grid_columns(0., 168.), None);
+    }
 
     #[test]
     fn counts_get_thousands_separators() {

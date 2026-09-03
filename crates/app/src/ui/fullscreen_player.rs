@@ -27,11 +27,363 @@ use crate::ui::visualizer::Visualizer;
 
 const ART_SIZE: u32 = 600;
 
-/// Text width inside the info card: its 480px minus the 24px padding either
-/// side. Needed as a number because the marquee measures against it.
-const CARD_TEXT_WIDTH: f32 = 432.;
+/// Padding either side of the info card's text, subtracted from the card width
+/// to get the width the marquee measures against.
+const CARD_TEXT_PAD: f32 = 48.;
 /// Tiny fetch for color extraction — low-res average is a fast palette sample.
 const BG_ART_SIZE: u32 = 32;
+
+// --- Content geometry ------------------------------------------------------
+// The overlay used to be built out of constants: a 460px cover beside a 480px
+// info card, a 320px panel, gaps and padding — roughly 1300x620 of window
+// before anything is cut off. The overlay does not scroll, so a smaller window
+// simply lost whatever fell past its edge. Sizes are derived from the window
+// instead, and a window taller than it is wide stacks the cover above the card
+// rather than squeezing two columns into a strip.
+
+/// Cover art, biggest and smallest it is drawn beside the card.
+const ART_MAX: f32 = 460.;
+const ART_MIN: f32 = 140.;
+/// Its cap in the stacked layout, where it has the whole width to itself: the
+/// side-by-side cap leaves it looking small under a tall window's card.
+const ART_MAX_STACKED: f32 = 560.;
+/// Share of the cover's width the card is drawn at in the stacked layout, so
+/// the column reads cover-first instead of as two equal blocks.
+const CARD_STACKED_SHARE: f32 = 0.85;
+/// How far the cover has to lead the card before the column reads that way.
+const ART_LEAD: f32 = 24.;
+/// Info card width. The minimum is what the transport row needs inside the
+/// card's own padding: five large buttons and the gaps between them.
+const CARD_MAX: f32 = 480.;
+const CARD_MIN: f32 = 340.;
+/// Card width below which the queue/visualizer/lyrics buttons drop their
+/// labels. Three labelled buttons need ~370px of row and stick out of a card
+/// narrower than this — the icons alone need ~160.
+const TOGGLE_LABEL_MIN: f32 = 430.;
+/// Height the info card needs for its own contents — title, artist, album,
+/// seek row, stream-info line, transport, toggles and its own padding. Measured
+/// from the rendered card rather than guessed: it decides how much vertical
+/// room the stacked layout leaves the cover, and an under-estimate pushes the
+/// toggles off the bottom of the window.
+const CARD_MIN_H: f32 = 360.;
+/// The same card with tightened padding and row gaps. Every line is still
+/// there — this is spacing given up, not content.
+const CARD_MIN_H_TIGHT: f32 = 325.;
+/// Tight, and the album and stream-info lines dropped as well.
+const CARD_MIN_H_COMPACT: f32 = 280.;
+/// Card width at which the stream-info line ("FLAC · 2910 kbps · 96 kHz ·
+/// 24-bit · stereo · RG -7.6 dB · album") still fits one row. Below it the line
+/// wraps and the card is a row taller — which is exactly the case the stacked
+/// layout lands in, since its card is a share of the cover's width.
+const INFO_ONE_LINE_MIN: f32 = 430.;
+/// That extra row, its gap included.
+const INFO_WRAP_H: f32 = 32.;
+/// Side panel (queue / lyrics) width, beside the card.
+const PANEL_MAX: f32 = 320.;
+const PANEL_MIN: f32 = 220.;
+/// Window padding (`px_10`) and the gap between content columns (`gap_8`).
+const EDGE: f32 = 40.;
+/// Vertical window padding once compact.
+const EDGE_COMPACT: f32 = 16.;
+const GAP: f32 = 32.;
+/// Top padding in the stacked layout: the cover reaches the corner the close
+/// pill floats in, so it gets that pill's height of clearance.
+const STACK_TOP: f32 = 72.;
+const STACK_TOP_COMPACT: f32 = 48.;
+/// Width the vertical volume column occupies.
+const VOLUME_W: f32 = 56.;
+/// Width the cover and card need before the volume column earns its place.
+const VOLUME_KEEP: f32 = 300. + CARD_MAX;
+/// Widest the floating mini player is drawn.
+const MINI_W: f32 = 560.;
+
+/// How much room the info card is given.
+///
+/// The card is the one piece of the overlay with a height floor of its own —
+/// everything else scales — so a window that cannot fit it takes it away in
+/// stages, and **spacing goes before content**: `Tight` is the same card with
+/// its padding and row gaps pulled in, and only a window too short for even
+/// that drops the album and stream-info lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardDensity {
+    Full,
+    Tight,
+    Compact,
+}
+
+impl CardDensity {
+    /// The densest form a window of this size has room for.
+    ///
+    /// The card width is only an estimate here — the exact one falls out of the
+    /// height that is left, which is what this is deciding — but it has to be
+    /// taken into account, because a card too narrow for the stream-info line
+    /// is a row taller. The estimate errs on the side of the taller card:
+    /// picking a denser form than fits is content off the bottom edge, picking
+    /// a tighter one costs only spacing.
+    fn for_window(width: f32, height: f32) -> Self {
+        let content = (width - 2. * EDGE).max(0.);
+        let card = if height > width {
+            // Stacked: the card is drawn to a share of the cover, which has the
+            // content width.
+            content.min(CARD_MAX) * CARD_STACKED_SHARE
+        } else {
+            (content - GAP - ART_MIN).clamp(CARD_MIN, CARD_MAX)
+        };
+        if height >= Self::Full.card_height(card) + 2. * EDGE {
+            Self::Full
+        } else if height >= Self::Tight.card_height(card) + 2. * EDGE_COMPACT {
+            Self::Tight
+        } else {
+            Self::Compact
+        }
+    }
+
+    /// Height this form of the card needs at a given width.
+    fn card_height(self, card_width: f32) -> f32 {
+        let base = match self {
+            Self::Full => CARD_MIN_H,
+            Self::Tight => CARD_MIN_H_TIGHT,
+            Self::Compact => CARD_MIN_H_COMPACT,
+        };
+        if self.secondary_lines() && card_width < INFO_ONE_LINE_MIN {
+            base + INFO_WRAP_H
+        } else {
+            base
+        }
+    }
+
+    /// Padding around the content, and above it in the stacked layout.
+    fn edge_y(self) -> f32 {
+        if self == Self::Full {
+            EDGE
+        } else {
+            EDGE_COMPACT
+        }
+    }
+
+    fn stack_top(self) -> f32 {
+        if self == Self::Full {
+            STACK_TOP
+        } else {
+            STACK_TOP_COMPACT
+        }
+    }
+
+    /// The card's own padding and the gap between its rows.
+    fn card_pad(self) -> f32 {
+        if self == Self::Full { 24. } else { 16. }
+    }
+
+    fn card_gap(self) -> f32 {
+        if self == Self::Full { 20. } else { 12. }
+    }
+
+    /// Whether the album line and the stream-info line are drawn.
+    fn secondary_lines(self) -> bool {
+        self != Self::Compact
+    }
+}
+/// Below this window width the tuning card no longer fits beside the mini
+/// player and is stacked above it instead.
+const TUNING_SIDE_MIN_W: f32 = 1000.;
+
+/// Content geometry of the overlay for one window size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Layout {
+    /// Cover above the info card instead of beside it.
+    stacked: bool,
+    /// How much room the card gets — see `CardDensity`.
+    density: CardDensity,
+    /// Cover edge length; 0 when there is no vertical room for one at all.
+    art: f32,
+    card: f32,
+    /// Side panel width; 0 when no panel is open.
+    panel: f32,
+    panel_max_h: f32,
+    /// The opt-in volume column fits. It is the first thing dropped, being the
+    /// one control the player bar already carries.
+    volume: bool,
+    /// Padding above and below the content.
+    pad_top: f32,
+    pad_bottom: f32,
+}
+
+impl Layout {
+    fn resolve(width: f32, height: f32, panel_open: bool, want_volume: bool) -> Self {
+        let density = CardDensity::for_window(width, height);
+        // Width left for the cover and the card once padding, gaps and the
+        // optional columns are taken out.
+        let free = |volume: bool, panel: f32| {
+            let columns = 2 + usize::from(volume) + usize::from(panel > 0.);
+            width
+                - 2. * EDGE
+                - GAP * (columns - 1) as f32
+                - panel
+                - if volume { VOLUME_W } else { 0. }
+        };
+        let side_panel = if panel_open {
+            (width * 0.26).clamp(PANEL_MIN, PANEL_MAX)
+        } else {
+            0.
+        };
+        // The volume column is kept only while it costs neither the card its
+        // full width nor the cover a reasonable size — the player bar carries a
+        // volume slider anyway, and the cover is what this page is for.
+        let volume = want_volume && free(true, side_panel) >= VOLUME_KEEP;
+        let row_fits = free(volume, side_panel) >= ART_MIN + CARD_MIN;
+        // An open panel is an explicit request; the cover is not. When the row
+        // holds the card and the panel but not the cover as well, drop the
+        // cover rather than stacking a column that fits neither.
+        let panel_row_fits = side_panel > 0. && width - 2. * EDGE - GAP - side_panel >= CARD_MIN;
+
+        if height > width || (!row_fits && !panel_row_fits) {
+            // Stacked: one column, so the panel goes under the card at the same
+            // width and the vertical volume slider has nowhere sensible to sit.
+            let content = (width - 2. * EDGE).max(0.);
+            let gaps = GAP * if panel_open { 2. } else { 1. };
+            // The column for one form of the card. Called twice: the cover gets
+            // the room the card gives up, so which form fits best is only
+            // knowable by laying both out.
+            let column = |density: CardDensity| {
+                let pad_top = density.stack_top();
+                let pad_bottom = density.edge_y();
+                // Place the cover and the card given a card height. The card's
+                // own height depends on its width, and its width comes from the
+                // height left over, so this runs twice: once for a card that
+                // fits the stream-info line on one row, then again if the card
+                // it produced is too narrow for that after all.
+                let place = |card_h: f32| {
+                    // What is left for the cover and the panel once the card,
+                    // the gaps and the padding have taken their share.
+                    let left = (height - card_h - pad_bottom - pad_top - gaps).max(0.);
+                    // The panel keeps a floor even where that overruns the
+                    // window: a 40px-tall queue is no more use than a scrollbar,
+                    // and the wrapper scrolls.
+                    let panel_max_h = if panel_open {
+                        (height * 0.28).clamp(140., left.max(140.))
+                    } else {
+                        0.
+                    };
+                    let room = left - panel_max_h;
+                    // Not even the smallest cover worth drawing fits: leave it
+                    // out rather than clamp it back up to a size the window
+                    // does not have — the controls are the part that has to
+                    // stay usable.
+                    let art = if room < ART_MIN {
+                        0.
+                    } else {
+                        room.min(content).clamp(ART_MIN, ART_MAX_STACKED)
+                    };
+                    // The cover leads this layout — it has the whole width to
+                    // itself, and a card drawn just as wide turns the column
+                    // into two equal blocks. The card is drawn to a share of the
+                    // cover instead, floored at the width its transport row
+                    // needs.
+                    let card = if art > 0. {
+                        (art * CARD_STACKED_SHARE)
+                            .clamp(CARD_MIN.min(content), content.clamp(0., CARD_MAX))
+                    } else {
+                        content.min(CARD_MAX)
+                    };
+                    (art, card, panel_max_h)
+                };
+
+                let (art, card, panel_max_h) = place(density.card_height(f32::MAX));
+                let (art, card, panel_max_h) =
+                    if density.card_height(card) > density.card_height(f32::MAX) {
+                        place(density.card_height(card))
+                    } else {
+                        (art, card, panel_max_h)
+                    };
+                Self {
+                    stacked: true,
+                    density,
+                    art,
+                    card,
+                    panel: if panel_open { card } else { 0. },
+                    panel_max_h,
+                    volume: false,
+                    pad_top,
+                    pad_bottom,
+                }
+            };
+
+            let full = column(density);
+            // A cover no bigger than the card under it reads as two stacked
+            // panels rather than a cover with its controls beneath. The card
+            // gives up spacing to free that height — but not its album or
+            // stream-info lines: this is a tall window, and the track's own
+            // details are the point of the page.
+            if density == CardDensity::Full && full.art < full.card + ART_LEAD {
+                let tight = column(CardDensity::Tight);
+                if tight.art > full.art {
+                    return tight;
+                }
+            }
+            return full;
+        }
+
+        // The row, for one card form.
+        let row = |density: CardDensity| {
+            let pad = density.edge_y();
+            let panel_max_h = (height - 2. * pad).min(620.);
+            // An open panel is an explicit request; the cover is not. Where the
+            // row holds the card and the panel but not the cover as well, the
+            // cover is what goes.
+            if !row_fits {
+                let free = width - 2. * EDGE - GAP - side_panel;
+                return Self {
+                    stacked: false,
+                    density,
+                    art: 0.,
+                    card: free.min(CARD_MAX),
+                    panel: side_panel,
+                    panel_max_h,
+                    volume: false,
+                    pad_top: pad,
+                    pad_bottom: pad,
+                };
+            }
+            let free = free(volume, side_panel);
+            // The cover is square, so the window's height caps it as well.
+            let art_cap = (height - 2. * pad).min(ART_MAX);
+            let art = (free - CARD_MIN).min(art_cap).max(ART_MIN);
+            let card = (free - art).clamp(CARD_MIN, CARD_MAX);
+            Self {
+                stacked: false,
+                density,
+                art,
+                card,
+                panel: side_panel,
+                panel_max_h,
+                volume,
+                pad_top: pad,
+                pad_bottom: pad,
+            }
+        };
+
+        // The card's height depends on its width — a narrow one wraps the
+        // stream-info line — and its width is only known once the cover has
+        // taken its share, so the form picked from the window alone can still
+        // come out too tall. Step down through the forms until one fits.
+        let mut chosen = row(density);
+        for tighter in [CardDensity::Tight, CardDensity::Compact] {
+            if chosen.fits_height(height) || tighter.card_height(0.) >= density.card_height(0.) {
+                continue;
+            }
+            chosen = row(tighter);
+        }
+        chosen
+    }
+
+    /// Whether the row this layout describes fits the window's height. The card
+    /// is the only piece with a floor, so this is the check that decides
+    /// whether a tighter card is needed.
+    fn fits_height(&self, height: f32) -> bool {
+        let body = self.density.card_height(self.card).max(self.art);
+        self.pad_top + body + self.pad_bottom <= height
+    }
+}
 
 /// Entrance duration. Long enough for the zoom to read, short enough that the
 /// overlay never feels like it is loading.
@@ -631,8 +983,14 @@ impl FullscreenPlayer {
         self.session.read(cx).client.clone()
     }
 
-    /// Right-hand queue list: click a row to jump to it.
-    fn render_queue_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Queue list: click a row to jump to it. Sized by the caller — the panel
+    /// sits beside the info card in a wide window and under it in a tall one.
+    fn render_queue_panel(
+        &self,
+        width: f32,
+        max_h: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let (rows, current) = {
             let p = self.player.read(cx);
             let rows: Vec<(usize, String, String)> = p
@@ -689,11 +1047,12 @@ impl FullscreenPlayer {
             .collect();
 
         v_flex()
-            .w(px(320.))
+            .w(px(width))
+            .flex_none()
             // Same card as the info column and the mini player, so an open
             // panel reads as part of the player rather than as a list dropped
             // onto the backdrop.
-            .max_h(px(620.))
+            .max_h(px(max_h))
             .p_4()
             .gap_2()
             .rounded_2xl()
@@ -721,7 +1080,12 @@ impl FullscreenPlayer {
     }
 
     /// Right-hand lyrics panel (classic getLyrics, unsynced text).
-    fn render_lyrics_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_lyrics_panel(
+        &self,
+        width: f32,
+        max_h: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let body: gpui::AnyElement = if self.lyrics_loading {
             div()
                 .text_sm()
@@ -746,11 +1110,12 @@ impl FullscreenPlayer {
             }
         };
         v_flex()
-            .w(px(320.))
+            .w(px(width))
+            .flex_none()
             // Same card as the info column and the mini player, so an open
             // panel reads as part of the player rather than as a list dropped
             // onto the backdrop.
-            .max_h(px(620.))
+            .max_h(px(max_h))
             .p_4()
             .gap_2()
             .rounded_2xl()
@@ -1094,8 +1459,16 @@ impl Render for FullscreenPlayer {
         let scrim = if viz_mode.is_on() { 0.15 } else { scrim };
         let (mini_title, mini_artist) = (title.clone(), artist.clone());
         let (mini_time_now, mini_time_total) = (time_now.clone(), time_total.clone());
-        let panel_open = self.panel.is_some();
-        let art_size = if panel_open { 360. } else { 460. };
+        // Everything below sizes itself off the window: the overlay has no
+        // scrollbar of its own beyond the fallback wrapper, so a fixed layout
+        // is content lost off the edge on any window smaller than the one it
+        // was drawn for.
+        let viewport = window.viewport_size();
+        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        let layout = Layout::resolve(vw, vh, self.panel.is_some(), show_volume && !is_radio);
+        // Labelled toggles stick out of a narrow card; the icons carry the
+        // meaning on their own, and tooltips are not the point here.
+        let toggle_labels = layout.card >= TOGGLE_LABEL_MIN;
 
         // --- Open/close transition ---------------------------------------
         // One clock, read straight from state, so the element tree keeps the
@@ -1210,7 +1583,8 @@ impl Render for FullscreenPlayer {
                 .justify_center()
                 .child(
                     v_flex()
-                        .w(px(560.))
+                        // Never wider than the window it floats over.
+                        .w(px(MINI_W.min(vw - 2. * EDGE).max(240.)))
                         .max_w_full()
                         // The card hangs off the right edge as an absolute
                         // child rather than sitting in the flow: in the flow it
@@ -1219,12 +1593,20 @@ impl Render for FullscreenPlayer {
                         // stay put.
                         .relative()
                         .when_some(tuning_card, |this, card| {
+                            // Beside the mini player where the window is wide
+                            // enough for it; directly above it otherwise, since
+                            // off to the right of a narrow window is off-screen.
+                            let beside = vw >= TUNING_SIDE_MIN_W;
                             this.child(
                                 div()
                                     .absolute()
-                                    .left(gpui::relative(1.))
-                                    .ml(px(12.))
-                                    .bottom_0()
+                                    .map(|this| {
+                                        if beside {
+                                            this.left(gpui::relative(1.)).ml(px(12.)).bottom_0()
+                                        } else {
+                                            this.left_0().bottom(gpui::relative(1.)).mb(px(12.))
+                                        }
+                                    })
                                     .child(card),
                             )
                         })
@@ -1492,46 +1874,76 @@ impl Render for FullscreenPlayer {
                             })),
                     ),
             )
-            // Main content: album art on the left, info + controls on the
-            // right, optional side panel + vertical volume at the far right.
+            // Main content: album art beside info + controls, optional side
+            // panel + vertical volume at the far right — or, in a window taller
+            // than it is wide, the same pieces stacked in one column.
             // Stood down while a scene runs — the visualizer wants the whole
             // window, and the mini player carries the controls instead.
             .when(!viz_mode.is_on(), |root| {
                 root.child({
-                    let content = h_flex()
-                        .size_full()
+                    let art_size = layout.art;
+                    let content = div()
+                        .flex()
+                        .map(|this| {
+                            if layout.stacked {
+                                this.flex_col()
+                            } else {
+                                this.flex_row()
+                            }
+                        })
+                        .w_full()
+                        // A minimum height rather than a full one: inside the
+                        // scrolling wrapper below, a box fixed to the window's
+                        // height would centre content that overruns it and clip
+                        // the top out of reach, while this one grows past the
+                        // window and scrolls. It has to be an absolute height —
+                        // a percentage resolves against the scroll container's
+                        // *content*, which is this element, so it collapses to
+                        // the content height and the centring is lost.
+                        .min_h(px(vh))
                         .items_center()
                         .justify_center()
                         .gap_8()
                         .px_10()
-                        // Album art.
-                        .child(
-                            div()
-                                .size(px(art_size))
-                                .flex_none()
-                                .rounded_2xl()
-                                .bg(cx.theme().muted)
-                                .overflow_hidden()
-                                .shadow_xl()
-                                .when_some(
-                                    self.art_path.clone().filter(|_| !is_radio),
-                                    |this, path| {
-                                        this.child(img(path).size(px(art_size)).rounded_2xl())
-                                    },
-                                )
-                                // A station has no artwork; mark the slot as
-                                // radio rather than leaving a blank square the
-                                // size of a record sleeve.
-                                .when(is_radio, |this| {
-                                    this.flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_color(cx.theme().primary)
-                                        .child(
-                                            app_icon(icons::RADIO).with_size(px(art_size * 0.28)),
-                                        )
-                                }),
-                        )
+                        // Vertical padding comes from the layout: it is part of
+                        // the height budget the cover is sized against, and in
+                        // the stacked layout the top also has to clear the close
+                        // pill the cover would otherwise run into.
+                        .pt(px(layout.pad_top))
+                        .pb(px(layout.pad_bottom))
+                        // Album art. Dropped outright in a window too short to
+                        // give it any meaningful size — the controls are the
+                        // part that has to stay usable.
+                        .when(art_size > 0., |this| {
+                            this.child(
+                                div()
+                                    .size(px(art_size))
+                                    .flex_none()
+                                    .rounded_2xl()
+                                    .bg(cx.theme().muted)
+                                    .overflow_hidden()
+                                    .shadow_xl()
+                                    .when_some(
+                                        self.art_path.clone().filter(|_| !is_radio),
+                                        |this, path| {
+                                            this.child(img(path).size(px(art_size)).rounded_2xl())
+                                        },
+                                    )
+                                    // A station has no artwork; mark the slot as
+                                    // radio rather than leaving a blank square the
+                                    // size of a record sleeve.
+                                    .when(is_radio, |this| {
+                                        this.flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_color(cx.theme().primary)
+                                            .child(
+                                                app_icon(icons::RADIO)
+                                                    .with_size(px(art_size * 0.28)),
+                                            )
+                                    }),
+                            )
+                        })
                         // Info + controls column — right of the cover. Same
                         // card treatment as the mini player and the same
                         // internal order (info, seek, transport, then a ruled
@@ -1540,10 +1952,13 @@ impl Render for FullscreenPlayer {
                         .child(
                             v_flex()
                                 .flex_none()
-                                .w(px(480.))
+                                .w(px(layout.card))
                                 .justify_center()
-                                .gap_5()
-                                .p_6()
+                                // Tighter in a short window: the card is the one
+                                // piece with a floor of its own, so its padding
+                                // and row gaps are part of what has to give.
+                                .gap(px(layout.density.card_gap()))
+                                .p(px(layout.density.card_pad()))
                                 .rounded_2xl()
                                 .bg(cx.theme().background.opacity(0.55))
                                 .border_1()
@@ -1568,7 +1983,7 @@ impl Render for FullscreenPlayer {
                                                 .clone()
                                                 .unwrap_or_else(|| "Nothing playing".into())
                                                 .into(),
-                                            px(CARD_TEXT_WIDTH),
+                                            px(layout.card - CARD_TEXT_PAD),
                                             window.rem_size() * 1.875,
                                             gpui::FontWeight::SEMIBOLD,
                                             (!has_track).then(|| cx.theme().muted_foreground),
@@ -1581,15 +1996,23 @@ impl Render for FullscreenPlayer {
                                                 .truncate()
                                                 .child(artist.unwrap_or_default()),
                                         )
-                                        .when_some(album, |this, alb| {
-                                            this.child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .truncate()
-                                                    .child(alb),
-                                            )
-                                        }),
+                                        // Album line and the stream-info line
+                                        // below are what a short window sheds
+                                        // first: the title and artist name the
+                                        // track, and the player bar still
+                                        // carries both lines in full.
+                                        .when_some(
+                                            album.filter(|_| layout.density.secondary_lines()),
+                                            |this, alb| {
+                                                this.child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .truncate()
+                                                        .child(alb),
+                                                )
+                                            },
+                                        ),
                                 )
                                 // Seek bar.
                                 .child(
@@ -1660,29 +2083,47 @@ impl Render for FullscreenPlayer {
                                         }),
                                 )
                                 // Stream info + ReplayGain: quiet, centered line.
-                                .when(stream_info.is_some() || replay_gain.is_some(), |this| {
-                                    this.child(
-                                        h_flex()
-                                            .gap_3()
-                                            .items_center()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground.opacity(0.8))
-                                            .when_some(stream_info, |this, info| {
-                                                this.child(div().child(info))
-                                            })
-                                            .when_some(replay_gain, |this, (label, db)| {
-                                                let text = match db {
-                                                    Some(db) => format!("RG {db:+.1} dB · {label}"),
-                                                    None => format!("RG · {label}"),
-                                                };
-                                                this.child(div().child(text))
-                                            }),
-                                    )
-                                })
-                                // Transport controls.
+                                // Wraps rather than running out of the card: the
+                                // codec line is long and the card is only as wide
+                                // as the window allows.
+                                .when(
+                                    layout.density.secondary_lines()
+                                        && (stream_info.is_some() || replay_gain.is_some()),
+                                    |this| {
+                                        this.child(
+                                            h_flex()
+                                                .w_full()
+                                                .flex_wrap()
+                                                .gap_3()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_xs()
+                                                .text_color(
+                                                    cx.theme().muted_foreground.opacity(0.8),
+                                                )
+                                                .when_some(stream_info, |this, info| {
+                                                    this.child(div().child(info))
+                                                })
+                                                .when_some(replay_gain, |this, (label, db)| {
+                                                    let text = match db {
+                                                        Some(db) => {
+                                                            format!("RG {db:+.1} dB · {label}")
+                                                        }
+                                                        None => format!("RG · {label}"),
+                                                    };
+                                                    this.child(div().child(text))
+                                                }),
+                                        )
+                                    },
+                                )
+                                // Transport controls. Wrapping is the last
+                                // resort in a window narrower than the row: a
+                                // second line of buttons beats a repeat button
+                                // clipped off the card's edge.
                                 .child(
                                     h_flex()
                                         .w_full()
+                                        .flex_wrap()
                                         .gap_4()
                                         .items_center()
                                         .justify_center()
@@ -1760,6 +2201,7 @@ impl Render for FullscreenPlayer {
                                 .child(
                                     h_flex()
                                         .w_full()
+                                        .flex_wrap()
                                         .gap_3()
                                         .items_center()
                                         .justify_center()
@@ -1771,7 +2213,7 @@ impl Render for FullscreenPlayer {
                                                 .ghost()
                                                 .large()
                                                 .icon(Icon::new(IconName::PanelRight))
-                                                .label("Queue")
+                                                .when(toggle_labels, |b| b.label("Queue"))
                                                 .when(self.panel == Some(SidePanel::Queue), |b| {
                                                     b.primary()
                                                 })
@@ -1785,7 +2227,7 @@ impl Render for FullscreenPlayer {
                                                 .ghost()
                                                 .large()
                                                 .icon(Icon::new(IconName::Frame))
-                                                .label(viz_mode.label())
+                                                .when(toggle_labels, |b| b.label(viz_mode.label()))
                                                 .when(viz_mode.is_on(), |b| b.primary())
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.cycle_visualizer(cx);
@@ -1797,7 +2239,7 @@ impl Render for FullscreenPlayer {
                                                 .ghost()
                                                 .large()
                                                 .icon(Icon::new(IconName::BookOpen))
-                                                .label("Lyrics")
+                                                .when(toggle_labels, |b| b.label("Lyrics"))
                                                 .when(self.panel == Some(SidePanel::Lyrics), |b| {
                                                     b.primary()
                                                 })
@@ -1810,8 +2252,10 @@ impl Render for FullscreenPlayer {
                         )
                         // Short vertical volume slider, right of the controls —
                         // off by default (the player bar already has one), opt-in
-                        // via settings; always hidden during live radio.
-                        .when(show_volume && !is_radio, |this| {
+                        // via settings; always hidden during live radio, and
+                        // dropped by the layout when the window is too narrow to
+                        // carry it beside the cover and the card.
+                        .when(layout.volume, |this| {
                             this.child(
                                 v_flex()
                                     .h_full()
@@ -1855,11 +2299,17 @@ impl Render for FullscreenPlayer {
                                     }),
                             )
                         })
-                        // Optional side panel.
+                        // Optional side panel — beside the card, or under it in
+                        // the stacked layout, at whatever width and height the
+                        // window leaves for it.
                         .when_some(self.panel, |this, panel| {
                             this.child(match panel {
-                                SidePanel::Queue => self.render_queue_panel(cx),
-                                SidePanel::Lyrics => self.render_lyrics_panel(cx),
+                                SidePanel::Queue => {
+                                    self.render_queue_panel(layout.panel, layout.panel_max_h, cx)
+                                }
+                                SidePanel::Lyrics => {
+                                    self.render_lyrics_panel(layout.panel, layout.panel_max_h, cx)
+                                }
                             })
                         });
 
@@ -1868,9 +2318,236 @@ impl Render for FullscreenPlayer {
                     // layer sliding. Entrance only: on the way out it stays put
                     // while the whole overlay drops, which keeps the exit from
                     // looking like two things leaving at different speeds.
-                    content.opacity(content_fade).top(px(content_rise))
+                    //
+                    // The scrolling wrapper is the last-resort fit: the sizes
+                    // above shrink to the window, but a window shorter than the
+                    // controls themselves has nowhere left to shrink to, and
+                    // scrolling past the edge beats being cut off at it.
+                    div()
+                        .id("fs-content")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .child(content)
+                        .opacity(content_fade)
+                        .top(px(content_rise))
                 })
             })
             .when_some(mini_player, |root, mini| root.child(mini))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ART_LEAD, ART_MAX, ART_MIN, CARD_MAX, CARD_MIN, CardDensity, EDGE, GAP, Layout};
+
+    /// Total width the landscape layout asks for, padding and gaps included.
+    /// A dropped cover is not a column and takes no gap with it.
+    fn row_width(l: &Layout, volume: f32) -> f32 {
+        let present = [l.art, l.card, l.panel, volume]
+            .iter()
+            .filter(|w| **w > 0.)
+            .count() as f32;
+        2. * EDGE + GAP * (present - 1.).max(0.) + l.art + l.card + l.panel + volume
+    }
+
+    /// Height the card is expected to need in this layout's form, at the width
+    /// this layout draws it.
+    fn card_height(l: &Layout) -> f32 {
+        l.density.card_height(l.card)
+    }
+
+    /// Total height the content asks for.
+    fn content_height(l: &Layout) -> f32 {
+        let body = if l.stacked {
+            let gaps = GAP * if l.panel > 0. { 2. } else { 1. };
+            l.art + gaps + card_height(l) + l.panel_max_h
+        } else {
+            l.art.max(card_height(l))
+        };
+        l.pad_top + body + l.pad_bottom
+    }
+
+    #[test]
+    fn a_roomy_window_keeps_the_full_size_layout() {
+        let l = Layout::resolve(1400., 900., false, false);
+        assert!(!l.stacked);
+        assert_eq!(l.art, ART_MAX);
+        assert_eq!(l.card, CARD_MAX);
+    }
+
+    #[test]
+    fn landscape_content_never_overruns_the_window() {
+        for &(w, h) in &[
+            (1400., 900.),
+            (1280., 800.),
+            (1100., 700.),
+            (900., 600.),
+            (820., 520.),
+        ] {
+            for &panel in &[false, true] {
+                let l = Layout::resolve(w, h, panel, false);
+                if l.stacked {
+                    continue;
+                }
+                assert!(
+                    row_width(&l, 0.) <= w + 0.5,
+                    "{w}x{h} panel={panel} overruns: {l:?}"
+                );
+                // The cover is square: it has to fit the height as well.
+                assert!(l.art <= h - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_volume_column_is_dropped_before_the_cover_is_squeezed() {
+        // Wide enough for cover + card + volume, panel open or not.
+        assert!(Layout::resolve(1400., 900., false, true).volume);
+        assert!(Layout::resolve(1400., 900., true, true).volume);
+        // Not wide enough: the column goes, the row survives.
+        let tight = Layout::resolve(760., 600., false, true);
+        assert!(!tight.volume);
+        assert!(!tight.stacked);
+        assert!(tight.art >= ART_MIN && tight.card >= CARD_MIN);
+    }
+
+    #[test]
+    fn a_window_taller_than_it_is_wide_stacks() {
+        let l = Layout::resolve(800., 1200., false, true);
+        assert!(l.stacked);
+        // One column, both pieces inside the window's width.
+        assert!(l.card <= 800. - 2. * EDGE);
+        assert!(l.art > 0. && l.art <= 800. - 2. * EDGE);
+        // The vertical volume slider belongs beside the controls, not under.
+        assert!(!l.volume);
+    }
+
+    #[test]
+    fn the_stacked_cover_leads_the_card() {
+        for &(w, h) in &[
+            (520., 860.),
+            (480., 900.),
+            (700., 1100.),
+            (900., 1400.),
+            (1000., 1300.),
+        ] {
+            let l = Layout::resolve(w, h, false, false);
+            assert!(l.stacked, "{w}x{h} should stack");
+            assert!(
+                l.art >= l.card + ART_LEAD,
+                "{w}x{h} cover does not lead the card: {l:?}"
+            );
+            // And the column still fits the window it was sized for.
+            assert!(content_height(&l) <= h + 0.5, "{w}x{h}: {l:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_two_columns_stacks_as_well() {
+        // Still room for a small cover beside the card: keep the row, since
+        // stacking this would leave the cover no vertical room at all.
+        let row = Layout::resolve(700., 500., false, false);
+        assert!(!row.stacked);
+        assert!(row.art >= ART_MIN);
+        // Below that the row cannot hold both columns.
+        assert!(Layout::resolve(560., 500., false, false).stacked);
+        assert!(Layout::resolve(500., 460., false, false).stacked);
+    }
+
+    #[test]
+    fn a_tight_window_with_a_panel_open_drops_the_cover_not_the_panel() {
+        // Cover + card + panel does not fit; card + panel does. The panel was
+        // asked for, the cover was not.
+        let l = Layout::resolve(760., 520., true, false);
+        assert!(!l.stacked);
+        assert_eq!(l.art, 0.);
+        assert!(l.panel > 0. && l.card >= CARD_MIN);
+        assert!(row_width(&l, 0.) <= 760. + 0.5, "{l:?}");
+    }
+
+    #[test]
+    fn a_short_window_drops_the_cover_rather_than_the_controls() {
+        let l = Layout::resolve(420., 460., false, false);
+        assert!(l.stacked);
+        assert_eq!(l.art, 0.);
+        assert!(l.card > 0.);
+    }
+
+    #[test]
+    fn the_content_fits_the_window_height() {
+        for &(w, h) in &[
+            (1400., 900.),
+            (1150., 380.),
+            (760., 520.),
+            (900., 600.),
+            (520., 860.),
+            (700., 1100.),
+            (480., 900.),
+        ] {
+            let l = Layout::resolve(w, h, false, false);
+            assert!(
+                content_height(&l) <= h + 0.5,
+                "{w}x{h} overruns the height: {l:?}"
+            );
+            // With a panel open the same has to hold wherever the window can
+            // hold the panel at all; below that the wrapper scrolls, and the
+            // panel keeps a usable height instead of being squeezed to nothing.
+            let l = Layout::resolve(w, h, true, false);
+            assert!(l.panel_max_h >= 140., "{w}x{h} squeezed the panel: {l:?}");
+            if content_height(&l) > h + 0.5 {
+                assert!(l.art == 0., "{w}x{h} overruns with a cover still on: {l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn spacing_is_given_up_before_the_track_details_are() {
+        // Room for the full card.
+        assert_eq!(
+            Layout::resolve(1400., 900., false, false).density,
+            CardDensity::Full
+        );
+        assert_eq!(
+            Layout::resolve(760., 520., false, false).density,
+            CardDensity::Full
+        );
+        // Too short for the full card, but the tight one still fits: the album
+        // and stream-info lines stay, the padding goes.
+        let short = Layout::resolve(1150., 380., false, false);
+        assert_eq!(short.density, CardDensity::Tight);
+        assert!(short.density.secondary_lines());
+        // Too short for even that: now the lines go.
+        assert_eq!(
+            Layout::resolve(1150., 300., false, false).density,
+            CardDensity::Compact
+        );
+    }
+
+    #[test]
+    fn a_portrait_window_keeps_the_track_details() {
+        // The stacked layout frees height for the cover by tightening the
+        // card's spacing, never by dropping what the card says.
+        for &(w, h) in &[(520., 860.), (480., 900.), (700., 1100.), (760., 880.)] {
+            let l = Layout::resolve(w, h, false, false);
+            assert!(l.stacked, "{w}x{h} should stack");
+            assert!(
+                l.density.secondary_lines(),
+                "{w}x{h} dropped the track details: {l:?}"
+            );
+            assert!(l.art >= l.card + ART_LEAD, "{w}x{h}: {l:?}");
+        }
+    }
+
+    #[test]
+    fn the_stacked_column_fits_its_width() {
+        for &(w, h) in &[(700., 1100.), (480., 900.), (1000., 1400.)] {
+            for &panel in &[false, true] {
+                let l = Layout::resolve(w, h, panel, false);
+                assert!(l.stacked, "{w}x{h} should stack");
+                assert!(l.card <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
+                assert!(l.art <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
+                assert!(l.panel <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
+            }
+        }
     }
 }

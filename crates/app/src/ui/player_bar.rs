@@ -22,6 +22,28 @@ use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
 use crate::ui::format_duration;
 
+/// Widest the now-playing and volume columns flanking the transport are drawn.
+const SIDE_WIDTH: f32 = 348.;
+/// Narrowest they shrink to: the cover, its gap, and enough room for a title
+/// to scroll through.
+const SIDE_MIN: f32 = 170.;
+/// Room the transport needs between them (buttons plus a usable seek bar).
+const TRANSPORT_MIN: f32 = 300.;
+/// The bar's own horizontal padding (`px_4`) and the gaps either side of the
+/// transport (`gap_4`).
+const BAR_CHROME: f32 = 32. + 32.;
+
+/// Width of the columns flanking the transport, at a given window width.
+///
+/// Both shrink together: a fixed width pushes the volume block off the edge of
+/// a narrow window, and shrinking only one puts the transport off centre, which
+/// is the reason the volume column is width-matched to the now-playing block in
+/// the first place.
+fn side_width(window_width: f32) -> f32 {
+    let free = window_width - TRANSPORT_MIN - BAR_CHROME;
+    (free / 2.).clamp(SIDE_MIN, SIDE_WIDTH)
+}
+
 /// Bubbled to RootView.
 pub enum PlayerBarEvent {
     ToggleQueue,
@@ -370,7 +392,7 @@ impl Render for PlayerBar {
         // in between lands in the middle of the bar rather than 50px right of
         // it, of the volume block facing it. Long titles are handled by
         // scrolling them, not by widening the column.
-        const SIDE_WIDTH: f32 = 348.;
+        let side_width = side_width(f32::from(window.viewport_size().width));
 
         // Small, quiet transport icon buttons; primary circular play.
         let icon_btn = |id: &'static str, icon_path: &'static str, active: bool| {
@@ -413,7 +435,7 @@ impl Render for PlayerBar {
             // album/artist pages.
             .child(
                 h_flex()
-                    .w(px(SIDE_WIDTH))
+                    .w(px(side_width))
                     .flex_none()
                     .gap_3()
                     .items_center()
@@ -492,7 +514,7 @@ impl Render for PlayerBar {
                                 // Titles longer than the column scroll rather
                                 // than get cut off — radio track titles run
                                 // long, and a clipped one is unreadable.
-                                let title_width = px(SIDE_WIDTH - 76. - 12.);
+                                let title_width = px(side_width - 76. - 12.);
                                 let base = div().child(crate::ui::scrolling_line(
                                     "np-title-text",
                                     title.unwrap_or_else(|| "Not playing".into()).into(),
@@ -745,9 +767,11 @@ impl Render for PlayerBar {
             // The three rows share a common left edge; the slider stretches to
             // the right so the block stays anchored to the bar's right side.
             .child(
-                h_flex().w(px(SIDE_WIDTH)).flex_none().justify_end().child(
+                h_flex().w(px(side_width)).flex_none().justify_end().child(
                     v_flex()
-                        .w(px(240.))
+                        // Never wider than the column it sits in, which shrinks
+                        // with the window.
+                        .w(px(240_f32.min(side_width)))
                         .gap_1p5()
                         // ReplayGain status chip: highlighted while playing; click
                         // opens a menu to change or disable the mode.
@@ -973,5 +997,31 @@ impl Render for PlayerBar {
                         }),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SIDE_MIN, SIDE_WIDTH, side_width};
+
+    #[test]
+    fn wide_windows_keep_the_full_side_columns() {
+        assert_eq!(side_width(1400.), SIDE_WIDTH);
+        assert_eq!(side_width(1060.), SIDE_WIDTH);
+    }
+
+    #[test]
+    fn narrow_windows_shrink_both_columns_together() {
+        // Both sides shrink, so the transport keeps its room and stays centred.
+        for w in [1000., 900., 800., 700., 600.] {
+            let side = side_width(w);
+            assert!((SIDE_MIN..=SIDE_WIDTH).contains(&side));
+            assert!(2. * side + 300. + 64. <= w + 0.5 || side == SIDE_MIN, "{w}");
+        }
+    }
+
+    #[test]
+    fn the_columns_never_shrink_past_the_cover_and_its_title() {
+        assert_eq!(side_width(200.), SIDE_MIN);
     }
 }

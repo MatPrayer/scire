@@ -1572,7 +1572,9 @@ impl RootView {
             .bg(gpui::hsla(0., 0., 0., 0.6))
             .child(
                 v_flex()
+                    // Clamped so the dialog cannot overrun a narrow window.
                     .w(px(460.))
+                    .max_w_full()
                     .gap_3()
                     .p_5()
                     .rounded_xl()
@@ -1873,7 +1875,9 @@ impl RootView {
             .bg(gpui::hsla(0., 0., 0., 0.6))
             .child(
                 v_flex()
+                    // Clamped so the dialog cannot overrun a narrow window.
                     .w(px(440.))
+                    .max_w_full()
                     .gap_4()
                     .p_5()
                     .rounded_xl()

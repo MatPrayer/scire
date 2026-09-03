@@ -32,6 +32,9 @@ const TEXT_BLOCK_H: f32 = NAME_LINE_H * 2. + META_LINE_H;
 /// chase the art. Also the pre-layout guess, before a viewport is measured.
 const ART_LOOKAHEAD_ROWS: usize = 4;
 
+/// Column guess for the very first frame, before anything has been laid out.
+const FALLBACK_COLS: usize = 5;
+
 pub enum ArtistsEvent {
     OpenArtist(String),
 }
@@ -113,6 +116,9 @@ pub struct ArtistsView {
     vi_cursor: Option<usize>,
     /// Catalog totals shown in the header, for the selected libraries.
     stats: LibraryStats,
+    /// Tracks the grid's width against the window's, so the column count
+    /// follows a resize on the same frame instead of one behind it.
+    live_width: crate::ui::LiveWidth,
 }
 
 impl EventEmitter<ArtistsEvent> for ArtistsView {}
@@ -140,6 +146,7 @@ impl ArtistsView {
             error: None,
             vi_cursor: None,
             stats: LibraryStats::default(),
+            live_width: crate::ui::LiveWidth::default(),
         };
         this.refresh_stats(cx);
         this.seed_from_cache(cx);
@@ -469,7 +476,7 @@ impl ArtistsView {
 }
 
 impl Render for ArtistsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Pick up cover-size changes: refetch art at the new resolution.
         let cover = self.session.read(cx).settings.cover_size;
         let tile = cover.px();
@@ -484,17 +491,11 @@ impl Render for ArtistsView {
         let loading = self.loading || connecting;
         let showing_cache = self.cached && loading;
 
-        // Columns from the measured viewport width; falls back to a guess on
-        // the very first frame (before layout), then self-corrects.
-        let base = self.scroll.0.borrow().base_handle.clone();
-        let width = f32::from(base.bounds().size.width);
-        let card_w = tile + 12.;
-        let gap = 16.;
-        let cols = if width > 0. {
-            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
-        } else {
-            5
-        };
+        // Columns from this frame's window width; falls back to a guess on the
+        // very first frame (before anything is laid out), then self-corrects.
+        let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
+        let width = self.live_width.resolve(measured, window);
+        let cols = crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS);
         let row_count = self.cards.len().div_ceil(cols);
         self.ensure_art_for_viewport(row_count, cols, cx);
 
@@ -588,23 +589,18 @@ impl Render for ArtistsView {
 }
 
 impl ArtistsView {
-    /// Columns from the measured viewport width; falls back to a guess on the
-    /// very first frame (before layout), then self-corrects.
-    fn grid_cols(&self, cx: &App) -> usize {
-        let base = self.scroll.0.borrow().base_handle.clone();
-        let width = f32::from(base.bounds().size.width);
-        let card_w = self.session.read(cx).settings.cover_size.px() + 12.;
-        let gap = 16.;
-        if width > 0. {
-            (((width + gap) / (card_w + gap)).floor() as usize).max(1)
-        } else {
-            5
-        }
+    /// Columns at the current window width; falls back to a guess on the very
+    /// first frame (before anything is laid out), then self-corrects.
+    fn grid_cols(&mut self, window: &Window, cx: &App) -> usize {
+        let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
+        let width = self.live_width.resolve(measured, window);
+        let tile = self.session.read(cx).settings.cover_size.px();
+        crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS)
     }
 
     /// Move the vi-mode cursor by `delta` cards, clamping and scrolling the
     /// focused card into view.
-    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.cards.len();
         if count == 0 {
             return;
@@ -616,7 +612,7 @@ impl ArtistsView {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        let cols = self.grid_cols(cx).max(1);
+        let cols = self.grid_cols(window, cx).max(1);
         self.scroll
             .scroll_to_item(next / cols, gpui::ScrollStrategy::Top);
         cx.notify();
