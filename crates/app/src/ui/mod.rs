@@ -997,9 +997,9 @@ pub fn divider() -> gpui::Div {
 pub fn focus_glow(cx: &App) -> Vec<BoxShadow> {
     let c = cx.theme().primary;
     vec![BoxShadow {
-        color: hsla(c.h, c.s, c.l, 0.45),
+        color: hsla(c.h, c.s, c.l, 0.28),
         offset: point(px(0.), px(0.)),
-        blur_radius: px(18.),
+        blur_radius: px(9.),
         spread_radius: px(0.),
     }]
 }
@@ -1019,9 +1019,9 @@ pub fn with_focus_animation<E: IntoElement + Styled + 'static>(
         Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
         move |el, t| {
             el.shadow(vec![BoxShadow {
-                color: hsla(c.h, c.s, c.l, 0.45 * t),
+                color: hsla(c.h, c.s, c.l, 0.28 * t),
                 offset: point(px(0.), px(0.)),
-                blur_radius: px(18. * t),
+                blur_radius: px(9. * t),
                 spread_radius: px(0.),
             }])
         },

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt as _, Context, Entity, EventEmitter, IntoElement, Render, Window, div,
-    img, linear_color_stop, linear_gradient, prelude::*, px,
+    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, Render,
+    Window, div, ease_out_quint, img, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::popover::Popover;
@@ -2303,14 +2303,32 @@ impl Render for FullscreenPlayer {
                         // the stacked layout, at whatever width and height the
                         // window leaves for it.
                         .when_some(self.panel, |this, panel| {
-                            this.child(match panel {
-                                SidePanel::Queue => {
-                                    self.render_queue_panel(layout.panel, layout.panel_max_h, cx)
-                                }
-                                SidePanel::Lyrics => {
-                                    self.render_lyrics_panel(layout.panel, layout.panel_max_h, cx)
-                                }
-                            })
+                            // Key by panel type so switching Queue <-> Lyrics
+                            // replays the slide-in. Margin + fade so the motion
+                            // is visible (gpui 0.2.2 has no translate/transform).
+                            let key = format!("fs-side-panel-{:?}", panel);
+                            this.child(
+                                div()
+                                    .h_full()
+                                    .child(match panel {
+                                        SidePanel::Queue => self.render_queue_panel(
+                                            layout.panel,
+                                            layout.panel_max_h,
+                                            cx,
+                                        ),
+                                        SidePanel::Lyrics => self.render_lyrics_panel(
+                                            layout.panel,
+                                            layout.panel_max_h,
+                                            cx,
+                                        ),
+                                    })
+                                    .with_animation(
+                                        ElementId::Name(key.into()),
+                                        Animation::new(Duration::from_millis(220))
+                                            .with_easing(ease_out_quint()),
+                                        |el, t| el.opacity(t).ml(px(28. * (1. - t))),
+                                    ),
+                            )
                         });
 
                     // Content trails the backdrop and travels further, so the

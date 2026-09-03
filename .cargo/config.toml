@@ -1,0 +1,7 @@
+# Repo-local cargo aliases shared with everyone who clones the project.
+#
+# `cargo dmg` builds an installable macOS .dmg. It delegates to the
+# `cargo-dmg` subcommand (crates/dmg), which runs `cargo build --release`
+# and then the packaging script `packaging/macos/make-dmg.sh`.
+[alias]
+dmg = "run --quiet --bin cargo-dmg -- @args"

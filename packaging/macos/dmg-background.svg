@@ -1,0 +1,17 @@
+<svg width="640" height="416" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+  <!-- white top, purple mid, near-black bottom: flat clean blend so Finder
+         renders WHITE captions under the icons (label color keys off
+         background darkness). No icons, no arrow, no text. -->
+  <linearGradient y2="1" x2="0" y1="0" x1="0" id="bg">
+   <stop stop-color="#f5f6ff" offset="0"/>
+   <stop stop-color="#8989ec" offset="0.5"/>
+   <stop stop-color="#4a4fbe" offset="0.75"/>
+   <stop stop-color="#17171f" offset="1"/>
+  </linearGradient>
+ </defs>
+ <g>
+  <title>Layer 1</title>
+  <rect transform="rotate(-180, 320, 208)" id="svg_1" fill="url(#bg)" height="416" width="640"/>
+ </g>
+</svg>

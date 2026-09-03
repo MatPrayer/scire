@@ -1,9 +1,6 @@
 //! Left navigation rail: library switcher + sections + playlists.
 
-use gpui::{
-    Animation, AnimationExt as _, App, ElementId, IntoElement, SharedString, Window, div,
-    ease_out_quint, hsla, prelude::*, px, relative,
-};
+use gpui::{App, IntoElement, SharedString, Window, div, hsla, prelude::*, px, relative};
 
 use crate::ui::root::RefreshStage;
 use gpui_component::checkbox::Checkbox;
@@ -105,7 +102,6 @@ fn row_icon(icon: Icon, collapsed: bool) -> Icon {
 pub fn render_sidebar(
     model: SidebarModel,
     on_action: impl Fn(SidebarAction, &mut Window, &mut App) + Clone + 'static,
-    reduced_motion: bool,
     cx: &App,
 ) -> impl IntoElement {
     let collapsed = model.collapsed;
@@ -139,16 +135,6 @@ pub fn render_sidebar(
             .on_click(move |_, window, cx| on_action(SidebarAction::Select(section), window, cx))
             .child(row_icon(Icon::new(icon), collapsed))
             .when(!collapsed, |s| s.child(label))
-            .with_animation(
-                ElementId::Name(format!("sidebar-nav-{}", label).into()),
-                Animation::new(std::time::Duration::from_millis(if reduced_motion {
-                    0
-                } else {
-                    150
-                }))
-                .with_easing(ease_out_quint()),
-                |this, _t| this,
-            )
     };
 
     // Fold handle: a grey icon row-mate, not a row. Expanded it rides the

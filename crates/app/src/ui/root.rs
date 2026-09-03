@@ -2205,7 +2205,6 @@ impl Render for RootView {
                                 }
                             });
                         },
-                        self.session.read(cx).settings.reduced_motion,
                         cx,
                     ))
                     .child(
@@ -2255,11 +2254,11 @@ impl Render for RootView {
                     )
                     .when(self.show_queue, |this| {
                         this.child(
-                            div().child(self.queue_panel.clone()).with_animation(
+                            div().flex().child(self.queue_panel.clone()).with_animation(
                                 ElementId::Name("queue-slide-in".into()),
-                                Animation::new(std::time::Duration::from_millis(200))
+                                Animation::new(std::time::Duration::from_millis(220))
                                     .with_easing(ease_out_quint()),
-                                |this, t| this.opacity(t),
+                                |this, t| this.opacity(t).ml(px(20. * (1. - t))),
                             ),
                         )
                     }),
