@@ -164,6 +164,13 @@ pub struct RootView {
     libraries_collapsed: bool,
     /// Sidebar playlist list folded away.
     playlists_collapsed: bool,
+    /// Whole sidebar folded down to an icon rail.
+    sidebar_collapsed: bool,
+    /// Window orientation at the last frame. A window turning portrait folds
+    /// the sidebar for itself — there is no room for a 210px rail beside the
+    /// content — and turning landscape again restores whatever the user had
+    /// persisted, so the automatic fold never eats their choice.
+    portrait: Option<bool>,
     /// Shared music library database.
     library_db: Arc<LibraryDb>,
     /// The two heavy catalog views, kept alive across navigation. Rebuilding
@@ -437,6 +444,7 @@ impl RootView {
         // every section on each start.
         let libraries_collapsed = session.read(cx).settings.sidebar_libraries_collapsed;
         let playlists_collapsed = session.read(cx).settings.sidebar_playlists_collapsed;
+        let sidebar_collapsed = session.read(cx).settings.sidebar_collapsed;
 
         let vi_enabled = session.read(cx).settings.vi_mode;
         Self {
@@ -476,6 +484,8 @@ impl RootView {
             last_libraries: Vec::new(),
             libraries_collapsed,
             playlists_collapsed,
+            sidebar_collapsed,
+            portrait: None,
             new_playlist_open: false,
             new_pl_name,
             new_pl_desc,
@@ -490,6 +500,46 @@ impl RootView {
             setup_local_dirs: Vec::new(),
             setup_dir_input: setup_dir,
             setup_error: None,
+        }
+    }
+
+    /// Fold the sidebar down to its icon rail, or unfold it, and remember the
+    /// choice. Persisted even in a portrait window: the value is what a return
+    /// to landscape restores.
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        let collapsed = self.sidebar_collapsed;
+        self.session.update(cx, |session, _| {
+            session.settings.sidebar_collapsed = collapsed;
+            session.persist_settings();
+        });
+        cx.notify();
+    }
+
+    /// Fold the sidebar when the window turns portrait, unfold it back to the
+    /// persisted preference when it turns landscape again.
+    ///
+    /// Only the *transition* acts, never every frame: otherwise the automatic
+    /// fold would fight the user the moment they unfolded it in a portrait
+    /// window. A landscape start therefore keeps the persisted value rather
+    /// than forcing the sidebar open.
+    fn apply_orientation(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let size = window.viewport_size();
+        // A zero-sized viewport is a frame laid out before the window has one;
+        // treating it as landscape would fire a spurious transition.
+        if size.width <= px(0.) || size.height <= px(0.) {
+            return;
+        }
+        let portrait = size.height > size.width;
+        if self.portrait == Some(portrait) {
+            return;
+        }
+        let first_frame = self.portrait.is_none();
+        self.portrait = Some(portrait);
+        if portrait {
+            self.sidebar_collapsed = true;
+        } else if !first_frame {
+            self.sidebar_collapsed = self.session.read(cx).settings.sidebar_collapsed;
         }
     }
 
@@ -1604,6 +1654,7 @@ impl RootView {
                     ))
                     .child(key(":pl list".into(), "List playlists".into()))
                     .child(key("/".into(), "Search (Ctrl+K)".into()))
+                    .child(key("Ctrl+B".into(), "Collapse / expand sidebar".into()))
                     .child(key("? / Esc".into(), "Toggle help / Dismiss".into()))
                     .child(
                         div()
@@ -1911,6 +1962,7 @@ impl Focusable for RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_orientation(window, cx);
         let connected = self.session.read(cx).status == ConnectionStatus::Connected;
         let palette_open = self.search_bar.read(cx).is_palette();
         let modal_open = self.new_playlist_open
@@ -1990,6 +2042,7 @@ impl Render for RootView {
             playlists_collapsed: self.playlists_collapsed,
             refreshing: self.refreshing,
             refresh_stage: self.refresh_stage,
+            collapsed: self.sidebar_collapsed,
             vi_selected_section: if self.vi_enabled
                 && self.mode == KeyboardMode::Normal
                 && self.focus_region == FocusRegion::Sidebar
@@ -2024,6 +2077,17 @@ impl Render for RootView {
                 cx.listener(|this, _, window, cx| this.nav_forward(window, cx)),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Fold the sidebar. Ahead of the mode split so it works the
+                // same in vi mode, but not while a text input has focus —
+                // Ctrl+B is a cursor key there.
+                if event.keystroke.key == "b"
+                    && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+                    && window.focused(cx).is_none_or(|f| f == this.focus_handle)
+                {
+                    this.toggle_sidebar(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.vi_enabled {
                     this.handle_vi_key(event, window, cx, false);
                 } else {
@@ -2126,6 +2190,9 @@ impl Render for RootView {
                                 }
                                 SidebarAction::RefreshLibrary => {
                                     root.refresh_library(window, cx);
+                                }
+                                SidebarAction::ToggleSidebar => {
+                                    root.toggle_sidebar(cx);
                                 }
                                 SidebarAction::TogglePlaylistSection => {
                                     root.playlists_collapsed = !root.playlists_collapsed;

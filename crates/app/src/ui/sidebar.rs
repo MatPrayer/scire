@@ -6,8 +6,8 @@ use gpui::{
 };
 
 use crate::ui::root::RefreshStage;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 /// Top-level nav sections shown in the sidebar.
@@ -38,6 +38,8 @@ pub enum SidebarAction {
     TogglePlaylistSection,
     /// Rescan local dirs and resync the server catalog now.
     RefreshLibrary,
+    /// Fold the whole rail down to icons (or unfold it).
+    ToggleSidebar,
 }
 
 pub struct SidebarModel {
@@ -58,6 +60,10 @@ pub struct SidebarModel {
     pub refresh_stage: RefreshStage,
     /// Section highlighted by vi-mode keyboard cursor.
     pub vi_selected_section: Option<NavSection>,
+    /// Rail folded down to icons: no labels, no library switcher, no
+    /// playlists. The nav sections and the two footer rows survive as icons
+    /// with tooltips, since those are what the rail is for.
+    pub collapsed: bool,
 }
 
 /// Thin progress track under the refresh row.
@@ -85,25 +91,40 @@ fn refresh_bar(stage: RefreshStage, cx: &App) -> impl IntoElement {
         })
 }
 
+/// Row icon sizing. Collapsed, the icon *is* the row — it carries the weight
+/// the label used to, and the 14px `small()` mark the labelled rows use reads
+/// as a speck in a 52px rail.
+fn row_icon(icon: Icon, collapsed: bool) -> Icon {
+    if collapsed {
+        icon.with_size(px(18.))
+    } else {
+        icon.small()
+    }
+}
+
 pub fn render_sidebar(
     model: SidebarModel,
     on_action: impl Fn(SidebarAction, &mut Window, &mut App) + Clone + 'static,
     reduced_motion: bool,
     cx: &App,
 ) -> impl IntoElement {
+    let collapsed = model.collapsed;
     let nav_item = |label: &'static str, icon: IconName, section: NavSection| {
         let on_action = on_action.clone();
         let is_active = model.active == Some(section);
         let is_vi_sel = model.vi_selected_section == Some(section);
         h_flex()
             .id(SharedString::from(label))
-            .px_3()
             .py_1p5()
-            .gap_2()
             .items_center()
             .rounded_lg()
             .cursor_pointer()
             .text_sm()
+            // Collapsed the label is gone, so the icon centres in the rail and
+            // the name moves into a tooltip — an icon nobody can name is not
+            // navigation.
+            .when(collapsed, |s| s.justify_center().px_0())
+            .when(!collapsed, |s| s.px_3().gap_2())
             .when(is_active, |s| {
                 s.bg(cx.theme().muted).text_color(cx.theme().foreground)
             })
@@ -112,9 +133,12 @@ pub fn render_sidebar(
             .when(is_vi_sel, |s| {
                 s.border_l_2().border_color(cx.theme().primary)
             })
+            .when(collapsed, |s| {
+                s.tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+            })
             .on_click(move |_, window, cx| on_action(SidebarAction::Select(section), window, cx))
-            .child(Icon::new(icon).small())
-            .child(label)
+            .child(row_icon(Icon::new(icon), collapsed))
+            .when(!collapsed, |s| s.child(label))
             .with_animation(
                 ElementId::Name(format!("sidebar-nav-{}", label).into()),
                 Animation::new(std::time::Duration::from_millis(if reduced_motion {
@@ -127,38 +151,79 @@ pub fn render_sidebar(
             )
     };
 
+    // Fold handle: a grey icon row-mate, not a row. Expanded it rides the
+    // first line that is already there — the Libraries header when the
+    // switcher is shown, the first nav row otherwise — so folding costs no
+    // vertical space. Collapsed it gets the top of the rail, the usual place
+    // to find the way back out.
+    let fold_handle = {
+        let on_action = on_action.clone();
+        let tip = if collapsed {
+            "Expand sidebar"
+        } else {
+            "Collapse sidebar"
+        };
+        div()
+            .id("sidebar-fold")
+            .p_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(cx.theme().muted_foreground)
+            .hover(|s| s.bg(cx.theme().muted))
+            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .on_click(move |_, window, cx| on_action(SidebarAction::ToggleSidebar, window, cx))
+            .child(row_icon(
+                Icon::new(if collapsed {
+                    IconName::PanelLeftOpen
+                } else {
+                    IconName::PanelLeftClose
+                }),
+                collapsed,
+            ))
+    };
+    let mut fold_slot = Some(fold_handle);
+    let rail_fold = if collapsed { fold_slot.take() } else { None };
+
     // Library switcher (only when the user can access more than one).
     // Checkboxes so several libraries can be browsed at once; checking
     // none (or all) means "all libraries". The section header folds it away.
     let mut library_switcher = v_flex().gap_0p5();
-    let show_libraries = model.libraries.len() > 1;
+    let show_libraries = !collapsed && model.libraries.len() > 1;
     if show_libraries {
         // Header: label + chevron, click to collapse/expand.
         {
             let on_action = on_action.clone();
             library_switcher = library_switcher.child(
                 h_flex()
-                    .id("lib-header")
-                    .px_3()
-                    .pt_3()
+                    .w_full()
+                    .pr_1()
+                    .pt_2()
                     .pb_1()
-                    .gap_1()
                     .items_center()
-                    .cursor_pointer()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .on_click(move |_, window, cx| {
-                        on_action(SidebarAction::ToggleLibrarySection, window, cx)
-                    })
-                    .child("Libraries")
+                    .justify_between()
                     .child(
-                        Icon::new(if model.libraries_collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .xsmall(),
-                    ),
+                        h_flex()
+                            .id("lib-header")
+                            .pl_3()
+                            .gap_1()
+                            .items_center()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .on_click(move |_, window, cx| {
+                                on_action(SidebarAction::ToggleLibrarySection, window, cx)
+                            })
+                            .child("Libraries")
+                            .child(
+                                Icon::new(if model.libraries_collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .xsmall(),
+                            ),
+                    )
+                    .when_some(fold_slot.take(), |s, fold| s.child(fold)),
             );
         }
         if !model.libraries_collapsed {
@@ -242,16 +307,20 @@ pub fn render_sidebar(
                     ),
             )
             .child(
-                Button::new("pl-new")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(IconName::Plus))
-                    .on_click(move |_, window, cx| on_new(SidebarAction::NewPlaylist, window, cx)),
+                div()
+                    .id("pl-new")
+                    .p_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(cx.theme().muted_foreground)
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .on_click(move |_, window, cx| on_new(SidebarAction::NewPlaylist, window, cx))
+                    .child(Icon::new(IconName::Plus).xsmall()),
             )
     };
 
     let mut playlist_items: Vec<gpui::AnyElement> = Vec::new();
-    if !model.playlists_collapsed {
+    if !collapsed && !model.playlists_collapsed {
         for (id, name, shared) in model.playlists.iter() {
             let on_action = on_action.clone();
             let id = id.clone();
@@ -288,21 +357,37 @@ pub fn render_sidebar(
         }
     }
 
+    // Expanded, the fold handle rides the first row that exists; only the
+    // collapsed rail spends a line on it.
+    let recent = nav_item("Recent", IconName::GalleryVerticalEnd, NavSection::Recent);
+    let recent_row = match fold_slot.take() {
+        Some(fold) => h_flex()
+            .w_full()
+            .items_center()
+            .gap_1()
+            .child(div().flex_1().min_w_0().child(recent))
+            .child(fold)
+            .into_any_element(),
+        None => recent.into_any_element(),
+    };
+
     v_flex()
-        .w(px(210.))
+        // Collapsed: wide enough for the icon rows' hover/active pill and
+        // nothing else.
+        .w(px(if collapsed { 52. } else { 210. }))
         .h_full()
-        .px_2()
+        .when(collapsed, |s| s.px_1())
+        .when(!collapsed, |s| s.px_2())
         .py_2()
         .gap_0p5()
         .border_r_1()
         .border_color(hsla(0., 0., 0.5, 0.15))
         .bg(cx.theme().sidebar)
+        .when_some(rail_fold, |this, fold| {
+            this.child(h_flex().w_full().justify_center().child(fold))
+        })
         .when(show_libraries, |this| this.child(library_switcher))
-        .child(nav_item(
-            "Recent",
-            IconName::GalleryVerticalEnd,
-            NavSection::Recent,
-        ))
+        .child(recent_row)
         .child(nav_item(
             "Albums",
             IconName::LayoutDashboard,
@@ -321,7 +406,7 @@ pub fn render_sidebar(
         .child(nav_item("Radio", IconName::Globe, NavSection::Radio))
         .child(nav_item("Local", IconName::Folder, NavSection::LocalMusic))
         .child(div().px_3().child(super::divider()))
-        .child(playlists_header)
+        .when(!collapsed, |this| this.child(playlists_header))
         .child(
             v_flex()
                 .id("sidebar-playlists")
@@ -338,16 +423,28 @@ pub fn render_sidebar(
             let on_refresh = on_action.clone();
             let refreshing = model.refreshing;
             let stage = model.refresh_stage;
+            let label = if refreshing {
+                SharedString::from(stage.label())
+            } else {
+                SharedString::from("Refresh library")
+            };
+            let tip = label.clone();
             v_flex()
                 .id("sidebar-refresh")
-                .px_3()
                 .py_1p5()
                 .gap_1()
                 .rounded_lg()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
+                .when(collapsed, |s| s.px_0())
+                .when(!collapsed, |s| s.px_3())
                 .when(!refreshing, |s| {
                     s.cursor_pointer().hover(|s| s.bg(cx.theme().muted))
+                })
+                // Collapsed the stage label has nowhere to go, so the tooltip
+                // carries it — that text is the only sign the refresh moved.
+                .when(collapsed, |s| {
+                    s.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 })
                 .on_click(move |_, window, cx| {
                     if !refreshing {
@@ -358,13 +455,13 @@ pub fn render_sidebar(
                     h_flex()
                         .gap_2()
                         .items_center()
+                        .when(collapsed, |s| s.justify_center())
                         .when(refreshing, |s| s.opacity(0.6))
-                        .child(crate::assets::app_icon(crate::assets::icons::REFRESH).small())
-                        .child(if refreshing {
-                            SharedString::from(stage.label())
-                        } else {
-                            SharedString::from("Refresh library")
-                        }),
+                        .child(row_icon(
+                            crate::assets::app_icon(crate::assets::icons::REFRESH),
+                            collapsed,
+                        ))
+                        .when(!collapsed, |s| s.child(label)),
                 )
                 // A refresh is minutes of work on a big library. Without a bar
                 // the row read as hung, which is exactly what it looked like.

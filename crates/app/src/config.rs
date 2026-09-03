@@ -121,6 +121,10 @@ pub struct Settings {
     pub sidebar_libraries_collapsed: bool,
     /// Sidebar playlist list folded away; restored across sessions.
     pub sidebar_playlists_collapsed: bool,
+    /// Sidebar folded down to an icon rail; restored across sessions. A
+    /// portrait window collapses it on its own whatever this says, and
+    /// restores this value when it turns landscape again.
+    pub sidebar_collapsed: bool,
     /// Vi-style modal keyboard navigation.
     pub vi_mode: bool,
     /// Draw the outer glow on album cards under the mouse. The vi-mode focus
@@ -419,6 +423,7 @@ impl Default for Settings {
             resume_playback: false,
             sidebar_libraries_collapsed: false,
             sidebar_playlists_collapsed: false,
+            sidebar_collapsed: false,
             vi_mode: false,
             hover_glow: false,
             show_nav_buttons: true,
