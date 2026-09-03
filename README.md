@@ -4,7 +4,7 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/) — and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.3.0-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.5.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#build--run)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
@@ -79,7 +79,7 @@ Log in with your Navidrome URL, username and password — or point **Settings �
 | **Waveform seek bar** | Per-track amplitude envelope (480 buckets, cached to disk) · click to seek · the next track's peaks are computed while the current one plays |
 | **OS media keys** | Media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS) |
 | **Artwork cache** | LRU-evicted disk cache (configurable cap) · HiDPI-aware resolution bump · album-scoped keys, so Navidrome's per-song cover ids don't re-download identical art |
-| **Navigation** | Mouse back/forward buttons · bracket keys · configurable default page · vi-mode navigation (below) |
+| **Navigation** | Mouse back/forward buttons · bracket keys · configurable default page · vi-mode navigation and a **Reduce motion** toggle (below) |
 | **Local music** | Directory scanner (`lofty` tags + `folder.jpg` / embedded art) into a SQLite library · incremental mtime-based rescan · periodic background scan · album grid with cover art (cached, no re-query per frame) · album detail view with track listing, play/shuffle/queue per track · cover art in player bar + fullscreen player · engine reads local files via `SourceReader` |
 
 ## Keyboard Shortcuts
@@ -113,6 +113,8 @@ Enable **Vi-mode** in Settings to replace the shortcuts above with vim-style nav
 | <kbd>:</kbd> | Command mode — `:q` quit · `:help` · `:newpl <name>` · `:pl add <name>` · `:pl list` |
 | <kbd>/</kbd> | Search |
 | <kbd>?</kbd> | Toggle the in-app vi-mode help |
+
+**Reduce motion** — a companion toggle just above the same settings cluster. When ON, the decorative cover/tab and player-bar animations are turned off (instant instead of animated), which is useful for anyone sensitive to motion. It doesn't disable vi-mode itself.
 
 ---
 
@@ -246,6 +248,18 @@ scire/
 │               ├── playlist_detail.rs
 │               ├── radio.rs
 │               └── mod.rs           # Shared utilities
+│
+│   └── dmg/                # cargo-dmg subcommand → macOS .dmg packaging
+│       └── src/main.rs     # thin wrapper that shells out to make-dmg.sh
+│
+├── packaging/
+│   └── macos/              # macOS app bundle + dmg scripts
+│       ├── bundle.sh             # build Scirè.app (Icon + Info.plist)
+│       ├── make-dmg.sh           # wrap the app into Scirè-<version>.dmg
+│       ├── dmg-background.svg    # installer window background
+│       ├── AppIcon.svg           # app icon source
+│       ├── Info.plist.in         # Info.plist template
+│       └── signing-identity.sh   # code-signing helper
 │
 ├── themes/                # Example theme JSON + pywal16 template
 ├── vendor/                # Local gpui-component fork (see the Cargo.toml patch)
@@ -382,6 +396,19 @@ libX11  fontconfig  freetype  alsa-lib  dbus
 `dbus` is only needed for media keys / MPRIS — without it that layer degrades to a no-op rather than failing.
 
 **macOS** needs nothing extra, and builds with Xcode Command Line Tools alone (GPUI's `runtime_shaders` feature avoids requiring `xcrun metal`).
+
+### macOS packaging
+
+A distributable app bundle and drag-and-drop installer are scripted under `packaging/`:
+
+```bash
+cargo dmg                     # cargo alias → release build + .app + .dmg
+# or, step by step:
+packaging/macos/bundle.sh     # build Scirè.app
+packaging/macos/make-dmg.sh   # wrap it in Scirè-<version>.dmg
+```
+
+`cargo dmg` produces `target/macos/Scirè-<version>.dmg` — an installer disk image with the app, a symlinked Applications folder and a themed background. Building the `.dmg` needs `rsvg-convert` (`brew install librsvg`) for the background artwork; the `.app` bundle itself needs nothing extra. The aliases live in `.cargo/config.toml`.
 
 ### Vendored dependency
 
