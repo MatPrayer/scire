@@ -13,12 +13,16 @@ use subsonic::{Song, SubsonicClient};
 use crate::services::artwork;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
-use crate::ui::{focus_glow, format_duration};
+use crate::ui::{focus_glow, format_count, format_duration, format_playtime};
 
 const ART_SIZE: u32 = 200;
 /// Fixed row height — `uniform_list` requires every row to be the same size.
 /// 44px thumbnail plus the row's vertical padding.
 const ROW_H: f32 = 56.;
+/// Album and duration column widths. Both are fixed so the columns line up
+/// down the page; the album one shrinks first when the window is narrow.
+const ALBUM_W: f32 = 180.;
+const DURATION_W: f32 = 48.;
 
 /// One row's pre-formatted contents.
 ///
@@ -53,6 +57,20 @@ fn to_rows(songs: &[Song]) -> Vec<Row> {
         .collect()
 }
 
+/// Header totals: how many tracks the page lists and how long they run.
+fn summarize(songs: &[Song]) -> String {
+    if songs.is_empty() {
+        return String::new();
+    }
+    let secs: f64 = songs.iter().filter_map(|s| s.duration).map(f64::from).sum();
+    let noun = if songs.len() == 1 { "track" } else { "tracks" };
+    format!(
+        "{} {noun} · {}",
+        format_count(songs.len() as i64),
+        format_playtime(secs)
+    )
+}
+
 /// Cheap stand-in for "the list changed": it is only ever pushed to at the
 /// front and capped, so length plus the head id can't miss an edit.
 fn signature(songs: &[Song]) -> (usize, Option<String>) {
@@ -64,6 +82,9 @@ pub struct RecentView {
     session: Entity<Session>,
     songs: Vec<Song>,
     rows: Vec<Row>,
+    /// Pre-formatted header totals, rebuilt with the rows rather than per
+    /// frame (this view repaints on every position tick).
+    summary: SharedString,
     /// Signature of `songs`, so a position tick doesn't rebuild everything.
     signature: (usize, Option<String>),
     /// Whether a client existed at the last art fetch, so one appearing later
@@ -87,6 +108,7 @@ impl RecentView {
             session,
             songs: Vec::new(),
             rows: Vec::new(),
+            summary: SharedString::default(),
             signature: (0, None),
             art_had_client: false,
             art_paths: HashMap::new(),
@@ -123,6 +145,7 @@ impl RecentView {
         self.art_had_client = has_client;
         self.songs = self.player.read(cx).recently_played.clone();
         self.rows = to_rows(&self.songs);
+        self.summary = summarize(&self.songs).into();
         self.fetch_missing_art(cx);
         true
     }
@@ -182,6 +205,10 @@ impl RecentView {
         let view = entity.clone();
         h_flex()
             .id(("recent-row", ix))
+            // `uniform_list` sizes its items to their content, so without this
+            // the row is only as wide as its text and the album and duration
+            // columns land at a different x on every line.
+            .w_full()
             .h(px(ROW_H))
             .px_2()
             .gap_3()
@@ -231,10 +258,12 @@ impl RecentView {
                             .child(row.artist.clone()),
                     ),
             )
-            // Album
+            // Album — fixed column, but allowed to shrink out of the way
+            // before the title does in a narrow window.
             .child(
                 div()
-                    .w(px(180.))
+                    .w(px(ALBUM_W))
+                    .min_w_0()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .truncate()
@@ -243,7 +272,8 @@ impl RecentView {
             // Duration
             .child(
                 div()
-                    .w(px(48.))
+                    .w(px(DURATION_W))
+                    .flex_shrink_0()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .text_right()
@@ -264,15 +294,34 @@ impl Render for RecentView {
                 .collect::<Vec<_>>()
         })
         .flex_1()
+        .min_h_0()
         .px_4()
         .track_scroll(self.scroll.clone());
 
+        // Same header shape as the catalog pages: title left, totals on the
+        // right edge. No bottom padding — the list runs under the player bar
+        // instead of stopping short of it.
         v_flex()
             .id("recent-scroll")
             .size_full()
             .pt_4()
             .gap_2()
-            .child(div().px_4().text_lg().child("Recently Played"))
+            .child(
+                h_flex()
+                    .px_4()
+                    .items_center()
+                    .gap_4()
+                    .child(div().text_lg().child("Recently Played"))
+                    .child(div().flex_1())
+                    .when(!empty, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(self.summary.clone()),
+                        )
+                    }),
+            )
             .when(empty, |this| {
                 this.child(
                     div()
@@ -354,6 +403,21 @@ mod tests {
         let before = vec![song("a", "A"), song("b", "B")];
         let after = vec![song("b", "B"), song("a", "A")];
         assert_ne!(signature(&before), signature(&after));
+    }
+
+    #[test]
+    fn summary_counts_tracks_and_their_playtime() {
+        let mut a = song("a", "A");
+        a.duration = Some(90);
+        let mut b = song("b", "B");
+        b.duration = Some(3600);
+        assert_eq!(summarize(&[a, b]), "2 tracks · 1h 1m");
+    }
+
+    #[test]
+    fn summary_is_empty_when_nothing_has_played() {
+        // The header hides the totals rather than printing "0 tracks · 0m".
+        assert!(summarize(&[]).is_empty());
     }
 
     #[test]

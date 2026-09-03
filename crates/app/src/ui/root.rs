@@ -61,10 +61,10 @@ enum KeyboardMode {
 
 /// Navigation-section order for vi-mode j/k cycling.
 const NAV_ORDER: &[NavSection] = &[
-    NavSection::Recent,
     NavSection::Albums,
     NavSection::Artists,
     NavSection::Favorites,
+    NavSection::Recent,
     NavSection::Radio,
     NavSection::LocalMusic,
     NavSection::Settings,

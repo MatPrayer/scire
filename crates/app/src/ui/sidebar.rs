@@ -359,16 +359,16 @@ pub fn render_sidebar(
 
     // Expanded, the fold handle rides the first row that exists; only the
     // collapsed rail spends a line on it.
-    let recent = nav_item("Recent", IconName::GalleryVerticalEnd, NavSection::Recent);
-    let recent_row = match fold_slot.take() {
+    let albums = nav_item("Albums", IconName::LayoutDashboard, NavSection::Albums);
+    let albums_row = match fold_slot.take() {
         Some(fold) => h_flex()
             .w_full()
             .items_center()
             .gap_1()
-            .child(div().flex_1().min_w_0().child(recent))
+            .child(div().flex_1().min_w_0().child(albums))
             .child(fold)
             .into_any_element(),
-        None => recent.into_any_element(),
+        None => albums.into_any_element(),
     };
 
     v_flex()
@@ -387,12 +387,7 @@ pub fn render_sidebar(
             this.child(h_flex().w_full().justify_center().child(fold))
         })
         .when(show_libraries, |this| this.child(library_switcher))
-        .child(recent_row)
-        .child(nav_item(
-            "Albums",
-            IconName::LayoutDashboard,
-            NavSection::Albums,
-        ))
+        .child(albums_row)
         .child(nav_item(
             "Artists",
             IconName::CircleUser,
@@ -402,6 +397,11 @@ pub fn render_sidebar(
             "Favorites",
             IconName::Heart,
             NavSection::Favorites,
+        ))
+        .child(nav_item(
+            "Recent",
+            IconName::GalleryVerticalEnd,
+            NavSection::Recent,
         ))
         .child(nav_item("Radio", IconName::Globe, NavSection::Radio))
         .child(nav_item("Local", IconName::Folder, NavSection::LocalMusic))
