@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Scirè
+GenericName=Music Player
+Comment=Native desktop music client for Navidrome and local files
+Exec=scire
+Icon=scire
+Terminal=false
+Categories=Audio;AudioVideo;Music;Player;
+Keywords=music;navidrome;subsonic;player;
+StartupNotify=true
