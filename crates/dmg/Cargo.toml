@@ -1,0 +1,11 @@
+[package]
+name = "dmg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cargo subcommand wrapping the macOS .dmg packaging scripts"
+publish = false
+
+[[bin]]
+name = "cargo-dmg"
+path = "src/main.rs"
