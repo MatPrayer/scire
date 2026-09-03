@@ -42,23 +42,23 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Icon: rendered from the SVG when librsvg is around, otherwise fall back to a
 # checked-in .icns so packaging still works on a machine without it.
-ICNS="$OUT_DIR/AppIcon.icns"
+ICNS="$OUT_DIR/scire.icns"
 if command -v rsvg-convert >/dev/null 2>&1; then
-	SET="$OUT_DIR/AppIcon.iconset"
+	SET="$OUT_DIR/scire.iconset"
 	rm -rf "$SET"; mkdir -p "$SET"
 	for size in 16 32 128 256 512; do
-		rsvg-convert -w $size -h $size "$HERE/AppIcon.svg" -o "$SET/icon_${size}x${size}.png"
-		rsvg-convert -w $((size * 2)) -h $((size * 2)) "$HERE/AppIcon.svg" \
+		rsvg-convert -w $size -h $size "$HERE/scire.svg" -o "$SET/icon_${size}x${size}.png"
+		rsvg-convert -w $((size * 2)) -h $((size * 2)) "$HERE/scire.svg" \
 			-o "$SET/icon_${size}x${size}@2x.png"
 	done
 	iconutil -c icns "$SET" -o "$ICNS"
 	rm -rf "$SET"
-elif [[ -f "$HERE/AppIcon.icns" ]]; then
-	cp "$HERE/AppIcon.icns" "$ICNS"
+elif [[ -f "$HERE/scire.icns" ]]; then
+	cp "$HERE/scire.icns" "$ICNS"
 else
-	echo "warning: no rsvg-convert and no prebuilt AppIcon.icns — bundling without an icon" >&2
+	echo "warning: no rsvg-convert and no prebuilt scire.icns — bundling without an icon" >&2
 fi
-[[ -f "$ICNS" ]] && cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
+[[ -f "$ICNS" ]] && cp "$ICNS" "$APP/Contents/Resources/scire.icns"
 
 # arm64 refuses to run an unsigned binary, and copying the binary invalidated
 # the linker's ad-hoc signature — re-sign the whole bundle.

@@ -19,7 +19,7 @@
 	<key>CFBundleVersion</key>
 	<string>@VERSION@</string>
 	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
+	<string>scire</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.music</string>
 	<key>LSMinimumSystemVersion</key>
