@@ -1,7 +1,7 @@
 //! Album page: header (artwork, star, rating) + track list with play,
 //! queue and playlist actions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
@@ -16,7 +16,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
     v_flex,
 };
-use subsonic::{Album, AlbumInfo2, AlbumWithSongs, Song, SubsonicClient};
+use subsonic::{AlbumInfo2, AlbumWithSongs, Song, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::config::ThemePref;
@@ -25,6 +25,7 @@ use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
+use crate::ui::albums::album_from_row;
 use crate::ui::{
     focus_glow, format_duration, strip_html, track_extras, truncate_at_word, with_focus_animation,
 };
@@ -41,6 +42,63 @@ const ART_SIZE: u32 = 512;
 
 /// Collapsed album-notes length, matching the artist page's bio preview.
 const NOTES_PREVIEW_CHARS: usize = 400;
+
+/// Read a cached cover file and reduce it to a page accent.
+///
+/// Shared by the two passes that produce one — the canonical fetch and the
+/// provisional cached rendition — so they cannot differ in anything but which
+/// file they are handed.
+fn accent_from_file(path: &Path) -> anyhow::Result<gpui::Hsla> {
+    let bytes = std::fs::read(path)?;
+    crate::ui::accent_from_cover_bytes(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
+}
+
+/// Namespaces `navidrome_sync` stores its rows under. This view is opened with
+/// the bare id the live listing uses, so both directions have to be crossed:
+/// the lookup is qualified up, and everything handed back out is stripped down.
+const ALBUM_NS: &str = "navidrome:album:";
+const TRACK_NS: &str = "navidrome:track:";
+
+/// The last sync's stand-in for `album_id`: its album row plus its tracks, or
+/// `None` when the cache cannot answer for it.
+///
+/// Split out of `seed_from_cache` so the id crossing above is testable without
+/// a window — it silently missed on every album once the sync started
+/// namespacing, which left the page seeding nothing at all.
+fn cached_album(db: &LibraryDb, album_id: &str) -> Option<AlbumWithSongs> {
+    let key = format!("{ALBUM_NS}{album_id}");
+    let row = db.album_by_id("navidrome", &key).ok().flatten()?;
+    let songs: Vec<Song> = db
+        .tracks_by_album(&key)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|track| {
+            let mut song = track.into_song();
+            // These ids leave the page: playback and scrobbling send them back
+            // to the server, and the playing-row highlight compares them
+            // against the player's own.
+            if let Some(bare) = song.id.strip_prefix(TRACK_NS) {
+                song.id = bare.to_string();
+            }
+            // Not stored per track, but `artwork::song_cover` groups an
+            // album's covers under it — without it every seeded row would ask
+            // for its own copy of the same art.
+            song.album_id = Some(album_id.to_string());
+            song
+        })
+        .collect();
+    // An album row whose tracks never landed (a sync interrupted between
+    // phases) would seed an empty track list, which reads as a broken page
+    // rather than a loading one.
+    if songs.is_empty() {
+        return None;
+    }
+    Some(AlbumWithSongs {
+        album: album_from_row(row),
+        song: songs,
+    })
+}
 
 pub enum AlbumDetailEvent {
     OpenArtist(String),
@@ -76,6 +134,11 @@ pub struct AlbumDetailView {
     /// Cover id the accent was extracted from, so a repaint doesn't re-fetch
     /// and re-decode it.
     accent_for: Option<String>,
+    /// Same, for the provisional accent below. Its own guard because it runs
+    /// on a different condition than the canonical pass — cached art rather
+    /// than a client — and a shared flag would let a repaint respawn one of
+    /// them every frame.
+    accent_seed_for: Option<String>,
 }
 
 impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
@@ -130,6 +193,7 @@ impl AlbumDetailView {
             vi_cursor: None,
             accent: None,
             accent_for: None,
+            accent_seed_for: None,
         };
         this.seed_from_cache(&db, cx);
         this.load(cx);
@@ -145,40 +209,11 @@ impl AlbumDetailView {
     /// everything the page needs except the per-file quality fields, so it is
     /// drawn immediately and `load` overwrites it in place.
     fn seed_from_cache(&mut self, db: &LibraryDb, cx: &mut Context<Self>) {
-        let Ok(Some(row)) = db.album_by_id("navidrome", &self.album_id) else {
+        let Some(seed) = cached_album(db, &self.album_id) else {
             return;
         };
-        let songs: Vec<Song> = db
-            .tracks_by_album(&self.album_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| t.into_song())
-            .collect();
-        // An album row whose tracks never landed (a sync interrupted between
-        // phases) would seed an empty track list, which reads as a broken
-        // page rather than a loading one.
-        if songs.is_empty() {
-            return;
-        }
-        let cover = row.cover_art.clone();
-        self.album = Some(AlbumWithSongs {
-            album: Album {
-                id: row.id,
-                name: row.title,
-                artist: row.artist,
-                artist_id: row.artist_id,
-                cover_art: row.cover_art,
-                song_count: Some(songs.len() as u32),
-                duration: Some(row.duration as u32),
-                created: row.created,
-                year: row.year,
-                genre: None,
-                starred: row.starred,
-                user_rating: None,
-                play_count: row.play_count.map(|c| c as u64),
-            },
-            song: songs,
-        });
+        let cover = seed.album.cover_art.clone();
+        self.album = Some(seed);
         if let Some(cover) = cover {
             // Straight off disk when the grid already downloaded this cover,
             // so the header art is there on the first frame — at whatever size
@@ -336,6 +371,7 @@ impl AlbumDetailView {
         let Some(cover_id) = self.album.as_ref().and_then(|a| a.album.cover_art.clone()) else {
             return;
         };
+        self.seed_accent(&cover_id, cx);
         if self.accent_for.as_ref() == Some(&cover_id) {
             return;
         }
@@ -350,9 +386,7 @@ impl AlbumDetailView {
             let accent = runtime::spawn_io(async move {
                 let path =
                     artwork::fetch_as(client, cover_id, key, crate::ui::ACCENT_ART_SIZE).await?;
-                let bytes = std::fs::read(&path)?;
-                crate::ui::accent_from_cover_bytes(&bytes)
-                    .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
+                accent_from_file(&path)
             })
             .await;
             let _ = this.update(cx, |view, cx| match accent {
@@ -363,6 +397,51 @@ impl AlbumDetailView {
                 // Undecodable cover: forget the key so a later repaint retries
                 // rather than pinning the page to no accent at all.
                 Err(_) => view.accent_for = None,
+            });
+        })
+        .detach();
+    }
+
+    /// Tint the page from whatever rendition of this cover is already on disk,
+    /// while `refresh_accent` above resolves the canonical one.
+    ///
+    /// The canonical pass wants one exact file so the page and the player bar
+    /// cannot disagree, and for an album that has never been played that file
+    /// is not cached — so it downloads it, and the tint arrives a round trip
+    /// after the header, the track list and the cover art, all of which the
+    /// cache already painted. The grid's own thumbnail of the same sleeve is
+    /// right there. A different resize can tip a two-hue cover onto the other
+    /// hue, which is exactly why this is not the authority: it is a stand-in
+    /// the canonical accent overwrites when it lands, the same bargain the
+    /// header art makes with `cached_best`.
+    fn seed_accent(&mut self, cover_id: &str, cx: &mut Context<Self>) {
+        if self.accent_seed_for.as_deref() == Some(cover_id) {
+            return;
+        }
+        // Album-scoped key first — those are the rungs the canonical pass
+        // itself reads, so they are the closest stand-ins — then the cover id,
+        // where the grid's thumbnail and this page's header art live.
+        let key = artwork::album_cover_key(&self.album_id);
+        let Some(path) = artwork::cached_best(&key, crate::ui::ACCENT_ART_SIZE)
+            .or_else(|| artwork::cached_best(cover_id, crate::ui::ACCENT_ART_SIZE))
+        else {
+            return;
+        };
+        self.accent_seed_for = Some(cover_id.to_string());
+        cx.spawn(async move |this, cx| {
+            // Decoding and walking every pixel of what may be a 1500px cover is
+            // pure CPU that never yields: the blocking pool, not one of the two
+            // IO workers everything else is queued behind.
+            let Ok(accent) = runtime::spawn_blocking_io(move || accent_from_file(&path)).await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                // A canonical accent that landed first outranks this one.
+                if view.accent.is_none() {
+                    view.accent = Some(accent);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -1319,8 +1398,59 @@ impl AlbumDetailView {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_bytes, fmt_khz, quality_chips, replaygain_line};
+    use super::{cached_album, fmt_bytes, fmt_khz, quality_chips, replaygain_line};
+    use crate::services::library_db::{AlbumRow, LibraryDb};
     use subsonic::Song;
+
+    /// The sync writes `navidrome:album:<id>` / `navidrome:track:<id>`, the
+    /// grid navigates with the bare id — so the seed has to qualify its lookup
+    /// and unqualify what it hands back. Missing the first half made every
+    /// lookup miss, and the page that was supposed to paint from cache waited
+    /// on `getAlbum` and a fresh cover download instead.
+    #[test]
+    fn the_seed_crosses_the_syncs_id_namespace() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut row = AlbumRow::new("navidrome:album:a1", "navidrome", "Album");
+        row.cover_art = Some("al-a1_deadbeef".into());
+        db.upsert_album(&row).unwrap();
+        db.upsert_track(
+            "navidrome:track:t1",
+            "navidrome",
+            "Track",
+            None,
+            None,
+            Some("Album"),
+            Some("navidrome:album:a1"),
+            None,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("mf-t1_deadbeef"),
+            None,
+        )
+        .unwrap();
+
+        let seeded = cached_album(&db, "a1").expect("bare id finds the namespaced row");
+        assert_eq!(seeded.album.id, "a1");
+        assert_eq!(seeded.album.cover_art.as_deref(), Some("al-a1_deadbeef"));
+        assert_eq!(seeded.song.len(), 1);
+        assert_eq!(seeded.song[0].id, "t1");
+        // Grouped under the album so all its rows share one cover download.
+        assert_eq!(seeded.song[0].album_id.as_deref(), Some("a1"));
+    }
+
+    /// A row whose tracks never landed seeds nothing: an empty track list under
+    /// a filled-in header reads as a broken page, not a loading one.
+    #[test]
+    fn an_album_without_cached_tracks_does_not_seed() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        db.upsert_album(&AlbumRow::new("navidrome:album:a1", "navidrome", "Album"))
+            .unwrap();
+        assert!(cached_album(&db, "a1").is_none());
+    }
 
     /// Songs carry ~20 fields; building them from JSON keeps the cases readable
     /// and exercises the same deserialization the client uses.

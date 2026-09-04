@@ -157,7 +157,7 @@ fn merge_ready(state: &mut TabState, tab: AlbumSort) -> Vec<Album> {
 /// so a placeholder card navigates and fetches art with the same id the live
 /// listing would use — that's also what lets the cover survive the swap instead
 /// of blanking and re-downloading.
-fn album_from_row(row: AlbumRow) -> Album {
+pub(crate) fn album_from_row(row: AlbumRow) -> Album {
     let strip = |id: &str, prefix: &str| id.strip_prefix(prefix).unwrap_or(id).to_string();
     Album {
         id: strip(&row.id, "navidrome:album:"),
