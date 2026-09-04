@@ -6,7 +6,7 @@ use gpui::{App, IntoElement, SharedString, Window, div, hsla, prelude::*, px, re
 
 use crate::assets::{app_icon, icons};
 use crate::ui::root::RefreshStage;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::popover::Popover;
 use gpui_component::tooltip::Tooltip;
@@ -23,6 +23,25 @@ type AfterPick = Rc<dyn Fn(&mut Window, &mut App)>;
 /// A row that does nothing once its action has run — the expanded sidebar.
 fn stay_put() -> AfterPick {
     Rc::new(|_, _| {})
+}
+
+/// Styling for the rail's dropdown triggers, so they read as rail rows rather
+/// than as buttons.
+///
+/// The dropdowns are the only things in the sidebar that must be `Button`s —
+/// a `Popover` trigger has to implement `Selectable`, which a plain div does
+/// not — and a ghost button paints itself in `secondary_foreground` over a
+/// `secondary` hover, both brighter than the muted icons and `muted` hover
+/// every other row in the rail uses. This restates the row's colours as a
+/// custom variant so the two sit at the same weight.
+fn rail_trigger(cx: &App) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .color(cx.theme().transparent)
+        .foreground(cx.theme().muted_foreground)
+        .border(cx.theme().transparent)
+        .hover(cx.theme().muted)
+        .active(cx.theme().muted)
+        .shadow(false)
 }
 
 /// Top-level nav sections shown in the sidebar.
@@ -410,7 +429,7 @@ pub fn render_sidebar(
         Popover::new("rail-libraries")
             .trigger(
                 Button::new("rail-libraries-btn")
-                    .ghost()
+                    .custom(rail_trigger(cx))
                     .icon(row_icon(app_icon(icons::LIBRARY), true))
                     .tooltip("Libraries"),
             )
@@ -450,7 +469,7 @@ pub fn render_sidebar(
         Popover::new("rail-playlists")
             .trigger(
                 Button::new("rail-playlists-btn")
-                    .ghost()
+                    .custom(rail_trigger(cx))
                     .icon(row_icon(app_icon(icons::LIST_MUSIC), true))
                     .tooltip("Playlists"),
             )
