@@ -69,8 +69,16 @@ pub fn song_cover(song: &Song) -> Option<(String, String)> {
     let key = song
         .album_id
         .as_ref()
-        .map_or_else(|| cover_id.clone(), |album| format!("album-{album}"));
+        .map_or_else(|| cover_id.clone(), |album| album_cover_key(album));
     Some((cover_id, key))
+}
+
+/// The cache key [`song_cover`] groups an album's covers under. Exposed so a
+/// view holding an album id — rather than one of its songs — can address the
+/// very same cache entry, which is what keeps the adaptive accent identical
+/// between the player bar and the album page.
+pub fn album_cover_key(album_id: &str) -> String {
+    format!("album-{album_id}")
 }
 
 /// Sizes art is actually stored at, smallest first.

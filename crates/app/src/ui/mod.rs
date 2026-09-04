@@ -830,6 +830,18 @@ pub fn apply_adaptive_accent(cx: &mut App, accent: Hsla) {
     cx.refresh_windows();
 }
 
+/// Edge length every adaptive accent is extracted from.
+///
+/// The accent has to come out of one rendition of the cover everywhere, or the
+/// chrome and the album page land on different colours for the same album: the
+/// hue is a saturation-weighted circular mean over the pixels, and a
+/// server-side resize moves those weights enough to tip a cover with two strong
+/// hues from one to the other. The player took the 64 it fetches, the album
+/// page took whatever rung happened to be cached (64 through 1500), so the two
+/// only agreed by luck. Small on purpose: it is the cheapest rung, and the
+/// playing album's page then re-uses the file the player already fetched.
+pub const ACCENT_ART_SIZE: u32 = 64;
+
 /// Derive a UI accent from cover-art bytes. Only a decode failure yields
 /// `None`: every cover that renders must also recolour the UI, or the accent
 /// silently keeps belonging to the *previous* album.

@@ -743,7 +743,8 @@ impl RootView {
         };
         cx.spawn(async move |this, cx| {
             let accent = runtime::spawn_io(async move {
-                let path = artwork::fetch_as(client, cover_id, key, 64).await?;
+                let path =
+                    artwork::fetch_as(client, cover_id, key, crate::ui::ACCENT_ART_SIZE).await?;
                 let bytes = std::fs::read(&path)?;
                 crate::ui::accent_from_cover_bytes(&bytes)
                     .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))

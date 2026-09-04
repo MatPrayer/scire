@@ -73,8 +73,9 @@ pub struct AlbumDetailView {
     /// under `Settings::adaptive_from_page`. The app's chrome keeps the playing
     /// track's accent; only this page carries the album's.
     accent: Option<gpui::Hsla>,
-    /// Cover the accent was extracted from, so a repaint doesn't re-decode it.
-    accent_for: Option<PathBuf>,
+    /// Cover id the accent was extracted from, so a repaint doesn't re-fetch
+    /// and re-decode it.
+    accent_for: Option<String>,
 }
 
 impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
@@ -316,23 +317,39 @@ impl AlbumDetailView {
             .filter(|_| self.session.read(cx).settings.adaptive_page_gradient)
     }
 
-    /// Extract the page's accent from the cover now on disk. Keyed on the path,
-    /// so the repeated `load`s this page does (playback entering or leaving the
-    /// album) don't re-decode the same image.
+    /// Extract the page's accent from this album's cover. Keyed on the cover
+    /// id, so the repeated `load`s this page does (playback entering or leaving
+    /// the album) don't re-decode the same image.
+    ///
+    /// Deliberately *not* taken from `art_path`: that is the header's cover, at
+    /// whichever rung was already cached, and the accent is a
+    /// saturation-weighted mean over the pixels — a different resize of the
+    /// same sleeve tips a two-hue cover onto the other hue, so the page and the
+    /// player bar showed the same album in two colours. Fetching
+    /// `ACCENT_ART_SIZE` under the album-scoped cache key instead means both
+    /// read the exact same file, and for the playing album it is already there.
     fn refresh_accent(&mut self, cx: &mut Context<Self>) {
         let settings = &self.session.read(cx).settings;
         if settings.theme != ThemePref::Adaptive || !settings.adaptive_from_page {
             return;
         }
-        let Some(path) = self.art_path.clone() else {
+        let Some(cover_id) = self.album.as_ref().and_then(|a| a.album.cover_art.clone()) else {
             return;
         };
-        if self.accent_for.as_ref() == Some(&path) {
+        if self.accent_for.as_ref() == Some(&cover_id) {
             return;
         }
-        self.accent_for = Some(path.clone());
+        // Pre-connect: leave the key unset so the next repaint retries once
+        // there is a client to fetch with.
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        self.accent_for = Some(cover_id.clone());
+        let key = artwork::album_cover_key(&self.album_id);
         cx.spawn(async move |this, cx| {
-            let accent = runtime::spawn_blocking_io(move || {
+            let accent = runtime::spawn_io(async move {
+                let path =
+                    artwork::fetch_as(client, cover_id, key, crate::ui::ACCENT_ART_SIZE).await?;
                 let bytes = std::fs::read(&path)?;
                 crate::ui::accent_from_cover_bytes(&bytes)
                     .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))
