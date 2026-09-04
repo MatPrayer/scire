@@ -795,7 +795,17 @@ impl Render for AlbumDetailView {
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .child(div().text_2xl().font_medium().child(name))
+                                .child(
+                                    // flex_1 + min_w_0 so a long title wraps
+                                    // inside the header instead of pushing the
+                                    // star button off the row.
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_2xl()
+                                        .font_medium()
+                                        .child(name),
+                                )
                                 .child(
                                     Button::new("album-star")
                                         .ghost()
