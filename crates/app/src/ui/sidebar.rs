@@ -1,11 +1,29 @@
 //! Left navigation rail: library switcher + sections + playlists.
 
+use std::rc::Rc;
+
 use gpui::{App, IntoElement, SharedString, Window, div, hsla, prelude::*, px, relative};
 
+use crate::assets::{app_icon, icons};
 use crate::ui::root::RefreshStage;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
+use gpui_component::popover::Popover;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+
+/// What a row does *after* its action has been dispatched.
+///
+/// The rail's dropdowns have to close themselves once something in them has
+/// been picked, while the same rows in the expanded sidebar are already where
+/// the user left them and must not move. Both build the row through the same
+/// helper and differ only in this hook.
+type AfterPick = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A row that does nothing once its action has run — the expanded sidebar.
+fn stay_put() -> AfterPick {
+    Rc::new(|_, _| {})
+}
 
 /// Top-level nav sections shown in the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +115,86 @@ fn row_icon(icon: Icon, collapsed: bool) -> Icon {
     } else {
         icon.small()
     }
+}
+
+/// One library row: an unlabeled checkbox plus muted text.
+///
+/// Checkbox's own label renders in full foreground, which is too loud for the
+/// sidebar. The action is wired to BOTH the checkbox and the row: the checkbox
+/// prevents default on mouse-down, which suppresses the row's click handler,
+/// so each click fires exactly once.
+///
+/// Shared by the expanded switcher and the collapsed rail's dropdown so the
+/// two cannot drift apart.
+fn library_row(
+    key: SharedString,
+    label: String,
+    checked: bool,
+    action: SidebarAction,
+    on_action: impl Fn(SidebarAction, &mut Window, &mut App) + Clone + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let on_row = on_action.clone();
+    let on_check = on_action;
+    let row_action = action.clone();
+    h_flex()
+        .id(key.clone())
+        .px_3()
+        .py_0p5()
+        .gap_2()
+        .items_center()
+        .rounded_lg()
+        .cursor_pointer()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .hover(|s| s.bg(cx.theme().muted))
+        .on_click(move |_, window, cx| on_row(row_action.clone(), window, cx))
+        .child(
+            Checkbox::new(key)
+                .checked(checked)
+                .xsmall()
+                .on_click(move |_, window, cx| on_check(action.clone(), window, cx)),
+        )
+        .child(div().truncate().child(label))
+}
+
+/// One playlist row. `key_prefix` keeps the expanded list's ids apart from the
+/// rail dropdown's copies of the same playlists.
+fn playlist_row(
+    key_prefix: &str,
+    playlist: &(String, String, bool),
+    is_active: bool,
+    on_action: impl Fn(SidebarAction, &mut Window, &mut App) + Clone + 'static,
+    after: AfterPick,
+    cx: &App,
+) -> impl IntoElement {
+    let (id, name, shared) = playlist.clone();
+    h_flex()
+        // Stable per-playlist element id (index would shift on reorder).
+        .id(SharedString::from(format!("{key_prefix}-{id}")))
+        .px_3()
+        .py_1()
+        .gap_1p5()
+        .items_center()
+        .rounded_lg()
+        .cursor_pointer()
+        .text_sm()
+        .when(is_active, |s| s.bg(cx.theme().muted))
+        .when(!is_active, |s| s.text_color(cx.theme().muted_foreground))
+        .hover(|s| s.bg(cx.theme().muted))
+        .on_click(move |_, window, cx| {
+            on_action(SidebarAction::OpenPlaylist(id.clone()), window, cx);
+            after(window, cx);
+        })
+        .child(div().flex_1().min_w_0().truncate().child(name))
+        // Playlists owned by another user get a person marker.
+        .when(shared, |s| {
+            s.child(
+                Icon::new(IconName::User)
+                    .xsmall()
+                    .text_color(cx.theme().muted_foreground),
+            )
+        })
 }
 
 pub fn render_sidebar(
@@ -213,48 +311,23 @@ pub fn render_sidebar(
             );
         }
         if !model.libraries_collapsed {
-            // Quiet rows: unlabeled checkbox + muted text (Checkbox's own
-            // label renders in full foreground — too loud for the sidebar).
-            // The action is wired to BOTH the checkbox and the row: the
-            // checkbox prevents default on mouse-down, which suppresses the
-            // row's click handler, so each click fires exactly once.
-            let lib_row =
-                |key: SharedString, label: String, checked: bool, action: SidebarAction| {
-                    let on_row = on_action.clone();
-                    let on_check = on_action.clone();
-                    let row_action = action.clone();
-                    h_flex()
-                        .id(key.clone())
-                        .px_3()
-                        .py_0p5()
-                        .gap_2()
-                        .items_center()
-                        .rounded_lg()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .hover(|s| s.bg(cx.theme().muted))
-                        .on_click(move |_, window, cx| on_row(row_action.clone(), window, cx))
-                        .child(
-                            Checkbox::new(key).checked(checked).xsmall().on_click(
-                                move |_, window, cx| on_check(action.clone(), window, cx),
-                            ),
-                        )
-                        .child(div().truncate().child(label))
-                };
-            library_switcher = library_switcher.child(lib_row(
+            library_switcher = library_switcher.child(library_row(
                 "lib-all".into(),
                 "All libraries".into(),
                 model.selected_libraries.is_empty(),
                 SidebarAction::AllLibraries,
+                on_action.clone(),
+                cx,
             ));
             for (id, name) in model.libraries.iter() {
                 let checked = model.selected_libraries.contains(id);
-                library_switcher = library_switcher.child(lib_row(
+                library_switcher = library_switcher.child(library_row(
                     SharedString::from(format!("lib-{id}")),
                     name.clone(),
                     checked,
                     SidebarAction::ToggleLibrary(id.clone()),
+                    on_action.clone(),
+                    cx,
                 ));
             }
         }
@@ -307,41 +380,138 @@ pub fn render_sidebar(
 
     let mut playlist_items: Vec<gpui::AnyElement> = Vec::new();
     if !collapsed && !model.playlists_collapsed {
-        for (id, name, shared) in model.playlists.iter() {
-            let on_action = on_action.clone();
-            let id = id.clone();
-            let shared = *shared;
-            let is_active = model.active_playlist.as_deref() == Some(id.as_str());
+        for playlist in model.playlists.iter() {
+            let is_active = model.active_playlist.as_deref() == Some(playlist.0.as_str());
             playlist_items.push(
-                h_flex()
-                    // Stable per-playlist element id (index would shift on reorder).
-                    .id(SharedString::from(format!("sidebar-pl-{id}")))
-                    .px_3()
-                    .py_1()
-                    .gap_1p5()
-                    .items_center()
-                    .rounded_lg()
-                    .cursor_pointer()
-                    .text_sm()
-                    .when(is_active, |s| s.bg(cx.theme().muted))
-                    .when(!is_active, |s| s.text_color(cx.theme().muted_foreground))
-                    .hover(|s| s.bg(cx.theme().muted))
-                    .on_click(move |_, window, cx| {
-                        on_action(SidebarAction::OpenPlaylist(id.clone()), window, cx)
-                    })
-                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
-                    // Playlists owned by another user get a person marker.
-                    .when(shared, |s| {
-                        s.child(
-                            Icon::new(IconName::User)
-                                .xsmall()
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                    })
-                    .into_any_element(),
+                playlist_row(
+                    "sidebar-pl",
+                    playlist,
+                    is_active,
+                    on_action.clone(),
+                    stay_put(),
+                    cx,
+                )
+                .into_any_element(),
             );
         }
     }
+
+    // Collapsed, the switcher and the playlist list have nowhere to live: both
+    // are lists of names and the rail is 52px wide. Each becomes an icon that
+    // opens the very same rows in a dropdown, so folding the sidebar hides the
+    // labels rather than the features. The rows come from the shared builders
+    // above — a library still toggles a checkbox and leaves the menu open,
+    // since selecting several is the point, while opening a playlist is a
+    // navigation and closes it.
+    let rail_libraries = {
+        let on_action = on_action.clone();
+        let libraries = model.libraries.clone();
+        let selected = model.selected_libraries.clone();
+        Popover::new("rail-libraries")
+            .trigger(
+                Button::new("rail-libraries-btn")
+                    .ghost()
+                    .icon(row_icon(app_icon(icons::LIBRARY), true))
+                    .tooltip("Libraries"),
+            )
+            .content(move |_, _, cx| {
+                let mut menu = v_flex()
+                    .id("rail-lib-menu")
+                    .gap_0p5()
+                    .min_w(px(180.))
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .child(library_row(
+                        "rail-lib-all".into(),
+                        "All libraries".into(),
+                        selected.is_empty(),
+                        SidebarAction::AllLibraries,
+                        on_action.clone(),
+                        cx,
+                    ));
+                for (id, name) in libraries.iter() {
+                    menu = menu.child(library_row(
+                        SharedString::from(format!("rail-lib-{id}")),
+                        name.clone(),
+                        selected.contains(id),
+                        SidebarAction::ToggleLibrary(id.clone()),
+                        on_action.clone(),
+                        cx,
+                    ));
+                }
+                menu
+            })
+    };
+
+    let rail_playlists = {
+        let on_action = on_action.clone();
+        let playlists = model.playlists.clone();
+        let active = model.active_playlist.clone();
+        Popover::new("rail-playlists")
+            .trigger(
+                Button::new("rail-playlists-btn")
+                    .ghost()
+                    .icon(row_icon(app_icon(icons::LIST_MUSIC), true))
+                    .tooltip("Playlists"),
+            )
+            .content(move |_, _, cx| {
+                // Closing is the popover state's own job, so the rows reach it
+                // through its entity: a row's click handler is handed an
+                // `&mut App`, which cannot dismiss anything on its own.
+                let state = cx.entity();
+                let dismiss: AfterPick = Rc::new(move |window, cx| {
+                    state.update(cx, |state, cx| state.dismiss(window, cx));
+                });
+                let on_new = on_action.clone();
+                let after_new = dismiss.clone();
+                let mut menu = v_flex()
+                    .id("rail-pl-menu")
+                    .gap_0p5()
+                    .min_w(px(200.))
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .child(
+                        h_flex()
+                            .id("rail-pl-new")
+                            .px_3()
+                            .py_1()
+                            .gap_1p5()
+                            .items_center()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .hover(|s| s.bg(cx.theme().muted))
+                            .on_click(move |_, window, cx| {
+                                on_new(SidebarAction::NewPlaylist, window, cx);
+                                after_new(window, cx);
+                            })
+                            .child(Icon::new(IconName::Plus).xsmall())
+                            .child("New playlist"),
+                    );
+                if playlists.is_empty() {
+                    menu = menu.child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No playlists yet"),
+                    );
+                }
+                for playlist in playlists.iter() {
+                    menu = menu.child(playlist_row(
+                        "rail-pl",
+                        playlist,
+                        active.as_deref() == Some(playlist.0.as_str()),
+                        on_action.clone(),
+                        dismiss.clone(),
+                        cx,
+                    ));
+                }
+                menu
+            })
+    };
 
     // Expanded, the fold handle rides the first row that exists; only the
     // collapsed rail spends a line on it.
@@ -373,6 +543,12 @@ pub fn render_sidebar(
             this.child(h_flex().w_full().justify_center().child(fold))
         })
         .when(show_libraries, |this| this.child(library_switcher))
+        // The rail's stand-in for the switcher, in the same place the
+        // switcher occupies expanded, and under the same "more than one
+        // library" condition: with a single library there is nothing to pick.
+        .when(collapsed && model.libraries.len() > 1, |this| {
+            this.child(h_flex().w_full().justify_center().child(rail_libraries))
+        })
         .child(albums_row)
         .child(nav_item(
             "Artists",
@@ -393,6 +569,11 @@ pub fn render_sidebar(
         .child(nav_item("Local", IconName::Folder, NavSection::LocalMusic))
         .child(div().px_3().child(super::divider()))
         .when(!collapsed, |this| this.child(playlists_header))
+        // Same place the playlists header sits expanded, so the fold does not
+        // move it.
+        .when(collapsed, |this| {
+            this.child(h_flex().w_full().justify_center().child(rail_playlists))
+        })
         .child(
             v_flex()
                 .id("sidebar-playlists")

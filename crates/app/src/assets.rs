@@ -68,6 +68,10 @@ pub mod icons {
     pub const REPEAT: &str = "icons/repeat.svg";
     pub const REPEAT_1: &str = "icons/repeat-one.svg";
     pub const LIST_PLUS: &str = "icons/list-plus.svg";
+    /// Playlist list, for the collapsed sidebar rail's playlists menu.
+    pub const LIST_MUSIC: &str = "icons/list-music.svg";
+    /// Shelved books, for the collapsed sidebar rail's libraries menu.
+    pub const LIBRARY: &str = "icons/library.svg";
     pub const VOLUME_LOW: &str = "icons/volume-1.svg";
     pub const VOLUME_HIGH: &str = "icons/volume-2.svg";
     pub const MUSIC: &str = "icons/music.svg";
