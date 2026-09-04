@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/subsonic", "crates/playback", "crates/app", "crates/dmg"]
+# `crates/dmg` carries a second workspace binary (`cargo-dmg`, the packaging
+# subcommand), which made a bare `cargo run` ambiguous. The app is what anyone
+# running the workspace means; the packager is reached through `cargo dmg`.
+# Commands that want the whole tree still say so — `cargo test --workspace`,
+# `cargo clippy --workspace`.
+default-members = ["crates/app"]
 
 [workspace.package]
 version = "0.5.0"
@@ -63,13 +69,17 @@ debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = true
 
-[profile.dev.package.gpui]
-opt-level = 2
-
-[profile.dev.package.gpui-macros]
-opt-level = 2
-
-[profile.dev.package.gpui-component]
+# Every *dependency* is optimized in dev builds; only the workspace crates
+# stay at opt-level 0, where the fast rebuild actually matters.
+#
+# The heavy lifting a debug build does is almost all in dependencies: cover
+# decode (`image`/`zune-jpeg`/`png`), the bundled SQLite C library, `lofty`
+# tag reads during a scan, symphonia decoding every played track, and an md5
+# per Subsonic request. Unoptimized those run several times slower than the
+# shipped binary, which is what made `cargo run` feel slow in ways `--release`
+# never was. Deps are compiled once and cached, so this costs one longer first
+# build and nothing afterwards.
+[profile.dev.package."*"]
 opt-level = 2
 
 [profile.release]

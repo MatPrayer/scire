@@ -3,5 +3,11 @@
 # `cargo dmg` builds an installable macOS .dmg. It delegates to the
 # `cargo-dmg` subcommand (crates/dmg), which runs `cargo build --release`
 # and then the packaging script `packaging/macos/make-dmg.sh`.
+#
+# `-p dmg` is required, not decoration: the workspace sets
+# `default-members = ["crates/app"]` so that a bare `cargo run` means the app,
+# and `--bin` alone is then only searched for among those default packages —
+# `cargo dmg` failed with "no bin target named `cargo-dmg` in default-run
+# packages". Naming the package puts it back in scope.
 [alias]
-dmg = "run --quiet --bin cargo-dmg -- @args"
+dmg = "run --quiet -p dmg --bin cargo-dmg -- @args"
