@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -138,10 +139,38 @@ pub struct LibraryDb {
     scan_version: AtomicU64,
 }
 
+/// Put a freshly opened file-backed connection into the shape this app uses it
+/// in: one writer (a scan or a sync) running against readers that must keep
+/// painting.
+///
+/// SQLite's defaults assume neither. The rollback journal blocks readers for
+/// the whole of a write and is created and fsynced per transaction, so a sync
+/// committing album rows stalled the grid querying them; WAL lets the readers
+/// through and keeps the writes in one appended file. `synchronous = NORMAL`
+/// drops the per-commit fsync (WAL still syncs at checkpoints) — the risk it
+/// takes is losing the last commits to an OS crash, which for a cache
+/// rebuildable from the server and the disk is not a risk at all. Without a
+/// `busy_timeout` a reader that does collide with a checkpoint fails
+/// immediately with SQLITE_BUSY rather than waiting the moment out.
+fn tune(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // execute_batch rather than pragma_update: several of these answer with a
+    // row (journal_mode reports the mode it settled on), which the execute
+    // path rejects.
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA cache_size = -16000;",
+    )?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(())
+}
+
 impl LibraryDb {
     /// Open (or create) the database at `path` and run pending migrations.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        tune(&conn)?;
         let db = Self {
             conn: Mutex::new(conn),
             scan_version: AtomicU64::new(0),
@@ -976,6 +1005,34 @@ mod tests {
 
     fn test_db() -> LibraryDb {
         LibraryDb::open_in_memory().unwrap()
+    }
+
+    /// A file-backed database comes up in WAL, so a sync writing album rows
+    /// does not lock out the grid reading them. In-memory databases cannot use
+    /// WAL at all, which is why this has to open a real file.
+    #[test]
+    fn a_file_database_opens_in_wal_mode() {
+        let dir = std::env::temp_dir().join(format!("scire-db-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("music.db");
+        let db = LibraryDb::open(&path).unwrap();
+        let mode: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        // NORMAL is 1; the default this replaces is FULL (2).
+        let sync: i32 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sync, 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Helper: insert a minimal track with just id, source, title.
