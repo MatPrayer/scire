@@ -26,9 +26,20 @@ command -v hdiutil >/dev/null 2>&1 || { echo "error: hdiutil not found" >&2; exi
 command -v osascript >/dev/null 2>&1 || { echo "error: osascript not found" >&2; exit 1; }
 command -v rsvg-convert >/dev/null 2>&1 || { echo "error: rsvg-convert not found (brew install librsvg)" >&2; exit 1; }
 
-# Build the .app if needed, or reuse the one bundle.sh produced.
+# Build the .app if needed, or reuse the one bundle.sh produced — but only
+# while it is not older than the binary it was made from. Reusing it
+# unconditionally meant that every run after the first packaged whatever was
+# bundled the first time: `cargo build --release` would update
+# target/release/scire, the .app would keep the previous copy, and the .dmg
+# shipped a stale binary with no warning at all. That is the kind of thing you
+# only notice by testing a fix and finding it absent.
+BIN="$ROOT/target/release/scire"
 if [[ ! -d "$APP" ]]; then
 	echo "Scirè.app not found — running bundle.sh first"
+	"$HERE/bundle.sh"
+elif [[ -f "$BIN" && "$BIN" -nt "$APP/Contents/MacOS/scire" ]]; then
+	echo "Scirè.app is older than target/release/scire — re-running bundle.sh"
+	rm -rf "$APP"
 	"$HERE/bundle.sh"
 fi
 
