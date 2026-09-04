@@ -29,7 +29,15 @@ use crate::ui::{
     focus_glow, format_duration, strip_html, track_extras, truncate_at_word, with_focus_animation,
 };
 
-const ART_SIZE: u32 = 600;
+/// Resolution to request for the header cover.
+///
+/// The header draws it at 220 logical px, so 512 covers a 2× display with room
+/// to spare — 600 was asking for detail no screen here can show, and it snapped
+/// up to a cache rung of its own that nothing else in the app used. 512 is the
+/// rung the album and artist grids already land on at the larger cover-size
+/// settings, so those settings now open a detail page straight off the grid's
+/// own download. The full-resolution copy behind the lightbox is unaffected.
+const ART_SIZE: u32 = 512;
 
 /// Collapsed album-notes length, matching the artist page's bio preview.
 const NOTES_PREVIEW_CHARS: usize = 400;
@@ -172,8 +180,13 @@ impl AlbumDetailView {
         });
         if let Some(cover) = cover {
             // Straight off disk when the grid already downloaded this cover,
-            // so the header art is there on the first frame.
-            self.art_path = artwork::cached(&cover, ART_SIZE);
+            // so the header art is there on the first frame — at whatever size
+            // was cached, since the grid's rung depends on the cover-size
+            // setting and only matches this one at the larger settings. The
+            // `fetch_art` below replaces it with the requested size when that
+            // lands; drawing the grid's thumbnail scaled up in the meantime is
+            // what stops the header opening empty.
+            self.art_path = artwork::cached_best(&cover, ART_SIZE);
             self.refresh_accent(cx);
             self.fetch_art(cover, cx);
         }

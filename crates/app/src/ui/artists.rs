@@ -751,9 +751,17 @@ impl ArtistDetailView {
 
     fn fetch_art(&mut self, album_id: String, cover_art: Option<String>, cx: &mut Context<Self>) {
         let Some(cover_id) = cover_art else { return };
-        // Synchronous cache hit: render instantly on restart, no task.
-        if let Some(path) = artwork::cached(&cover_id, ART_SIZE) {
-            self.art_paths.insert(album_id, path);
+        // Draw whatever is already on disk right now, at whatever size it was
+        // cached — the albums grid usually holds this very cover, at a rung
+        // that depends on the cover-size setting rather than matching this
+        // view's. Rendering it instantly is the difference between a page of
+        // covers and a page of empty squares.
+        if let Some(path) = artwork::cached_best(&cover_id, ART_SIZE) {
+            self.art_paths.insert(album_id.clone(), path);
+        }
+        // Only the exact size ends the job; anything else is a stand-in that
+        // still needs the real one fetched behind it.
+        if artwork::cached(&cover_id, ART_SIZE).is_some() {
             return;
         }
         let Some(client) = self.client(cx) else {
