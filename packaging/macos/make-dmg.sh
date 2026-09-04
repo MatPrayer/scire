@@ -54,7 +54,7 @@ trap '[[ -n "$MOUNT" ]] && hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; rm -
 
 STAGE="$WORK/stage"
 STAGEDMG="$WORK/staged.dmg"
-VOLNAME="Scirè Installer"
+VOLNAME="Intall Scirè"
 
 # Background dimensions (must match dmg-background.svg's viewBox).
 # Was 1000x650; shrunk ~36% to a more compact installer window.
@@ -115,8 +115,8 @@ tell application "Finder"
 	set winW to (item 3 of b) - (item 1 of b)
 	set winH to (item 4 of b) - (item 2 of b)
 	-- approximate icon grid inset; tune these to taste
-	set position of item "Scirè.app" of win to {90, (winH - 150)}
-	set position of item "Applications" of win to {((winW - 150)), (winH - 150)}
+	set position of item "Scirè.app" of win to {160, 207}
+	set position of item "Applications" of win to {480, 207}
 	delay 0.5
 	close win
 end tell

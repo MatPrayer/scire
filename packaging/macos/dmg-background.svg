@@ -1,17 +1,64 @@
-<svg width="640" height="416" xmlns="http://www.w3.org/2000/svg">
- <defs>
-  <!-- white top, purple mid, near-black bottom: flat clean blend so Finder
-         renders WHITE captions under the icons (label color keys off
-         background darkness). No icons, no arrow, no text. -->
-  <linearGradient y2="1" x2="0" y1="0" x1="0" id="bg">
-   <stop stop-color="#f5f6ff" offset="0"/>
-   <stop stop-color="#8989ec" offset="0.5"/>
-   <stop stop-color="#4a4fbe" offset="0.75"/>
-   <stop stop-color="#17171f" offset="1"/>
-  </linearGradient>
- </defs>
- <g>
-  <title>Layer 1</title>
-  <rect transform="rotate(-180, 320, 208)" id="svg_1" fill="url(#bg)" height="416" width="640"/>
- </g>
+<svg width="640" height="416" viewBox="0 0 640 416" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="dmg-background" clip-path="url(#clip0_9_4)">
+<rect width="640" height="416" fill="url(#paint0_linear_9_4)"/>
+<g id="top-left-glow" opacity="0.3" filter="url(#filter0_f_9_4)">
+<circle cx="160" cy="160" r="160" transform="matrix(1 0 0 -1 -50 500)" fill="#A594FF"/>
+</g>
+<g id="bottom-right-glow" opacity="0.6" filter="url(#filter1_f_9_4)">
+<circle cx="530" cy="50" r="150" fill="#321CA6"/>
+</g>
+<g id="bg-grid-mesh" opacity="0.06">
+<line id="Line" y1="51.5" x2="640" y2="51.5" stroke="white"/>
+<line id="Line_2" y1="103.5" x2="640" y2="103.5" stroke="white"/>
+<line id="Line_3" y1="155.5" x2="640" y2="155.5" stroke="white"/>
+<line id="Line_4" y1="207.5" x2="640" y2="207.5" stroke="white"/>
+<line id="Line_5" y1="259.5" x2="640" y2="259.5" stroke="white"/>
+<line id="Line_6" y1="311.5" x2="640" y2="311.5" stroke="white"/>
+<line id="Line_7" y1="363.5" x2="640" y2="363.5" stroke="white"/>
+<line id="Line_8" y1="415.5" x2="640" y2="415.5" stroke="white"/>
+</g>
+<g id="installer-canvas">
+<foreignObject x="80" y="128" width="160" height="160"><div xmlns="http://www.w3.org/1999/xhtml" style="backdrop-filter:blur(10px);clip-path:url(#bgblur_1_9_4_clip_path);height:100%;width:100%"></div></foreignObject><g id="source-app-target" data-figma-bg-blur-radius="20">
+<rect x="100" y="148" width="120" height="120" rx="28" fill="white" fill-opacity="0.0392157"/>
+<rect x="100.5" y="148.5" width="119" height="119" rx="27.5" stroke="white" stroke-opacity="0.101961" stroke-dasharray="4 4"/>
+<circle id="inner-ring" cx="160" cy="208" r="35.5" stroke="white" stroke-opacity="0.101961"/>
+</g>
+<g id="directional-arrow-container">
+<line id="arrow-shaft" x1="281.5" y1="206.5" x2="358.5" y2="206.5" stroke="white" stroke-opacity="0.4" stroke-width="3" stroke-linecap="round"/>
+<g id="arrow-chevron">
+<g id="chevron-right">
+<path id="Vector" d="M359.5 211.25L362.5 206.5L359.5 201.75" stroke="white" stroke-opacity="0.4" stroke-width="3" stroke-linecap="round"/>
+</g>
+</g>
+</g>
+<foreignObject x="400" y="128" width="160" height="160"><div xmlns="http://www.w3.org/1999/xhtml" style="backdrop-filter:blur(10px);clip-path:url(#bgblur_2_9_4_clip_path);height:100%;width:100%"></div></foreignObject><g id="destination-apps-target" data-figma-bg-blur-radius="20">
+<rect x="420" y="148" width="120" height="120" rx="28" fill="white" fill-opacity="0.0392157"/>
+<rect x="420.5" y="148.5" width="119" height="119" rx="27.5" stroke="white" stroke-opacity="0.101961" stroke-dasharray="4 4"/>
+<circle id="inner-ring_2" cx="480" cy="208" r="35.5" stroke="white" stroke-opacity="0.101961"/>
+</g>
+</g>
+<rect id="dmg-window-border" x="0.5" y="0.5" width="639" height="415" stroke="white" stroke-opacity="0.14902"/>
+</g>
+<defs>
+<filter id="filter0_f_9_4" x="-130" y="100" width="480" height="480" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feGaussianBlur stdDeviation="40" result="effect1_foregroundBlur_9_4"/>
+</filter>
+<filter id="filter1_f_9_4" x="290" y="-190" width="480" height="480" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feGaussianBlur stdDeviation="45" result="effect1_foregroundBlur_9_4"/>
+</filter>
+<clipPath id="bgblur_1_9_4_clip_path" transform="translate(-80 -128)"><rect x="100" y="148" width="120" height="120" rx="28"/>
+</clipPath><clipPath id="bgblur_2_9_4_clip_path" transform="translate(-400 -128)"><rect x="420" y="148" width="120" height="120" rx="28"/>
+</clipPath><linearGradient id="paint0_linear_9_4" x1="320" y1="0" x2="320" y2="416" gradientUnits="userSpaceOnUse">
+<stop stop-color="#1D106B"/>
+<stop offset="0.5" stop-color="#573CE6"/>
+<stop offset="1" stop-color="#9484FF"/>
+</linearGradient>
+<clipPath id="clip0_9_4">
+<rect width="640" height="416" fill="white"/>
+</clipPath>
+</defs>
 </svg>
