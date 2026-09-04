@@ -33,9 +33,28 @@ pub struct Queue {
     current: Option<usize>,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    /// Bumped by every change to the contents or the play order.
+    ///
+    /// `PlayerState` notifies its observers on every event, position ticks
+    /// included, so a view that draws the queue cannot tell a new track from
+    /// the same track a quarter-second later. Comparing this against the last
+    /// value it drew answers that in one integer, with no walk of the songs.
+    /// It is deliberately `#[serde(skip)]`: it counts edits within a session
+    /// and means nothing across a restore.
+    #[serde(skip)]
+    revision: u64,
 }
 
 impl Queue {
+    /// Counter bumped by every mutation. See [`Queue::revision`]'s field docs.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     /// Structural sanity check for queues deserialized from disk: `order`
     /// must be a permutation of song indices and `current` must be in range.
     pub fn is_valid(&self) -> bool {
@@ -64,6 +83,7 @@ impl Queue {
         if self.shuffle {
             self.reshuffle();
         }
+        self.touch();
     }
 
     /// Append songs at the end of the play order.
@@ -71,6 +91,7 @@ impl Queue {
         let base = self.songs.len();
         self.songs.extend(songs);
         self.order.extend(base..self.songs.len());
+        self.touch();
     }
 
     /// Insert songs directly after the current one in play order.
@@ -81,6 +102,7 @@ impl Queue {
         let at = self.current.map(|c| c + 1).unwrap_or(0);
         let at = at.min(self.order.len());
         self.order.splice(at..at, base..base + count);
+        self.touch();
     }
 
     /// Remove the item at `order_pos` (position in play order).
@@ -109,6 +131,7 @@ impl Queue {
             }
             _ => {}
         }
+        self.touch();
     }
 
     /// Move an item within the play order.
@@ -126,12 +149,14 @@ impl Queue {
                 c => c,
             });
         }
+        self.touch();
     }
 
     pub fn clear(&mut self) {
         self.songs.clear();
         self.order.clear();
         self.current = None;
+        self.touch();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -162,6 +187,7 @@ impl Queue {
     pub fn jump_to(&mut self, order_pos: usize) -> Option<&Song> {
         if order_pos < self.order.len() {
             self.current = Some(order_pos);
+            self.touch();
             self.current_song()
         } else {
             None
@@ -208,6 +234,7 @@ impl Queue {
     pub fn advance_to(&mut self, order_pos: usize) {
         if order_pos < self.order.len() {
             self.current = Some(order_pos);
+            self.touch();
         }
     }
 
@@ -223,6 +250,7 @@ impl Queue {
             self.order = (0..self.songs.len()).collect();
             self.current = current_song_idx;
         }
+        self.touch();
     }
 
     fn reshuffle(&mut self) {

@@ -32,6 +32,9 @@ pub struct PlaylistDetailView {
     rename_input: Entity<InputState>,
     renaming: bool,
     error: Option<String>,
+    /// Id of the playing song — the only thing this view draws out of the
+    /// player, so the only change worth repainting for.
+    playing_id: Option<String>,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
     /// Song index under the vi-mode cursor (None = cursor hidden).
@@ -63,8 +66,18 @@ impl PlaylistDetailView {
         // Reload when the shared playlists state changes (e.g. song added).
         cx.observe(&playlists.clone(), |this: &mut Self, _, cx| this.load(cx))
             .detach();
-        // Re-render when the playing song changes so the highlight stays fresh.
-        cx.observe(&player.clone(), |_, _, cx| cx.notify()).detach();
+        // Re-render when the playing song changes so the highlight stays
+        // fresh — and only then. PlayerState notifies on every event, position
+        // ticks included, and rebuilding a playlist's worth of rows several
+        // times a second is the whole cost of leaving this page open.
+        cx.observe(&player.clone(), |this: &mut Self, player, cx| {
+            let id = player.read(cx).current_song().map(|s| s.id.clone());
+            if id != this.playing_id {
+                this.playing_id = id;
+                cx.notify();
+            }
+        })
+        .detach();
 
         let scroll = ScrollHandle::new();
         let mut this = Self {
@@ -76,6 +89,7 @@ impl PlaylistDetailView {
             rename_input,
             renaming: false,
             error: None,
+            playing_id: None,
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
@@ -139,7 +153,7 @@ impl PlaylistDetailView {
 
 impl Render for PlaylistDetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
+        let playing_id = self.playing_id.clone();
         let name = self
             .playlist
             .as_ref()

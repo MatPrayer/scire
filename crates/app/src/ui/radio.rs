@@ -8,11 +8,33 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_f
 use crate::state::player::PlayerState;
 use crate::state::radio::RadioState;
 
+/// What the radio page draws out of the player: the live station's name, and
+/// the track it announced.
+///
+/// Match on the station, not on `now_playing()`: once the station announces a
+/// track, that title is the track's, not the station's.
+fn player_signature(
+    player: &Entity<PlayerState>,
+    cx: &gpui::App,
+) -> (Option<String>, Option<String>) {
+    let p = player.read(cx);
+    let station = p.radio_station_name().map(str::to_string);
+    let track = p.radio_now_playing().map(|(artist, title)| match artist {
+        Some(artist) => format!("{artist} — {title}"),
+        None => title,
+    });
+    (station, track)
+}
+
 pub struct RadioView {
     radio: Entity<RadioState>,
     player: Entity<PlayerState>,
     name_input: Entity<InputState>,
     url_input: Entity<InputState>,
+    /// The two things this view draws out of the player: which station is
+    /// live, and what it says is on. Everything else the player reports —
+    /// position above all — changes nothing here.
+    playing: (Option<String>, Option<String>),
 }
 
 impl RadioView {
@@ -23,14 +45,25 @@ impl RadioView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&radio, |_, _, cx| cx.notify()).detach();
-        cx.observe(&player, |_, _, cx| cx.notify()).detach();
+        // PlayerState notifies on every event, position ticks included; only a
+        // change to the live station or its announced track shows up here.
+        cx.observe(&player, |this: &mut Self, player, cx| {
+            let now = player_signature(&player, cx);
+            if now != this.playing {
+                this.playing = now;
+                cx.notify();
+            }
+        })
+        .detach();
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Station name"));
         let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("Stream URL"));
+        let playing = player_signature(&player, cx);
         Self {
             radio,
             player,
             name_input,
             url_input,
+            playing,
         }
     }
 
@@ -50,22 +83,8 @@ impl RadioView {
 
 impl Render for RadioView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Match on the station, not on `now_playing()`: once the station
-        // announces a track, that title is the track's, not the station's.
-        let playing_station = self
-            .player
-            .read(cx)
-            .radio_station_name()
-            .map(str::to_string);
-        // What the playing station says is on right now, if anything.
-        let playing_track = self
-            .player
-            .read(cx)
-            .radio_now_playing()
-            .map(|(artist, title)| match artist {
-                Some(artist) => format!("{artist} — {title}"),
-                None => title,
-            });
+        // Kept in step by the player observer rather than re-read here.
+        let (playing_station, playing_track) = self.playing.clone();
         let (stations, error) = {
             let r = self.radio.read(cx);
             (r.stations.clone(), r.error.clone())

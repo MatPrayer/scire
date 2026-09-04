@@ -24,6 +24,9 @@ pub struct FavoritesView {
     player: Entity<PlayerState>,
     starred: Option<Starred>,
     error: Option<String>,
+    /// Id of the playing song — the only thing this view draws out of the
+    /// player, so the only change worth repainting for.
+    playing_id: Option<String>,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
     /// Flat item index across songs → albums → artists (None = hidden).
@@ -44,12 +47,22 @@ impl FavoritesView {
             player,
             starred: None,
             error: None,
+            playing_id: None,
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
         };
-        cx.observe(&this.player.clone(), |_, _, cx| cx.notify())
-            .detach();
+        // PlayerState notifies on every event, position ticks included. This
+        // view only marks the playing row, so repaint when that row moves and
+        // not several times a second while it doesn't.
+        cx.observe(&this.player.clone(), |this, _, cx| {
+            let id = this.player.read(cx).current_song().map(|s| s.id.clone());
+            if id != this.playing_id {
+                this.playing_id = id;
+                cx.notify();
+            }
+        })
+        .detach();
         this.load(cx);
         this
     }
@@ -123,18 +136,20 @@ impl FavoritesView {
 
 impl Render for FavoritesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
+        let playing_id = self.playing_id.clone();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
 
-        if let Some(starred) = self.starred.clone() {
+        // Borrowed, not cloned: this view observes the player, so `render`
+        // runs on every `Event::Position` — several times a second while
+        // anything plays — and cloning the starred lists here copied every
+        // song, album and artist that often.
+        if let Some(starred) = &self.starred {
             let ns = starred.song.len();
             let na = starred.album.len();
             if !starred.song.is_empty() {
                 rows.push(section_title("Songs", cx));
-                let all_songs = starred.song.clone();
                 for (i, song) in starred.song.iter().enumerate() {
                     let id = song.id.clone();
-                    let songs = all_songs.clone();
                     let is_playing = playing_id.as_deref() == Some(song.id.as_str());
                     let focused = self.vi_cursor == Some(i);
                     let anchor = self.focus_anchor.clone();
@@ -161,12 +176,9 @@ impl Render for FavoritesView {
                                 .shadow(focus_glow(cx))
                                 .anchor_scroll(Some(anchor))
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Play all starred songs starting here.
-                            this.player.update(cx, |p, cx| {
-                                p.play_queue(songs.clone(), i, cx);
-                            });
-                        }))
+                        // Reads the song list at click time rather than
+                        // carrying a copy of it into every row's handler.
+                        .on_click(cx.listener(move |this, _, _, cx| this.play_from(i, cx)))
                         .child(
                             div()
                                 .flex_1()
@@ -333,6 +345,18 @@ impl Render for FavoritesView {
 }
 
 impl FavoritesView {
+    /// Play the starred songs, starting at `index`.
+    fn play_from(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(songs) = self.starred.as_ref().map(|s| s.song.clone()) else {
+            return;
+        };
+        if songs.is_empty() {
+            return;
+        }
+        self.player
+            .update(cx, |p, cx| p.play_queue(songs, index, cx));
+    }
+
     /// Move the vi-mode cursor by `delta` items across the song/album/artist
     /// sections, clamping and scrolling the focused row into view.
     pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -363,21 +387,21 @@ impl FavoritesView {
     /// Act on the item under the vi-mode cursor: play a song, open an album
     /// or artist depending on which section the cursor is in.
     pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
-        let Some(starred) = &self.starred else {
-            return;
-        };
         let Some(cur) = self.vi_cursor else {
             return;
         };
-        let ns = starred.song.len();
+        // Section sizes first, so the song branch can take `&mut self` for
+        // `play_from` without the starred borrow still being live.
+        let Some((ns, na)) = self.starred.as_ref().map(|s| (s.song.len(), s.album.len())) else {
+            return;
+        };
         if cur < ns {
-            let songs = starred.song.clone();
-            if !songs.is_empty() {
-                self.player.update(cx, |p, cx| p.play_queue(songs, cur, cx));
-            }
+            self.play_from(cur, cx);
             return;
         }
-        let na = starred.album.len();
+        let Some(starred) = &self.starred else {
+            return;
+        };
         if cur < ns + na {
             if let Some(album) = starred.album.get(cur - ns) {
                 cx.emit(FavoritesEvent::OpenAlbum(album.id.clone()));
