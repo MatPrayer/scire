@@ -54,7 +54,7 @@ trap '[[ -n "$MOUNT" ]] && hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; rm -
 
 STAGE="$WORK/stage"
 STAGEDMG="$WORK/staged.dmg"
-VOLNAME="Intall Scirè"
+VOLNAME="Install Scirè"
 
 # Background dimensions (must match dmg-background.svg's viewBox).
 # Was 1000x650; shrunk ~36% to a more compact installer window.
