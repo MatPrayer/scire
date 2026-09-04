@@ -18,6 +18,20 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
+## Versioning
+
+`[workspace.package] version` in `Cargo.toml` is the single source of truth. Two things mirror it and must move in the same commit: the README badge (`badge/version-<x.y.z>-6f7ce8`) and `Cargo.lock`, where **all four workspace members** (`scire`, `subsonic`, `playback`, `dmg`) carry the inherited version — any `cargo check` rewrites them, stage the result. The macOS bundle reads the version out of `Cargo.toml` at package time, so `packaging/macos/bundle.sh` after a bump needs a fresh `cargo build --release` first or it wraps the old binary under the new number.
+
+Pre-1.0 semver, and the bump ships **in the commit that makes the change** — never a separate "bump version" commit:
+
+- **patch** (`0.5.0` → `0.5.1`) — bug fixes, perf work, UI polish, anything a user would describe as "it works right now".
+- **minor** (`0.5.1` → `0.6.0`) — a new user-facing capability, or a behaviour change noticeable enough to be worth a line in the README.
+- **major** stays `0` until the app promises stability.
+
+Not every commit bumps: refactors, tests, docs and comment-only changes leave the version alone. The version tracks what a user gets, not what the tree did.
+
+If the change is already pushed when the bump is noticed, it goes in its own follow-up commit (`chore: bump version to x.y.z`) rather than an amend — rewriting published history costs more than a tidy log is worth.
+
 ## Architecture
 
 Cargo workspace, three crates with a strict dependency direction — UI → services → protocol:
