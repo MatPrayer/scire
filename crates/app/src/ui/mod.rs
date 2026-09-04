@@ -145,11 +145,28 @@ pub fn library_summary(primary: (i64, &str), stats: &LibraryStats) -> String {
     )
 }
 
-/// Gap between grid cards, and the padding a card adds around its cover.
+/// Gap between grid cards, and the chrome a card adds around its cover.
 /// Shared by the album and artist grids so the two pages line up column for
 /// column at every width.
+///
+/// `CARD_PADDING` is the card's `p_1p5` (6px a side) *plus* its 1px border:
+/// taffy lays out border-box, so both come out of the width the card is given
+/// and a card only `tile + 12` wide squeezes its own cover by 2px. The column
+/// maths has to use the same number the card is built with, which is why the
+/// cards take their width from this constant rather than repeating a literal.
 pub const GRID_GAP: f32 = 16.;
-pub const CARD_PADDING: f32 = 12.;
+pub const CARD_PADDING: f32 = 14.;
+
+/// Horizontal padding the grids place *inside* their scrolling element
+/// (`px_4` a side).
+///
+/// A tracked `ScrollHandle` reports the element's own bounds, padding
+/// included, while the rows are laid out inside that padding. Feeding the raw
+/// bounds to `grid_columns` therefore buys a column the row cannot fit: the
+/// row overflows and, because it is centred, is clipped at *both* edges. It
+/// only happens in the 32px band either side of a column boundary, so dragging
+/// the window edge flickers in and out of it.
+pub const GRID_PADDING_X: f32 = 32.;
 
 /// Columns that fit in `width` for a cover `tile` px wide. Zero width means
 /// nothing has been laid out yet — the caller's guess stands.
@@ -159,6 +176,12 @@ pub fn grid_columns(width: f32, tile: f32) -> Option<usize> {
     }
     let card = tile + CARD_PADDING;
     Some((((width + GRID_GAP) / (card + GRID_GAP)).floor() as usize).max(1))
+}
+
+/// Columns that fit inside a scrolling grid element `element_width` wide,
+/// taking off the padding the rows are laid out within.
+pub fn grid_columns_padded(element_width: f32, tile: f32) -> Option<usize> {
+    grid_columns(element_width - GRID_PADDING_X, tile)
 }
 
 /// Frame-accurate width for a layout that reflows with the window.
@@ -179,21 +202,45 @@ pub struct LiveWidth {
     viewport: f32,
     /// That viewport minus the measured element width.
     chrome: f32,
+    /// The measurement `chrome` was learned from, so a second call inside one
+    /// frame re-reads it instead of relearning against the wrong viewport.
+    measured: f32,
 }
 
 impl LiveWidth {
     /// Feed the element's width as measured last frame, get its width for this
     /// one. Zero until the first measurement lands.
+    ///
+    /// Chrome is only relearned when the measurement actually moves. Callers
+    /// ask more than once per frame (the vi-mode cursor needs the column count
+    /// outside `render`), and relearning from an unchanged measurement would
+    /// pair it with *this* frame's viewport rather than the one it was laid out
+    /// in — during a resize drag that folds the frame's delta into the chrome
+    /// and the grid falls a frame behind, which is the trailing this type
+    /// exists to avoid.
     pub fn resolve(&mut self, measured: f32, window: &Window) -> f32 {
         let viewport = f32::from(window.viewport_size().width);
         if measured > 0. && self.viewport > 0. {
-            self.chrome = (self.viewport - measured).max(0.);
+            if measured != self.measured {
+                self.chrome = (self.viewport - measured).max(0.);
+                self.measured = measured;
+                self.viewport = viewport;
+            }
+        } else {
+            self.viewport = viewport;
         }
-        self.viewport = viewport;
         if measured <= 0. {
             return 0.;
         }
         (viewport - self.chrome).max(0.)
+    }
+
+    /// Columns for a card grid of `tile`-wide covers laid out inside the
+    /// measured element's `GRID_PADDING_X`. `fallback` stands in on the first
+    /// frame, before anything has been laid out.
+    pub fn columns(&mut self, measured: f32, tile: f32, window: &Window, fallback: usize) -> usize {
+        let width = self.resolve(measured, window);
+        grid_columns_padded(width, tile).unwrap_or(fallback)
     }
 }
 
@@ -1093,21 +1140,34 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_from_cover_bytes, format_count, format_playtime, grid_columns, strip_html,
-        truncate_at_word,
+        accent_from_cover_bytes, format_count, format_playtime, grid_columns, grid_columns_padded,
+        strip_html, truncate_at_word,
     };
 
     #[test]
     fn grid_columns_fit_the_cards_and_their_gaps() {
-        // 168px cover + 12px card padding = 180 wide, 16 between.
-        assert_eq!(grid_columns(180., 168.), Some(1));
-        // One more card needs its gap too: 180 + 16 + 180.
-        assert_eq!(grid_columns(375., 168.), Some(1));
-        assert_eq!(grid_columns(376., 168.), Some(2));
+        // 168px cover + 14px card padding and border = 182 wide, 16 between.
+        assert_eq!(grid_columns(182., 168.), Some(1));
+        // One more card needs its gap too: 182 + 16 + 182.
+        assert_eq!(grid_columns(379., 168.), Some(1));
+        assert_eq!(grid_columns(380., 168.), Some(2));
         // Never zero, however narrow.
         assert_eq!(grid_columns(20., 168.), Some(1));
         // Nothing laid out yet — the caller's guess stands.
         assert_eq!(grid_columns(0., 168.), None);
+    }
+
+    /// The grid's own `px_4` is inside the bounds a scroll handle reports, so
+    /// the last column has to be bought out of the padded width — measuring
+    /// from the raw bounds fits a card the row then clips.
+    #[test]
+    fn grid_columns_leave_room_for_the_grid_padding() {
+        // Two 182-wide cards, one 16 gap, and the grid's 32 of padding.
+        assert_eq!(grid_columns_padded(412., 168.), Some(2));
+        assert_eq!(grid_columns_padded(411., 168.), Some(1));
+        // The unpadded maths is exactly one column too eager over that band.
+        assert_eq!(grid_columns(411., 168.), Some(2));
+        assert_eq!(grid_columns_padded(0., 168.), None);
     }
 
     #[test]

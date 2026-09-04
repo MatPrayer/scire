@@ -506,9 +506,9 @@ impl AlbumsView {
     /// Number of grid columns at the current window width.
     fn grid_cols(&mut self, window: &Window, cx: &App) -> usize {
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
-        let width = self.live_width.resolve(measured, window);
         let tile = self.session.read(cx).settings.cover_size.px();
-        crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS)
+        self.live_width
+            .columns(measured, tile, window, FALLBACK_COLS)
     }
 
     /// Move the vi-mode cursor by `delta` grid positions, clamping and
@@ -741,7 +741,7 @@ impl AlbumsView {
         let card = v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
             .group("acard")
-            .w(px(tile + 12.))
+            .w(px(tile + crate::ui::CARD_PADDING))
             .p_1p5()
             .gap_1p5()
             .rounded_lg()
@@ -954,10 +954,12 @@ impl Render for AlbumsView {
 
         // Columns from this frame's window width; falls back to a guess on the
         // very first frame (before anything is laid out), then self-corrects.
-        let width = self
-            .live_width
-            .resolve(f32::from(base.bounds().size.width), window);
-        let cols = crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS);
+        let cols = self.live_width.columns(
+            f32::from(base.bounds().size.width),
+            tile,
+            window,
+            FALLBACK_COLS,
+        );
         let row_count = album_count.div_ceil(cols);
 
         let entity = cx.entity();

@@ -401,7 +401,7 @@ impl ArtistsView {
         let view = entity.clone();
         let card_el = v_flex()
             .id(card.id.clone())
-            .w(px(tile + 12.))
+            .w(px(tile + crate::ui::CARD_PADDING))
             .p_1p5()
             .gap_1p5()
             .items_center()
@@ -494,8 +494,9 @@ impl Render for ArtistsView {
         // Columns from this frame's window width; falls back to a guess on the
         // very first frame (before anything is laid out), then self-corrects.
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
-        let width = self.live_width.resolve(measured, window);
-        let cols = crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS);
+        let cols = self
+            .live_width
+            .columns(measured, tile, window, FALLBACK_COLS);
         let row_count = self.cards.len().div_ceil(cols);
         self.ensure_art_for_viewport(row_count, cols, cx);
 
@@ -593,9 +594,9 @@ impl ArtistsView {
     /// first frame (before anything is laid out), then self-corrects.
     fn grid_cols(&mut self, window: &Window, cx: &App) -> usize {
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
-        let width = self.live_width.resolve(measured, window);
         let tile = self.session.read(cx).settings.cover_size.px();
-        crate::ui::grid_columns(width, tile).unwrap_or(FALLBACK_COLS)
+        self.live_width
+            .columns(measured, tile, window, FALLBACK_COLS)
     }
 
     /// Move the vi-mode cursor by `delta` cards, clamping and scrolling the

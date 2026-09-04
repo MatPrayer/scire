@@ -225,6 +225,25 @@ pub struct RootView {
     setup_error: Option<String>,
 }
 
+/// Ask for one more frame after the chrome around the content changes width.
+///
+/// `ui::LiveWidth` learns the chrome from the *previous* frame's layout, so the
+/// frame that folds the sidebar still lays the content out at the old width —
+/// the grids pick the new column count up on the frame after. Nothing else
+/// necessarily notifies once the fold has been painted, so without this the
+/// wrong column count simply stays on screen until an unrelated redraw comes
+/// along, which is the fold's cards visibly jumping a beat later.
+///
+/// Not `Window::request_animation_frame`: that resolves the view to notify with
+/// `rendered_entity_stack.last().unwrap()` behind a paint-or-prepaint debug
+/// assert, so it is only callable from inside an element's paint (where the
+/// visualizer uses it). From a click handler or from `render` it panics on both
+/// counts. `Context::on_next_frame` names the entity outright and has no phase
+/// requirement.
+fn settle_reflow(window: &mut Window, cx: &mut Context<RootView>) {
+    cx.on_next_frame(window, |_, _, cx| cx.notify());
+}
+
 impl RootView {
     pub fn new(
         session: Entity<Session>,
@@ -506,7 +525,7 @@ impl RootView {
     /// Fold the sidebar down to its icon rail, or unfold it, and remember the
     /// choice. Persisted even in a portrait window: the value is what a return
     /// to landscape restores.
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         let collapsed = self.sidebar_collapsed;
         self.session.update(cx, |session, _| {
@@ -514,6 +533,7 @@ impl RootView {
             session.persist_settings();
         });
         cx.notify();
+        settle_reflow(window, cx);
     }
 
     /// Fold the sidebar when the window turns portrait, unfold it back to the
@@ -523,7 +543,7 @@ impl RootView {
     /// fold would fight the user the moment they unfolded it in a portrait
     /// window. A landscape start therefore keeps the persisted value rather
     /// than forcing the sidebar open.
-    fn apply_orientation(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn apply_orientation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let size = window.viewport_size();
         // A zero-sized viewport is a frame laid out before the window has one;
         // treating it as landscape would fire a spurious transition.
@@ -536,10 +556,14 @@ impl RootView {
         }
         let first_frame = self.portrait.is_none();
         self.portrait = Some(portrait);
+        let was = self.sidebar_collapsed;
         if portrait {
             self.sidebar_collapsed = true;
         } else if !first_frame {
             self.sidebar_collapsed = self.session.read(cx).settings.sidebar_collapsed;
+        }
+        if self.sidebar_collapsed != was {
+            settle_reflow(window, cx);
         }
     }
 
@@ -2084,7 +2108,7 @@ impl Render for RootView {
                     && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
                     && window.focused(cx).is_none_or(|f| f == this.focus_handle)
                 {
-                    this.toggle_sidebar(cx);
+                    this.toggle_sidebar(window, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -2192,7 +2216,7 @@ impl Render for RootView {
                                     root.refresh_library(window, cx);
                                 }
                                 SidebarAction::ToggleSidebar => {
-                                    root.toggle_sidebar(cx);
+                                    root.toggle_sidebar(window, cx);
                                 }
                                 SidebarAction::TogglePlaylistSection => {
                                     root.playlists_collapsed = !root.playlists_collapsed;
