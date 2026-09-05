@@ -75,6 +75,15 @@ fn main() {
                 p.set_transcoding(settings.transcoding.to_stream_options())
             });
             services::artwork::set_cache_cap_mb(settings.artwork_cache_mb);
+            // One-off: square art cached before covers were cropped on the way
+            // in. Whole-file decodes, so it goes to the blocking pool and is
+            // left to run — the views paint from the same cache meanwhile and
+            // pick the cropped files up as they are asked for again.
+            cx.background_spawn(services::runtime::spawn_blocking_io(|| {
+                services::artwork::squarify_cached_art();
+                Ok(())
+            }))
+            .detach();
             let playlists = state::playlists::init(session.clone(), cx);
 
             // Music library database — shared between local scanner, navidrome

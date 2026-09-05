@@ -12,6 +12,7 @@ use lofty::Accessor;
 use lofty::AudioFile;
 use lofty::TaggedFileExt;
 
+use crate::services::artwork;
 use crate::services::library_db::{AlbumRow, LibraryDb};
 
 pub const IDLE: u8 = 0;
@@ -344,7 +345,19 @@ fn cache_cover_file(src: &Path) -> Option<String> {
     let dest = local_art_path(&hash)?;
     if !dest.exists() {
         let _ = std::fs::create_dir_all(dest.parent()?);
-        let _ = std::fs::copy(src, &dest);
+        // Square it on the way in like every other cover, rather than copying
+        // a `folder.jpg` of whatever shape the user's library happens to hold.
+        match std::fs::read(src)
+            .ok()
+            .and_then(|bytes| artwork::square_crop(&bytes))
+        {
+            Some(square) => {
+                let _ = std::fs::write(&dest, square);
+            }
+            None => {
+                let _ = std::fs::copy(src, &dest);
+            }
+        }
     }
     Some(hash)
 }
@@ -357,7 +370,8 @@ fn cache_cover_bytes(data: &[u8]) -> Option<String> {
     let dest = local_art_path(&hash)?;
     if !dest.exists() {
         let _ = std::fs::create_dir_all(dest.parent()?);
-        let _ = std::fs::write(&dest, data);
+        let squared = artwork::square_crop(data);
+        let _ = std::fs::write(&dest, squared.as_deref().unwrap_or(data));
     }
     Some(hash)
 }
@@ -377,9 +391,13 @@ fn simple_hash(path: &Path) -> Option<String> {
 }
 
 pub fn local_art_path(hash: &str) -> Option<PathBuf> {
+    Some(local_art_dir()?.join(format!("{hash}.jpg")))
+}
+
+/// Directory holding art extracted from local files.
+pub fn local_art_dir() -> Option<PathBuf> {
     let dir = crate::config::project_dirs().ok()?;
-    let cache = dir.cache_dir().join("local_art");
-    Some(cache.join(format!("{hash}.jpg")))
+    Some(dir.cache_dir().join("local_art"))
 }
 
 #[cfg(test)]

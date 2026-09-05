@@ -1141,6 +1141,13 @@ async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
     }
     std::fs::create_dir_all(&dir)?;
     let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+    // Artist photos are rarely square and every view draws them in a circle or
+    // a square tile, so crop before caching — off the two IO workers, since a
+    // decode would hold one of them.
+    let bytes = tokio::task::spawn_blocking(move || {
+        artwork::square_crop(&bytes).unwrap_or_else(|| bytes.to_vec())
+    })
+    .await?;
     // Temp file + rename so a partial download never poisons the cache.
     let tmp = path.with_extension("part");
     std::fs::write(&tmp, &bytes)?;

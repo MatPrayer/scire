@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, Render,
-    Window, div, ease_out_quint, img, linear_color_stop, linear_gradient, prelude::*, px,
+    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, ObjectFit,
+    Render, StyledImage as _, Window, div, ease_out_quint, img, linear_color_stop, linear_gradient,
+    prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::popover::Popover;
@@ -1180,8 +1181,11 @@ impl FullscreenPlayer {
                 .bg(cx.theme().muted)
                 .overflow_hidden()
                 // The tiny 32px art scaled to full size reads as a soft blur.
+                // Square art in a landscape window would otherwise sit between
+                // two bands of bare `muted` — cover the window and let the
+                // parent's `overflow_hidden` clip what hangs over.
                 .when_some(self.bg_art_path.clone(), |this, path| {
-                    this.child(img(path).size_full())
+                    this.child(img(path).size_full().object_fit(ObjectFit::Cover))
                 })
                 .into_any_element(),
             FullscreenBackground::Animated => {

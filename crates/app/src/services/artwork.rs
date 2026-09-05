@@ -236,6 +236,13 @@ pub async fn fetch_as(
             .error_for_status()?
             .bytes()
             .await?;
+        // Square the art before it lands in the cache. Decoding a cover is
+        // CPU work and the IO runtime has two workers, so it goes to the
+        // blocking pool rather than parking one of them behind a JPEG.
+        let bytes = tokio::task::spawn_blocking(move || {
+            square_crop(&bytes).unwrap_or_else(|| bytes.to_vec())
+        })
+        .await?;
         std::fs::create_dir_all(&dir)?;
         // Write via temp file so partial downloads never poison the cache.
         let tmp = path2.with_extension("part");
@@ -250,6 +257,111 @@ pub async fn fetch_as(
         Ok(path2)
     })
     .await
+}
+
+/// Center-crop art that is not square, so a cover fills the square tile it is
+/// drawn in instead of being letterboxed.
+///
+/// Cropping the *file* rather than the draw is what keeps the rounded corners
+/// every view gives its art: gpui's `ObjectFit::Cover` paints the image
+/// outside the element's bounds, the corner radii are applied to that
+/// oversized quad, and the only clip gpui offers is a rectangular content
+/// mask — so the rounding would land off-tile and be cut away. A square file
+/// needs no fit at all and is square in every view that draws it.
+///
+/// Returns `None` when the image is already square, or cannot be read, in
+/// which case the caller stores the bytes exactly as they arrived. The
+/// dimensions come from the header, so the common case — square art — never
+/// pays for a decode.
+///
+/// CPU-bound when it does crop: call it from a blocking context.
+pub fn square_crop(bytes: &[u8]) -> Option<Vec<u8>> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let format = reader.format();
+    let (width, height) = reader.into_dimensions().ok()?;
+    if width == height {
+        return None;
+    }
+    let edge = width.min(height);
+    let cropped = image::load_from_memory(bytes).ok()?.crop_imm(
+        (width - edge) / 2,
+        (height - edge) / 2,
+        edge,
+        edge,
+    );
+    let mut out = Vec::new();
+    // PNG art keeps its format (transparency, flat-colour covers); everything
+    // else is re-encoded as JPEG, which is what it almost always already was.
+    if format == Some(image::ImageFormat::Png) {
+        cropped
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .ok()?;
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+            .encode_image(&cropped.to_rgb8())
+            .ok()?;
+    }
+    Some(out)
+}
+
+/// Marker written into a cache directory once its art has been squared.
+const SQUARED_MARKER: &str = ".squared-v1";
+
+/// One-off pass over the art already on disk, cropping what was cached before
+/// covers were squared on the way in.
+///
+/// Both caches are keyed by cover id and size rather than by content, so a
+/// name bump is not an option: the server cache would re-download the whole
+/// library's art, and the local one would simply lose its covers, since the
+/// scanner re-extracts art only for files whose mtime moved. Cropping what is
+/// already there costs a header read per file and nothing over the network.
+///
+/// Best-effort and idempotent — a file that fails to read, decode or write is
+/// left as it is, and an already-square one is skipped. CPU-bound: call from a
+/// blocking context.
+pub fn squarify_cached_art() {
+    for dir in [
+        config::artwork_cache_dir().ok(),
+        crate::services::local_library::local_art_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        squarify_dir(&dir);
+    }
+}
+
+fn squarify_dir(dir: &Path) {
+    let marker = dir.join(SQUARED_MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Ok(read) = std::fs::read_dir(dir) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            // Skip the marker and the temp files a cancelled download leaves.
+            if path == marker || path.extension().is_some_and(|ext| ext == "part") {
+                continue;
+            }
+            if !entry.metadata().is_ok_and(|meta| meta.is_file()) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(square) = square_crop(&bytes) else {
+                continue;
+            };
+            let tmp = path.with_extension("part");
+            if std::fs::write(&tmp, &square).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&marker, b"");
 }
 
 /// If the cache exceeds the cap, delete oldest files (by modified time) until
@@ -296,7 +408,40 @@ fn evict_if_over_cap(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SIZE_LADDER, bucket, search_order, stable_key};
+    use super::{SIZE_LADDER, bucket, search_order, square_crop, stable_key};
+
+    fn encode(width: u32, height: u32) -> Vec<u8> {
+        let img =
+            image::RgbImage::from_fn(width, height, |x, _| image::Rgb([(x % 256) as u8, 0, 0]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    fn dimensions(bytes: &[u8]) -> (u32, u32) {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap()
+    }
+
+    #[test]
+    fn art_is_cropped_to_a_square_before_it_is_cached() {
+        // Wide and tall art both come back at their short edge, so the square
+        // tile every view draws it in is filled rather than letterboxed.
+        let wide = square_crop(&encode(40, 20)).expect("wide art cropped");
+        assert_eq!(dimensions(&wide), (20, 20));
+        let tall = square_crop(&encode(20, 50)).expect("tall art cropped");
+        assert_eq!(dimensions(&tall), (20, 20));
+        // Already square: the caller stores the original bytes untouched, so
+        // nothing is re-encoded for the covers that are the common case.
+        assert!(square_crop(&encode(300, 300)).is_none());
+        // Undecodable input is left alone rather than dropped.
+        assert!(square_crop(b"not an image").is_none());
+    }
 
     #[test]
     fn a_view_falls_back_to_the_nearest_cached_size() {
