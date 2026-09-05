@@ -2328,8 +2328,11 @@ impl Render for FullscreenPlayer {
                                     })
                                     .with_animation(
                                         ElementId::Name(key.into()),
-                                        Animation::new(Duration::from_millis(220))
-                                            .with_easing(ease_out_quint()),
+                                        Animation::new(crate::ui::transition(
+                                            self.session.read(cx).settings.reduced_motion,
+                                            220,
+                                        ))
+                                        .with_easing(ease_out_quint()),
                                         |el, t| el.opacity(t).ml(px(28. * (1. - t))),
                                     ),
                             )

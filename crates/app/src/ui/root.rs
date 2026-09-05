@@ -1191,7 +1191,14 @@ impl RootView {
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
-            _ => {}
+            // No cursor protocol on these three, so j/k does nothing there.
+            // Spelled out rather than caught by `_`: the match is exhaustive
+            // so a new `Content` variant is a compile error here instead of a
+            // page where the keyboard silently stops working.
+            Some(Content::ArtistDetail(_))
+            | Some(Content::Radio(_))
+            | Some(Content::Settings(_)) => {}
+            None => {}
         }
     }
 
@@ -1206,7 +1213,10 @@ impl RootView {
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
-            _ => {}
+            Some(Content::ArtistDetail(_))
+            | Some(Content::Radio(_))
+            | Some(Content::Settings(_)) => {}
+            None => {}
         }
     }
 
@@ -1229,7 +1239,10 @@ impl RootView {
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
-            _ => {}
+            Some(Content::ArtistDetail(_))
+            | Some(Content::Radio(_))
+            | Some(Content::Settings(_)) => {}
+            None => {}
         }
     }
 
@@ -2083,6 +2096,7 @@ impl Render for RootView {
         let show_fullscreen = self.show_fullscreen;
         let client_titlebar = self.session.read(cx).settings.client_titlebar;
         let minimal_titlebar = self.session.read(cx).settings.minimal_titlebar;
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
 
         v_flex()
@@ -2278,13 +2292,22 @@ impl Render for RootView {
                             }),
                     )
                     .when(self.show_queue, |this| {
+                        // `h_full()` on the wrapper, not only on the panel:
+                        // the row is an `h_flex`, which centres its children
+                        // rather than stretching them, so without a definite
+                        // height here the panel's own `h_full()` resolves
+                        // against nothing and its track list collapses.
                         this.child(
-                            div().flex().child(self.queue_panel.clone()).with_animation(
-                                ElementId::Name("queue-slide-in".into()),
-                                Animation::new(std::time::Duration::from_millis(220))
-                                    .with_easing(ease_out_quint()),
-                                |this, t| this.opacity(t).ml(px(20. * (1. - t))),
-                            ),
+                            div()
+                                .h_full()
+                                .flex()
+                                .child(self.queue_panel.clone())
+                                .with_animation(
+                                    ElementId::Name("queue-slide-in".into()),
+                                    Animation::new(crate::ui::transition(reduced_motion, 220))
+                                        .with_easing(ease_out_quint()),
+                                    |this, t| this.opacity(t).ml(px(20. * (1. - t))),
+                                ),
                         )
                     }),
             )

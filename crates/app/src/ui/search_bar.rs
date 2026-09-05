@@ -651,7 +651,11 @@ impl SearchBar {
             })
             .with_animation(
                 ElementId::Name("search-palette-anim".into()),
-                Animation::new(std::time::Duration::from_millis(150)).with_easing(ease_out_quint()),
+                Animation::new(crate::ui::transition(
+                    self.session.read(cx).settings.reduced_motion,
+                    150,
+                ))
+                .with_easing(ease_out_quint()),
                 |this, t| this.opacity(t),
             )
             .into_any_element()

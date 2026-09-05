@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, Render,
-    Window, div, ease_out_quint, hsla, img, linear_color_stop, linear_gradient, prelude::*, px,
+    SharedString, Window, div, ease_out_quint, hsla, img, linear_color_stop, linear_gradient,
+    prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -74,10 +75,6 @@ pub struct PlayerBar {
     title_hovered: bool,
     /// Index of the artist credit currently hovered (for the underline).
     artist_hovered: Option<usize>,
-    /// Previous track ID for animation triggering.
-    prev_track_id: Option<String>,
-    /// Previous art path for cover animation.
-    prev_art_path: Option<std::path::PathBuf>,
 }
 
 impl PlayerBar {
@@ -174,8 +171,6 @@ impl PlayerBar {
             seek_hover: None,
             title_hovered: false,
             artist_hovered: None,
-            prev_track_id: None,
-            prev_art_path: None,
         }
     }
 
@@ -305,17 +300,6 @@ impl Render for PlayerBar {
                 p.current_song().map(|s| s.id.clone()),
             )
         };
-
-        // Track change detection for animations
-        let track_changed = track_id.as_ref() != self.prev_track_id.as_ref();
-        let art_changed = art_path.as_ref() != self.prev_art_path.as_ref();
-
-        if track_changed {
-            self.prev_track_id = track_id.clone();
-        }
-        if art_changed {
-            self.prev_art_path = art_path.clone();
-        }
 
         // Navigation targets for the track-info text; live radio has none.
         // `artists` is the per-credit list (id + name), each individually
@@ -454,14 +438,20 @@ impl Render for PlayerBar {
                             // mutually exclusive, and drawing both stacks the
                             // placeholder on top of whatever art was last set.
                             .when_some(art_path.filter(|_| has_track && !is_radio), |this, path| {
-                                let anim_id = track_id.clone().unwrap_or_default();
+                                // Keyed by the art, not by the track: the id is
+                                // what makes gpui drop the animation state and
+                                // replay the fade, and consecutive tracks in one
+                                // album share a cover path (`PlayerState` keeps
+                                // it when the album-scoped art key is unchanged).
+                                // Keyed by track, an unchanged image re-faded on
+                                // every track change and the cover visibly blinked.
+                                let anim_id: SharedString =
+                                    format!("np-cover-art-{}", path.display()).into();
                                 this.child(
                                     img(path).size(px(76.)).rounded_md().with_animation(
-                                        ElementId::Name(format!("np-cover-art-{anim_id}").into()),
-                                        Animation::new(std::time::Duration::from_millis(
-                                            if reduced_motion { 0 } else { 120 },
-                                        ))
-                                        .with_easing(ease_out_quint()),
+                                        ElementId::Name(anim_id),
+                                        Animation::new(crate::ui::transition(reduced_motion, 120))
+                                            .with_easing(ease_out_quint()),
                                         |this, t| this.opacity(t),
                                     ),
                                 )
@@ -617,10 +607,8 @@ impl Render for PlayerBar {
                                     format!("np-info-{}", track_id.as_deref().unwrap_or("none"))
                                         .into(),
                                 ),
-                                Animation::new(std::time::Duration::from_millis(
-                                    if reduced_motion { 0 } else { 120 },
-                                ))
-                                .with_easing(ease_out_quint()),
+                                Animation::new(crate::ui::transition(reduced_motion, 120))
+                                    .with_easing(ease_out_quint()),
                                 |this, t| this.opacity(t),
                             ),
                     ),

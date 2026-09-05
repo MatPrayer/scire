@@ -1051,6 +1051,23 @@ pub fn divider() -> gpui::Div {
     div().h(px(1.)).w_full().bg(hsla(0., 0., 0.5, 0.15))
 }
 
+/// How long a non-essential transition should run for.
+///
+/// One place decides it so `Settings::reduced_motion` cannot be honoured by
+/// some entrance animations and quietly ignored by the rest, which is what
+/// happened when each call site spelled its own duration out.
+///
+/// Reduced motion collapses the animation to a single frame rather than
+/// removing it: `with_animation` needs the wrapper either way, and rebuilding
+/// each site to drop it would double every one of them. The floor is 1ms and
+/// not 0 on purpose — gpui divides the elapsed time by the duration, so a zero
+/// duration yields `0.0 / 0.0` on a frame landing in the same clock tick as
+/// the animation's start, and the `debug_assert!` on the resulting delta trips
+/// on the NaN.
+pub fn transition(reduced_motion: bool, ms: u64) -> Duration {
+    Duration::from_millis(if reduced_motion { 1 } else { ms })
+}
+
 /// Outer glow used by the vi-mode focus cursor, and by the card hover
 /// highlight when `Settings::hover_glow` is on (off by default).
 pub fn focus_glow(cx: &App) -> Vec<BoxShadow> {
