@@ -11,8 +11,9 @@
 #
 # Steps:
 #   1. Reuse bundle.sh to produce Scirè.app (runs it if missing).
-#   2. Stage a writable image with the .app, an Applications symlink, and a
-#      themed background, then arrange the icons via AppleScript.
+#   2. Convert dmg-icon.png to an .icns volume icon and stage a writable
+#      image with the .app, an Applications symlink, and a themed background,
+#      then set the volume icon and arrange the Finder icons via AppleScript.
 #   3. Compress the staged image into the final .dmg.
 set -euo pipefail
 
@@ -65,6 +66,20 @@ H=416
 BG_PNG="$WORK/background.png"
 rsvg-convert -w "$W" -h "$H" "$HERE/dmg-background.svg" -o "$BG_PNG"
 
+# ---- 1b. Volume icon (PNG → .icns) ------------------------------------------
+ICONSET="$WORK/icon.iconset"
+mkdir -p "$ICONSET"
+ICON_SRC="$HERE/dmg-icon.png"
+command -v sips >/dev/null 2>&1 || { echo "error: sips not found" >&2; exit 1; }
+command -v iconutil >/dev/null 2>&1 || { echo "error: iconutil not found" >&2; exit 1; }
+for size in 16 32 128 256 512; do
+	sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+	two=$(( size * 2 ))
+	sips -z "$two" "$two" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+ICON_ICNS="$WORK/volume-icon.icns"
+iconutil -c icns "$ICONSET" -o "$ICON_ICNS"
+
 # ---- 2. Stage & mount a writable image --------------------------------------
 mkdir -p "$STAGE/.background"
 cp "$BG_PNG" "$STAGE/.background/background.png"
@@ -86,7 +101,13 @@ MOUNT="$(hdiutil attach "$STAGEDMG" -nobrowse -readwrite 2>/dev/null \
 	| awk -F '\t' '/\/Volumes\//{print $NF}' | head -1)"
 [[ -n "$MOUNT" ]] || { echo "error: failed to mount staging image" >&2; exit 1; }
 
-# ---- 3. Arrange icons & set the background via Finder ------------------------
+# Volume icon: Finder picks up .VolumeIcon.icns at the volume root once the
+# custom-icon flag is set. hdiutil has no direct "set icon" option.
+command -v SetFile >/dev/null 2>&1 || { echo "error: SetFile not found" >&2; exit 1; }
+cp "$ICON_ICNS" "$MOUNT/.VolumeIcon.icns"
+SetFile -a C "$MOUNT"
+
+# ---- 3. Volume icon, arrange icons & set the background via Finder -----------
 # Finder's icon coordinates are relative to the visible content area of the
 # window (below the title bar). We size the window to the background then
 # place the app bottom-left and Applications bottom-right. AppleScript blocks
