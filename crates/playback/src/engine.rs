@@ -26,6 +26,9 @@ const TICK: Duration = Duration::from_millis(500);
 /// out of rodio's queue.
 const COMMIT_LEAD: Duration = Duration::from_secs(3);
 
+/// Ticks between output-route checks (~2s at `TICK`).
+const ROUTE_CHECK_TICKS: u8 = 4;
+
 /// A fully-opened, decoded-and-ready track, not yet handed to rodio.
 struct Prepared {
     track: TrackSource,
@@ -68,6 +71,16 @@ async fn control_loop(
     // Chosen output device name (None = OS default) and the currently-loaded
     // track, retained so a device switch can reopen and resume in place.
     let mut selected_device: Option<String> = None;
+    // Resolved name of the device `output` was actually opened on, and the
+    // device playback was auto-paused for when it disappeared. macOS hands a
+    // Bluetooth disconnect (earbuds off, AirPods out of the ear) to us as a
+    // dead stream on a device that is no longer the default: rodio's player
+    // then drains, which the tick below used to read as "track finished" and
+    // the queue walked on through the laptop speakers. Watching the route
+    // instead lets the engine pause, move the output, and resume only when the
+    // device that vanished comes back.
+    let mut open_device: Option<String> = None;
+    let mut lost_device: Option<String> = None;
     let mut current: Option<Loaded> = None;
     // Next track already appended behind `current` (committed, cannot be
     // withdrawn) and the one prepared but still withheld.
@@ -84,6 +97,11 @@ async fn control_loop(
     let (end_tx, mut end_rx) = mpsc::unbounded_channel::<u64>();
     let mut serials: u64 = 0;
     let mut ticker = tokio::time::interval(TICK);
+    // Ticks since the output route was last checked. Asking the OS costs a
+    // device enumeration (a `pactl` subprocess on Linux), so it is throttled to
+    // ~2s and skipped entirely when nothing is playing and nothing is waiting
+    // for its device to come back.
+    let mut route_ticks: u8 = 0;
     let mut playing = false;
 
     loop {
@@ -114,8 +132,9 @@ async fn control_loop(
                         {
                             Ok((new_sink, loaded)) => {
                                 if !output_was_open {
+                                    open_device = resolved_device_name(&selected_device);
                                     let _ = event_tx.send(Event::OutputOpened {
-                                        device: resolved_device_name(&selected_device),
+                                        device: open_device.clone(),
                                     });
                                 }
                                 if let Some(d) = loaded.duration {
@@ -161,8 +180,10 @@ async fn control_loop(
                     Command::SetOutputDevice(name) => {
                         if name != selected_device {
                             selected_device = name;
+                            lost_device = None;
+                            open_device = resolved_device_name(&selected_device);
                             let _ = event_tx.send(Event::OutputOpened {
-                                device: resolved_device_name(&selected_device),
+                                device: open_device.clone(),
                             });
                             // Reopen on the new device, resuming the current
                             // track at its position (paused stays paused).
@@ -325,7 +346,86 @@ async fn control_loop(
                 }
             }
             _ = ticker.tick() => {
-                if let Some(s) = &sink
+                // Route watch first: a dead output makes rodio's player look
+                // drained, and the `empty()` branch below would report that as
+                // a finished track and advance the queue onto the speakers.
+                route_ticks = route_ticks.saturating_add(1);
+                let check_route = output.is_some()
+                    && (playing || lost_device.is_some())
+                    && route_ticks >= ROUTE_CHECK_TICKS;
+                if check_route {
+                    route_ticks = 0;
+                }
+                if check_route && route_lost(&selected_device, &open_device) {
+                    // Only a route that vanished *during* playback earns a
+                    // resume when it comes back; a device swapped while paused
+                    // just moves the output.
+                    if playing {
+                        lost_device = open_device.clone();
+                    }
+                    let pos = sink.as_ref().map(|s| s.get_pos());
+                    // The appended next track dies with the old player.
+                    let requeue = queued.take().map(|l| l.track);
+                    if let Some(s) = sink.take() {
+                        s.stop();
+                    }
+                    output = None;
+                    playing = false;
+                    if let Some(loaded) = current.take() {
+                        match start_track(
+                            &mut output,
+                            &selected_device,
+                            loaded.track,
+                            volume,
+                            &mut serials,
+                            &end_tx,
+                            &tap,
+                            &event_tx,
+                        )
+                        .await
+                        {
+                            Ok((new_sink, loaded)) => {
+                                if let Some(p) = pos
+                                    && let Err(e) = new_sink.try_seek(p)
+                                {
+                                    tracing::warn!("seek after route change failed: {e}");
+                                }
+                                new_sink.pause();
+                                current = Some(loaded);
+                                sink = Some(new_sink);
+                                let _ = event_tx.send(Event::Paused);
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(Event::Failed(e.to_string()));
+                            }
+                        }
+                    }
+                    open_device = resolved_device_name(&selected_device);
+                    let _ = event_tx.send(Event::OutputOpened {
+                        device: open_device.clone(),
+                    });
+                    // The device that was pulled out is back: pick playback up
+                    // where it stopped. Anything else stays paused — the user
+                    // asked for audio in the earbuds, not in the room.
+                    if lost_device.is_some() && lost_device == open_device {
+                        lost_device = None;
+                        if let Some(s) = &sink {
+                            s.play();
+                            playing = true;
+                            let _ = event_tx.send(Event::Playing);
+                        }
+                    }
+                    if let Some(track) = requeue {
+                        start_prefetch(
+                            track,
+                            &mut prefetch,
+                            &mut prefetch_gen,
+                            &mut pending,
+                            &prep_tx,
+                            &event_tx,
+                        );
+                    }
+                } else if let Some(s) = &sink
                     && playing
                 {
                     if s.empty() {
@@ -355,6 +455,35 @@ async fn control_loop(
             }
         }
     }
+}
+
+/// Has the output route moved out from under an open sink?
+///
+/// With no device chosen that means the OS default is no longer the device the
+/// sink was opened on (a Bluetooth disconnect flips it to the built-in
+/// speakers); with one chosen it means that device is no longer present at all,
+/// so `open_output` would now be falling back to the default.
+fn route_lost(selected: &Option<String>, open: &Option<String>) -> bool {
+    match selected {
+        // Never seen the device we opened on: nothing to compare against, and
+        // a name query that keeps failing must not restart playback every tick.
+        None if open.is_none() => false,
+        None => default_output_device_name() != *open,
+        Some(name) => !output_device_present(name),
+    }
+}
+
+/// Is a device with this description name currently connected?
+fn output_device_present(name: &str) -> bool {
+    use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
+    let Ok(devices) = rodio::cpal::default_host().output_devices() else {
+        // Can't enumerate: assume it is there rather than tearing the output
+        // down on a transient host error.
+        return true;
+    };
+    devices
+        .into_iter()
+        .any(|d| d.description().ok().is_some_and(|desc| desc.name() == name))
 }
 
 /// Name of the OS default output device (what `open_default_sink` uses).

@@ -866,11 +866,16 @@ impl Render for AlbumDetailView {
 
             h_flex()
                 .gap_4()
-                .items_start()
+                // Centred, not top-aligned: the info column's height depends on
+                // how many chips and lines this album has, so a fixed-height
+                // cover pinned to the top leaves the card visibly lopsided —
+                // most of all against the header's colour wash.
+                .items_center()
                 .flex_wrap()
                 .child(
                     div()
                         .id("album-cover")
+                        .flex_none()
                         .size(px(220.))
                         .rounded_2xl()
                         .bg(cx.theme().muted)

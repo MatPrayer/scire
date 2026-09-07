@@ -703,7 +703,8 @@ impl ArtistDetailView {
             .await;
             let _ = this.update(cx, |view, cx| {
                 match result {
-                    Ok(artist) => {
+                    Ok(mut artist) => {
+                        sort_discography(&mut artist.album);
                         let artist_id = artist.artist.id.clone();
                         for album in &artist.album {
                             view.fetch_art(album.id.clone(), album.cover_art.clone(), cx);
@@ -864,6 +865,17 @@ impl ArtistDetailView {
         })
         .detach();
     }
+}
+
+/// Order an artist's albums newest first, undated albums last (Navidrome's own
+/// order is not guaranteed).
+fn sort_discography(albums: &mut [Album]) {
+    albums.sort_by(|a, b| {
+        b.year
+            .unwrap_or(i32::MIN)
+            .cmp(&a.year.unwrap_or(i32::MIN))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 }
 
 impl Render for ArtistDetailView {
@@ -1254,5 +1266,36 @@ mod grid_tests {
     fn nameless_artist_yields_no_initial_instead_of_panicking() {
         let cards = to_cards(&[artist("")]);
         assert!(cards[0].initial.is_empty());
+    }
+
+    fn album(name: &str, year: Option<i32>) -> Album {
+        Album {
+            id: name.to_string(),
+            name: name.to_string(),
+            artist: None,
+            artist_id: None,
+            cover_art: None,
+            song_count: None,
+            duration: None,
+            created: None,
+            year,
+            genre: None,
+            starred: None,
+            user_rating: None,
+            play_count: None,
+        }
+    }
+
+    #[test]
+    fn discography_runs_newest_first_with_undated_albums_last() {
+        let mut albums = vec![
+            album("Debut", Some(1999)),
+            album("Unknown", None),
+            album("Later", Some(2020)),
+            album("Split B", Some(2020)),
+        ];
+        sort_discography(&mut albums);
+        let names: Vec<_> = albums.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Later", "Split B", "Debut", "Unknown"]);
     }
 }
