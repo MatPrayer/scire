@@ -13,7 +13,7 @@ use subsonic::{Song, SubsonicClient};
 use crate::services::artwork;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
-use crate::ui::{focus_glow, format_count, format_duration, format_playtime};
+use crate::ui::{format_count, format_duration, format_playtime, with_focus_cursor};
 
 const ART_SIZE: u32 = 200;
 /// Fixed row height — `uniform_list` requires every row to be the same size.
@@ -203,7 +203,8 @@ impl RecentView {
             .and_then(|key| self.art_paths.get(key))
             .cloned();
         let view = entity.clone();
-        h_flex()
+        let glow = self.session.read(cx).settings.selection_glow;
+        let row_el = h_flex()
             .id(("recent-row", ix))
             // `uniform_list` sizes its items to their content, so without this
             // the row is only as wide as its text and the album and duration
@@ -216,12 +217,6 @@ impl RecentView {
             .rounded_lg()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().muted))
-            .when(focused, |s| {
-                s.bg(cx.theme().muted)
-                    .border_1()
-                    .border_color(cx.theme().primary)
-                    .shadow(focus_glow(cx))
-            })
             .on_click(move |_, _, cx: &mut gpui::App| {
                 view.update(cx, |this, cx| {
                     let Some(song) = this.songs.get(ix).cloned() else {
@@ -278,8 +273,8 @@ impl RecentView {
                     .text_color(cx.theme().muted_foreground)
                     .text_right()
                     .child(row.duration.clone()),
-            )
-            .into_any_element()
+            );
+        with_focus_cursor(format!("vi-focus-{ix}"), row_el, focused, glow, cx)
     }
 }
 

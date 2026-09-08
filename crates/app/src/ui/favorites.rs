@@ -12,7 +12,7 @@ use crate::assets::{app_icon, icons};
 use crate::services::runtime;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
-use crate::ui::{focus_glow, with_focus_animation};
+use crate::ui::{sync_focus_scroll, with_focus_cursor};
 
 pub enum FavoritesEvent {
     OpenAlbum(String),
@@ -31,6 +31,9 @@ pub struct FavoritesView {
     focus_anchor: ScrollAnchor,
     /// Flat item index across songs → albums → artists (None = hidden).
     vi_cursor: Option<usize>,
+    /// Cursor position the scroll has caught up to, so `render` scrolls only
+    /// when the cursor actually moved (`ui::sync_focus_scroll`).
+    vi_scroll_synced: Option<usize>,
 }
 
 impl EventEmitter<FavoritesEvent> for FavoritesView {}
@@ -51,6 +54,7 @@ impl FavoritesView {
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
+            vi_scroll_synced: None,
         };
         // PlayerState notifies on every event, position ticks included. This
         // view only marks the playing row, so repaint when that row moves and
@@ -135,8 +139,20 @@ impl FavoritesView {
 }
 
 impl Render for FavoritesView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Scroll-into-view runs here, not in `vi_move`: the anchor's origin
+        // is only as fresh as the last paint, and from a key handler that is
+        // the row the cursor just LEFT — going up, the focused row landed one
+        // row above the viewport and the highlight vanished.
+        sync_focus_scroll(
+            &self.focus_anchor,
+            self.vi_cursor,
+            &mut self.vi_scroll_synced,
+            window,
+            cx,
+        );
         let playing_id = self.playing_id.clone();
+        let glow = self.session.read(cx).settings.selection_glow;
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
 
         // Borrowed, not cloned: this view observes the player, so `render`
@@ -169,13 +185,7 @@ impl Render for FavoritesView {
                                 .border_color(cx.theme().accent)
                                 .text_color(cx.theme().accent)
                         })
-                        .when(focused, |s| {
-                            s.bg(cx.theme().muted)
-                                .border_1()
-                                .border_color(cx.theme().primary)
-                                .shadow(focus_glow(cx))
-                                .anchor_scroll(Some(anchor))
-                        })
+                        .when(focused, |s| s.anchor_scroll(Some(anchor)))
                         // Reads the song list at click time rather than
                         // carrying a copy of it into every row's handler.
                         .on_click(cx.listener(move |this, _, _, cx| this.play_from(i, cx)))
@@ -203,11 +213,7 @@ impl Render for FavoritesView {
                                     cx.stop_propagation();
                                 })),
                         );
-                    let row = if focused {
-                        with_focus_animation(format!("vi-focus-{i}"), row, cx).into_any_element()
-                    } else {
-                        row.into_any_element()
-                    };
+                    let row = with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, cx);
                     rows.push(row);
                 }
             }
@@ -229,13 +235,7 @@ impl Render for FavoritesView {
                         .rounded_md()
                         .cursor_pointer()
                         .hover(|s| s.bg(cx.theme().muted))
-                        .when(focused, |s| {
-                            s.bg(cx.theme().muted)
-                                .border_1()
-                                .border_color(cx.theme().primary)
-                                .shadow(focus_glow(cx))
-                                .anchor_scroll(Some(anchor))
-                        })
+                        .when(focused, |s| s.anchor_scroll(Some(anchor)))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(FavoritesEvent::OpenAlbum(open_id.clone()));
                         }))
@@ -263,12 +263,8 @@ impl Render for FavoritesView {
                                     cx.stop_propagation();
                                 })),
                         );
-                    let row = if focused {
-                        with_focus_animation(format!("vi-focus-{}", ns + i), row, cx)
-                            .into_any_element()
-                    } else {
-                        row.into_any_element()
-                    };
+                    let row =
+                        with_focus_cursor(format!("vi-focus-{}", ns + i), row, focused, glow, cx);
                     rows.push(row);
                 }
             }
@@ -288,13 +284,7 @@ impl Render for FavoritesView {
                         .rounded_md()
                         .cursor_pointer()
                         .hover(|s| s.bg(cx.theme().muted))
-                        .when(focused, |s| {
-                            s.bg(cx.theme().muted)
-                                .border_1()
-                                .border_color(cx.theme().primary)
-                                .shadow(focus_glow(cx))
-                                .anchor_scroll(Some(anchor))
-                        })
+                        .when(focused, |s| s.anchor_scroll(Some(anchor)))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(FavoritesEvent::OpenArtist(open_id.clone()));
                         }))
@@ -309,12 +299,13 @@ impl Render for FavoritesView {
                                     cx.stop_propagation();
                                 })),
                         );
-                    let row = if focused {
-                        with_focus_animation(format!("vi-focus-{}", ns + na + i), row, cx)
-                            .into_any_element()
-                    } else {
-                        row.into_any_element()
-                    };
+                    let row = with_focus_cursor(
+                        format!("vi-focus-{}", ns + na + i),
+                        row,
+                        focused,
+                        glow,
+                        cx,
+                    );
                     rows.push(row);
                 }
             }
@@ -359,7 +350,7 @@ impl FavoritesView {
 
     /// Move the vi-mode cursor by `delta` items across the song/album/artist
     /// sections, clamping and scrolling the focused row into view.
-    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(starred) = &self.starred else {
             return;
         };
@@ -374,7 +365,6 @@ impl FavoritesView {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        self.focus_anchor.scroll_to(window, cx);
         cx.notify();
     }
 

@@ -1,12 +1,16 @@
 //! Internet radio: station list, play, add, delete.
 
-use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, Focusable as _, IntoElement, Render, Window, div, prelude::*, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 
 use crate::state::player::PlayerState;
 use crate::state::radio::RadioState;
+use crate::state::session::Session;
+use crate::ui::with_focus_cursor;
 
 /// What the radio page draws out of the player: the live station's name, and
 /// the track it announced.
@@ -29,18 +33,24 @@ fn player_signature(
 pub struct RadioView {
     radio: Entity<RadioState>,
     player: Entity<PlayerState>,
+    /// Read for one thing: whether the vi cursor glows.
+    session: Entity<Session>,
     name_input: Entity<InputState>,
     url_input: Entity<InputState>,
     /// The two things this view draws out of the player: which station is
     /// live, and what it says is on. Everything else the player reports —
     /// position above all — changes nothing here.
     playing: (Option<String>, Option<String>),
+    /// Station row / form input index under the vi-mode cursor. Flattened:
+    /// station rows 0..n, then name input, url input, Add button.
+    vi_cursor: Option<usize>,
 }
 
 impl RadioView {
     pub fn new(
         radio: Entity<RadioState>,
         player: Entity<PlayerState>,
+        session: Entity<Session>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -61,9 +71,11 @@ impl RadioView {
         Self {
             radio,
             player,
+            session,
             name_input,
             url_input,
             playing,
+            vi_cursor: None,
         }
     }
 
@@ -79,6 +91,69 @@ impl RadioView {
         self.url_input
             .update(cx, |i, cx| i.set_value("", window, cx));
     }
+
+    /// True while one of the add-station fields has the keyboard.
+    pub fn is_typing(&self, window: &Window, cx: &App) -> bool {
+        self.name_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.url_input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    fn station_count(&self, cx: &App) -> usize {
+        self.radio.read(cx).stations.len()
+    }
+
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+        // Three form targets (name, url, Add) always follow the station rows.
+        let count = self.station_count(cx) + 3;
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        cx.notify();
+    }
+
+    /// Enter on the focused station/form target: play the station, focus the
+    /// pinned input, or run `add_station`.
+    pub fn vi_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.station_count(cx);
+        let Some(i) = self.vi_cursor else {
+            return;
+        };
+        if i < n {
+            let (name, url) = {
+                let r = self.radio.read(cx);
+                let s = &r.stations[i];
+                (s.name.clone(), s.stream_url.clone())
+            };
+            self.player.update(cx, |p, cx| p.play_radio(name, url, cx));
+        } else if i == n {
+            self.name_input.update(cx, |s, cx| s.focus(window, cx));
+            cx.notify();
+        } else if i == n + 1 {
+            self.url_input.update(cx, |s, cx| s.focus(window, cx));
+            cx.notify();
+        } else if i == n + 2 {
+            self.add_station(window, cx);
+        }
+    }
+
+    /// `i` on the radio page: focus the name field.
+    pub fn vi_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.name_input.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
 }
 
 impl Render for RadioView {
@@ -90,6 +165,7 @@ impl Render for RadioView {
             (r.stations.clone(), r.error.clone())
         };
 
+        let glow = self.session.read(cx).settings.selection_glow;
         let rows: Vec<_> = stations
             .into_iter()
             .enumerate()
@@ -99,7 +175,8 @@ impl Render for RadioView {
                 let name = station.name.clone();
                 let url = station.stream_url.clone();
                 let id = station.id.clone();
-                h_flex()
+                let focused = self.vi_cursor == Some(i);
+                let row = h_flex()
                     .id(("radio", i))
                     .px_2()
                     .py_1p5()
@@ -146,8 +223,8 @@ impl Render for RadioView {
                                 this.radio.update(cx, |r, cx| r.delete(id.clone(), cx));
                                 cx.stop_propagation();
                             })),
-                    )
-                    .into_any_element()
+                    );
+                with_focus_cursor(format!("vi-radio-{i}"), row, focused, glow, cx)
             })
             .collect();
 

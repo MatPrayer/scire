@@ -23,9 +23,9 @@ use std::time::Duration;
 
 use directories::ProjectDirs;
 use gpui::{
-    Animation, AnimationElement, AnimationExt as _, App, BoxShadow, ElementId, Hsla, IntoElement,
-    Pixels, SharedString, Styled, Window, WindowBounds, WindowDecorations, WindowOptions, div,
-    ease_out_quint, hsla, point, prelude::*, px,
+    Animation, AnimationElement, AnimationExt as _, AnyElement, App, BoxShadow, ElementId, Hsla,
+    IntoElement, Pixels, ScrollAnchor, SharedString, Styled, Window, WindowBounds,
+    WindowDecorations, WindowOptions, div, ease_out_quint, hsla, point, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::TitleBar;
@@ -1068,9 +1068,11 @@ pub fn transition(reduced_motion: bool, ms: u64) -> Duration {
     Duration::from_millis(if reduced_motion { 1 } else { ms })
 }
 
-/// Outer glow used by the vi-mode focus cursor, and by the card hover
-/// highlight when `Settings::hover_glow` is on (off by default).
-pub fn focus_glow(cx: &App) -> Vec<BoxShadow> {
+/// Outer glow used by the vi-mode focus cursor.
+///
+/// Private on purpose: [`with_focus_cursor`] is the only way in, so the glow
+/// cannot be painted somewhere that forgot to ask whether the user wants it.
+fn focus_glow(cx: &App) -> Vec<BoxShadow> {
     let c = cx.theme().primary;
     vec![BoxShadow {
         color: hsla(c.h, c.s, c.l, 0.28),
@@ -1084,7 +1086,7 @@ pub fn focus_glow(cx: &App) -> Vec<BoxShadow> {
 /// each time the vi cursor lands on the item. The wrapper element id is
 /// per-item, so it mounts when focused and unmounts when the cursor moves —
 /// the animation replays on every jump.
-pub fn with_focus_animation<E: IntoElement + Styled + 'static>(
+fn with_focus_animation<E: IntoElement + Styled + 'static>(
     id: impl Into<SharedString>,
     el: E,
     cx: &App,
@@ -1102,6 +1104,69 @@ pub fn with_focus_animation<E: IntoElement + Styled + 'static>(
             }])
         },
     )
+}
+
+/// Mark `el` as the item the vi cursor is on.
+///
+/// The border is the cursor itself and is always drawn: something has to say
+/// where the keyboard is. The fill, the glow and the glow's entry animation are
+/// the flourish behind `Settings::selection_glow`, off by default — every j/k
+/// step lighting up was a lot of motion for a text cursor.
+///
+/// One function decides this so the setting cannot be honoured by the card
+/// grids and quietly ignored by every list of rows, which is exactly what
+/// happened while each call site spelled the styling out for itself. `id` must
+/// differ per item — `with_animation` keys its state on the element-id path.
+///
+/// Scroll-into-view is *not* here: `anchor_scroll` belongs to the stateful
+/// element traits and takes a per-view anchor, so it stays at the call site,
+/// where it must run whether or not the glow is on.
+pub fn with_focus_cursor<E: IntoElement + Styled + 'static>(
+    id: impl Into<SharedString>,
+    el: E,
+    focused: bool,
+    glow: bool,
+    cx: &App,
+) -> AnyElement {
+    if !focused {
+        return el.into_any_element();
+    }
+    let el = el.border_1().border_color(cx.theme().primary);
+    if !glow {
+        return el.into_any_element();
+    }
+    with_focus_animation(id, el.bg(cx.theme().muted).shadow(focus_glow(cx)), cx).into_any_element()
+}
+
+/// Scroll the vi-focused element into view, from `render`.
+///
+/// A `ScrollAnchor`'s origin is only as fresh as the last paint, and
+/// `ScrollAnchor::scroll_to` applies it at the start of the *next* frame. From
+/// a key handler (input dispatch, before this frame's draw) that origin is
+/// still the row the cursor just LEFT: going down the new row merely rides one
+/// below the top edge, but going up it lands one row above the viewport and
+/// the highlight vanishes. Called from `render` instead, the callback fires a
+/// frame after the focused element's own paint, with its fresh origin; the
+/// `refresh` is what makes that frame draw at all, since a bare scroll offset
+/// dirties nothing and would otherwise sit unpainted until the next repaint.
+///
+/// `synced` tracks the cursor position the scroll has caught up to, so a
+/// repaint that didn't move the cursor doesn't scroll again.
+pub fn sync_focus_scroll(
+    anchor: &ScrollAnchor,
+    cursor: Option<usize>,
+    synced: &mut Option<usize>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if *synced == cursor {
+        return;
+    }
+    *synced = cursor;
+    if cursor.is_some() {
+        anchor.scroll_to(window, cx);
+        window.refresh();
+    }
 }
 
 /// Height of the minimal title bar. macOS's traffic lights are 12px tall and

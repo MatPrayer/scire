@@ -23,7 +23,7 @@ use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::{ConnectionStatus, Session};
-use crate::ui::{focus_glow, with_focus_animation};
+use crate::ui::with_focus_cursor;
 
 const PAGE_SIZE: u32 = 100;
 /// Load the next page when scrolled within this many pixels of the bottom.
@@ -721,7 +721,6 @@ impl AlbumsView {
     ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = album.id.clone();
-        let hover_glow = self.session.read(cx).settings.hover_glow;
         let art = self.art_paths.get(&album.id).cloned();
         let name = album.name.clone();
         let artist = album.artist.clone().unwrap_or_default();
@@ -737,6 +736,7 @@ impl AlbumsView {
         // frame is a resize's worth of allocations for a menu that is usually
         // closed.
         let menu_pl_list = self.menu_playlists.clone();
+        let glow = self.session.read(cx).settings.selection_glow;
 
         let card = v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
@@ -748,22 +748,8 @@ impl AlbumsView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            // Hover glow stays behind its setting; the press dim came in with
-            // the animation pass and is not a glow.
-            .hover(|s| {
-                let s = s.bg(cx.theme().muted);
-                if hover_glow {
-                    s.shadow(focus_glow(cx))
-                } else {
-                    s
-                }
-            })
+            .hover(|s| s.bg(cx.theme().muted))
             .active(|s| s.opacity(0.8))
-            .when(focused, |s| {
-                s.bg(cx.theme().muted)
-                    .border_color(cx.theme().primary)
-                    .shadow(focus_glow(cx))
-            })
             .on_click(move |_, _, cx: &mut App| {
                 open_view.update(cx, |_, cx| cx.emit(AlbumsEvent::OpenAlbum(id.clone())));
             })
@@ -886,11 +872,7 @@ impl AlbumsView {
                 }
                 menu
             });
-        if focused {
-            with_focus_animation(format!("vi-focus-{index}"), card, cx).into_any_element()
-        } else {
-            card.into_any_element()
-        }
+        with_focus_cursor(format!("vi-focus-{index}"), card, focused, glow, cx)
     }
 }
 

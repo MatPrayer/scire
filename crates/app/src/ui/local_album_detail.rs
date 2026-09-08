@@ -20,7 +20,7 @@ use crate::services::library_db::{AlbumRow, LibraryDb};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
-use crate::ui::{focus_glow, format_duration, with_focus_animation};
+use crate::ui::{format_duration, sync_focus_scroll, with_focus_cursor};
 
 pub struct LocalAlbumDetailView {
     db: Arc<LibraryDb>,
@@ -34,6 +34,9 @@ pub struct LocalAlbumDetailView {
     focus_anchor: ScrollAnchor,
     /// Track index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
+    /// Cursor position the scroll has caught up to, so `render` scrolls only
+    /// when the cursor actually moved (`ui::sync_focus_scroll`).
+    vi_scroll_synced: Option<usize>,
     /// Accent extracted from this album's cover, for the page's own tint under
     /// `Settings::adaptive_from_page`; see `album_detail.rs`.
     accent: Option<gpui::Hsla>,
@@ -61,6 +64,7 @@ impl LocalAlbumDetailView {
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
+            vi_scroll_synced: None,
             accent: None,
             accent_for: None,
         };
@@ -164,7 +168,18 @@ impl LocalAlbumDetailView {
 }
 
 impl Render for LocalAlbumDetailView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Scroll-into-view runs here, not in `vi_move`: the anchor's origin
+        // is only as fresh as the last paint, and from a key handler that is
+        // the row the cursor just LEFT — going up, the focused row landed one
+        // row above the viewport and the highlight vanished.
+        sync_focus_scroll(
+            &self.focus_anchor,
+            self.vi_cursor,
+            &mut self.vi_scroll_synced,
+            window,
+            cx,
+        );
         let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
         // This album's own colour, when the page is set to carry one; the
         // playing-track highlight below keeps the theme's accent. Kicked off
@@ -256,6 +271,7 @@ impl Render for LocalAlbumDetailView {
                 )
         };
 
+        let glow = self.session.read(cx).settings.selection_glow;
         let rows: Vec<_> = self
             .tracks
             .iter()
@@ -287,11 +303,7 @@ impl Render for LocalAlbumDetailView {
                             .text_color(cx.theme().primary)
                     })
                     .when(focused, |s| {
-                        s.bg(cx.theme().muted)
-                            .border_1()
-                            .border_color(cx.theme().primary)
-                            .shadow(focus_glow(cx))
-                            .anchor_scroll(Some(self.focus_anchor.clone()))
+                        s.anchor_scroll(Some(self.focus_anchor.clone()))
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -383,11 +395,7 @@ impl Render for LocalAlbumDetailView {
                             )
                         }
                     });
-                if focused {
-                    with_focus_animation(format!("vi-focus-{i}"), row, cx).into_any_element()
-                } else {
-                    row.into_any_element()
-                }
+                with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, cx)
             })
             .collect();
 
@@ -423,7 +431,7 @@ impl Render for LocalAlbumDetailView {
 impl LocalAlbumDetailView {
     /// Move the vi-mode cursor by `delta` tracks, clamping to the track list
     /// and scrolling the focused row into view.
-    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
         let count = self.tracks.len();
         if count == 0 {
             return;
@@ -435,7 +443,6 @@ impl LocalAlbumDetailView {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        self.focus_anchor.scroll_to(window, cx);
         cx.notify();
     }
 

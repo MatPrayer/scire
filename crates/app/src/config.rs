@@ -127,9 +127,6 @@ pub struct Settings {
     pub sidebar_collapsed: bool,
     /// Vi-style modal keyboard navigation.
     pub vi_mode: bool,
-    /// Draw the outer glow on album cards under the mouse. The vi-mode focus
-    /// cursor keeps its glow either way.
-    pub hover_glow: bool,
     /// Draw the back/forward history buttons above the content area. The
     /// mouse's navigation buttons and the `[`/`]` keys work either way.
     pub show_nav_buttons: bool,
@@ -146,6 +143,11 @@ pub struct Settings {
     /// Useful on lower-end GPUs or for users sensitive to motion.
     #[serde(default)]
     pub reduced_motion: bool,
+    /// In vi mode, the focused card's highlight also gets a muted fill, an
+    /// outer glow, and a growing entry animation. Off, the cursor is just a
+    /// primary border around the card.
+    #[serde(default)]
+    pub selection_glow: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -425,11 +427,11 @@ impl Default for Settings {
             sidebar_playlists_collapsed: false,
             sidebar_collapsed: false,
             vi_mode: false,
-            hover_glow: false,
             show_nav_buttons: true,
             adaptive_from_page: false,
             adaptive_page_gradient: false,
             reduced_motion: false,
+            selection_glow: false,
         }
     }
 }
