@@ -582,7 +582,7 @@ impl FullscreenPlayer {
                 .min(0.)
                 .max(1.)
                 .step(0.01)
-                .default_value(initial_volume)
+                .default_value(crate::ui::volume_position(initial_volume))
         });
 
         cx.subscribe(&seek, |this: &mut Self, _, event, cx| {
@@ -598,7 +598,7 @@ impl FullscreenPlayer {
 
         cx.subscribe(&volume, |this: &mut Self, _, event, cx| {
             let SliderEvent::Change(value) = event;
-            let v = value.start().clamp(0., 1.);
+            let v = crate::ui::volume_amplitude(value.start());
             this.player.update(cx, |p, cx| p.set_volume(v, cx));
         })
         .detach();
@@ -1420,7 +1420,12 @@ impl Render for FullscreenPlayer {
         let waveform_enabled = self.session.read(cx).settings.waveform_seekbar;
         let show_volume = self.session.read(cx).settings.fullscreen_volume;
         let detailed_volume = self.session.read(cx).settings.detailed_volume;
-        let volume_level = self.player.read(cx).volume;
+        // The handle's own position, not the amplitude: the slider is tapered,
+        // and a readout in amplitude would disagree with where the handle sits.
+        let volume_level = crate::ui::volume_position(self.player.read(cx).volume);
+        // Keep it in step with changes made elsewhere (player bar, media keys).
+        self.volume
+            .update(cx, |s, cx| s.set_value(volume_level, window, cx));
         let replay_gain = self.player.read(cx).replay_gain_active();
         let stream_info = if is_radio {
             crate::ui::radio_info_line(self.player.read(cx), &self.session.read(cx).settings)

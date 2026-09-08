@@ -69,6 +69,27 @@ pub async fn poll_until_done<T: Send + 'static>(
     task.await
 }
 
+/// Amplitude for a volume slider sitting at `position` [0,1].
+///
+/// The engine's volume is an amplitude multiplier, and a fader that *is* the
+/// amplitude does not feel linear: loudness goes roughly as amplitude^0.6, so a
+/// straight fader spends its top half on changes that are barely audible and
+/// crams everything audible into the bottom of its travel. Squaring the
+/// position makes perceived loudness track the handle about linearly
+/// (position^2 raised to 0.6 is position^1.2) while still reaching silence at
+/// the bottom and unity at the top.
+pub fn volume_amplitude(position: f32) -> f32 {
+    let p = position.clamp(0., 1.);
+    p * p
+}
+
+/// Inverse of `volume_amplitude`: where the handle sits for a given amplitude.
+/// The stored/persisted volume is the amplitude, so this is what the sliders
+/// resync from.
+pub fn volume_position(amplitude: f32) -> f32 {
+    amplitude.clamp(0., 1.).sqrt()
+}
+
 /// Seek position for a `fraction` [0,1] of `total`, guarding against NaN /
 /// non-finite / overflow inputs (which would panic `Duration::from_secs_f32`).
 pub fn seek_position(total: Duration, fraction: f32) -> Duration {
@@ -1168,6 +1189,22 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_volume_taper_round_trips_and_keeps_its_ends() {
+        use super::{volume_amplitude, volume_position};
+        assert_eq!(volume_amplitude(0.), 0.);
+        assert_eq!(volume_amplitude(1.), 1.);
+        // Mid-handle is well under half amplitude — that is the whole point.
+        assert!((volume_amplitude(0.5) - 0.25).abs() < 1e-6);
+        for step in 0..=10 {
+            let p = step as f32 / 10.;
+            assert!((volume_position(volume_amplitude(p)) - p).abs() < 1e-5);
+        }
+        // Out-of-range input is clamped, not propagated as a silly amplitude.
+        assert_eq!(volume_amplitude(2.), 1.);
+        assert_eq!(volume_position(-1.), 0.);
+    }
+
     use super::{
         accent_from_cover_bytes, format_count, format_playtime, grid_columns, grid_columns_padded,
         strip_html, truncate_at_word,

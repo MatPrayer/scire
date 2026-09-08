@@ -91,7 +91,7 @@ impl PlayerBar {
                 .min(0.)
                 .max(1.)
                 .step(0.01)
-                .default_value(initial_volume)
+                .default_value(crate::ui::volume_position(initial_volume))
         });
         let vol_input =
             cx.new(|cx| InputState::new(window, cx).default_value(db_string(initial_volume)));
@@ -149,7 +149,7 @@ impl PlayerBar {
 
         cx.subscribe(&volume, |this: &mut Self, _, event, cx| {
             let SliderEvent::Change(value) = event;
-            let v = value.start().clamp(0., 1.);
+            let v = crate::ui::volume_amplitude(value.start());
             this.player
                 .update(cx, |player, cx| player.set_volume(v, cx));
             this.session.update(cx, |session, _| {
@@ -358,8 +358,9 @@ impl Render for PlayerBar {
         }
         // Keep the volume slider in sync (also reflects media-key / dB-input
         // changes), and refresh the dB input unless the user is editing it.
-        self.volume
-            .update(cx, |s, cx| s.set_value(volume, window, cx));
+        self.volume.update(cx, |s, cx| {
+            s.set_value(crate::ui::volume_position(volume), window, cx)
+        });
         if !self.vol_input_focused {
             self.vol_input
                 .update(cx, |s, cx| s.set_value(db_string(volume), window, cx));

@@ -14,7 +14,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
-use subsonic::{SearchResult3, Song};
+use subsonic::{Artist, SearchResult3, Song};
 
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
@@ -27,6 +27,37 @@ const ART_SIZE: u32 = 64;
 const MAX_SONGS: usize = 8;
 const MAX_ALBUMS: usize = 6;
 const MAX_ARTISTS: usize = 5;
+
+/// How well an artist name answers what was typed. Lower sorts first.
+fn artist_rank(query: &str, name: &str) -> u8 {
+    let q = query.trim().to_lowercase();
+    let n = name.trim().to_lowercase();
+    if q.is_empty() {
+        return 3;
+    }
+    if n == q {
+        return 0;
+    }
+    // "Skrillex & Damian Marley" is the artist plus someone else; "Skrillexia"
+    // is a different name that merely starts with the same letters.
+    if let Some(rest) = n.strip_prefix(&q)
+        && rest.starts_with(|c: char| !c.is_alphanumeric())
+    {
+        return 1;
+    }
+    2
+}
+
+/// Put the artist the user actually typed at the top of the list.
+///
+/// A heavily-featured name matches every collaboration credited as its own
+/// artist ("Skrillex & Damian Marley", "Skrillex, Diplo & …"), and the server
+/// ranks by its own relevance, so the plain artist can land past the handful of
+/// rows this dropdown shows. Sorting is stable, so within a tier the server's
+/// order survives.
+fn rank_artists(query: &str, artists: &mut [Artist]) {
+    artists.sort_by_key(|a| artist_rank(query, &a.name));
+}
 
 pub enum SearchBarEvent {
     OpenAlbum(String),
@@ -268,7 +299,9 @@ impl SearchBar {
                         None => merged = Some(r),
                     }
                 }
-                Ok::<_, anyhow::Error>(merged.unwrap_or_default())
+                let mut merged = merged.unwrap_or_default();
+                rank_artists(&query, &mut merged.artist);
+                Ok::<_, anyhow::Error>(merged)
             })
             .await;
             let _ = this.update(cx, |bar, cx| {
@@ -670,5 +703,43 @@ impl Render for SearchBar {
         }
         // ponytail: inline search bar removed. Only palette mode (Ctrl+K) remains.
         div().into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artist(name: &str) -> Artist {
+        Artist {
+            id: name.to_string(),
+            name: name.to_string(),
+            cover_art: None,
+            album_count: None,
+            artist_image_url: None,
+            biography: None,
+            starred: None,
+        }
+    }
+
+    #[test]
+    fn the_typed_artist_outranks_its_collaborations() {
+        let mut artists = vec![
+            artist("Skrillex & Damian Marley"),
+            artist("Skrillexia"),
+            artist("Boys Noize & Skrillex"),
+            artist("Skrillex"),
+        ];
+        rank_artists("skrillex", &mut artists);
+        let names: Vec<_> = artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names[0], "Skrillex");
+        assert_eq!(names[1], "Skrillex & Damian Marley");
+        // Neither an exact nor a collaboration match; the server's order holds.
+        assert_eq!(&names[2..], ["Skrillexia", "Boys Noize & Skrillex"]);
+    }
+
+    #[test]
+    fn ranking_ignores_case_and_surrounding_space() {
+        assert_eq!(artist_rank(" SKRILLEX ", "skrillex"), 0);
     }
 }

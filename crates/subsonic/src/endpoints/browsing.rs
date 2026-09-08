@@ -139,7 +139,11 @@ impl SubsonicClient {
         // Explicit counts: don't rely on server defaults for any category.
         let mut params: Vec<(&str, &str)> = vec![
             ("query", query),
-            ("artistCount", "12"),
+            // Deliberately generous: a heavily-featured name ("Skrillex")
+            // matches dozens of collaboration artists, and the one the user
+            // typed can sit well down the server's list. The client ranks the
+            // exact match to the top, but only out of what it was sent.
+            ("artistCount", "40"),
             ("albumCount", "12"),
             ("songCount", "25"),
         ];
