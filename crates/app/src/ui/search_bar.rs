@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement,
-    KeyDownEvent, Render, ScrollHandle, Window, div, ease_out_quint, img, prelude::*, px,
+    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, Focusable as _,
+    IntoElement, KeyDownEvent, Render, ScrollHandle, Window, div, ease_out_quint, img, prelude::*,
+    px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -137,6 +138,17 @@ impl SearchBar {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// True while the query field holds the keyboard, in either form of the
+    /// bar (top-right dropdown or centred palette).
+    ///
+    /// The root view's shortcuts stand down while this is true. A space typed
+    /// into a query is a space, and the shortcut does not merely win the key —
+    /// stopping propagation for it means gpui never falls through to text
+    /// insertion, so the character is swallowed outright.
+    pub fn is_typing(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     pub fn is_palette(&self) -> bool {

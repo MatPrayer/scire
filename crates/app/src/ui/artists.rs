@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, IntoElement, Render, SharedString, UniformListScrollHandle,
-    Window, div, img, prelude::*, px, uniform_list,
+    App, Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle,
+    SharedString, UniformListScrollHandle, Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::link::Link;
@@ -19,7 +19,7 @@ use crate::services::library_db::{LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
-use crate::ui::{focus_glow, strip_html, truncate_at_word, with_focus_animation};
+use crate::ui::{strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor};
 
 const ART_SIZE: u32 = 320;
 
@@ -399,6 +399,7 @@ impl ArtistsView {
         let art = self.art_paths.get(card.id.as_ref()).cloned();
         let id = card.id.clone();
         let view = entity.clone();
+        let glow = self.session.read(cx).settings.selection_glow;
         let card_el = v_flex()
             .id(card.id.clone())
             .w(px(tile + crate::ui::CARD_PADDING))
@@ -409,11 +410,6 @@ impl ArtistsView {
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().muted))
             .active(|s| s.opacity(0.8))
-            .when(focused, |s| {
-                s.border_1()
-                    .border_color(cx.theme().primary)
-                    .shadow(focus_glow(cx))
-            })
             .on_click(move |_, _, cx: &mut gpui::App| {
                 let id = id.clone();
                 view.update(cx, |_, cx| {
@@ -466,12 +462,7 @@ impl ArtistsView {
                             .child(card.albums.clone()),
                     ),
             );
-        let card_el = if focused {
-            with_focus_animation(card.id.clone(), card_el, cx).into_any_element()
-        } else {
-            card_el.into_any_element()
-        };
-        card_el
+        with_focus_cursor(card.id.clone(), card_el, focused, glow, cx)
     }
 }
 
@@ -654,6 +645,18 @@ pub struct ArtistDetailView {
     image_requested: bool,
     /// Long bios render clamped to a few lines until expanded.
     bio_expanded: bool,
+    scroll: ScrollHandle,
+    focus_anchor: ScrollAnchor,
+    /// Album id per flattened discography card (album cards then singles/EPs),
+    /// rebuilt each render to map the vi cursor index onto a card.
+    discography_ids: Vec<String>,
+    /// Whether the bio "More/Less" toggle is present and can take the cursor.
+    bio_toggle_focusable: bool,
+    /// Discography card / bio toggle index under the vi-mode cursor.
+    vi_cursor: Option<usize>,
+    /// Cursor position the scroll has caught up to, so `render` scrolls only
+    /// when the cursor actually moved (`ui::sync_focus_scroll`).
+    vi_scroll_synced: Option<usize>,
 }
 
 pub enum ArtistDetailEvent {
@@ -669,6 +672,7 @@ impl ArtistDetailView {
         artist_id: String,
         cx: &mut Context<Self>,
     ) -> Self {
+        let scroll = ScrollHandle::new();
         let mut this = Self {
             session,
             player,
@@ -682,6 +686,12 @@ impl ArtistDetailView {
             info: None,
             image_requested: false,
             bio_expanded: false,
+            scroll: scroll.clone(),
+            focus_anchor: ScrollAnchor::for_handle(scroll),
+            discography_ids: Vec::new(),
+            bio_toggle_focusable: false,
+            vi_cursor: None,
+            vi_scroll_synced: None,
         };
         this.load(cx);
         this
@@ -865,10 +875,129 @@ impl ArtistDetailView {
         })
         .detach();
     }
-}
 
-/// Order an artist's albums newest first, undated albums last (Navidrome's own
-/// order is not guaranteed).
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+        let bio = self.bio_toggle_focusable as usize;
+        let count = self.discography_ids.len() + bio;
+        if count == 0 {
+            return;
+        }
+        let cur = self.vi_cursor.unwrap_or(0);
+        let next = if delta > 0 {
+            (cur + delta as usize).min(count - 1)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs())
+        };
+        self.vi_cursor = Some(next);
+        cx.notify();
+    }
+
+    pub fn vi_clear(&mut self, cx: &mut Context<Self>) {
+        if self.vi_cursor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Enter on a focused discography card opens the album; on the bio toggle
+    /// it expands/collapses the biography.
+    pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.vi_cursor else {
+            return;
+        };
+        if let Some(id) = self.discography_ids.get(i) {
+            cx.emit(ArtistDetailEvent::OpenAlbum(id.clone()));
+        } else if self.bio_toggle_focusable {
+            self.bio_expanded = !self.bio_expanded;
+            cx.notify();
+        }
+    }
+
+    /// One discography card, focus-ringed and scroll-anchored when the vi
+    /// cursor is on it.
+    fn render_album_card(
+        &self,
+        album: &Album,
+        play_index: usize,
+        flat: usize,
+        focused: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let id = album.id.clone();
+        let play_id = album.id.clone();
+        let art = self.art_paths.get(&album.id).cloned();
+        let year = album.year.map(|y| y.to_string()).unwrap_or_default();
+        let anchor = self.focus_anchor.clone();
+        let glow = self.session.read(cx).settings.selection_glow;
+        let card = v_flex()
+            .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
+            .group("aacard")
+            .w(px(172.))
+            .p_1p5()
+            .gap_1p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().muted))
+            .active(|s| s.opacity(0.8))
+            .when(focused, |s| s.anchor_scroll(Some(anchor)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(ArtistDetailEvent::OpenAlbum(id.clone()));
+            }))
+            .child(
+                div()
+                    .size(px(160.))
+                    .rounded_lg()
+                    .bg(cx.theme().muted)
+                    .overflow_hidden()
+                    .shadow_sm()
+                    .relative()
+                    .when_some(art, |this, path| {
+                        this.child(img(path).size(px(160.)).rounded_lg())
+                    })
+                    // Hover play button over the artwork, same as the
+                    // album grid's cards.
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_2()
+                            .right_2()
+                            .opacity(0.)
+                            .group_hover("aacard", |s| s.opacity(1.))
+                            .child(
+                                Button::new(("artist-album-play", play_index))
+                                    .primary()
+                                    .icon(app_icon(icons::PLAY))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.play_album(play_id.clone(), cx);
+                                        cx.stop_propagation();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_0()
+                    // Explicit line heights: the default line box clips
+                    // descenders (y, g, j) inside truncated text.
+                    .child(
+                        div()
+                            .text_sm()
+                            .line_height(px(20.))
+                            .truncate()
+                            .child(album.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(px(17.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(year),
+                    ),
+            );
+        with_focus_cursor(format!("vi-artist-card-{flat}"), card, focused, glow, cx)
+    }
+}
 fn sort_discography(albums: &mut [Album]) {
     albums.sort_by(|a, b| {
         b.year
@@ -879,7 +1008,18 @@ fn sort_discography(albums: &mut [Album]) {
 }
 
 impl Render for ArtistDetailView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Scroll-into-view runs here, not in `vi_move`: the anchor's origin
+        // is only as fresh as the last paint, and from a key handler that is
+        // the row the cursor just LEFT — going up, the focused row landed one
+        // row above the viewport and the highlight vanished.
+        sync_focus_scroll(
+            &self.focus_anchor,
+            self.vi_cursor,
+            &mut self.vi_scroll_synced,
+            window,
+            cx,
+        );
         let name = self
             .artist
             .as_ref()
@@ -932,88 +1072,34 @@ impl Render for ArtistDetailView {
             .map(|g| format!("Genres: {g}"));
         let hero_art = self.artist_image_path.clone();
 
+        // Build the discography in render order (album cards first, then
+        // singles/EPs) and record each card's album id at its flat vi index.
+        self.discography_ids.clear();
         let mut album_cards: Vec<gpui::AnyElement> = Vec::new();
         let mut single_cards: Vec<gpui::AnyElement> = Vec::new();
         if let Some(artist) = self.artist.as_ref() {
             for (index, album) in artist.album.iter().enumerate() {
-                let id = album.id.clone();
-                let play_id = album.id.clone();
-                let art = self.art_paths.get(&album.id).cloned();
-                let year = album.year.map(|y| y.to_string()).unwrap_or_default();
-                let card = v_flex()
-                    .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
-                    .group("aacard")
-                    .w(px(172.))
-                    .p_1p5()
-                    .gap_1p5()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(gpui::hsla(0., 0., 0.5, 0.15))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().muted))
-                    .active(|s| s.opacity(0.8))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(ArtistDetailEvent::OpenAlbum(id.clone()));
-                    }))
-                    .child(
-                        div()
-                            .size(px(160.))
-                            .rounded_lg()
-                            .bg(cx.theme().muted)
-                            .overflow_hidden()
-                            .shadow_sm()
-                            .relative()
-                            .when_some(art, |this, path| {
-                                this.child(img(path).size(px(160.)).rounded_lg())
-                            })
-                            // Hover play button over the artwork, same as the
-                            // album grid's cards.
-                            .child(
-                                div()
-                                    .absolute()
-                                    .bottom_2()
-                                    .right_2()
-                                    .opacity(0.)
-                                    .group_hover("aacard", |s| s.opacity(1.))
-                                    .child(
-                                        Button::new(("artist-album-play", index))
-                                            .primary()
-                                            .icon(app_icon(icons::PLAY))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.play_album(play_id.clone(), cx);
-                                                cx.stop_propagation();
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_0()
-                            // Explicit line heights: the default line box clips
-                            // descenders (y, g, j) inside truncated text.
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .line_height(px(20.))
-                                    .truncate()
-                                    .child(album.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .line_height(px(17.))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(year),
-                            ),
-                    )
-                    .into_any_element();
                 if is_single_or_ep(album) {
-                    single_cards.push(card);
-                } else {
-                    album_cards.push(card);
+                    continue;
                 }
+                let flat = self.discography_ids.len();
+                self.discography_ids.push(album.id.clone());
+                let focused = self.vi_cursor == Some(flat);
+                album_cards.push(self.render_album_card(album, index, flat, focused, cx));
+            }
+            for (index, album) in artist.album.iter().enumerate() {
+                if !is_single_or_ep(album) {
+                    continue;
+                }
+                let flat = self.discography_ids.len();
+                self.discography_ids.push(album.id.clone());
+                let focused = self.vi_cursor == Some(flat);
+                single_cards.push(self.render_album_card(album, index, flat, focused, cx));
             }
         }
+        // The bio More/Less toggle is the last target when it exists.
+        self.bio_toggle_focusable = bio_long;
+        let bio_focused = bio_long && self.vi_cursor == Some(self.discography_ids.len());
 
         let make_section = |title: String, cards: Vec<gpui::AnyElement>| {
             let title_text = title.clone();
@@ -1037,6 +1123,7 @@ impl Render for ArtistDetailView {
             .id("artist-detail-scroll")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .p_4()
             .gap_4()
             .child(
@@ -1075,23 +1162,28 @@ impl Render for ArtistDetailView {
                                     .child(div().text_sm().child(bio_text))
                                     .when(bio_long, |this| {
                                         let expanded = self.bio_expanded;
-                                        this.child(
-                                            h_flex().child(
-                                                Button::new("bio-toggle")
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .label(if expanded { "Less" } else { "More" })
-                                                    .icon(Icon::new(if expanded {
-                                                        IconName::ChevronUp
-                                                    } else {
-                                                        IconName::ChevronDown
-                                                    }))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.bio_expanded = !this.bio_expanded;
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                        )
+                                        let focused = bio_focused;
+                                        let glow = self.session.read(cx).settings.selection_glow;
+                                        let btn = Button::new("bio-toggle")
+                                            .ghost()
+                                            .xsmall()
+                                            .label(if expanded { "Less" } else { "More" })
+                                            .icon(Icon::new(if expanded {
+                                                IconName::ChevronUp
+                                            } else {
+                                                IconName::ChevronDown
+                                            }))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.bio_expanded = !this.bio_expanded;
+                                                cx.notify();
+                                            }));
+                                        this.child(h_flex().child(with_focus_cursor(
+                                            "vi-bio-toggle",
+                                            btn,
+                                            focused,
+                                            glow,
+                                            cx,
+                                        )))
                                     })
                                     .when_some(genres_line, |this, desc| {
                                         this.child(

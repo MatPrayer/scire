@@ -1,8 +1,8 @@
 //! Playlist page: rename, delete, play, remove songs.
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle, Window, div,
-    prelude::*, px,
+    App, Context, Entity, EventEmitter, Focusable as _, IntoElement, Render, ScrollAnchor,
+    ScrollHandle, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -16,7 +16,7 @@ use crate::services::runtime;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
-use crate::ui::{focus_glow, format_duration, track_extras, with_focus_animation};
+use crate::ui::{format_duration, sync_focus_scroll, track_extras, with_focus_cursor};
 
 pub enum PlaylistDetailEvent {
     /// Playlist was deleted — navigate away.
@@ -39,6 +39,9 @@ pub struct PlaylistDetailView {
     focus_anchor: ScrollAnchor,
     /// Song index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
+    /// Cursor position the scroll has caught up to, so `render` scrolls only
+    /// when the cursor actually moved (`ui::sync_focus_scroll`).
+    vi_scroll_synced: Option<usize>,
 }
 
 impl EventEmitter<PlaylistDetailEvent> for PlaylistDetailView {}
@@ -93,6 +96,7 @@ impl PlaylistDetailView {
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
+            vi_scroll_synced: None,
         };
         this.load(cx);
         this
@@ -153,6 +157,17 @@ impl PlaylistDetailView {
 
 impl Render for PlaylistDetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Scroll-into-view runs here, not in `vi_move`: the anchor's origin
+        // is only as fresh as the last paint, and from a key handler that is
+        // the row the cursor just LEFT — going up, the focused row landed one
+        // row above the viewport and the highlight vanished.
+        sync_focus_scroll(
+            &self.focus_anchor,
+            self.vi_cursor,
+            &mut self.vi_scroll_synced,
+            window,
+            cx,
+        );
         let playing_id = self.playing_id.clone();
         let name = self
             .playlist
@@ -233,6 +248,7 @@ impl Render for PlaylistDetailView {
             );
 
         let info_prefs = self.session.read(cx).settings.track_info.clone();
+        let glow = self.session.read(cx).settings.selection_glow;
 
         let rows: Vec<_> = self
             .playlist
@@ -264,11 +280,7 @@ impl Render for PlaylistDetailView {
                             .text_color(cx.theme().primary)
                     })
                     .when(focused, |s| {
-                        s.bg(cx.theme().muted)
-                            .border_1()
-                            .border_color(cx.theme().primary)
-                            .shadow(focus_glow(cx))
-                            .anchor_scroll(Some(self.focus_anchor.clone()))
+                        s.anchor_scroll(Some(self.focus_anchor.clone()))
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -317,15 +329,10 @@ impl Render for PlaylistDetailView {
                                 cx.stop_propagation();
                             })),
                     );
-                if focused {
-                    with_focus_animation(format!("vi-focus-{i}"), row, cx).into_any_element()
-                } else {
-                    row.into_any_element()
-                }
+                with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, cx)
             })
             .collect();
 
-        let _ = window;
         v_flex()
             .id("playlist-scroll")
             .size_full()
@@ -350,7 +357,7 @@ impl Render for PlaylistDetailView {
 impl PlaylistDetailView {
     /// Move the vi-mode cursor by `delta` songs, clamping to the playlist's
     /// track list and scrolling the focused row into view.
-    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(count) = self.playlist.as_ref().map(|p| p.songs.len()) else {
             return;
         };
@@ -364,7 +371,6 @@ impl PlaylistDetailView {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        self.focus_anchor.scroll_to(window, cx);
         cx.notify();
     }
 
@@ -372,6 +378,15 @@ impl PlaylistDetailView {
         if self.vi_cursor.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// True while the rename box has the keyboard — playlist names have spaces
+    /// in them more often than not.
+    pub fn is_typing(&self, window: &Window, cx: &App) -> bool {
+        self.rename_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
     }
 
     /// Play the track under the vi-mode cursor.

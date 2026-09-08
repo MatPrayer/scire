@@ -2,7 +2,7 @@
 //! (sidebar | content | optional queue panel / player bar).
 
 use gpui::{
-    Animation, AnimationExt as _, AsyncWindowContext, Context, ElementId, Entity, FocusHandle,
+    Animation, AnimationExt as _, App, AsyncWindowContext, Context, ElementId, Entity, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, MouseButton, NavigationDirection, Render, SharedString,
     WeakEntity, Window, div, ease_out_quint, prelude::*, px,
 };
@@ -40,7 +40,9 @@ use crate::ui::radio::RadioView;
 use crate::ui::recent::RecentView;
 use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 use crate::ui::settings::SettingsView;
-use crate::ui::sidebar::{NavSection, SidebarAction, SidebarModel, render_sidebar};
+use crate::ui::sidebar::{
+    NavSection, SidebarAction, SidebarFocus, SidebarModel, render_sidebar, sidebar_targets,
+};
 
 /// How often a running refresh resamples its workers' progress counters.
 const REFRESH_POLL: Duration = Duration::from_millis(400);
@@ -58,17 +60,6 @@ enum KeyboardMode {
     Insert,
     Command,
 }
-
-/// Navigation-section order for vi-mode j/k cycling.
-const NAV_ORDER: &[NavSection] = &[
-    NavSection::Albums,
-    NavSection::Artists,
-    NavSection::Favorites,
-    NavSection::Recent,
-    NavSection::Radio,
-    NavSection::LocalMusic,
-    NavSection::Settings,
-];
 
 #[derive(Clone)]
 enum NavEntry {
@@ -187,6 +178,10 @@ pub struct RootView {
     refreshing: bool,
     /// What that refresh is doing right now, for the sidebar's progress bar.
     refresh_stage: RefreshStage,
+    /// Folded rail only: whether the playlist dropdown is showing. The vi
+    /// cursor opens it on its way through the playlists, so it cannot be left
+    /// to the popover's own internal state.
+    rail_playlists_open: bool,
     /// New-playlist dialog state.
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
@@ -505,6 +500,7 @@ impl RootView {
             playlists_collapsed,
             sidebar_collapsed,
             portrait: None,
+            rail_playlists_open: false,
             new_playlist_open: false,
             new_pl_name,
             new_pl_desc,
@@ -527,6 +523,9 @@ impl RootView {
     /// to landscape restores.
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        // The dropdown belongs to the folded rail; unfolding puts the same
+        // playlists back in rows and leaving it open would stack the two.
+        self.rail_playlists_open = false;
         let collapsed = self.sidebar_collapsed;
         self.session.update(cx, |session, _| {
             session.settings.sidebar_collapsed = collapsed;
@@ -927,16 +926,23 @@ impl RootView {
                 let Some(window) = window else {
                     return; // radio's add-station form needs a window
                 };
-                let view = cx
-                    .new(|cx| RadioView::new(self.radio.clone(), self.player.clone(), window, cx));
+                let view = cx.new(|cx| {
+                    RadioView::new(
+                        self.radio.clone(),
+                        self.player.clone(),
+                        self.session.clone(),
+                        window,
+                        cx,
+                    )
+                });
                 Content::Radio(view)
             }
             NavSection::LocalMusic => {
                 let view = cx.new(|cx| {
                     LocalMusicView::new(
+                        self.session.clone(),
                         self.library_db.clone(),
                         self.player.clone(),
-                        self.session.clone(),
                         cx,
                     )
                 });
@@ -1167,89 +1173,200 @@ impl RootView {
         }
     }
 
-    fn sidebar_select_next(&mut self) {
-        self.vi_selected = (self.vi_selected + 1) % NAV_ORDER.len();
+    /// The sidebar j/k target list for this frame's shape (collapsed rail vs.
+    /// expanded with playlists).
+    fn current_sidebar_targets(&self, cx: &App) -> Vec<SidebarFocus> {
+        let playlists: Vec<(String, String)> = self
+            .playlists
+            .read(cx)
+            .playlists
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
+        sidebar_targets(self.sidebar_collapsed, &playlists)
     }
 
-    fn sidebar_select_prev(&mut self) {
+    fn sidebar_select_next(&mut self, cx: &mut Context<Self>) {
+        let len = self.current_sidebar_targets(cx).len();
+        if len == 0 {
+            self.vi_selected = 0;
+            return;
+        }
+        self.vi_selected = (self.vi_selected + 1) % len;
+        self.sync_rail_playlists(cx);
+    }
+
+    fn sidebar_select_prev(&mut self, cx: &mut Context<Self>) {
+        let len = self.current_sidebar_targets(cx).len();
+        if len == 0 {
+            self.vi_selected = 0;
+            return;
+        }
         self.vi_selected = if self.vi_selected == 0 {
-            NAV_ORDER.len() - 1
+            len - 1
         } else {
             self.vi_selected - 1
         };
+        self.sync_rail_playlists(cx);
+    }
+
+    /// Show the folded rail's playlist dropdown while the cursor is inside it.
+    ///
+    /// Collapsed there are no playlist rows to mark, so the dropdown standing
+    /// in for them is what the cursor is walking; it opens on the way in and
+    /// closes on the way out. Nothing happens while the sidebar is expanded,
+    /// where the rows are on screen already.
+    fn sync_rail_playlists(&mut self, cx: &mut Context<Self>) {
+        let on_playlist = matches!(
+            self.current_sidebar_targets(cx).get(self.vi_selected),
+            Some(SidebarFocus::Playlist(_))
+        );
+        self.rail_playlists_open = self.sidebar_collapsed && on_playlist;
     }
 
     fn content_vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::ArtistDetail(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::LocalAlbumDetail(v)) => {
                 v.update(cx, |v, cx| v.vi_move(delta, window, cx))
             }
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
-            // No cursor protocol on these three, so j/k does nothing there.
-            // Spelled out rather than caught by `_`: the match is exhaustive
-            // so a new `Content` variant is a compile error here instead of a
-            // page where the keyboard silently stops working.
-            Some(Content::ArtistDetail(_))
-            | Some(Content::Radio(_))
-            | Some(Content::Settings(_)) => {}
             None => {}
         }
     }
 
     /// Enter: open/play the focused item in the content region.
-    fn content_vi_activate(&mut self, cx: &mut Context<Self>) {
+    fn content_vi_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::ArtistDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_activate(window, cx)),
+            Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_activate(window, cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
-            Some(Content::ArtistDetail(_))
-            | Some(Content::Radio(_))
-            | Some(Content::Settings(_)) => {}
             None => {}
         }
     }
 
-    /// Cycle the album filter tab (`[`/`]`). No-op outside the album grid.
-    fn content_vi_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if let Some(Content::Albums(v)) = &self.content {
-            v.update(cx, |v, cx| v.vi_tab(delta, cx));
+    /// `i` on a content page with its own text field: focus that field.
+    fn content_vi_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.content {
+            Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
+            Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
+            _ => {}
+        }
+    }
+
+    /// Cycle the album filter tab or the Settings sections (`[`/`]`).
+    fn content_vi_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.content {
+            Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_tab(delta, cx)),
+            Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_tab(delta, window, cx)),
+            _ => {}
         }
     }
 
     /// Forget the per-view vi cursor when the mode is turned off, so no
     /// stale highlight survives a settings toggle.
     fn vi_clear_cursors(&mut self, cx: &mut Context<Self>) {
+        // The folded rail's dropdown is a cursor of sorts as well: only vi mode
+        // opens it from the keyboard, so it must not be left hanging over the
+        // rail once the mode is gone.
+        self.rail_playlists_open = false;
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::ArtistDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
-            Some(Content::ArtistDetail(_))
-            | Some(Content::Radio(_))
-            | Some(Content::Settings(_)) => {}
             None => {}
         }
     }
 
     fn sidebar_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.vi_selected < NAV_ORDER.len() {
-            let section = NAV_ORDER[self.vi_selected];
-            self.navigate_push(section, window, cx);
+        let Some(target) = self
+            .current_sidebar_targets(cx)
+            .get(self.vi_selected)
+            .cloned()
+        else {
+            return;
+        };
+        match target {
+            SidebarFocus::Section(section) => self.navigate_push(section, window, cx),
+            SidebarFocus::Playlist(id) => {
+                // The pick is made; the dropdown has served its purpose, same
+                // as when one of its rows is clicked.
+                self.rail_playlists_open = false;
+                self.open_playlist(id, window, cx);
+            }
+            SidebarFocus::Refresh => self.refresh_library(window, cx),
+        }
+    }
+
+    /// Whether a text field is taking the keys, so the vi shortcuts must not.
+    ///
+    /// In insert mode the focused thing is a field a view put the cursor in, so
+    /// anything holding focus other than this view's own handle counts.
+    ///
+    /// Normal mode cannot use that test: gpui-component's buttons are focusable
+    /// and gpui focuses anything with a tracked handle on mouse-down, so "focus
+    /// is not mine" would read as "the user is typing" from the first button
+    /// click onwards and j/k would go dead for the rest of the session. Every
+    /// field is therefore asked directly — reachable in normal mode by clicking
+    /// into it, which is how a space ends up wanted rather than a shortcut.
+    fn vi_typing(&self, window: &Window, cx: &App) -> bool {
+        if self.mode == KeyboardMode::Insert {
+            return window
+                .focused(cx)
+                .is_some_and(|focused| focused != self.focus_handle);
+        }
+        let mine = [
+            &self.new_pl_name,
+            &self.new_pl_desc,
+            &self.cmd_input,
+            &self.setup_server_url,
+            &self.setup_username,
+            &self.setup_password,
+            &self.setup_dir_input,
+        ];
+        if mine
+            .iter()
+            .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+        {
+            return true;
+        }
+        self.search_bar.read(cx).is_typing(window, cx)
+            || self.player_bar.read(cx).is_typing()
+            || self.content_typing(window, cx)
+    }
+
+    /// The current page's own text fields, for `vi_typing`. Only the three
+    /// views that have any are listed.
+    fn content_typing(&self, window: &Window, cx: &App) -> bool {
+        match &self.content {
+            Some(Content::Settings(v)) => v.read(cx).is_typing(window, cx),
+            Some(Content::Radio(v)) => v.read(cx).is_typing(window, cx),
+            Some(Content::Playlist(v)) => v.read(cx).is_typing(window, cx),
+            _ => false,
         }
     }
 
@@ -1258,11 +1375,11 @@ impl RootView {
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
-        _is_text_input: bool,
+        is_text_input: bool,
     ) {
         match self.mode {
-            KeyboardMode::Normal => self.handle_vi_normal(event, window, cx),
-            KeyboardMode::Insert => self.handle_vi_insert(event, window, cx),
+            KeyboardMode::Normal => self.handle_vi_normal(event, window, cx, is_text_input),
+            KeyboardMode::Insert => self.handle_vi_insert(event, window, cx, is_text_input),
             KeyboardMode::Command => self.handle_vi_command(event, window, cx),
         }
     }
@@ -1272,9 +1389,17 @@ impl RootView {
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
+        is_text_input: bool,
     ) {
         let key = event.keystroke.key.as_str();
         let ctrl = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        // A focused query box owns the keyboard: every one of these shortcuts
+        // is a printable character, and claiming the key here also swallows it
+        // (gpui only inserts text for a keystroke nothing else took). Escape is
+        // the exception, since dismissing the box is how the shortcuts return.
+        if is_text_input && key != "escape" {
+            return;
+        }
         // Shift+/ → "?" help toggle (some layouts report "/" with shift)
         if !ctrl && key == "/" && event.keystroke.modifiers.shift {
             self.show_vi_help = !self.show_vi_help;
@@ -1286,6 +1411,7 @@ impl RootView {
             // Region switching (vim-window style)
             (true, "h") => {
                 self.focus_region = FocusRegion::Sidebar;
+                self.sync_rail_playlists(cx);
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -1302,7 +1428,7 @@ impl RootView {
             // j/k dispatch by current region
             (false, "j") => match self.focus_region {
                 FocusRegion::Sidebar => {
-                    self.sidebar_select_next();
+                    self.sidebar_select_next(cx);
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -1319,7 +1445,7 @@ impl RootView {
             },
             (false, "k") => match self.focus_region {
                 FocusRegion::Sidebar => {
-                    self.sidebar_select_prev();
+                    self.sidebar_select_prev(cx);
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -1350,7 +1476,7 @@ impl RootView {
                     cx.stop_propagation();
                 }
                 FocusRegion::Content => {
-                    self.content_vi_activate(cx);
+                    self.content_vi_activate(window, cx);
                     cx.stop_propagation();
                 }
                 FocusRegion::PlayerBar => {
@@ -1360,7 +1486,11 @@ impl RootView {
             },
             // Media keys
             (false, "space") => {
-                self.player.update(cx, |p, cx| p.toggle_play(cx));
+                if matches!(self.content, Some(Content::Settings(_))) {
+                    self.content_vi_activate(window, cx);
+                } else {
+                    self.player.update(cx, |p, cx| p.toggle_play(cx));
+                }
                 cx.stop_propagation();
             }
             (false, "left") => {
@@ -1373,14 +1503,17 @@ impl RootView {
             }
             // Album filter tabs (new/random/...) in the grid.
             (false, "[") => {
-                self.content_vi_tab(-1, cx);
+                self.content_vi_tab(-1, window, cx);
                 cx.stop_propagation();
             }
             (false, "]") => {
-                self.content_vi_tab(1, cx);
+                self.content_vi_tab(1, window, cx);
                 cx.stop_propagation();
             }
             (false, "i") => {
+                if matches!(self.content, Some(Content::Settings(_) | Content::Radio(_))) {
+                    self.content_vi_insert(window, cx);
+                }
                 self.mode = KeyboardMode::Insert;
                 cx.notify();
                 cx.stop_propagation();
@@ -1430,6 +1563,7 @@ impl RootView {
         event: &KeyDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
+        is_text_input: bool,
     ) {
         let key = event.keystroke.key.as_str();
         match key {
@@ -1438,26 +1572,28 @@ impl RootView {
                 cx.notify();
                 cx.stop_propagation();
             }
-            // Media keys still work in insert mode.
-            "space" => {
+            // Media keys still work in insert mode — but not while a field has
+            // the keyboard. Space belongs to the text being typed there, and
+            // the arrows to its caret.
+            "space" if !is_text_input => {
                 self.player.update(cx, |p, cx| p.toggle_play(cx));
                 cx.stop_propagation();
             }
-            "left" => {
+            "left" if !is_text_input => {
                 self.player.update(cx, |p, cx| p.previous(cx));
                 cx.stop_propagation();
             }
-            "right" => {
+            "right" if !is_text_input => {
                 self.player.update(cx, |p, cx| p.next(cx));
                 cx.stop_propagation();
             }
-            "up" => {
+            "up" if !is_text_input => {
                 self.player.update(cx, |p, cx| {
                     p.set_volume((p.volume + 0.05).min(1.0), cx);
                 });
                 cx.stop_propagation();
             }
-            "down" => {
+            "down" if !is_text_input => {
                 self.player.update(cx, |p, cx| {
                     p.set_volume((p.volume - 0.05).max(0.0), cx);
                 });
@@ -1672,17 +1808,23 @@ impl RootView {
                     .child(div().text_lg().font_semibold().child("Vi-mode help"))
                     .child(key(
                         "j / k".into(),
-                        "Scroll / navigate current region".into(),
+                        "Navigate sidebar (incl. playlists), grids, settings".into(),
                     ))
                     .child(key(
                         "Ctrl+h/j/k/l".into(),
                         "Focus sidebar / player / content".into(),
                     ))
-                    .child(key("Enter".into(), "Open/play focused item".into()))
+                    .child(key(
+                        "Enter".into(),
+                        "Open/play focused item; toggle Settings control".into(),
+                    ))
                     .child(key("h / l".into(), "Back / forward in history".into()))
-                    .child(key("Space".into(), "Toggle play/pause".into()))
+                    .child(key(
+                        "Space".into(),
+                        "Toggle play/pause; toggle Settings control".into(),
+                    ))
                     .child(key("← / →".into(), "Previous / next track".into()))
-                    .child(key("[ / ]".into(), "Album tabs: new/random/…".into()))
+                    .child(key("[ / ]".into(), "Album tabs / Settings sections".into()))
                     .child(key("i".into(), "Insert mode (pass keys to input)".into()))
                     .child(key(":".into(), "Command mode (:q / :help)".into()))
                     .child(key(":newpl <name>".into(), "Create playlist".into()))
@@ -2052,6 +2194,18 @@ impl Render for RootView {
             .server
             .as_ref()
             .map(|s| s.username.clone());
+        let sidebar_targets = self.current_sidebar_targets(cx);
+        if !sidebar_targets.is_empty() {
+            self.vi_selected = self.vi_selected.min(sidebar_targets.len() - 1);
+        }
+        let vi_selected = if self.vi_enabled
+            && self.mode == KeyboardMode::Normal
+            && self.focus_region == FocusRegion::Sidebar
+        {
+            sidebar_targets.get(self.vi_selected).cloned()
+        } else {
+            None
+        };
         let sidebar_model = SidebarModel {
             active: self.section,
             active_playlist: self.active_playlist.clone(),
@@ -2081,14 +2235,8 @@ impl Render for RootView {
             refreshing: self.refreshing,
             refresh_stage: self.refresh_stage,
             collapsed: self.sidebar_collapsed,
-            vi_selected_section: if self.vi_enabled
-                && self.mode == KeyboardMode::Normal
-                && self.focus_region == FocusRegion::Sidebar
-            {
-                Some(NAV_ORDER[self.vi_selected])
-            } else {
-                None
-            },
+            vi_selected,
+            playlist_menu_open: self.rail_playlists_open,
         };
 
         let this = cx.entity();
@@ -2128,7 +2276,8 @@ impl Render for RootView {
                     return;
                 }
                 if this.vi_enabled {
-                    this.handle_vi_key(event, window, cx, false);
+                    let typing = this.vi_typing(window, cx);
+                    this.handle_vi_key(event, window, cx, typing);
                 } else {
                     // Ctrl+K (Cmd+K) opens the command palette (vi-mode excluded).
                     if event.keystroke.key == "k"
@@ -2146,21 +2295,21 @@ impl Render for RootView {
                             this.player.update(cx, |p, cx| p.toggle_play(cx));
                             cx.stop_propagation();
                         }
-                        "left" => {
+                        "left" if !is_text_input => {
                             this.player.update(cx, |p, cx| p.previous(cx));
                             cx.stop_propagation();
                         }
-                        "right" => {
+                        "right" if !is_text_input => {
                             this.player.update(cx, |p, cx| p.next(cx));
                             cx.stop_propagation();
                         }
-                        "up" => {
+                        "up" if !is_text_input => {
                             this.player.update(cx, |p, cx| {
                                 p.set_volume((p.volume + 0.05).min(1.0), cx);
                             });
                             cx.stop_propagation();
                         }
-                        "down" => {
+                        "down" if !is_text_input => {
                             this.player.update(cx, |p, cx| {
                                 p.set_volume((p.volume - 0.05).max(0.0), cx);
                             });
@@ -2232,6 +2381,10 @@ impl Render for RootView {
                                 }
                                 SidebarAction::ToggleSidebar => {
                                     root.toggle_sidebar(window, cx);
+                                }
+                                SidebarAction::PlaylistMenu(open) => {
+                                    root.rail_playlists_open = open;
+                                    cx.notify();
                                 }
                                 SidebarAction::TogglePlaylistSection => {
                                     root.playlists_collapsed = !root.playlists_collapsed;
@@ -2356,6 +2509,47 @@ impl Render for RootView {
 #[cfg(test)]
 mod tests {
     use super::RefreshStage;
+    use crate::ui::sidebar::{NavSection, SidebarFocus, sidebar_targets};
+
+    #[test]
+    fn sidebar_targets_expanded_walk_sections_playlists_refresh_settings() {
+        let targets = sidebar_targets(
+            false,
+            &[("pl-a".into(), "A".into()), ("pl-b".into(), "B".into())],
+        );
+        assert_eq!(targets[0], SidebarFocus::Section(NavSection::Albums));
+        assert_eq!(targets[5], SidebarFocus::Section(NavSection::LocalMusic));
+        assert_eq!(targets[6], SidebarFocus::Playlist("pl-a".into()));
+        assert_eq!(targets[7], SidebarFocus::Playlist("pl-b".into()));
+        assert_eq!(targets[8], SidebarFocus::Refresh);
+        assert_eq!(targets[9], SidebarFocus::Section(NavSection::Settings));
+        assert_eq!(targets.len(), 10);
+    }
+
+    #[test]
+    fn sidebar_targets_include_playlists_when_collapsed() {
+        // Folded, the playlists live in the rail's dropdown rather than in
+        // rows — but they are still there, so the walk is the same one and the
+        // cursor entering their range is what opens the dropdown.
+        let playlists = [("pl-a".into(), "A".into()), ("pl-b".into(), "B".into())];
+        let collapsed = sidebar_targets(true, &playlists);
+        assert_eq!(collapsed, sidebar_targets(false, &playlists));
+        assert_eq!(collapsed[6], SidebarFocus::Playlist("pl-a".into()));
+        assert_eq!(collapsed[7], SidebarFocus::Playlist("pl-b".into()));
+        assert_eq!(collapsed[8], SidebarFocus::Refresh);
+        assert_eq!(collapsed[9], SidebarFocus::Section(NavSection::Settings));
+        assert_eq!(collapsed.len(), 10);
+    }
+
+    #[test]
+    fn sidebar_targets_without_playlists_are_sections_refresh_settings() {
+        // Nothing to walk into, so the cursor can never sit on a playlist and
+        // the folded rail's dropdown is never opened by j/k.
+        let targets = sidebar_targets(true, &[]);
+        assert_eq!(targets.len(), 8); // 6 sections + Refresh + Settings
+        assert_eq!(targets[6], SidebarFocus::Refresh);
+        assert_eq!(targets[7], SidebarFocus::Section(NavSection::Settings));
+    }
 
     #[test]
     fn only_the_import_stage_has_a_fraction() {

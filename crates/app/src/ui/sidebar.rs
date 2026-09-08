@@ -56,6 +56,52 @@ pub enum NavSection {
     Settings,
 }
 
+/// One thing the vi-mode keyboard cursor can land on in the sidebar.
+///
+/// Replaces the old section-only cursor: playlists and the refresh row sit
+/// between the nav sections and Settings, and j/k now reaches all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarFocus {
+    Section(NavSection),
+    Playlist(String),
+    Refresh,
+}
+
+/// Section order for the vi-mode cursor, excluding Settings (which is always
+/// the last target, after Refresh).
+pub const SIDEBAR_SECTIONS: &[NavSection] = &[
+    NavSection::Albums,
+    NavSection::Artists,
+    NavSection::Favorites,
+    NavSection::Recent,
+    NavSection::Radio,
+    NavSection::LocalMusic,
+];
+
+/// The ordered list of j/k targets for the sidebar.
+///
+/// The same walk whether the rail is folded or not: collapsed, the playlists
+/// live in the rail's dropdown rather than in rows, and the cursor entering
+/// their range is what opens it (`RootView::rail_playlists_open`). Skipping
+/// them there used to make the folded rail's playlists unreachable by keyboard
+/// altogether, which is not what folding the labels away asked for.
+///
+/// `collapsed` is kept in the signature: the shapes have diverged before and
+/// the caller should not have to know that they currently agree.
+pub fn sidebar_targets(_collapsed: bool, playlists: &[(String, String)]) -> Vec<SidebarFocus> {
+    let mut targets: Vec<SidebarFocus> = SIDEBAR_SECTIONS
+        .iter()
+        .copied()
+        .map(SidebarFocus::Section)
+        .collect();
+    for (id, _) in playlists {
+        targets.push(SidebarFocus::Playlist(id.clone()));
+    }
+    targets.push(SidebarFocus::Refresh);
+    targets.push(SidebarFocus::Section(NavSection::Settings));
+    targets
+}
+
 /// What the sidebar reports back to the root view.
 #[derive(Debug, Clone)]
 pub enum SidebarAction {
@@ -74,6 +120,9 @@ pub enum SidebarAction {
     RefreshLibrary,
     /// Fold the whole rail down to icons (or unfold it).
     ToggleSidebar,
+    /// The folded rail's playlist dropdown was opened or dismissed. Its state
+    /// lives in the root view because the vi cursor drives it too.
+    PlaylistMenu(bool),
 }
 
 pub struct SidebarModel {
@@ -93,7 +142,10 @@ pub struct SidebarModel {
     /// Which step that refresh is on, for the label and the progress bar.
     pub refresh_stage: RefreshStage,
     /// Section highlighted by vi-mode keyboard cursor.
-    pub vi_selected_section: Option<NavSection>,
+    pub vi_selected: Option<SidebarFocus>,
+    /// Folded rail only: whether the playlist dropdown is showing. Controlled
+    /// rather than left to the popover, since j/k opens it as well as a click.
+    pub playlist_menu_open: bool,
     /// Rail folded down to icons: no labels, no library switcher, no
     /// playlists. The nav sections and the two footer rows survive as icons
     /// with tooltips, since those are what the rail is for.
@@ -183,6 +235,7 @@ fn playlist_row(
     key_prefix: &str,
     playlist: &(String, String, bool),
     is_active: bool,
+    focused: bool,
     on_action: impl Fn(SidebarAction, &mut Window, &mut App) + Clone + 'static,
     after: AfterPick,
     cx: &App,
@@ -200,6 +253,7 @@ fn playlist_row(
         .text_sm()
         .when(is_active, |s| s.bg(cx.theme().muted))
         .when(!is_active, |s| s.text_color(cx.theme().muted_foreground))
+        .when(focused, |s| s.border_l_2().border_color(cx.theme().primary))
         .hover(|s| s.bg(cx.theme().muted))
         .on_click(move |_, window, cx| {
             on_action(SidebarAction::OpenPlaylist(id.clone()), window, cx);
@@ -225,7 +279,7 @@ pub fn render_sidebar(
     let nav_item = |label: &'static str, icon: IconName, section: NavSection| {
         let on_action = on_action.clone();
         let is_active = model.active == Some(section);
-        let is_vi_sel = model.vi_selected_section == Some(section);
+        let is_vi_sel = model.vi_selected == Some(SidebarFocus::Section(section));
         h_flex()
             .id(SharedString::from(label))
             .py_1p5()
@@ -401,11 +455,13 @@ pub fn render_sidebar(
     if !collapsed && !model.playlists_collapsed {
         for playlist in model.playlists.iter() {
             let is_active = model.active_playlist.as_deref() == Some(playlist.0.as_str());
+            let focused = model.vi_selected == Some(SidebarFocus::Playlist(playlist.0.clone()));
             playlist_items.push(
                 playlist_row(
                     "sidebar-pl",
                     playlist,
                     is_active,
+                    focused,
                     on_action.clone(),
                     stay_put(),
                     cx,
@@ -464,9 +520,24 @@ pub fn render_sidebar(
 
     let rail_playlists = {
         let on_action = on_action.clone();
+        let on_open = on_action.clone();
         let playlists = model.playlists.clone();
         let active = model.active_playlist.clone();
+        // The vi cursor walks the playlists in the folded rail too, and it has
+        // to be able to show what it is on: the dropdown's open state is
+        // therefore ours, and the popover is told rather than asked. Pairing
+        // `open` with `on_open_change` is how the popover wants to be driven —
+        // without the callback a click on the trigger would be reverted by the
+        // next render.
+        let focused_playlist = match &model.vi_selected {
+            Some(SidebarFocus::Playlist(id)) => Some(id.clone()),
+            _ => None,
+        };
         Popover::new("rail-playlists")
+            .open(model.playlist_menu_open)
+            .on_open_change(move |open, window, cx| {
+                on_open(SidebarAction::PlaylistMenu(*open), window, cx)
+            })
             .trigger(
                 Button::new("rail-playlists-btn")
                     .custom(rail_trigger(cx))
@@ -523,6 +594,7 @@ pub fn render_sidebar(
                         "rail-pl",
                         playlist,
                         active.as_deref() == Some(playlist.0.as_str()),
+                        focused_playlist.as_deref() == Some(playlist.0.as_str()),
                         on_action.clone(),
                         dismiss.clone(),
                         cx,
@@ -615,6 +687,7 @@ pub fn render_sidebar(
                 SharedString::from("Refresh library")
             };
             let tip = label.clone();
+            let refresh_focused = model.vi_selected == Some(SidebarFocus::Refresh);
             v_flex()
                 .id("sidebar-refresh")
                 .py_1p5()
@@ -622,6 +695,9 @@ pub fn render_sidebar(
                 .rounded_lg()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
+                .when(refresh_focused, |s| {
+                    s.border_l_2().border_color(cx.theme().primary)
+                })
                 .when(collapsed, |s| s.px_0())
                 .when(!collapsed, |s| s.px_3())
                 .when(!refreshing, |s| {

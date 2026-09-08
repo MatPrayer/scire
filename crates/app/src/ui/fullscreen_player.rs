@@ -1260,10 +1260,11 @@ impl FullscreenPlayer {
     }
 
     fn fetch_art(&mut self, cover_id: String, key: String, cx: &mut Context<Self>) {
-        // Local track: resolve cover from local_art_path directly.
-        if self.client(cx).is_none()
-            && let Some(path) =
-                crate::services::local_library::local_art_path(&cover_id).filter(|p| p.exists())
+        // Local track: resolve cover from local_art_path directly. Local ids
+        // are 16-hex hashes; server ids (`al-/ar-/mf-…`) never collide, so
+        // this resolves local tracks even when a server is connected.
+        if let Some(path) =
+            crate::services::local_library::local_art_path(&cover_id).filter(|p| p.exists())
         {
             self.art_path = Some(path.clone());
             self.bg_art_path = Some(path.clone());

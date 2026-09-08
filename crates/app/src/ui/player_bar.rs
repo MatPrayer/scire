@@ -265,6 +265,14 @@ fn parse_db(raw: &str) -> Option<f32> {
     Some(10f32.powf(db / 20.0).clamp(0.0, 1.0))
 }
 
+impl PlayerBar {
+    /// True while the volume box has the keyboard, so the root view's
+    /// shortcuts leave the digits (and the space between them) alone.
+    pub fn is_typing(&self) -> bool {
+        self.vol_input_focused
+    }
+}
+
 impl Render for PlayerBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (

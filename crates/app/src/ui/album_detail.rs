@@ -27,7 +27,8 @@ use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
 use crate::ui::albums::album_from_row;
 use crate::ui::{
-    focus_glow, format_duration, strip_html, track_extras, truncate_at_word, with_focus_animation,
+    format_duration, strip_html, sync_focus_scroll, track_extras, truncate_at_word,
+    with_focus_cursor,
 };
 
 /// Resolution to request for the header cover.
@@ -127,6 +128,9 @@ pub struct AlbumDetailView {
     focus_anchor: ScrollAnchor,
     /// Track index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
+    /// Cursor position the scroll has caught up to, so `render` scrolls only
+    /// when the cursor actually moved (`ui::sync_focus_scroll`).
+    vi_scroll_synced: Option<usize>,
     /// Accent extracted from *this album's* cover, for the page's own tint
     /// under `Settings::adaptive_from_page`. The app's chrome keeps the playing
     /// track's accent; only this page carries the album's.
@@ -191,6 +195,7 @@ impl AlbumDetailView {
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
+            vi_scroll_synced: None,
             accent: None,
             accent_for: None,
             accent_seed_for: None,
@@ -764,7 +769,18 @@ fn fmt_added(created: &str) -> String {
 }
 
 impl Render for AlbumDetailView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Scroll-into-view runs here, not in `vi_move`: the anchor's origin
+        // is only as fresh as the last paint, and from a key handler that is
+        // the row the cursor just LEFT — going up, the focused row landed one
+        // row above the viewport and the highlight vanished.
+        sync_focus_scroll(
+            &self.focus_anchor,
+            self.vi_cursor,
+            &mut self.vi_scroll_synced,
+            window,
+            cx,
+        );
         let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
         // This album's own colour, when the page is set to carry one. The
         // playing-track highlight below deliberately keeps the theme's accent:
@@ -984,6 +1000,7 @@ impl Render for AlbumDetailView {
         };
 
         let info_prefs = self.session.read(cx).settings.track_info.clone();
+        let glow = self.session.read(cx).settings.selection_glow;
 
         let rows: Vec<_> = self
             .album
@@ -1038,11 +1055,7 @@ impl Render for AlbumDetailView {
                             .text_color(cx.theme().primary)
                     })
                     .when(self.vi_cursor == Some(i), |s| {
-                        s.bg(cx.theme().muted)
-                            .border_1()
-                            .border_color(cx.theme().primary)
-                            .shadow(focus_glow(cx))
-                            .anchor_scroll(Some(self.focus_anchor.clone()))
+                        s.anchor_scroll(Some(self.focus_anchor.clone()))
                     })
                     .on_click(cx.listener(move |view, _, _, cx| view.play_from(i, cx)))
                     .child(
@@ -1210,11 +1223,13 @@ impl Render for AlbumDetailView {
                         }
                         menu
                     });
-                if self.vi_cursor == Some(i) {
-                    with_focus_animation(format!("vi-focus-{i}"), row, cx).into_any_element()
-                } else {
-                    row.into_any_element()
-                }
+                with_focus_cursor(
+                    format!("vi-focus-{i}"),
+                    row,
+                    self.vi_cursor == Some(i),
+                    glow,
+                    cx,
+                )
             })
             .collect();
 
@@ -1369,7 +1384,7 @@ impl Render for AlbumDetailView {
 impl AlbumDetailView {
     /// Move the vi-mode cursor by `delta` tracks, clamping to the album's
     /// track list and scrolling the focused row into view.
-    pub fn vi_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(count) = self.album.as_ref().map(|a| a.song.len()) else {
             return;
         };
@@ -1383,7 +1398,6 @@ impl AlbumDetailView {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        self.focus_anchor.scroll_to(window, cx);
         cx.notify();
     }
 
