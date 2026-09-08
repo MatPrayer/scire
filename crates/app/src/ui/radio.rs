@@ -103,11 +103,9 @@ impl RadioView {
     }
 
     pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
-        // Three form targets (name, url, Add) always follow the station rows.
+        // Three form targets (name, url, Add) always follow the station rows,
+        // so there is always something to land on even with no stations.
         let count = self.station_count(cx) + 3;
-        if count == 0 {
-            return;
-        }
         let cur = self.vi_cursor.unwrap_or(0);
         let next = if delta > 0 {
             (cur + delta as usize).min(count - 1)
@@ -166,6 +164,9 @@ impl Render for RadioView {
         };
 
         let glow = self.session.read(cx).settings.selection_glow;
+        // The three add-station targets sit after the station rows in the same
+        // flat vi index space `vi_move`/`vi_activate` walk.
+        let station_count = stations.len();
         let rows: Vec<_> = stations
             .into_iter()
             .enumerate()
@@ -239,24 +240,40 @@ impl Render for RadioView {
                 this.child(div().text_color(cx.theme().danger).text_sm().child(e))
             })
             .child(v_flex().gap_0p5().children(rows))
-            // Add-station form.
+            // Add-station form. Each control is a vi target in its own right,
+            // so each carries the cursor ring — without it j/k past the last
+            // station leaves nothing highlighted while Enter still fires.
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
                     .mt_2()
-                    .child(div().w(px(200.)).child(Input::new(&self.name_input)))
-                    .child(
+                    .child(with_focus_cursor(
+                        "vi-radio-name",
+                        div().w(px(200.)).child(Input::new(&self.name_input)),
+                        self.vi_cursor == Some(station_count),
+                        glow,
+                        cx,
+                    ))
+                    .child(with_focus_cursor(
+                        "vi-radio-url",
                         div()
                             .flex_1()
                             .max_w(px(360.))
                             .child(Input::new(&self.url_input)),
-                    )
-                    .child(
-                        Button::new("radio-add").primary().label("Add").on_click(
+                        self.vi_cursor == Some(station_count + 1),
+                        glow,
+                        cx,
+                    ))
+                    .child(with_focus_cursor(
+                        "vi-radio-add",
+                        div().child(Button::new("radio-add").primary().label("Add").on_click(
                             cx.listener(|this, _, window, cx| this.add_station(window, cx)),
-                        ),
-                    ),
+                        )),
+                        self.vi_cursor == Some(station_count + 2),
+                        glow,
+                        cx,
+                    )),
             )
     }
 }

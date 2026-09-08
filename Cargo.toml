@@ -9,7 +9,7 @@ members = ["crates/subsonic", "crates/playback", "crates/app", "crates/dmg"]
 default-members = ["crates/app"]
 
 [workspace.package]
-version = "0.5.9"
+version = "0.5.10"
 edition = "2024"
 license = "MIT"
 
