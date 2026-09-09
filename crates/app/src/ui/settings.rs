@@ -44,6 +44,36 @@ const SECTION_ACTIVE_LINE: f32 = 24.;
 /// its pill would otherwise be unreachable by scrolling.
 const SECTION_BOTTOM_SLOP: f32 = 4.;
 
+/// Widest a section card is allowed to get; past this the page reads as a
+/// stretched table rather than a column of settings.
+const SECTION_MAX_W: f32 = 640.;
+/// Narrowest it may be squeezed to before it is allowed to overrun the window
+/// instead — below this the labels are unreadable anyway.
+const SECTION_MIN_W: f32 = 240.;
+/// The scroll body's own horizontal padding (`px_4`), which the cards sit
+/// inside of.
+const SECTION_BODY_PAD: f32 = 16.;
+
+/// The width to lay a section card out at, inside a scroll body `body` wide.
+///
+/// **Definite on purpose, and load-bearing.** Built the obvious way — `w_full()`
+/// plus `max_w(SECTION_MAX_W)` — the card's width is still indefinite at the
+/// point taffy sizes its height, so every wrapping paragraph inside it is
+/// measured against an unbounded width and comes out one line tall. The card
+/// then reserved less height than its own content, drew its border through the
+/// last paragraph and let the rest spill into the section below. Handing it a
+/// resolved number means the paragraphs are measured at the width they are
+/// actually painted at.
+///
+/// `None` before anything has been laid out, when there is no measurement to
+/// resolve one from.
+fn section_width(body: f32) -> Option<f32> {
+    if body <= 0. {
+        return None;
+    }
+    Some((body - 2. * SECTION_BODY_PAD).clamp(SECTION_MIN_W, SECTION_MAX_W))
+}
+
 /// Which section a scroll position sits in.
 ///
 /// `tops` holds each section card's *unscrolled* layout top in document order,
@@ -202,6 +232,12 @@ pub struct SettingsView {
     section_starts: Vec<(usize, &'static str)>,
     /// The quick-nav jump currently running, if any.
     scroll_anim: Option<SectionScroll>,
+    /// Content width of the scroll body, tracked across a resize so the cards
+    /// reflow on the same frame as the window (see [`crate::ui::LiveWidth`]).
+    live_width: crate::ui::LiveWidth,
+    /// This frame's section-card width, resolved once at the top of `render`
+    /// and read by every `section` call.
+    card_width: Option<f32>,
 }
 
 impl SettingsView {
@@ -230,6 +266,8 @@ impl SettingsView {
             vi_count: 0,
             section_starts: Vec::new(),
             scroll_anim: None,
+            live_width: crate::ui::LiveWidth::default(),
+            card_width: None,
         }
     }
 
@@ -1012,8 +1050,14 @@ impl SettingsView {
     fn section(&mut self, title: &'static str, cx: &Context<Self>) -> gpui::Div {
         self.section_starts.push((self.vi_actions.len(), title));
         v_flex()
-            .w_full()
-            .max_w(px(640.))
+            // See `section_width`: the resolved number is what makes the card
+            // tall enough for its own wrapping paragraphs. The `w_full`/`max_w`
+            // form is only the first frame's fallback, before there is a
+            // measurement to resolve one from.
+            .map(|card| match self.card_width {
+                Some(w) => card.w(px(w)),
+                None => card.w_full().max_w(px(SECTION_MAX_W)),
+            })
             .mx_auto()
             .flex_none()
             .gap_3()
@@ -1039,6 +1083,14 @@ impl Render for SettingsView {
             window,
             cx,
         );
+        // Resolved before the cards are built, since every `section` reads it.
+        // Through `LiveWidth` rather than the handle's own bounds: those are
+        // last frame's layout, so during a resize drag the cards would rewrap a
+        // frame behind the window edge.
+        let body = self
+            .live_width
+            .resolve(f32::from(self.scroll.bounds().size.width), window);
+        self.card_width = section_width(body);
         self.vi_actions.clear();
         let (
             theme,
@@ -1917,6 +1969,42 @@ mod tests {
         let tops = tops();
         assert_eq!(section_for_scroll(&tops, VIEWPORT_TOP, -1800., 1800.), 6);
         assert_eq!(section_for_scroll(&tops, VIEWPORT_TOP, -1797., 1800.), 6);
+    }
+
+    #[test]
+    fn a_card_fits_inside_the_scroll_body_at_every_width() {
+        // Overrunning it is the failure the definite width exists to avoid, so
+        // the arithmetic gets checked rather than trusted.
+        for body in [300., 480., 672., 700., 1200., 3000.] {
+            let w = section_width(body).expect("a measured body resolves a width");
+            assert!(
+                w <= body - 2. * SECTION_BODY_PAD || w == SECTION_MIN_W,
+                "{body}px body produced a {w}px card"
+            );
+            assert!(w <= SECTION_MAX_W, "{body}px body produced a {w}px card");
+        }
+    }
+
+    #[test]
+    fn a_roomy_page_caps_the_card_and_a_tight_one_shrinks_it() {
+        assert_eq!(section_width(3000.), Some(SECTION_MAX_W));
+        // 672 = the cap plus the body's padding: the first width that fills it.
+        assert_eq!(section_width(672.), Some(SECTION_MAX_W));
+        assert_eq!(section_width(500.), Some(468.));
+    }
+
+    #[test]
+    fn a_card_never_shrinks_below_the_floor() {
+        // Past this the card is allowed to overrun instead: a 40px-wide card
+        // would be unreadable, and the window is unusable at that size anyway.
+        assert_eq!(section_width(80.), Some(SECTION_MIN_W));
+    }
+
+    #[test]
+    fn nothing_measured_yet_resolves_no_width() {
+        // The first frame has no measurement, and falls back to `w_full`.
+        assert_eq!(section_width(0.), None);
+        assert_eq!(section_width(-1.), None);
     }
 
     #[test]
