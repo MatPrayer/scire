@@ -1143,9 +1143,13 @@ impl FullscreenPlayer {
     }
 
     /// The background layer for the chosen mode (behind the readability scrim).
+    /// `vw`/`vh` are the window's size — the animated mode's blob field is laid
+    /// out in pixels, so it needs them rather than percentages.
     fn render_background(
         &self,
         mode: FullscreenBackground,
+        vw: f32,
+        vh: f32,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let base = || div().absolute().left_0().top_0().size_full();
@@ -1189,21 +1193,16 @@ impl FullscreenPlayer {
                 })
                 .into_any_element(),
             FullscreenBackground::Animated => {
-                // A single 2-stop ramp between an album's (usually low-variance) colours
-                // reads as a static, banded diagonal — that's the "bar". Instead stack
-                // TWO translucent gradients at crossing angles: their band lines never
-                // align, so there's no visible seam, and they expose several hues at once
-                // for a richer field. Both phases advance monotonically through the
-                // palette-as-cycle (wrap is a lerp), so flow is always one direction.
+                // Boosted saturation and lifted a little, so mono covers still
+                // show some spread and the blobs read as colour rather than as
+                // shading. The player-bar tint is deliberately *not* one of
+                // them: it is near black, and a near-black blob over a
+                // near-black base is a hole, not a colour.
                 let ring: Vec<gpui::Rgba> = {
-                    // Boosted saturation + a floor of variance so mono covers still move.
-                    // The player-bar tint is one of the cycle's stops, so the
-                    // sweep keeps passing back through the bar's colour.
-                    let mut r: Vec<gpui::Rgba> = palette
+                    let r: Vec<gpui::Rgba> = palette
                         .iter()
-                        .map(|&c| scale_rgb(vivid(c, 1.5), 1.0))
+                        .map(|&c| scale_rgb(vivid(c, 1.6), 1.15))
                         .collect();
-                    r.push(tint);
                     if r.len() < 2 {
                         let b = *r
                             .first()
@@ -1213,47 +1212,16 @@ impl FullscreenPlayer {
                         r
                     }
                 };
-                let ring2 = ring.clone();
-                let anim_layer = |id: &'static str,
-                                  angle: f32,
-                                  ring: Vec<gpui::Rgba>,
-                                  oa: f32,
-                                  ob: f32,
-                                  alpha: f32| {
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .size_full()
-                        .with_animation(
-                            id,
-                            // Slower: full palette sweep over 40s.
-                            Animation::new(Duration::from_secs(40)).repeat(),
-                            move |this, delta| {
-                                let n = ring.len();
-                                let sample = |offset: f32| -> gpui::Rgba {
-                                    let pos = (delta + offset).rem_euclid(1.0) * n as f32;
-                                    let i0 = pos.floor() as usize % n;
-                                    let i1 = (i0 + 1) % n;
-                                    let mut c = lerp_rgb(ring[i0], ring[i1], pos.fract());
-                                    c.a = alpha;
-                                    c
-                                };
-                                this.bg(linear_gradient(
-                                    angle,
-                                    linear_color_stop(sample(oa), 0.),
-                                    linear_color_stop(sample(ob), 1.),
-                                ))
-                            },
-                        )
-                };
+                let short = vw.min(vh);
                 base()
-                    // Solid base so the translucent layers composite over
-                    // something — the player-bar tint again.
-                    .bg(tint)
+                    .bg(blob_base(&ring, tint))
                     .overflow_hidden()
-                    .child(anim_layer("fs-bg-a", 229., ring, 0.0, 0.5, 1.0))
-                    .child(anim_layer("fs-bg-b", 63., ring2, 0.28, 0.78, 0.55))
+                    .children(
+                        blob_field(vw, vh, &ring)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, b)| render_blob(i, b, vw, vh, short)),
+                    )
                     .into_any_element()
             }
         }
@@ -1301,6 +1269,202 @@ impl FullscreenPlayer {
         })
         .detach();
     }
+}
+
+// --- Animated background: blurred blob field --------------------------------
+// The animated mode used to be two translucent linear gradients at crossing
+// angles, cycling through the palette. A ramp between an album's (usually
+// low-variance) colours has no shape to it, so however the phases moved it read
+// as one diagonal wash sliding across the window. The reference look is a mesh
+// gradient: a field of soft-edged ellipses in the cover's colours, each
+// drifting and breathing on its own clock, overlapping into a field with no
+// visible band lines at all.
+//
+// gpui exposes no blur filter, so a blob is an *empty* rounded element whose
+// only paint is a `BoxShadow` — gpui blurs shadows with a real gaussian in the
+// shader (four samples, analytic along x, so the per-pixel cost is fixed), and
+// with no background set the blurred shadow is all that lands.
+//
+// Cost is the one thing to watch: the shader's quad is dilated by 3× the blur
+// radius on every side, so a blob costs `(size + 6·blur)²` pixels. Blur is
+// therefore a *ratio of the blob* (`BLOB_BLUR`) rather than a constant, and the
+// grid is sized so the blobs overlap about twice over — enough that the base
+// colour never shows through as a hole, without paying for a third layer.
+
+/// Blur radius as a fraction of a blob's mean diameter. Higher merges the field
+/// into one soft wash but squares up the fill cost fast (see above).
+const BLOB_BLUR: f32 = 0.12;
+/// How far a blob wanders from its cell, as a fraction of the window's short
+/// side.
+const BLOB_DRIFT: (f32, f32) = (0.04, 0.10);
+/// Peak size swing of the breathing cycle, either side of the base radius.
+const BLOB_BREATH: f32 = 0.16;
+/// Seconds for one full drift/breath cycle. Every blob gets its own, so the
+/// field never pulses in lockstep.
+const BLOB_PERIOD: (f32, f32) = (26., 46.);
+/// Rows of the jittered grid the blobs are placed on; columns follow the
+/// window's aspect so the cells stay roughly square.
+const BLOB_ROWS: usize = 4;
+/// The grid spills past the window on every side — a blob centred on the edge
+/// is what keeps the corners from falling back to the base colour.
+const BLOB_BLEED: f32 = 0.12;
+
+/// One blob of the animated background's field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Blob {
+    /// Centre in window fractions. May fall outside `0..1` (see `BLOB_BLEED`).
+    cx: f32,
+    cy: f32,
+    /// Half-extents as a fraction of the window's short side. Kept near-square:
+    /// gpui clamps a corner radius to half the shorter side, so `rounded_full`
+    /// on a lopsided quad is a stadium, not an ellipse.
+    rx: f32,
+    ry: f32,
+    color: gpui::Rgba,
+    alpha: f32,
+    /// Drift amplitude, fraction of the short side.
+    drift: f32,
+    /// Seconds for one full cycle.
+    period: f32,
+    /// Whole cycles per period for the x drift, y drift and breath. Integers so
+    /// every term is periodic in the animation's 0→1 delta and the repeat is
+    /// seamless; `fx != fy` so the path is a Lissajous wander, not a line.
+    fx: f32,
+    fy: f32,
+    fb: f32,
+    /// Phase of each of those three cycles, in turns.
+    px: f32,
+    py: f32,
+    pb: f32,
+}
+
+/// Deterministic `0..1` from an integer. A field reshuffled per frame would
+/// boil, and one seeded from the clock could not be tested.
+fn hash01(seed: u32) -> f32 {
+    let mut x = seed.wrapping_add(0x9E37_79B9);
+    x = (x ^ (x >> 16)).wrapping_mul(0x85EB_CA6B);
+    x = (x ^ (x >> 13)).wrapping_mul(0xC2B2_AE35);
+    x ^= x >> 16;
+    (x >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// The flat colour the blobs composite over. Mostly a darkened mean of the
+/// field's own colours, pulled a little toward the player-bar tint for design
+/// continuity with the bar: the tint alone is near black, and every gap between
+/// blobs then read as a dark blotch rather than as part of the gradient.
+fn blob_base(colors: &[gpui::Rgba], tint: gpui::Rgba) -> gpui::Rgba {
+    if colors.is_empty() {
+        return tint;
+    }
+    let n = colors.len() as f32;
+    let mean = gpui::Rgba {
+        r: colors.iter().map(|c| c.r).sum::<f32>() / n,
+        g: colors.iter().map(|c| c.g).sum::<f32>() / n,
+        b: colors.iter().map(|c| c.b).sum::<f32>() / n,
+        a: 1.0,
+    };
+    let floor = scale_rgb(mean, 0.55);
+    gpui::Rgba {
+        r: tint.r * 0.35 + floor.r * 0.65,
+        g: tint.g * 0.35 + floor.g * 0.65,
+        b: tint.b * 0.35 + floor.b * 0.65,
+        a: 1.0,
+    }
+}
+
+/// Lay the animated background's blobs out for a window of `vw`×`vh`, drawing
+/// colours from `colors` in order so neighbouring blobs differ.
+fn blob_field(vw: f32, vh: f32, colors: &[gpui::Rgba]) -> Vec<Blob> {
+    if colors.is_empty() || vw <= 0. || vh <= 0. {
+        return Vec::new();
+    }
+    let aspect = (vw / vh).clamp(0.4, 3.0);
+    let rows = BLOB_ROWS;
+    let cols = ((rows as f32 * aspect).round() as usize).clamp(3, 8);
+    let short = vw.min(vh);
+    let span = 1. + 2. * BLOB_BLEED;
+    let (cw, ch) = (span / cols as f32, span / rows as f32);
+    let mut blobs = Vec::with_capacity(cols * rows);
+    // The colour walk always advances by at least one, so no two blobs laid
+    // down in a row share a hue — a repeat between neighbours merges them into
+    // one shapeless patch. Picking at random instead clusters and does exactly
+    // that.
+    let mut hue = 0usize;
+    for r in 0..rows {
+        for c in 0..cols {
+            let i = (r * cols + c) as u32;
+            let s = |k: u32| hash01(i.wrapping_mul(97).wrapping_add(k));
+            // Jittered inside the middle half of its cell rather than placed
+            // freely: blobs dropped at random leave bald patches, and even a
+            // full-cell jitter can pull two neighbours far enough apart to open
+            // one — which reads as a gradient with a hole in it, not a field.
+            let cx = -BLOB_BLEED + cw * (c as f32 + 0.25 + 0.5 * s(1));
+            let cy = -BLOB_BLEED + ch * (r as f32 + 0.25 + 0.5 * s(2));
+            // Radius in short-side fractions. Wider than the cell, so
+            // neighbours overlap before their blur has even started.
+            let base = cw * vw / short * 0.60;
+            // Integer cycle counts; fy is nudged off fx so the two never agree.
+            let fx = 1. + (s(7) * 2.).floor();
+            let fy = {
+                let f = 1. + (s(8) * 3.).floor();
+                if f == fx { f + 1. } else { f }
+            };
+            hue = (hue + 1 + (s(5) * (colors.len() - 1) as f32) as usize) % colors.len();
+            blobs.push(Blob {
+                cx,
+                cy,
+                rx: base * (0.85 + 0.45 * s(3)),
+                ry: base * (0.85 + 0.45 * s(4)),
+                color: colors[hue],
+                // High enough that a single-covered patch still reads as its
+                // own colour: at a low alpha only the overlaps came up to the
+                // palette and everything between them sank toward the base.
+                alpha: 0.6 + 0.3 * s(6),
+                drift: BLOB_DRIFT.0 + (BLOB_DRIFT.1 - BLOB_DRIFT.0) * s(9),
+                period: BLOB_PERIOD.0 + (BLOB_PERIOD.1 - BLOB_PERIOD.0) * s(10),
+                fx,
+                fy,
+                fb: 2. + (s(11) * 2.).floor(),
+                px: s(12),
+                py: s(13),
+                pb: s(14),
+            });
+        }
+    }
+    blobs
+}
+
+/// One blob as an animated element: an empty rounded quad carrying a single
+/// blurred shadow, moved and resized by its own repeating cycle.
+fn render_blob(i: usize, b: Blob, vw: f32, vh: f32, short: f32) -> impl IntoElement {
+    let (bw, bh) = (b.rx * short, b.ry * short);
+    let (ox, oy) = (b.cx * vw, b.cy * vh);
+    div().absolute().rounded_full().with_animation(
+        ("fs-blob", i),
+        Animation::new(Duration::from_secs_f32(b.period)).repeat(),
+        move |this, delta| {
+            let turn =
+                |cycles: f32, phase: f32| (std::f32::consts::TAU * (cycles * delta + phase)).sin();
+            let dx = b.drift * short * turn(b.fx, b.px);
+            let dy = b.drift * short * turn(b.fy, b.py);
+            let breath = 1. + BLOB_BREATH * turn(b.fb, b.pb);
+            let (w, h) = (bw * breath, bh * breath);
+            this.left(px(ox + dx - w))
+                .top(px(oy + dy - h))
+                .w(px(w * 2.))
+                .h(px(h * 2.))
+                .shadow(vec![gpui::BoxShadow {
+                    color: gpui::Rgba {
+                        a: b.alpha,
+                        ..b.color
+                    }
+                    .into(),
+                    offset: gpui::point(px(0.), px(0.)),
+                    blur_radius: px((w + h) * BLOB_BLUR),
+                    spread_radius: px(0.),
+                }])
+        },
+    )
 }
 
 /// Average colour of each horizontal band, top→bottom. More bands = richer
@@ -1356,16 +1520,6 @@ fn vivid(c: gpui::Rgba, amt: f32) -> gpui::Rgba {
         r: (mean + (c.r - mean) * amt).clamp(0., 1.),
         g: (mean + (c.g - mean) * amt).clamp(0., 1.),
         b: (mean + (c.b - mean) * amt).clamp(0., 1.),
-        a: 1.0,
-    }
-}
-
-/// Linear blend between two RGB colours.
-fn lerp_rgb(a: gpui::Rgba, b: gpui::Rgba, t: f32) -> gpui::Rgba {
-    gpui::Rgba {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
         a: 1.0,
     }
 }
@@ -1460,7 +1614,9 @@ impl Render for FullscreenPlayer {
             FullscreenBackground::Gradient => 0.4 + 0.3 * luma,
             FullscreenBackground::Vibrant => 0.18 + 0.4 * luma,
             FullscreenBackground::BlurredArt => 0.55,
-            FullscreenBackground::Animated => 0.3 + 0.4 * luma,
+            // The blob field carries more of the palette than the gradient it
+            // replaced, so it needs a touch more scrim under the text.
+            FullscreenBackground::Animated => 0.35 + 0.4 * luma,
         };
         // The visualizer draws light geometry on the theme background, so the
         // per-mode scrim (tuned for album-art backdrops) would only mute it.
@@ -1848,7 +2004,7 @@ impl Render for FullscreenPlayer {
             .child(if viz_mode.is_on() {
                 self.visualizer.render(cx.theme().primary)
             } else {
-                self.render_background(bg_mode, cx)
+                self.render_background(bg_mode, vw, vh, cx)
             })
             // Readability scrim.
             .child(
@@ -2369,7 +2525,138 @@ impl Render for FullscreenPlayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ART_LEAD, ART_MAX, ART_MIN, CARD_MAX, CARD_MIN, CardDensity, EDGE, GAP, Layout};
+    use super::{
+        ART_LEAD, ART_MAX, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity, EDGE, GAP, Layout,
+        blob_base, blob_field, hash01,
+    };
+
+    fn rgba(r: f32, g: f32, b: f32) -> gpui::Rgba {
+        gpui::Rgba { r, g, b, a: 1.0 }
+    }
+
+    fn palette() -> Vec<gpui::Rgba> {
+        vec![
+            rgba(0.8, 0.2, 0.3),
+            rgba(0.2, 0.6, 0.9),
+            rgba(0.9, 0.8, 0.2),
+            rgba(0.3, 0.9, 0.5),
+        ]
+    }
+
+    #[test]
+    fn hash01_is_stable_and_in_range() {
+        for i in 0..500u32 {
+            let v = hash01(i);
+            assert!((0. ..1.).contains(&v), "hash01({i}) = {v}");
+            assert_eq!(v, hash01(i), "hash01 is not deterministic");
+        }
+        // A field whose cells all landed on the same value would be a grid.
+        let spread = (0..64).map(hash01).fold(f32::MIN, f32::max)
+            - (0..64).map(hash01).fold(f32::MAX, f32::min);
+        assert!(spread > 0.8, "hash01 barely varies: spread {spread}");
+    }
+
+    #[test]
+    fn the_blob_field_is_empty_without_a_window_or_colours() {
+        assert!(blob_field(0., 0., &palette()).is_empty());
+        assert!(blob_field(1920., 0., &palette()).is_empty());
+        assert!(blob_field(1920., 1080., &[]).is_empty());
+    }
+
+    #[test]
+    fn blobs_bleed_past_every_edge() {
+        // Corners fall back to the flat base colour unless the field spills
+        // out of the window — the jitter alone does not guarantee it, the
+        // blobs' own radii have to carry them over.
+        for &(w, h) in &[(2560., 1440.), (1280., 800.), (700., 1200.), (900., 900.)] {
+            let f = blob_field(w, h, &palette());
+            assert!(!f.is_empty(), "{w}x{h} produced no blobs");
+            let short = w.min(h);
+            let (mut left, mut right, mut top, mut bottom) =
+                (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+            for b in &f {
+                let (ex, ey) = (b.rx * short / w, b.ry * short / h);
+                left = left.min(b.cx - ex);
+                right = right.max(b.cx + ex);
+                top = top.min(b.cy - ey);
+                bottom = bottom.max(b.cy + ey);
+            }
+            assert!(left < 0. && top < 0., "{w}x{h}: {left},{top}");
+            assert!(right > 1. && bottom > 1., "{w}x{h}: {right},{bottom}");
+            // Centres stay inside the bleed band; a blob further out than that
+            // is fill cost paid entirely off-screen.
+            let far = f
+                .iter()
+                .map(|b| (b.cx - 0.5).abs().max((b.cy - 0.5).abs()))
+                .fold(0., f32::max);
+            assert!(far <= 0.5 + BLOB_BLEED + 0.01, "{w}x{h}: centre at {far}");
+        }
+    }
+
+    #[test]
+    fn blob_cells_stay_roughly_square() {
+        // Columns follow the aspect ratio; cells far off square give stripes.
+        for &(w, h) in &[(2560., 1440.), (1600., 1200.), (800., 1400.)] {
+            let cols = blob_field(w, h, &palette()).len() / super::BLOB_ROWS;
+            let cell_w = w / cols as f32;
+            let cell_h = h / super::BLOB_ROWS as f32;
+            let ratio = (cell_w / cell_h).max(cell_h / cell_w);
+            assert!(ratio < 1.8, "{w}x{h}: {cols} cols, cell ratio {ratio}");
+        }
+    }
+
+    #[test]
+    fn blob_motion_is_seamless_across_the_loop() {
+        // Every cycle count must be a whole number of turns per period, or the
+        // repeating animation snaps back to its start on each wrap.
+        for b in blob_field(2560., 1440., &palette()) {
+            for f in [b.fx, b.fy, b.fb] {
+                assert_eq!(f.fract(), 0., "non-integer cycle count {f}");
+                assert!(f >= 1., "cycle count {f} below one turn");
+            }
+            assert_ne!(b.fx, b.fy, "equal drift rates collapse the path to a line");
+            assert!(b.period > 0. && b.rx > 0. && b.ry > 0., "{b:?}");
+            assert!((0. ..=1.).contains(&b.alpha), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn neighbouring_blobs_do_not_share_a_colour() {
+        // A repeated hue between adjacent cells reads as a blob-shaped hole.
+        let f = blob_field(2560., 1440., &palette());
+        for pair in f.windows(2) {
+            assert_ne!(pair[0].color, pair[1].color, "adjacent blobs match");
+        }
+    }
+
+    #[test]
+    fn the_base_sits_under_the_field_without_going_black() {
+        // Gaps between blobs show the base. Left on the near-black player-bar
+        // tint they read as blotches rather than as part of the gradient.
+        let tint = rgba(0.06, 0.06, 0.08);
+        let base = blob_base(&palette(), tint);
+        let lum = |c: gpui::Rgba| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+        assert!(
+            lum(base) > lum(tint),
+            "base {base:?} no lighter than the tint"
+        );
+        // …but it still has to sit under the blobs, not compete with them.
+        let brightest = palette().into_iter().map(lum).fold(0., f32::max);
+        assert!(
+            lum(base) < brightest,
+            "base {base:?} is as bright as a blob"
+        );
+        // No colours at all is the pre-cover state: fall back to the tint.
+        assert_eq!(blob_base(&[], tint), tint);
+    }
+
+    #[test]
+    fn the_field_is_deterministic() {
+        assert_eq!(
+            blob_field(2560., 1440., &palette()),
+            blob_field(2560., 1440., &palette()),
+        );
+    }
 
     /// Total width the landscape layout asks for, padding and gaps included.
     /// A dropped cover is not a column and takes no gap with it.
