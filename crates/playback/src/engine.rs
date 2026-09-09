@@ -14,6 +14,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+#[cfg(target_os = "linux")]
+use crate::pulse;
 use crate::source::{self, EndSignal, Hint, Opened, SourceReader};
 use crate::spectrum::{SpectrumTap, Tap};
 use crate::{Command, Event, PlaybackError, TrackSource};
@@ -28,6 +30,14 @@ const COMMIT_LEAD: Duration = Duration::from_secs(3);
 
 /// Ticks between output-route checks (~2s at `TICK`).
 const ROUTE_CHECK_TICKS: u8 = 4;
+
+/// Ticks between route checks while nothing is playing (~8s at `TICK`). The
+/// output sink outlives the track playing through it, so the route has to be
+/// watched while idle too — earbuds connected between tracks would otherwise go
+/// unnoticed for the rest of the session, since nothing reopens an output that
+/// was never dropped. Checking costs a `pactl` subprocess on Linux, hence the
+/// slower cadence; a Play or Resume forces a check anyway.
+const IDLE_ROUTE_CHECK_TICKS: u8 = 16;
 
 /// A fully-opened, decoded-and-ready track, not yet handed to rodio.
 struct Prepared {
@@ -99,9 +109,13 @@ async fn control_loop(
     let mut ticker = tokio::time::interval(TICK);
     // Ticks since the output route was last checked. Asking the OS costs a
     // device enumeration (a `pactl` subprocess on Linux), so it is throttled to
-    // ~2s and skipped entirely when nothing is playing and nothing is waiting
-    // for its device to come back.
+    // ~2s while playing (or while waiting for a device to come back), ~8s while
+    // idle, and skipped entirely until an output has been opened.
     let mut route_ticks: u8 = 0;
+    // Set by Play/Resume, cleared by the next route check: the user asked for
+    // audio *now*, so a device found missing in that window must not put
+    // playback on hold waiting for it to come back.
+    let mut route_grace = false;
     let mut playing = false;
 
     loop {
@@ -117,6 +131,16 @@ async fn control_loop(
                             s.stop();
                         }
                         let _ = event_tx.send(Event::Buffering);
+                        // The route may have moved while we sat idle: an output
+                        // is only ever opened when there is none, so a stale one
+                        // would keep this track on the old device until the tick
+                        // below tore it down mid-playback. Drop it here instead
+                        // and let `start_track` open on the current route.
+                        if output.is_some() && route_lost(&selected_device, &open_device) {
+                            output = None;
+                        }
+                        route_ticks = 0;
+                        route_grace = true;
                         let output_was_open = output.is_some();
                         match start_track(
                             &mut output,
@@ -165,6 +189,12 @@ async fn control_loop(
                         if let Some(s) = &sink {
                             s.play();
                             playing = true;
+                            // Resuming onto a route that moved while paused
+                            // would play the first seconds on the old device;
+                            // make the next tick reconcile it instead of
+                            // waiting out the idle interval.
+                            route_ticks = u8::MAX;
+                            route_grace = true;
                             let _ = event_tx.send(Event::Playing);
                         }
                     }
@@ -350,19 +380,26 @@ async fn control_loop(
                 // drained, and the `empty()` branch below would report that as
                 // a finished track and advance the queue onto the speakers.
                 route_ticks = route_ticks.saturating_add(1);
-                let check_route = output.is_some()
-                    && (playing || lost_device.is_some())
-                    && route_ticks >= ROUTE_CHECK_TICKS;
+                let due = if playing || lost_device.is_some() {
+                    ROUTE_CHECK_TICKS
+                } else {
+                    IDLE_ROUTE_CHECK_TICKS
+                };
+                let check_route = output.is_some() && route_ticks >= due;
                 if check_route {
                     route_ticks = 0;
                 }
                 if check_route && route_lost(&selected_device, &open_device) {
-                    // Only a route that vanished *during* playback earns a
-                    // resume when it comes back; a device swapped while paused
-                    // just moves the output.
-                    if playing {
+                    // A device pulled out from under playback is not the same
+                    // event as a new one taking the route over, and only the
+                    // first should stop the music.
+                    let vanished = open_device.as_deref().is_none_or(|name| !device_present(name));
+                    let action = route_action(playing, vanished, route_grace);
+                    route_grace = false;
+                    if action == RouteAction::HoldForDevice {
                         lost_device = open_device.clone();
                     }
+                    let resume = action == RouteAction::Follow;
                     let pos = sink.as_ref().map(|s| s.get_pos());
                     // The appended next track dies with the old player.
                     let requeue = queued.take().map(|l| l.track);
@@ -390,10 +427,17 @@ async fn control_loop(
                                 {
                                     tracing::warn!("seek after route change failed: {e}");
                                 }
-                                new_sink.pause();
+                                if !resume {
+                                    new_sink.pause();
+                                }
                                 current = Some(loaded);
                                 sink = Some(new_sink);
-                                let _ = event_tx.send(Event::Paused);
+                                playing = resume;
+                                let _ = event_tx.send(if resume {
+                                    Event::Playing
+                                } else {
+                                    Event::Paused
+                                });
                             }
                             Err(e) => {
                                 let _ = event_tx.send(Event::Failed(e.to_string()));
@@ -459,22 +503,63 @@ async fn control_loop(
 
 /// Has the output route moved out from under an open sink?
 ///
-/// With no device chosen that means the OS default is no longer the device the
-/// sink was opened on (a Bluetooth disconnect flips it to the built-in
-/// speakers); with one chosen it means that device is no longer present at all,
-/// so `open_output` would now be falling back to the default.
+/// The test is the same in every case: where would audio go if we opened now,
+/// and is that still where this sink was opened? With no device chosen that
+/// catches the default moving (a Bluetooth headset connecting, or being pulled
+/// out and dropping the route back to the speakers); with one chosen it catches
+/// both it going away — `open_output` falls back to the default — and it coming
+/// back, which is when we should leave the fallback and go claim it.
 fn route_lost(selected: &Option<String>, open: &Option<String>) -> bool {
-    match selected {
-        // Never seen the device we opened on: nothing to compare against, and
-        // a name query that keeps failing must not restart playback every tick.
-        None if open.is_none() => false,
-        None => default_output_device_name() != *open,
-        Some(name) => !output_device_present(name),
+    // Never seen the device we opened on, or cannot tell where audio would go
+    // now: nothing to compare against, and a name query that keeps failing must
+    // not restart playback every tick.
+    if open.is_none() {
+        return false;
+    }
+    let Some(resolved) = resolved_device_name(selected) else {
+        return false;
+    };
+    Some(resolved.as_str()) != open.as_deref()
+}
+
+/// What a detected route change means for playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteAction {
+    /// Move the output and keep playing: the route moved to another device
+    /// (earbuds connected) rather than the one in use going away.
+    Follow,
+    /// The device playing was pulled out. Pause, and resume only when it comes
+    /// back — the user asked for audio in the earbuds, not in the room.
+    HoldForDevice,
+    /// Nothing was playing: move the output and stay as we were.
+    Moved,
+}
+
+/// Decide what to do about a route change. `user_started` marks a Play or
+/// Resume since the last check: an explicit request for audio outranks waiting
+/// for a device, so a device found missing in that window is followed rather
+/// than held for.
+fn route_action(playing: bool, vanished: bool, user_started: bool) -> RouteAction {
+    match (playing, vanished && !user_started) {
+        (false, _) => RouteAction::Moved,
+        (true, true) => RouteAction::HoldForDevice,
+        (true, false) => RouteAction::Follow,
     }
 }
 
-/// Is a device with this description name currently connected?
-fn output_device_present(name: &str) -> bool {
+/// Is the device this name refers to still connected? Names come from
+/// `output_devices`, so they are PulseAudio/PipeWire sink descriptions on Linux
+/// and cpal descriptions elsewhere.
+fn device_present(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(sinks) = pulse::descriptions() {
+        return sinks.iter().any(|d| d == name);
+    }
+    cpal_device_present(name)
+}
+
+/// Is a device with this cpal description name currently connected?
+fn cpal_device_present(name: &str) -> bool {
     use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
     let Ok(devices) = rodio::cpal::default_host().output_devices() else {
         // Can't enumerate: assume it is there rather than tearing the output
@@ -491,7 +576,7 @@ fn output_device_present(name: &str) -> bool {
 /// PulseAudio/PipeWire for the real sink description first.
 fn default_output_device_name() -> Option<String> {
     #[cfg(target_os = "linux")]
-    if let Some(desc) = pulse_default_sink_description() {
+    if let Some(desc) = pulse::default_sink_description() {
         return Some(desc);
     }
     use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
@@ -499,44 +584,6 @@ fn default_output_device_name() -> Option<String> {
         .default_output_device()
         .and_then(|d| d.description().ok())
         .map(|desc| desc.name().to_string())
-}
-
-/// Human-readable description of the default PulseAudio/PipeWire sink, via
-/// `pactl` (best-effort; None when unavailable).
-#[cfg(target_os = "linux")]
-fn pulse_default_sink_description() -> Option<String> {
-    use std::process::Command;
-    let out = Command::new("pactl")
-        .env("LC_ALL", "C") // keep field labels unlocalized
-        .arg("get-default-sink")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sink = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if sink.is_empty() {
-        return None;
-    }
-    let out = Command::new("pactl")
-        .env("LC_ALL", "C")
-        .args(["list", "sinks"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let mut in_target = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(name) = line.strip_prefix("Name:") {
-            in_target = name.trim() == sink;
-        } else if in_target && let Some(desc) = line.strip_prefix("Description:") {
-            return Some(desc.trim().to_string());
-        }
-    }
-    None
 }
 
 /// Start preparing `track`, superseding any prefetch already in flight.
@@ -803,9 +850,27 @@ async fn start_track(
     Ok((player, loaded))
 }
 
-/// Open the sink for `selected` (a cpal device description name), falling back
-/// to the system default when None or when the named device is gone.
+/// Open the sink for `selected` (a name as `output_devices` reports it), falling
+/// back to the system default when None or when the named device is gone.
 fn open_output(selected: &Option<String>) -> Result<rodio::MixerDeviceSink, PlaybackError> {
+    // On Linux the names are PulseAudio/PipeWire sink descriptions, which cpal
+    // cannot open by name — it only sees ALSA devices, and a Bluetooth sink is
+    // not one. Open the default stream and move it to the chosen sink instead,
+    // the same thing a desktop volume applet does.
+    #[cfg(target_os = "linux")]
+    if pulse::descriptions().is_some() {
+        let sink = rodio::DeviceSinkBuilder::open_default_sink()
+            .map_err(|e| PlaybackError(e.to_string()))?;
+        // A name saved before this machine's sinks changed (or by an older
+        // build, which stored cpal names) matches nothing; the default is where
+        // that should land, without spending the retry window looking for a
+        // sink that is not there.
+        if let Some(name) = selected.as_deref().filter(|name| device_present(name)) {
+            retarget_stream(name);
+        }
+        return Ok(sink);
+    }
+
     use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
     if let Some(name) = selected
         && let Ok(devices) = rodio::cpal::default_host().output_devices()
@@ -827,12 +892,45 @@ fn open_output(selected: &Option<String>) -> Result<rodio::MixerDeviceSink, Play
     rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| PlaybackError(e.to_string()))
 }
 
-/// Display name for the selected device: the chosen name, or the resolved
-/// default device description when None.
+/// Move this process's playback stream onto `name`, retrying briefly.
+///
+/// The sound server registers the stream a moment after the device is opened,
+/// and there is nothing to move until it has; a move that lands late plays the
+/// first fraction of a second on the wrong device. Blocking is deliberate —
+/// this runs inside `open_output`, which is already a blocking device open, and
+/// only on a first play, a device switch or a route change.
+#[cfg(target_os = "linux")]
+fn retarget_stream(name: &str) {
+    use crate::pulse::MoveResult;
+    const ATTEMPTS: u32 = 10;
+    const WAIT: Duration = Duration::from_millis(30);
+    for _ in 0..ATTEMPTS {
+        match pulse::move_output_to(name) {
+            MoveResult::Landed => return,
+            // Something else on this desktop owns the routing. Retrying would
+            // only fight it, and it would win.
+            MoveResult::Grabbed(actual) => {
+                tracing::warn!(
+                    "asked for output on {name}, but another program routes our audio to {actual}"
+                );
+                return;
+            }
+            MoveResult::NoStream => std::thread::sleep(WAIT),
+        }
+    }
+    tracing::warn!("could not move the output to {name}; playing on the default device");
+}
+
+/// Where audio would actually go if the output were opened right now: the
+/// chosen device, or the system default when nothing is chosen — or when the
+/// chosen device is gone, since `open_output` falls back to the default. That
+/// fallback has to be reported honestly: naming the chosen device anyway would
+/// hide it, and would leave the route watch with nothing to notice when the
+/// device came back.
 fn resolved_device_name(selected: &Option<String>) -> Option<String> {
     match selected {
-        Some(name) => Some(name.clone()),
-        None => default_output_device_name(),
+        Some(name) if device_present(name) => Some(name.clone()),
+        _ => default_output_device_name(),
     }
 }
 
@@ -870,6 +968,31 @@ mod tests {
         let hint = Hint::MimeType("audio/flac".into());
         let err = decoder_failure(DecoderError::UnrecognizedFormat, Some(&hint), true);
         assert_eq!(err.0, DecoderError::UnrecognizedFormat.to_string());
+    }
+
+    #[test]
+    fn earbuds_taking_the_route_over_keep_playing() {
+        // Default moved to a device that just appeared; the one we were on is
+        // still there, so follow it rather than stopping the music.
+        assert_eq!(route_action(true, false, false), RouteAction::Follow);
+    }
+
+    #[test]
+    fn a_device_pulled_out_mid_track_holds_playback() {
+        assert_eq!(route_action(true, true, false), RouteAction::HoldForDevice);
+    }
+
+    #[test]
+    fn a_route_change_while_paused_only_moves_the_output() {
+        assert_eq!(route_action(false, true, false), RouteAction::Moved);
+        assert_eq!(route_action(false, false, false), RouteAction::Moved);
+    }
+
+    #[test]
+    fn pressing_play_outranks_waiting_for_a_missing_device() {
+        // Unplugged while paused, then Play: the user wants audio now, on
+        // whatever is connected.
+        assert_eq!(route_action(true, true, true), RouteAction::Follow);
     }
 
     #[test]

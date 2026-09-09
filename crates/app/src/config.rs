@@ -96,7 +96,10 @@ pub struct Settings {
     pub show_queue_button: bool,
     /// ReplayGain loudness-normalization mode.
     pub replay_gain: ReplayGainMode,
-    /// Chosen audio output device (cpal description name); None = OS default.
+    /// Chosen audio output device, named as `playback::output_devices` reports
+    /// it (a PulseAudio/PipeWire sink description on Linux, a cpal one
+    /// elsewhere); None = OS default. A name that no longer matches any device
+    /// falls back to the default rather than failing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_device: Option<String>,
     /// What to do when the play queue reaches its end.

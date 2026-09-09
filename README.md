@@ -6,7 +6,7 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/), and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.5.12-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.6.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#installation)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
@@ -51,6 +51,7 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 - [x] **Internet radio**: list, play, add and delete stations, with a live ICY now-playing title.
 - [x] **Transcoding**: per-session format (mp3 / ogg / raw) and max bitrate.
 - [x] **Fullscreen player**: album art, track info, waveform seek bar, lyrics and queue panels, five background styles.
+- [x] **Output device picker**: pick where audio goes — PulseAudio/PipeWire sinks on Linux, Bluetooth included — and playback follows the route when a device is connected or pulled out.
 - [x] **OS media keys**: media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS).
 - [x] **Artwork cache**: LRU-evicted disk cache (configurable cap) with HiDPI-aware resolution bump.
 - [x] **Navigation**: mouse back/forward buttons, bracket keys, configurable default page, and optional vi-mode navigation with a **Reduce motion** toggle.

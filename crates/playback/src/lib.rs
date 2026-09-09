@@ -8,6 +8,8 @@
 
 mod engine;
 pub mod icy;
+#[cfg(target_os = "linux")]
+mod pulse;
 mod source;
 pub mod spectrum;
 pub mod waveform;
@@ -61,10 +63,25 @@ pub enum Command {
     SetOutputDevice(Option<String>),
 }
 
-/// Enumerate available output device names (cpal descriptions), de-duplicated.
-/// Best-effort: returns an empty list when the host cannot be queried. Skips
-/// the "null" driver so dummy devices don't appear in the picker.
+/// Enumerate the output devices a user could pick, de-duplicated. Best-effort:
+/// returns an empty list when nothing can be queried.
+///
+/// On Linux these are PulseAudio/PipeWire sink descriptions — the same outputs
+/// the rest of the desktop offers, Bluetooth included. cpal's ALSA hints are
+/// the fallback for a machine without `pactl`, and they are a poor list: sound
+/// servers, resampler plugins and capture-only devices all appear in it, and no
+/// PipeWire sink does. Elsewhere (macOS) cpal is the only list and a good one.
 pub fn output_devices() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(sinks) = pulse::descriptions() {
+        return sinks;
+    }
+    cpal_output_devices()
+}
+
+/// Output device names as cpal describes them, skipping the "null" driver so
+/// dummy devices don't appear in the picker.
+fn cpal_output_devices() -> Vec<String> {
     use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
     let mut names = Vec::new();
     if let Ok(devices) = rodio::cpal::default_host().output_devices() {
