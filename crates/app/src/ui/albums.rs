@@ -36,6 +36,9 @@ const CACHE_ART_PREFETCH: usize = 300;
 /// Column guess for the very first frame, before anything has been laid out.
 const FALLBACK_COLS: usize = 5;
 
+/// Rows of covers fetched beyond each edge of the viewport.
+const ART_LOOKAHEAD_ROWS: usize = 2;
+
 /// Card text metrics. The line heights are explicit because gpui's default
 /// line box for these font sizes clips descenders; the block height is fixed
 /// so every card is the same size (a requirement of the virtualized rows).
@@ -236,9 +239,13 @@ pub struct AlbumsView {
     /// into one re-render instead of one per completed download.
     art_repaint_pending: bool,
     active_tab: AlbumSort,
-    /// Resolution thumbnails are currently fetched at; tracked so a cover-size
-    /// change can drop stale art and refetch at the new resolution.
+    /// Rung thumbnails are currently fetched at — the *bucketed* size, not the
+    /// setting's raw width, so a cover-size change that resolves to the same
+    /// cache entry doesn't drop art it would only look up again.
     art_px: u32,
+    /// Card range covers were last requested for, so a repaint that hasn't
+    /// scrolled doesn't walk the viewport again.
+    art_range: Option<(usize, usize)>,
     /// Virtualized row scroll handle: only visible rows are built/uploaded.
     pub scroll: UniformListScrollHandle,
     error: Option<String>,
@@ -265,7 +272,7 @@ impl AlbumsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let active_tab = session.read(cx).settings.album_sort;
-        let art_px = session.read(cx).settings.cover_size.art_px();
+        let art_px = artwork::bucket(session.read(cx).settings.cover_size.art_px());
         let mut this = Self {
             session,
             player,
@@ -277,6 +284,7 @@ impl AlbumsView {
             art_repaint_pending: false,
             active_tab,
             art_px,
+            art_range: None,
             scroll: UniformListScrollHandle::new(),
             error: None,
             vi_cursor: None,
@@ -380,6 +388,9 @@ impl AlbumsView {
 
     fn select_tab(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
         self.active_tab = tab;
+        // The range is per tab's list; the new tab's cards at those indices are
+        // different albums.
+        self.art_range = None;
         if self.tabs.get(&tab).is_none_or(|t| t.albums.is_empty()) {
             self.seed_from_cache(tab, cx);
             self.load_more(tab, cx);
@@ -657,6 +668,14 @@ impl AlbumsView {
         let Some(client) = self.client(cx) else {
             return;
         };
+        // Meanwhile, draw whatever rendition of this cover is already on disk.
+        // The case that matters is the cover-size setting moving to another
+        // rung: every card would otherwise blank until its new download lands,
+        // for art that differs only in how many pixels it is scaled from. The
+        // task below replaces it when the right size arrives.
+        if let Some(path) = artwork::cached_best(&cover_id, self.art_px) {
+            self.art_paths.insert(album.id.clone(), path);
+        }
         let album_id = album.id.clone();
         let art_px = self.art_px;
         // Soft-cap the bag: oldest entries are the earliest-scrolled covers,
@@ -695,18 +714,64 @@ impl AlbumsView {
         .detach();
     }
 
-    /// Drop cached thumbnail paths and refetch the active tab's art at the
-    /// current `art_px` (called when the cover-size setting changes).
-    fn refetch_art(&mut self, cx: &mut Context<Self>) {
+    /// Drop cached thumbnail paths so the next frame refetches at the current
+    /// `art_px` (called when the cover-size setting lands on a new rung).
+    ///
+    /// Only clears: the tab holds every album loaded so far, and refetching all
+    /// of them queued a lookup — and on a miss a download — for thousands of
+    /// cards nobody is looking at, ahead of the ones on screen.
+    /// `ensure_art_for_viewport` refills what is visible.
+    fn refetch_art(&mut self) {
         self.art_paths.clear();
         // Cancel in-flight downloads at the old resolution.
         self.art_tasks.clear();
-        let albums: Vec<Album> = self
+        self.art_range = None;
+    }
+
+    /// Fetch covers for the rows on screen, plus a few past the edge.
+    ///
+    /// The grid's own art is normally fetched as pages land, which covers
+    /// scrolling; this is what repopulates it after a resolution change, and
+    /// what carries the seeded cache rows past `CACHE_ART_PREFETCH`.
+    fn ensure_art_for_viewport(&mut self, row_count: usize, cols: usize, cx: &mut Context<Self>) {
+        if cols == 0 || row_count == 0 {
+            return;
+        }
+        let album_count = self
             .tabs
             .get(&self.active_tab)
-            .map(|t| t.albums.clone())
+            .map(|t| t.albums.len())
+            .unwrap_or(0);
+        if album_count == 0 {
+            return;
+        }
+        let base = self.scroll.0.borrow().base_handle.clone();
+        let viewport = f32::from(base.bounds().size.height);
+        let content = f32::from(base.max_offset().height) + viewport;
+        let (first_row, last_row) = if viewport > 0. && content > 0. {
+            let row_h = content / row_count as f32;
+            let scrolled = f32::from(-base.offset().y).max(0.);
+            (
+                (scrolled / row_h).floor() as usize,
+                ((scrolled + viewport) / row_h).ceil() as usize,
+            )
+        } else {
+            // Pre-layout: no measured viewport yet, so cover a guessed screenful
+            // rather than nothing — the next frame corrects it.
+            (0, ART_LOOKAHEAD_ROWS)
+        };
+        let start = first_row.saturating_sub(ART_LOOKAHEAD_ROWS) * cols;
+        let end = ((last_row + 1 + ART_LOOKAHEAD_ROWS) * cols).min(album_count);
+        if start >= end || self.art_range == Some((start, end)) {
+            return;
+        }
+        self.art_range = Some((start, end));
+        let window: Vec<Album> = self
+            .tabs
+            .get(&self.active_tab)
+            .map(|t| t.albums[start..end].to_vec())
             .unwrap_or_default();
-        for album in &albums {
+        for album in &window {
             self.fetch_art(album, cx);
         }
     }
@@ -884,12 +949,16 @@ impl Render for AlbumsView {
 
         // Pick up cover-size changes: refetch art at the new resolution. The
         // fetch resolution follows the *setting*, not the tile the window ends
-        // up picking inside its range, so a resize never invalidates art.
+        // up picking inside its range, so a resize never invalidates art — and
+        // it is compared at the rung art is actually stored at, so the two
+        // settings that share one (Medium and Large) don't invalidate it
+        // either.
         let cover = self.session.read(cx).settings.cover_size;
         let (min_tile, max_tile) = cover.range();
-        if cover.art_px() != self.art_px {
-            self.art_px = cover.art_px();
-            self.refetch_art(cx);
+        let want_px = artwork::bucket(cover.art_px());
+        if want_px != self.art_px {
+            self.art_px = want_px;
+            self.refetch_art();
         }
 
         // The filled primary button is the whole selection marker. An
@@ -949,6 +1018,7 @@ impl Render for AlbumsView {
             FALLBACK_COLS,
         );
         let row_count = album_count.div_ceil(cols);
+        self.ensure_art_for_viewport(row_count, cols, cx);
 
         let entity = cx.entity();
         let grid = uniform_list("albums-grid", row_count, move |range, _window, cx| {

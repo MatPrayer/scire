@@ -96,7 +96,12 @@ pub fn album_cover_key(album_id: &str) -> String {
 const SIZE_LADDER: [u32; 5] = [64, 256, 512, 640, 1500];
 
 /// Snap a requested edge length up to the nearest stored size.
-fn bucket(size: u32) -> u32 {
+///
+/// Public so a view can tell a size change that matters from one that does not:
+/// two settings whose widths land on the same rung name the very same cache
+/// entry, and dropping the art to "refetch at the new resolution" would look up
+/// the identical files again.
+pub fn bucket(size: u32) -> u32 {
     SIZE_LADDER
         .into_iter()
         .find(|&rung| rung >= size)
@@ -471,13 +476,21 @@ mod tests {
 
     #[test]
     fn requests_snap_up_to_a_stored_size() {
-        // The four grid widths (cover size × 1.5) collapse onto two rungs, so
-        // changing the setting between Small and Medium re-uses what is
-        // already on disk instead of re-downloading the library.
-        assert_eq!(bucket(180), 256); // Small
-        assert_eq!(bucket(240), 256); // Medium
-        assert_eq!(bucket(300), 512); // Large
-        assert_eq!(bucket(390), 512); // ExtraLarge
+        // The four grid widths (cover size × 1.5) collapse onto three rungs,
+        // Medium and Large sharing one — read off `CoverSize` rather than
+        // written out, since the grid's guard against a pointless refetch is
+        // exactly this comparison and the two must not drift apart.
+        use crate::config::CoverSize;
+        let rungs: Vec<u32> = [
+            CoverSize::Small,
+            CoverSize::Medium,
+            CoverSize::Large,
+            CoverSize::ExtraLarge,
+        ]
+        .into_iter()
+        .map(|size| bucket(size.art_px()))
+        .collect();
+        assert_eq!(rungs, vec![256, 512, 512, 640]);
         // The other views land on the same rungs rather than each keeping a
         // private copy of the same picture.
         assert_eq!(bucket(200), 256); // recent
