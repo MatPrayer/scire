@@ -48,6 +48,18 @@ const ART_MIN: f32 = 140.;
 /// Its cap in the stacked layout, where it has the whole width to itself: the
 /// side-by-side cap leaves it looking small under a tall window's card.
 const ART_MAX_STACKED: f32 = 560.;
+/// Caps for a window with room to spare. `ART_MAX`/`ART_MAX_STACKED` are what a
+/// window that only just holds the overlay draws; a bigger one has the room to
+/// make the cover the subject of the page instead of a fixed square sitting in
+/// the middle of a mostly empty window, so past those the cap grows with the
+/// window up to these.
+const ART_MAX_ROOMY: f32 = 780.;
+const ART_MAX_STACKED_ROOMY: f32 = 880.;
+/// What the grown cover is allowed to take: a share of the window's height
+/// beside the card (the card sets the width it can have), and a share of the
+/// content width stacked (the column has height to spare, width is the limit).
+const ART_ROOMY_SHARE: f32 = 0.62;
+const ART_ROOMY_STACK_SHARE: f32 = 0.82;
 /// Share of the cover's width the card is drawn at in the stacked layout, so
 /// the column reads cover-first instead of as two equal blocks.
 const CARD_STACKED_SHARE: f32 = 0.85;
@@ -82,6 +94,12 @@ const INFO_WRAP_H: f32 = 32.;
 /// Side panel (queue / lyrics) width, beside the card.
 const PANEL_MAX: f32 = 320.;
 const PANEL_MIN: f32 = 220.;
+/// Queue row height. `uniform_list` needs every row the same size, and a whole
+/// number of them is what keeps the panel from ending mid-row.
+const QUEUE_ROW_H: f32 = 44.;
+/// The queue panel's own chrome around that list: `p_4` above and below, the
+/// "Queue" header, and the `gap_2` under it.
+const QUEUE_CHROME_H: f32 = 16. * 2. + 20. + 8.;
 /// Window padding (`px_10`) and the gap between content columns (`gap_8`).
 const EDGE: f32 = 40.;
 /// Vertical window padding once compact.
@@ -184,6 +202,29 @@ impl CardDensity {
         self != Self::Compact
     }
 }
+/// Cover cap beside the card once the window has height to spare. Below the
+/// point where the share reaches `ART_MAX` this is exactly the old cap, so a
+/// window that only just fits the overlay is laid out as it always was.
+fn roomy_art_cap(height: f32) -> f32 {
+    (height * ART_ROOMY_SHARE).clamp(ART_MAX, ART_MAX_ROOMY)
+}
+
+/// The same, stacked: there the column has the height and the content width is
+/// what the cover has to stay inside.
+fn stacked_art_cap(content: f32) -> f32 {
+    (content * ART_ROOMY_STACK_SHARE).clamp(ART_MAX_STACKED, ART_MAX_STACKED_ROOMY)
+}
+
+/// How many whole queue rows a panel of `max_h` holds — at least one, and never
+/// more than the queue has. The panel is then drawn at exactly that many rows
+/// rather than at the room it was given: a panel sized to the room ends with a
+/// row sliced through the middle, which reads as a rendering fault rather than
+/// as a list that carries on below the fold.
+fn queue_visible_rows(max_h: f32, len: usize) -> usize {
+    let fits = ((max_h - QUEUE_CHROME_H) / QUEUE_ROW_H).floor().max(1.) as usize;
+    fits.min(len.max(1))
+}
+
 /// Below this window width the tuning card no longer fits beside the mini
 /// player and is stacked above it instead.
 const TUNING_SIDE_MIN_W: f32 = 1000.;
@@ -273,7 +314,7 @@ impl Layout {
                     let art = if room < ART_MIN {
                         0.
                     } else {
-                        room.min(content).clamp(ART_MIN, ART_MAX_STACKED)
+                        room.min(content).clamp(ART_MIN, stacked_art_cap(content))
                     };
                     // The cover leads this layout — it has the whole width to
                     // itself, and a card drawn just as wide turns the column
@@ -349,6 +390,12 @@ impl Layout {
             // The cover is square, so the window's height caps it as well.
             let art_cap = (height - 2. * pad).min(ART_MAX);
             let art = (free - CARD_MIN).min(art_cap).max(ART_MIN);
+            // A window with room to spare grows the cover past `ART_MAX`, but
+            // only into width the card does not want: taking it out of the card
+            // instead would push it toward `CARD_MIN` and cost the toggles their
+            // labels, which is a trade a roomy window never has to make.
+            let roomy = (free - CARD_MAX).min((height - 2. * pad).min(roomy_art_cap(height)));
+            let art = art.max(roomy);
             let card = (free - art).clamp(CARD_MIN, CARD_MAX);
             Self {
                 stacked: false,
@@ -538,6 +585,13 @@ pub struct FullscreenPlayer {
     /// Album-scoped art key the loaded art belongs to (see `artwork::song_cover`).
     last_art_key: Option<String>,
     panel: Option<SidePanel>,
+    /// Scroll handle of the queue panel's list, so the playing track can be
+    /// scrolled back into view when it changes.
+    queue_scroll: gpui::UniformListScrollHandle,
+    /// Queue position the panel has already followed. Only a change scrolls, so
+    /// a user reading further down the queue is not dragged back every frame;
+    /// cleared when the panel closes, so reopening re-centres on the track.
+    queue_followed: Option<usize>,
     /// Lyrics text for the song in `lyrics_for`; None while loading or when
     /// the server has none.
     lyrics: Option<String>,
@@ -671,6 +725,8 @@ impl FullscreenPlayer {
             gradient_palette: None,
             last_art_key: None,
             panel: None,
+            queue_scroll: gpui::UniformListScrollHandle::new(),
+            queue_followed: None,
             lyrics: None,
             lyrics_for: None,
             lyrics_loading: false,
@@ -782,8 +838,45 @@ impl FullscreenPlayer {
         } else {
             Some(panel)
         };
+        // A reopened queue starts on the playing track again, wherever the
+        // list was left scrolled.
+        self.queue_followed = None;
         self.maybe_fetch_lyrics(cx);
         cx.notify();
+    }
+
+    /// Keep the playing track visible in the queue panel.
+    ///
+    /// Called from `render` rather than from the player observer: the list only
+    /// exists while the panel is open, and a scroll requested for a list that
+    /// is not being drawn is one the handle applies to whatever it holds next.
+    /// Only a *change* of position scrolls — see `queue_followed`.
+    fn sync_queue_scroll(&mut self, panel_max_h: f32, cx: &Context<Self>) {
+        if self.panel != Some(SidePanel::Queue) {
+            return;
+        }
+        let (pos, len) = {
+            let q = &self.player.read(cx).queue;
+            match q.current_pos() {
+                Some(pos) => (pos, q.len()),
+                None => return,
+            }
+        };
+        if self.queue_followed == Some(pos) {
+            return;
+        }
+        self.queue_followed = Some(pos);
+        // Scrolled in whole rows: `ScrollStrategy::Top` puts a row's own top at
+        // the list's, so which row is sent there is what places the playing
+        // track, and every row on screen stays whole. Centring on the track
+        // itself would leave half a row at each edge, which is the thing the
+        // panel's row-snapped height is there to avoid.
+        let visible = queue_visible_rows(panel_max_h, len);
+        let top = pos
+            .saturating_sub(visible / 2)
+            .min(len.saturating_sub(visible));
+        self.queue_scroll
+            .scroll_to_item(top, gpui::ScrollStrategy::Top);
     }
 
     /// Advance the visualizer to the next scene (and off again), persisting the
@@ -1001,51 +1094,71 @@ impl FullscreenPlayer {
                 .collect();
             (rows, p.queue.current_pos())
         };
-        let items: Vec<gpui::AnyElement> = rows
-            .into_iter()
-            .map(|(pos, title, artist)| {
-                let is_current = current == Some(pos);
-                h_flex()
-                    .id(gpui::SharedString::from(format!("fsq-{pos}")))
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .border_l_2()
-                    .border_color(gpui::transparent_black())
-                    .hover(|s| s.bg(cx.theme().muted.opacity(0.6)))
-                    .when(is_current, |s| {
-                        s.bg(cx.theme().primary.opacity(0.12))
-                            .border_color(cx.theme().primary)
-                            .text_color(cx.theme().primary)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.player.update(cx, |p, cx| p.jump_to(pos, cx));
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
+        let player = self.player.clone();
+        // Drawn at a whole number of rows, so the panel never ends halfway
+        // through one; `uniform_list` also virtualizes a long queue and is what
+        // `sync_queue_scroll` steers to follow the playing track.
+        let height = QUEUE_CHROME_H + queue_visible_rows(max_h, rows.len()) as f32 * QUEUE_ROW_H;
+        let list = gpui::uniform_list(
+            "fs-queue-list",
+            rows.len(),
+            move |range, _window, cx: &mut gpui::App| {
+                range
+                    .filter_map(|ix| rows.get(ix).cloned())
+                    .map(|(pos, title, artist)| {
+                        let is_current = current == Some(pos);
+                        let player = player.clone();
+                        h_flex()
+                            .id(("fsq", pos))
+                            // `uniform_list` sizes items to their content: a row
+                            // that does not claim the width lands at whatever
+                            // its own text needs.
+                            .w_full()
+                            .h(px(QUEUE_ROW_H))
+                            .px_2()
+                            .gap_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_l_2()
+                            .border_color(gpui::transparent_black())
+                            .hover(|s| s.bg(cx.theme().muted.opacity(0.6)))
+                            .when(is_current, |s| {
+                                s.bg(cx.theme().primary.opacity(0.12))
+                                    .border_color(cx.theme().primary)
+                                    .text_color(cx.theme().primary)
+                            })
+                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                player.update(cx, |p, cx| p.jump_to(pos, cx));
+                                cx.stop_propagation();
+                            })
                             .child(
-                                div()
-                                    .text_sm()
-                                    .truncate()
-                                    .when(is_current, |s| s.font_medium())
-                                    .child(title),
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .truncate()
+                                            .when(is_current, |s| s.font_medium())
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .truncate()
+                                            .child(artist),
+                                    ),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .truncate()
-                                    .child(artist),
-                            ),
-                    )
-                    .into_any_element()
-            })
-            .collect();
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .flex_1()
+        .min_h_0()
+        .track_scroll(self.queue_scroll.clone());
 
         v_flex()
             .w(px(width))
@@ -1053,7 +1166,7 @@ impl FullscreenPlayer {
             // Same card as the info column and the mini player, so an open
             // panel reads as part of the player rather than as a list dropped
             // onto the backdrop.
-            .max_h(px(max_h))
+            .h(px(height))
             .p_4()
             .gap_2()
             .rounded_2xl()
@@ -1068,15 +1181,7 @@ impl FullscreenPlayer {
                     .text_color(cx.theme().muted_foreground)
                     .child("Queue"),
             )
-            .child(
-                v_flex()
-                    .id("fs-queue-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .gap_0p5()
-                    .children(items),
-            )
+            .child(list)
             .into_any_element()
     }
 
@@ -1632,6 +1737,9 @@ impl Render for FullscreenPlayer {
         let viewport = window.viewport_size();
         let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
         let layout = Layout::resolve(vw, vh, self.panel.is_some(), show_volume && !is_radio);
+        // Follow the playing track in the queue panel, now that the room the
+        // panel gets — and so how many rows it holds — is known.
+        self.sync_queue_scroll(layout.panel_max_h, cx);
         // Labelled toggles stick out of a narrow card; the icons carry the
         // meaning on their own, and tooltips are not the point here.
         let toggle_labels = layout.card >= TOGGLE_LABEL_MIN;
@@ -2526,8 +2634,9 @@ impl Render for FullscreenPlayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        ART_LEAD, ART_MAX, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity, EDGE, GAP, Layout,
-        blob_base, blob_field, hash01,
+        ART_LEAD, ART_MAX, ART_MAX_ROOMY, ART_MAX_STACKED, ART_MAX_STACKED_ROOMY, ART_MIN,
+        BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity, EDGE, GAP, Layout, QUEUE_CHROME_H,
+        QUEUE_ROW_H, VOLUME_W, blob_base, blob_field, hash01, queue_visible_rows,
     };
 
     fn rgba(r: f32, g: f32, b: f32) -> gpui::Rgba {
@@ -2689,8 +2798,70 @@ mod tests {
     fn a_roomy_window_keeps_the_full_size_layout() {
         let l = Layout::resolve(1400., 900., false, false);
         assert!(!l.stacked);
-        assert_eq!(l.art, ART_MAX);
+        assert!(l.art >= ART_MAX);
         assert_eq!(l.card, CARD_MAX);
+    }
+
+    #[test]
+    fn a_big_window_grows_the_cover_without_costing_the_card() {
+        // The window that only just holds the overlay is laid out as before…
+        assert_eq!(Layout::resolve(1000., 640., false, false).art, ART_MAX);
+        // …and past that the cover grows with the window rather than leaving
+        // the room around it empty — never by taking width off the card.
+        let mut last = ART_MAX;
+        for &(w, h) in &[(1400., 900.), (1920., 1080.), (2560., 1440.)] {
+            let l = Layout::resolve(w, h, false, false);
+            assert!(!l.stacked, "{w}x{h} should not stack");
+            assert!(l.art > last, "{w}x{h} did not grow the cover: {l:?}");
+            assert_eq!(l.card, CARD_MAX, "{w}x{h} squeezed the card: {l:?}");
+            assert!(l.art <= ART_MAX_ROOMY + 0.5, "{w}x{h}: {l:?}");
+            assert!(row_width(&l, 0.) <= w + 0.5, "{w}x{h} overruns: {l:?}");
+            assert!(content_height(&l) <= h + 0.5, "{w}x{h} overruns: {l:?}");
+            last = l.art;
+        }
+        // With the panel and the volume column open too, on the same window.
+        let l = Layout::resolve(2560., 1440., true, true);
+        assert!(l.volume && l.panel > 0.);
+        assert!(l.art > ART_MAX && l.card == CARD_MAX, "{l:?}");
+        assert!(row_width(&l, VOLUME_W) <= 2560. + 0.5, "{l:?}");
+    }
+
+    #[test]
+    fn a_big_portrait_window_grows_the_cover_too() {
+        let mut last = ART_MAX_STACKED;
+        for &(w, h) in &[(800., 1200.), (1100., 1700.), (1440., 2560.)] {
+            let l = Layout::resolve(w, h, false, false);
+            assert!(l.stacked, "{w}x{h} should stack");
+            assert!(l.art > last, "{w}x{h} did not grow the cover: {l:?}");
+            assert!(l.art <= ART_MAX_STACKED_ROOMY + 0.5, "{w}x{h}: {l:?}");
+            assert!(l.art <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
+            assert!(l.art >= l.card + ART_LEAD, "{w}x{h}: {l:?}");
+            assert!(content_height(&l) <= h + 0.5, "{w}x{h} overruns: {l:?}");
+            last = l.art;
+        }
+    }
+
+    #[test]
+    fn the_queue_panel_shows_whole_rows_only() {
+        // Whatever room the panel is given, it draws a whole number of rows —
+        // a row cut through the middle reads as a bug, not as a longer list.
+        for max_h in [140., 260., 333., 620., 900.] {
+            let rows = queue_visible_rows(max_h, 200);
+            let drawn = QUEUE_CHROME_H + rows as f32 * QUEUE_ROW_H;
+            assert!(drawn <= max_h + 0.5, "{max_h}: {rows} rows is {drawn}");
+            // …and it uses the room it has: one more row would not fit.
+            assert!(
+                drawn + QUEUE_ROW_H > max_h,
+                "{max_h}: {rows} rows wastes a row"
+            );
+        }
+        // A short queue shrinks the panel instead of padding it out.
+        assert_eq!(queue_visible_rows(620., 3), 3);
+        // A panel too short for even one row still draws one rather than
+        // collapsing to its header.
+        assert_eq!(queue_visible_rows(0., 10), 1);
+        // An empty queue keeps the panel a panel.
+        assert_eq!(queue_visible_rows(620., 0), 1);
     }
 
     #[test]
