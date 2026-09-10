@@ -506,9 +506,10 @@ impl AlbumsView {
     /// Number of grid columns at the current window width.
     fn grid_cols(&mut self, window: &Window, cx: &App) -> usize {
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
-        let tile = self.session.read(cx).settings.cover_size.px();
+        let (min_tile, max_tile) = self.session.read(cx).settings.cover_size.range();
         self.live_width
-            .columns(measured, tile, window, FALLBACK_COLS)
+            .grid(measured, min_tile, max_tile, window, FALLBACK_COLS)
+            .0
     }
 
     /// Move the vi-mode cursor by `delta` grid positions, clamping and
@@ -881,9 +882,11 @@ impl Render for AlbumsView {
         let active = self.active_tab;
         self.sync_menu_playlists(cx);
 
-        // Pick up cover-size changes: refetch art at the new resolution.
+        // Pick up cover-size changes: refetch art at the new resolution. The
+        // fetch resolution follows the *setting*, not the tile the window ends
+        // up picking inside its range, so a resize never invalidates art.
         let cover = self.session.read(cx).settings.cover_size;
-        let tile = cover.px();
+        let (min_tile, max_tile) = cover.range();
         if cover.art_px() != self.art_px {
             self.art_px = cover.art_px();
             self.refetch_art(cx);
@@ -934,11 +937,14 @@ impl Render for AlbumsView {
         let paginating = loading && !showing_cache && album_count > 0;
         let header_loading = loading && !paginating;
 
-        // Columns from this frame's window width; falls back to a guess on the
-        // very first frame (before anything is laid out), then self-corrects.
-        let cols = self.live_width.columns(
+        // Columns *and* the tile they're drawn at, from this frame's window
+        // width: the covers grow inside the setting's range to spend what would
+        // otherwise be left as gutters. Falls back to a guess on the very first
+        // frame (before anything is laid out), then self-corrects.
+        let (cols, tile) = self.live_width.grid(
             f32::from(base.bounds().size.width),
-            tile,
+            min_tile,
+            max_tile,
             window,
             FALLBACK_COLS,
         );

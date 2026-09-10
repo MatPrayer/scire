@@ -1528,7 +1528,8 @@ impl Render for SettingsView {
             )
             .child(self.subheading("Cover size", cx))
             .child(self.note(
-                "Album cover size — albums per row adapt to the window width.",
+                "Roughly how big album covers are — the exact size and the number \
+                 per row adapt to the window so the grid fills its width.",
                 cx,
             ))
             .child(

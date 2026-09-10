@@ -205,6 +205,32 @@ pub fn grid_columns_padded(element_width: f32, tile: f32) -> Option<usize> {
     grid_columns(element_width - GRID_PADDING_X, tile)
 }
 
+/// Columns *and* the tile size to draw them at, for a cover size given as a
+/// range.
+///
+/// Columns are whole cards, so a fixed tile always leaves the division's
+/// remainder as gutters — on a wide 16:9 window that is most of a card's width
+/// of emptiness either side, while a narrower pane whose width happens to
+/// divide evenly looks right. Taking the column count at `min_tile` and then
+/// spending the leftover on the tiles themselves removes the remainder instead
+/// of centring it: the grid fills the width until the covers hit `max_tile`,
+/// past which the gutters come back rather than the art growing without limit.
+pub fn grid_fit(width: f32, min_tile: f32, max_tile: f32) -> Option<(usize, f32)> {
+    let cols = grid_columns(width, min_tile)?;
+    // Inverse of `grid_columns`: the row is `cols` cards plus `cols - 1` gaps,
+    // so each card gets `(width + GRID_GAP) / cols` and the tile is what's left
+    // of it once the gap and the card's own padding are taken off.
+    let tile =
+        ((width + GRID_GAP) / cols as f32 - GRID_GAP - CARD_PADDING).clamp(min_tile, max_tile);
+    Some((cols, tile))
+}
+
+/// [`grid_fit`] inside a scrolling grid element, minus the padding the rows are
+/// laid out within.
+pub fn grid_fit_padded(element_width: f32, min_tile: f32, max_tile: f32) -> Option<(usize, f32)> {
+    grid_fit(element_width - GRID_PADDING_X, min_tile, max_tile)
+}
+
 /// Frame-accurate width for a layout that reflows with the window.
 ///
 /// A `ScrollHandle`'s bounds are last frame's layout, so a grid whose column
@@ -271,20 +297,31 @@ impl LiveWidth {
         (viewport - self.chrome).max(0.)
     }
 
-    /// Columns for a card grid of `tile`-wide covers laid out inside the
-    /// measured element's `GRID_PADDING_X`. `fallback` stands in on the first
-    /// frame, before anything has been laid out.
+    /// Columns and tile size for a card grid whose covers may be drawn anywhere
+    /// in `min_tile..=max_tile`, laid out inside the measured element's
+    /// `GRID_PADDING_X`. `fallback` stands in on the first frame, before
+    /// anything has been laid out.
     ///
     /// The fallback is capped at what the *whole window* could hold: it is a
     /// guess made before the chrome is known, and a guess wider than the window
     /// itself overflows a centred row out past both edges — the one failure
     /// this type exists to prevent. Guessing too few only leaves a gap for the
-    /// frame it takes the real measurement to arrive.
-    pub fn columns(&mut self, measured: f32, tile: f32, window: &Window, fallback: usize) -> usize {
+    /// frame it takes the real measurement to arrive, and the fallback tile is
+    /// the range's minimum for the same reason: too small is a gutter for one
+    /// frame, too big is an overflowing row.
+    pub fn grid(
+        &mut self,
+        measured: f32,
+        min_tile: f32,
+        max_tile: f32,
+        window: &Window,
+        fallback: usize,
+    ) -> (usize, f32) {
         let viewport = f32::from(window.viewport_size().width);
         let width = self.resolve_at(measured, viewport);
-        grid_columns_padded(width, tile).unwrap_or_else(|| {
-            fallback.min(grid_columns_padded(viewport, tile).unwrap_or(fallback))
+        grid_fit_padded(width, min_tile, max_tile).unwrap_or_else(|| {
+            let cols = grid_columns_padded(viewport, min_tile).unwrap_or(fallback);
+            (fallback.min(cols), min_tile)
         })
     }
 }
@@ -1295,8 +1332,9 @@ mod tests {
     }
 
     use super::{
-        LiveWidth, accent_from_cover_bytes, format_count, format_playtime, grid_columns,
-        grid_columns_padded, strip_html, truncate_at_word,
+        CARD_PADDING, GRID_GAP, GRID_PADDING_X, LiveWidth, accent_from_cover_bytes, format_count,
+        format_playtime, grid_columns, grid_columns_padded, grid_fit, grid_fit_padded, strip_html,
+        truncate_at_word,
     };
 
     /// Chrome between the window edge and the grid: sidebar plus the content
@@ -1392,6 +1430,63 @@ mod tests {
         // The unpadded maths is exactly one column too eager over that band.
         assert_eq!(grid_columns(411., 168.), Some(2));
         assert_eq!(grid_columns_padded(0., 168.), None);
+    }
+
+    /// Row width for `cols` cards of `tile`, gaps included — what the grid
+    /// actually lays out, so the fit can be checked against the width it was
+    /// given rather than against the formula that produced it.
+    fn row_width(cols: usize, tile: f32) -> f32 {
+        cols as f32 * (tile + CARD_PADDING) + (cols - 1) as f32 * GRID_GAP
+    }
+
+    /// The point of the range: whatever the width, the row fills it rather than
+    /// leaving the division's remainder as gutters.
+    #[test]
+    fn grid_fit_spends_the_leftover_on_the_tiles() {
+        // A 16:9 window's content pane. At a fixed 150 tile this fits 12
+        // columns and leaves ~154px of gutter; the tiles take it instead.
+        let (cols, tile) = grid_fit(2298., 150., 198.).unwrap();
+        assert_eq!(cols, 12);
+        assert!(tile > 150. && tile <= 198., "tile {tile}");
+        assert!((row_width(cols, tile) - 2298.).abs() < 0.5);
+
+        // Same setting in a laptop-sized pane: fewer columns, still flush.
+        let (cols, tile) = grid_fit(1200., 150., 198.).unwrap();
+        assert_eq!(cols, 6);
+        assert!((row_width(cols, tile) - 1200.).abs() < 0.5);
+    }
+
+    /// The column count comes from the minimum, so the range only ever grows
+    /// covers into space a further column could not have used.
+    #[test]
+    fn grid_fit_never_trades_a_column_for_a_bigger_tile() {
+        for width in (400..3000).step_by(7) {
+            let width = width as f32;
+            let (cols, tile) = grid_fit(width, 150., 198.).unwrap();
+            assert_eq!(cols, grid_columns(width, 150.).unwrap(), "at {width}");
+            assert!((150. ..=198.).contains(&tile), "tile {tile} at {width}");
+            assert!(row_width(cols, tile) <= width + 0.5, "overflow at {width}");
+        }
+    }
+
+    /// A window too wide for the largest tile keeps the gutters rather than
+    /// letting the art grow without limit — the maximum is the setting's
+    /// promise about how big "medium" gets.
+    #[test]
+    fn grid_fit_stops_growing_at_the_maximum() {
+        let (cols, tile) = grid_fit(2298., 150., 160.).unwrap();
+        assert_eq!(tile, 160.);
+        assert!(row_width(cols, tile) < 2298.);
+    }
+
+    #[test]
+    fn grid_fit_takes_the_grid_padding_off_like_the_column_maths_does() {
+        assert_eq!(grid_fit_padded(412., 168., 168.), Some((2, 168.)));
+        assert_eq!(grid_fit_padded(411., 168., 168.), Some((1, 168.)));
+        assert_eq!(grid_fit_padded(0., 168., 200.), None);
+        // The tile fills the padded width, not the element's own.
+        let (cols, tile) = grid_fit_padded(1200., 150., 198.).unwrap();
+        assert!((row_width(cols, tile) - (1200. - GRID_PADDING_X)).abs() < 0.5);
     }
 
     #[test]

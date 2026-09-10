@@ -166,9 +166,19 @@ pub enum ReplayGainMode {
     Auto,
 }
 
-/// Cover-art tile size for the album grid. The value doubles as the pixel
-/// resolution requested/decoded for grid thumbnails, so smaller tiles fetch
-/// and render smaller textures — full-res art is only used on detail pages.
+/// Cover-art tile size for the album grid — a *range*, not one width.
+///
+/// A fixed tile size leaves the grid's leftover width as gutters: the columns
+/// are whole cards, so a 2560px-wide window keeps up to a card's worth of empty
+/// space split either side, which is why a 16:9 monitor looked padded where a
+/// laptop's 16:10 pane happened to divide evenly. The grid instead takes as
+/// many columns as fit at the range's *minimum* and grows the tile up to the
+/// maximum to spend what's left over, so the setting picks how big covers are
+/// roughly and the window decides exactly.
+///
+/// The maximum doubles as the pixel resolution requested/decoded for grid
+/// thumbnails, so smaller tiles still fetch smaller textures — and the fetch
+/// resolution depends only on the setting, so a resize never refetches art.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CoverSize {
@@ -180,20 +190,32 @@ pub enum CoverSize {
 }
 
 impl CoverSize {
-    /// Rendered tile edge in logical pixels.
-    pub fn px(self) -> f32 {
+    /// Smallest and largest rendered tile edge, in logical pixels.
+    ///
+    /// The spread is wide enough to absorb one column's worth of leftover at
+    /// the column counts these sizes actually produce (a grid `n` columns wide
+    /// needs `max >= min * (n + 1) / n` to swallow the gutters), and the ranges
+    /// don't overlap so the four settings stay visibly different.
+    pub fn range(self) -> (f32, f32) {
         match self {
-            Self::Small => 120.,
-            Self::Medium => 160.,
-            Self::Large => 200.,
-            Self::ExtraLarge => 260.,
+            Self::Small => (110., 148.),
+            Self::Medium => (150., 198.),
+            Self::Large => (200., 262.),
+            Self::ExtraLarge => (264., 350.),
         }
     }
 
+    /// Largest tile the grid will grow to before it leaves gutters again.
+    pub fn max_px(self) -> f32 {
+        self.range().1
+    }
+
     /// Resolution to request/decode for grid thumbnails. Bumped ~1.5× over the
-    /// tile size so HiDPI screens stay crisp without decoding full art.
+    /// *largest* tile the setting can draw so HiDPI screens stay crisp without
+    /// decoding full art — and so a resize, which moves the tile inside the
+    /// range, never invalidates already-cached covers.
     pub fn art_px(self) -> u32 {
-        (self.px() * 1.5) as u32
+        (self.max_px() * 1.5) as u32
     }
 }
 
