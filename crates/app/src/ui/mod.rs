@@ -219,8 +219,9 @@ pub fn grid_columns_padded(element_width: f32, tile: f32) -> Option<usize> {
 /// frame, exactly as the measured width alone would have been.
 #[derive(Default)]
 pub struct LiveWidth {
-    /// Viewport width at the frame the last measurement was laid out in.
-    viewport: f32,
+    /// Viewport width at the previous call — the frame the measurement arriving
+    /// now was laid out in.
+    prev_viewport: f32,
     /// That viewport minus the measured element width.
     chrome: f32,
     /// The measurement `chrome` was learned from, so a second call inside one
@@ -231,6 +232,12 @@ pub struct LiveWidth {
 impl LiveWidth {
     /// Feed the element's width as measured last frame, get its width for this
     /// one. Zero until the first measurement lands.
+    pub fn resolve(&mut self, measured: f32, window: &Window) -> f32 {
+        self.resolve_at(measured, f32::from(window.viewport_size().width))
+    }
+
+    /// [`Self::resolve`] against an explicit viewport, so the frame sequence a
+    /// resize produces can be unit-tested without a window.
     ///
     /// Chrome is only relearned when the measurement actually moves. Callers
     /// ask more than once per frame (the vi-mode cursor needs the column count
@@ -239,17 +246,25 @@ impl LiveWidth {
     /// in — during a resize drag that folds the frame's delta into the chrome
     /// and the grid falls a frame behind, which is the trailing this type
     /// exists to avoid.
-    pub fn resolve(&mut self, measured: f32, window: &Window) -> f32 {
-        let viewport = f32::from(window.viewport_size().width);
-        if measured > 0. && self.viewport > 0. {
-            if measured != self.measured {
-                self.chrome = (self.viewport - measured).max(0.);
-                self.measured = measured;
-                self.viewport = viewport;
-            }
-        } else {
-            self.viewport = viewport;
+    ///
+    /// `prev_viewport` advances on **every** call, including the ones that
+    /// don't relearn. Advancing it only alongside a relearn was a bug with a
+    /// visible tail: the frame that shrinks the window carries the *old*
+    /// measurement (bounds are a frame behind), so it takes the no-relearn path
+    /// and leaves `prev_viewport` at the pre-resize width. The next frame's
+    /// measurement — laid out at the new, smaller viewport — is then subtracted
+    /// from that stale one, and the chrome comes out roughly a whole window too
+    /// wide. `viewport - chrome` clamps to 0, `grid_columns` reads 0 as
+    /// "nothing laid out yet", and the grid falls back to its first-frame guess
+    /// of five columns inside a pane that fits one. The row overflows, and
+    /// since it is centred the overflow splits: half of it disappears under the
+    /// sidebar. Nothing repaints once a resize settles, so it stays there.
+    fn resolve_at(&mut self, measured: f32, viewport: f32) -> f32 {
+        if measured > 0. && self.prev_viewport > 0. && measured != self.measured {
+            self.chrome = (self.prev_viewport - measured).max(0.);
+            self.measured = measured;
         }
+        self.prev_viewport = viewport;
         if measured <= 0. {
             return 0.;
         }
@@ -259,9 +274,18 @@ impl LiveWidth {
     /// Columns for a card grid of `tile`-wide covers laid out inside the
     /// measured element's `GRID_PADDING_X`. `fallback` stands in on the first
     /// frame, before anything has been laid out.
+    ///
+    /// The fallback is capped at what the *whole window* could hold: it is a
+    /// guess made before the chrome is known, and a guess wider than the window
+    /// itself overflows a centred row out past both edges — the one failure
+    /// this type exists to prevent. Guessing too few only leaves a gap for the
+    /// frame it takes the real measurement to arrive.
     pub fn columns(&mut self, measured: f32, tile: f32, window: &Window, fallback: usize) -> usize {
-        let width = self.resolve(measured, window);
-        grid_columns_padded(width, tile).unwrap_or(fallback)
+        let viewport = f32::from(window.viewport_size().width);
+        let width = self.resolve_at(measured, viewport);
+        grid_columns_padded(width, tile).unwrap_or_else(|| {
+            fallback.min(grid_columns_padded(viewport, tile).unwrap_or(fallback))
+        })
     }
 }
 
@@ -1271,9 +1295,78 @@ mod tests {
     }
 
     use super::{
-        accent_from_cover_bytes, format_count, format_playtime, grid_columns, grid_columns_padded,
-        strip_html, truncate_at_word,
+        LiveWidth, accent_from_cover_bytes, format_count, format_playtime, grid_columns,
+        grid_columns_padded, strip_html, truncate_at_word,
     };
+
+    /// Chrome between the window edge and the grid: sidebar plus the content
+    /// column's own padding. Constant while the window is dragged, which is the
+    /// assumption `LiveWidth` is built on.
+    const CHROME: f32 = 262.;
+
+    /// Drive one frame: the grid is measured at whatever it was laid out at
+    /// last frame, and asks for the width to lay out at now.
+    fn frame(live: &mut LiveWidth, last_layout: f32, viewport: f32) -> f32 {
+        live.resolve_at(last_layout, viewport)
+    }
+
+    #[test]
+    fn live_width_holds_still_when_the_window_does() {
+        let mut live = LiveWidth::default();
+        // First frame: nothing laid out yet, so no width to offer.
+        assert_eq!(frame(&mut live, 0., 1200.), 0.);
+        // The measurement lands and the chrome is learned from it.
+        assert_eq!(frame(&mut live, 1200. - CHROME, 1200.), 1200. - CHROME);
+        // A settled window keeps answering the same width.
+        assert_eq!(frame(&mut live, 1200. - CHROME, 1200.), 1200. - CHROME);
+    }
+
+    /// The regression: a shrink is two frames, and the second one carries the
+    /// first one's measurement. Subtracting it from the pre-resize viewport put
+    /// the chrome a window too wide, `viewport - chrome` clamped to zero, and
+    /// the grid read that as "not laid out yet" and fell back to five columns
+    /// inside a pane that fits one — which is the row that ended up half under
+    /// the sidebar.
+    #[test]
+    fn live_width_survives_the_frame_a_resize_lands_on() {
+        let mut live = LiveWidth::default();
+        frame(&mut live, 0., 1200.);
+        frame(&mut live, 1200. - CHROME, 1200.);
+
+        // The window is now 620 wide, but the grid was measured at 1200.
+        assert_eq!(frame(&mut live, 1200. - CHROME, 620.), 620. - CHROME);
+        // ...and now the measurement catches up. This is the frame that broke.
+        assert_eq!(frame(&mut live, 620. - CHROME, 620.), 620. - CHROME);
+        // Still right once everything has settled.
+        assert_eq!(frame(&mut live, 620. - CHROME, 620.), 620. - CHROME);
+    }
+
+    /// A drag is a run of those, every frame both a new viewport and a stale
+    /// measurement. The width must track the window, never the measurement.
+    #[test]
+    fn live_width_tracks_a_drag_without_trailing() {
+        let mut live = LiveWidth::default();
+        frame(&mut live, 0., 1400.);
+        let mut laid_out = frame(&mut live, 1400. - CHROME, 1400.);
+        for viewport in [1300., 1200., 1100., 1000., 900., 800.] {
+            laid_out = frame(&mut live, laid_out, viewport);
+            assert_eq!(laid_out, viewport - CHROME, "at viewport {viewport}");
+        }
+    }
+
+    /// The vi cursor asks for the column count outside `render`, so a second
+    /// call inside one frame must not relearn the chrome against a measurement
+    /// that has already been folded into it.
+    #[test]
+    fn live_width_is_stable_across_repeated_calls_in_one_frame() {
+        let mut live = LiveWidth::default();
+        frame(&mut live, 0., 1200.);
+        frame(&mut live, 1200. - CHROME, 1200.);
+        let measured = 1200. - CHROME;
+        assert_eq!(frame(&mut live, measured, 900.), 900. - CHROME);
+        assert_eq!(frame(&mut live, measured, 900.), 900. - CHROME);
+        assert_eq!(frame(&mut live, measured, 900.), 900. - CHROME);
+    }
 
     #[test]
     fn grid_columns_fit_the_cards_and_their_gaps() {
