@@ -74,6 +74,228 @@ fn section_width(body: f32) -> Option<f32> {
     Some((body - 2. * SECTION_BODY_PAD).clamp(SECTION_MIN_W, SECTION_MAX_W))
 }
 
+/// Gap between the compact grid's columns, and between the cards stacked
+/// inside one (`gap_3`).
+const COMPACT_GAP: f32 = 12.;
+/// Height one weight unit of a card costs, and the card's own padding on top of
+/// its rows — the model `compact_columns` picks a column count with. Measured
+/// off the running page rather than derived: a switch row and its gap come to
+/// about 30px, `p_3` adds 24, and the gap under the card another 12.
+const COMPACT_ROW_H: f32 = 30.;
+const COMPACT_CARD_H: f32 = 24. + COMPACT_GAP;
+/// The width a column is drawn at when the page has room for it. Wider than
+/// this and two columns of settings read as two pages side by side; the grid
+/// simply doesn't spend the rest of the window, and is centred in it.
+const COMPACT_COL_TARGET: f32 = 460.;
+/// Narrowest a column may be squeezed to before the count is reduced instead.
+/// A switch's label is one line whatever the room — "Album pages tint from
+/// their own cover" and the switch beside it need about 330px inside the card's
+/// padding, and a column any narrower than this pushes it out through the
+/// card's edge instead of wrapping it.
+const COMPACT_COL_MIN: f32 = 380.;
+/// Past four columns the cards are short and far apart — the page reads as a
+/// scattering rather than a grid.
+const COMPACT_COL_MAX: usize = 4;
+/// How far a column's width may fall below and rise above an even split. The
+/// asymmetry is the point — a column carrying more gets more room, so its rows
+/// wrap less and the columns come out closer to the same height — but a column
+/// that is a third of its neighbour stops reading as the same grid.
+const COMPACT_SHARE_MIN: f32 = 0.8;
+const COMPACT_SHARE_MAX: f32 = 1.3;
+
+/// The sections in document order, with a rough count of the rows each one
+/// draws in compact mode (captions hidden), used only to plan the columns.
+///
+/// Hand-kept rather than measured: what a card actually costs is known after it
+/// is built, and the column widths are needed before. Being a row or two out
+/// costs a slightly uneven grid and nothing else. `section` debug-asserts the
+/// titles against this list, so a section added without a weight is caught in
+/// development rather than silently shifting the layout.
+///
+/// Account is last because it is the one that may be absent (signed out), which
+/// makes "the sections that are present" a prefix of this list.
+const COMPACT_SECTIONS: [(&str, u16); 7] = [
+    ("Window", 4),
+    ("Appearance", 13),
+    ("Playback", 14),
+    ("Browsing", 11),
+    ("Streaming", 5),
+    ("Library", 12),
+    ("Account", 3),
+];
+
+/// One column of the compact grid: the sections that landed in it, in document
+/// order, and the width to lay their cards out at.
+#[derive(Debug, Clone, PartialEq)]
+struct GridColumn {
+    sections: Vec<usize>,
+    width: f32,
+}
+
+/// What a card of `weight` rows costs vertically, its padding and the gap under
+/// it included.
+fn card_height(weight: u16) -> f32 {
+    f32::from(weight) * COMPACT_ROW_H + COMPACT_CARD_H
+}
+
+/// Split the cards into `cols` **contiguous** runs, making the tallest run as
+/// short as the split allows.
+///
+/// Contiguous is the requirement, not an implementation detail: the columns are
+/// the settings page in its usual order, wrapped — read down the first column
+/// and on to the next and the sections come in the order they always have.
+/// Packing them by size instead balances the columns better and shuffles the
+/// page.
+///
+/// Binary search on "could every run fit under this height", which a left-to-
+/// right greedy answers in one pass, then one more pass to cut at the height
+/// the search settled on.
+fn split_runs(heights: &[f32], cols: usize) -> Vec<Vec<usize>> {
+    let runs_under = |cap: f32| -> usize {
+        let mut runs = 1;
+        let mut used = 0.;
+        for &h in heights {
+            if used + h > cap && used > 0. {
+                runs += 1;
+                used = 0.;
+            }
+            used += h;
+        }
+        runs
+    };
+
+    let tallest = heights.iter().copied().fold(0., f32::max);
+    let total: f32 = heights.iter().sum();
+    let (mut lo, mut hi) = (tallest, total.max(tallest));
+    // ~1px of resolution over any page this will ever hold; a fixed iteration
+    // count keeps it obviously terminating.
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if runs_under(mid) <= cols {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    let mut runs: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut used = 0.;
+    for (i, &h) in heights.iter().enumerate() {
+        // The last run takes whatever is left: with `cols` runs already open,
+        // a rounding error in the cap must not open one more.
+        if used + h > hi && used > 0. && runs.len() < cols {
+            runs.push(Vec::new());
+            used = 0.;
+        }
+        runs.last_mut().expect("a run is always open").push(i);
+        used += h;
+    }
+    runs
+}
+
+/// The width `cols` columns take inside a `usable` body, the gaps between them
+/// excluded — [`COMPACT_COL_TARGET`] each where the body has room for it, and
+/// what there is where it does not.
+fn columns_width(cols: usize, usable: f32) -> f32 {
+    let gaps = COMPACT_GAP * (cols - 1) as f32;
+    (usable - gaps)
+        .max(SECTION_MIN_W)
+        .min(COMPACT_COL_TARGET * cols as f32)
+}
+
+/// The tallest of the runs a `cols`-way split produces.
+fn tallest_run(heights: &[f32], cols: usize) -> f32 {
+    split_runs(heights, cols)
+        .iter()
+        .map(|run| run.iter().map(|&i| heights[i]).sum::<f32>())
+        .fold(0., f32::max)
+}
+
+/// How many columns to wrap the page into, or `None` where the window cannot
+/// hold a grid at all.
+///
+/// This is also the decision of *whether* the page is a grid: the layout has no
+/// setting behind it, so a count is only returned when at least two columns fit
+/// in the window's width and the tallest of them fits its height. One column is
+/// not a grid — it is the scrolling page with its captions taken away, which is
+/// a worse page, not a denser one — and a grid that does not fit has given up
+/// the only thing it was for.
+///
+/// Of the counts that do fit, the one that comes out **closest to square**,
+/// compared as the log of the grid's aspect so that half as wide as tall and
+/// twice as wide count the same. Neither extreme is the page anyone wants: the
+/// widest count the width allows leaves every card in the top strip of a tall
+/// window, and the fewest that fit leaves one 460px column down the middle of a
+/// wide one.
+///
+/// What the width decides is the ceiling: how many columns of
+/// [`COMPACT_COL_MIN`] fit in it, capped at [`COMPACT_COL_MAX`] and at one per
+/// section.
+fn compact_columns(heights: &[f32], body: f32, height: f32) -> Option<usize> {
+    let usable = body - 2. * SECTION_BODY_PAD;
+    let by_width = ((usable + COMPACT_GAP) / (COMPACT_COL_MIN + COMPACT_GAP)) as usize;
+    let max = by_width.min(heights.len()).min(COMPACT_COL_MAX);
+    (2..=max)
+        .filter_map(|cols| {
+            let tall = tallest_run(heights, cols);
+            if tall > height {
+                return None;
+            }
+            let wide = columns_width(cols, usable) + COMPACT_GAP * (cols - 1) as f32;
+            Some(((wide / tall).ln().abs(), cols))
+        })
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, cols)| cols)
+}
+
+/// Plan the grid the settings page is drawn as, or nothing where the window
+/// wants the scrolling column instead — see [`compact_columns`], which is where
+/// that choice is made.
+///
+/// Widths are proportional to what each column ended up carrying, clamped
+/// around an even split: the taller column is also the one whose rows are most
+/// likely to wrap, so giving it the extra width buys height back where it is
+/// short. The grid is laid out at [`COMPACT_COL_TARGET`] per column and only
+/// squeezed below that when the window is too narrow to hold it — a wide window
+/// gets a centred grid rather than cards stretched across it.
+fn compact_grid(weights: &[u16], body: f32, height: f32) -> Vec<GridColumn> {
+    if weights.is_empty() || body <= 0. || height <= 0. {
+        return Vec::new();
+    }
+    let heights: Vec<f32> = weights.iter().copied().map(card_height).collect();
+    let Some(cols) = compact_columns(&heights, body, height) else {
+        return Vec::new();
+    };
+    let spread = columns_width(cols, body - 2. * SECTION_BODY_PAD);
+
+    let runs = split_runs(&heights, cols);
+    let loads: Vec<f32> = runs
+        .iter()
+        .map(|run| run.iter().map(|&i| heights[i]).sum())
+        .collect();
+    let total = loads.iter().sum::<f32>().max(1.);
+    let even = 1. / cols as f32;
+    let shares: Vec<f32> = loads
+        .iter()
+        .map(|load| (load / total).clamp(even * COMPACT_SHARE_MIN, even * COMPACT_SHARE_MAX))
+        .collect();
+    // Renormalized after the clamp, so the columns still spend exactly the
+    // width the grid was given however far the clamp moved them.
+    let spent: f32 = shares.iter().sum();
+    let mut widths: Vec<f32> = shares.iter().map(|share| spread * share / spent).collect();
+    // The asymmetry is a nicety and the floor is not: a column under
+    // `COMPACT_COL_MIN` pushes its switch labels out through the card's edge,
+    // and a count is only chosen when an even split clears the floor — so where
+    // the shares would breach it, they give way and the columns are even.
+    if widths.iter().any(|w| *w < COMPACT_COL_MIN) {
+        widths = vec![spread / cols as f32; cols];
+    }
+    runs.into_iter()
+        .zip(widths)
+        .map(|(sections, width)| GridColumn { sections, width })
+        .collect()
+}
+
 /// Which section a scroll position sits in.
 ///
 /// `tops` holds each section card's *unscrolled* layout top in document order,
@@ -119,7 +341,7 @@ impl TaskState {
     }
 }
 
-/// Which of the 17 on/off switches this is — enough to toggle it through the
+/// Which of the on/off switches this is — enough to toggle it through the
 /// same `set_*` method the mouse path uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsSwitch {
@@ -242,6 +464,14 @@ pub struct SettingsView {
     /// This frame's section-card width, resolved once at the top of `render`
     /// and read by every `section` call.
     card_width: Option<f32>,
+    /// Whether this frame is drawn as the grid, decided by the window's size
+    /// (see `compact_grid`) and stored because every card, caption and task row
+    /// is built from it.
+    compact: bool,
+    /// The grid's per-section card width, in document order — the width of the
+    /// column each section was placed in. All zero when the page is the
+    /// ordinary scrolling column.
+    compact_widths: Vec<f32>,
 }
 
 impl SettingsView {
@@ -273,6 +503,8 @@ impl SettingsView {
             scroll_anim: None,
             live_width: crate::ui::LiveWidth::default(),
             card_width: None,
+            compact: false,
+            compact_widths: Vec::new(),
         }
     }
 
@@ -910,12 +1142,16 @@ impl SettingsView {
         v_flex()
             .gap_1p5()
             .items_start()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(description),
-            )
+            // The description is a caption like `note`'s, and goes the same way
+            // in compact mode.
+            .when(!self.compact, |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(description),
+                )
+            })
             .child(h_flex().child(self.vi_control(SettingsAction::Button(action), control, cx)))
             .when_some(message, |this, message| {
                 this.child(
@@ -997,6 +1233,12 @@ impl SettingsView {
         if let Some(anim) = self.scroll_anim.as_ref() {
             return anim.section;
         }
+        // The compact grid's children are columns, not sections, so there is
+        // nothing to measure a section's top against — and nothing to scroll
+        // to either, which is why the pills are not drawn there.
+        if self.compact {
+            return 0;
+        }
         // `map_while` rather than `filter_map`: a frame laid out before all the
         // cards have been measured yields a prefix, and dropping a hole in the
         // middle instead would shift every section after it.
@@ -1018,6 +1260,12 @@ impl SettingsView {
     /// pills are a navigation bar, so the travel is what shows which way the
     /// page moved.
     fn scroll_to_section(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // In the compact grid every section is already on screen, and item
+        // `index` is a column rather than the section asked for — `vi_tab` has
+        // moved the cursor, which is the whole of the jump there.
+        if self.compact {
+            return;
+        }
         let Some(bounds) = self.scroll.bounds_for_item(index) else {
             return;
         };
@@ -1092,7 +1340,16 @@ impl SettingsView {
     }
 
     /// Muted explanatory paragraph under a control.
+    ///
+    /// The captions are most of the page's height, so compact mode drops them —
+    /// through `hidden()` (`display: none`) rather than by not building the
+    /// element, since a card is a `gap`ped column and an empty child would
+    /// still leave its gap behind. Taffy excludes a `Display::None` child from
+    /// the flex items entirely, gaps included.
     fn note(&self, text: &str, cx: &Context<Self>) -> gpui::AnyElement {
+        if self.compact {
+            return div().hidden().into_any_element();
+        }
         div()
             .text_xs()
             .text_color(cx.theme().muted_foreground)
@@ -1123,20 +1380,35 @@ impl SettingsView {
     /// `ScrollHandle::bounds_for_item` to measure them, which is what tells the
     /// pills where each section sits.
     fn section(&mut self, title: &'static str, cx: &Context<Self>) -> gpui::Div {
+        let index = self.section_starts.len();
+        debug_assert_eq!(
+            COMPACT_SECTIONS.get(index).map(|(t, _)| *t),
+            Some(title),
+            "section {index} is {title}, but COMPACT_SECTIONS says otherwise — \
+             the compact grid's weights are keyed by document order"
+        );
         self.section_starts.push((self.vi_actions.len(), title));
+        // Compact mode's width is its column's, laid out by `compact_grid`;
+        // either way it is a resolved number, see `section_width`. The
+        // `w_full`/`max_w` form is only the first frame's fallback, before
+        // there is a measurement to resolve one from.
+        let width = match self.compact {
+            // A zero is a frame with nothing measured yet, and falls back to
+            // `w_full` like the scrolling column's own first frame does.
+            true => self.compact_widths.get(index).copied().filter(|w| *w > 0.),
+            false => self.card_width,
+        };
         v_flex()
-            // See `section_width`: the resolved number is what makes the card
-            // tall enough for its own wrapping paragraphs. The `w_full`/`max_w`
-            // form is only the first frame's fallback, before there is a
-            // measurement to resolve one from.
-            .map(|card| match self.card_width {
+            .map(|card| match width {
                 Some(w) => card.w(px(w)),
                 None => card.w_full().max_w(px(SECTION_MAX_W)),
             })
             .mx_auto()
             .flex_none()
-            .gap_3()
-            .p_4()
+            .map(|card| match self.compact {
+                true => card.gap_2().p_3(),
+                false => card.gap_3().p_4(),
+            })
             .rounded_lg()
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
@@ -1162,9 +1434,22 @@ impl Render for SettingsView {
         // Through `LiveWidth` rather than the handle's own bounds: those are
         // last frame's layout, so during a resize drag the cards would rewrap a
         // frame behind the window edge.
-        let body = self
-            .live_width
-            .resolve(f32::from(self.scroll.bounds().size.width), window);
+        let measured = f32::from(self.scroll.bounds().size.width);
+        let body = self.live_width.resolve(measured, window);
+        // The body's width is only known once this frame has been laid out, and
+        // the measurement landing dirties nothing — so the unmeasured frame's
+        // fallback layout stays up until something else happens to repaint the
+        // view, which with nothing playing is the next input. Opening the page
+        // showed its fallback (one centred column — exactly what the compact
+        // grid is not) for 333ms against the 20ms it takes to ask for the frame
+        // that has the measurement, both timed in the running app.
+        //
+        // `request_animation_frame`, not `refresh`: a refresh is a no-op while
+        // the window is drawing, which is exactly when a view renders — it only
+        // marks the window dirty from outside a draw.
+        if measured <= 0. {
+            window.request_animation_frame();
+        }
         self.card_width = section_width(body);
         self.vi_actions.clear();
         let (
@@ -1227,6 +1512,34 @@ impl Render for SettingsView {
         // Rebuilt from scratch each render: `section` re-registers every card
         // it opens, in the order they are laid out.
         self.section_starts.clear();
+
+        // The grid is planned before a single card is built: each one is laid
+        // out at its column's width, and `section` reads that as it goes.
+        // Account is the only section that can be absent, and it is last in
+        // `COMPACT_SECTIONS`, so the present sections are a prefix of it.
+        //
+        // The plan is also the decision: a window that can hold the whole page
+        // at once gets it, and one that cannot gets the scrolling column with
+        // its captions back. There is no setting — the page is one or the other
+        // depending on the window it is in.
+        let present = COMPACT_SECTIONS.len() - usize::from(account.is_none());
+        let weights: Vec<u16> = COMPACT_SECTIONS[..present]
+            .iter()
+            .map(|(_, w)| *w)
+            .collect();
+        // The height is the scroll body's own, i.e. last frame's — it decides
+        // how many columns the page wraps into, and a window resized vertically
+        // re-plans a frame later. Only the *width* needs `LiveWidth`'s
+        // same-frame treatment, since that is what the cards are laid out at.
+        let grid = compact_grid(&weights, body, f32::from(self.scroll.bounds().size.height));
+        let compact = !grid.is_empty();
+        self.compact = compact;
+        self.compact_widths = vec![0.; present];
+        for column in &grid {
+            for &section in &column.sections {
+                self.compact_widths[section] = column.width;
+            }
+        }
 
         // Window
         let window_section = self
@@ -1971,22 +2284,38 @@ impl Render for SettingsView {
                 .into_any_element()
         });
 
+        // The sections in document order, which is what both layouts and the
+        // compact plan index by. `Option` so a column can take its own out
+        // without cloning an element.
+        let mut cards: Vec<Option<gpui::AnyElement>> = vec![
+            Some(window_section.into_any_element()),
+            Some(appearance_section.into_any_element()),
+            Some(playback_section.into_any_element()),
+            Some(browsing_section.into_any_element()),
+            Some(streaming_section.into_any_element()),
+            Some(library_section.into_any_element()),
+        ];
+        cards.extend(account_section.map(Some));
+
         // Quick-nav pills, built from the sections that were actually
         // registered above — the filled one is whatever the page is scrolled
-        // to, or a jump's destination while one is running.
+        // to, or a jump's destination while one is running. The grid has
+        // everything on screen at once, so there is nowhere to jump.
         let current_section = self.current_section();
         let mut pills = h_flex().gap_1().flex_wrap();
-        for (i, (_, title)) in self.section_starts.iter().enumerate() {
-            pills = pills.child(
-                Button::new(("settings-pill", i))
-                    .ghost()
-                    .xsmall()
-                    .label(*title)
-                    .when(i == current_section, |b| b.primary())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.scroll_to_section(i, window, cx);
-                    })),
-            );
+        if !compact {
+            for (i, (_, title)) in self.section_starts.iter().enumerate() {
+                pills = pills.child(
+                    Button::new(("settings-pill", i))
+                        .ghost()
+                        .xsmall()
+                        .label(*title)
+                        .when(i == current_section, |b| b.primary())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.scroll_to_section(i, window, cx);
+                        })),
+                );
+            }
         }
 
         // Same header shape as the catalog pages: the page name and its nav
@@ -2012,6 +2341,14 @@ impl Render for SettingsView {
                     .flex_1()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
+                    // Nothing is measured on the first frame, so which layout
+                    // the window wants is not known yet either — it is laid out
+                    // (that is what produces the measurement) and not painted,
+                    // rather than showing a column that the next frame may
+                    // replace with a grid. Opacity, not `hidden()`: the latter
+                    // is `display: none`, which skips the layout this frame
+                    // exists for.
+                    .when(measured <= 0., |body| body.opacity(0.))
                     // The wheel is the user overruling a jump in flight, and
                     // the highlight has to follow the new position rather than
                     // the target that was abandoned. Notifying here is also
@@ -2023,14 +2360,48 @@ impl Render for SettingsView {
                     }))
                     .px_4()
                     .gap_4()
-                    .pb(px(148.))
-                    .child(window_section)
-                    .child(appearance_section)
-                    .child(playback_section)
-                    .child(browsing_section)
-                    .child(streaming_section)
-                    .child(library_section)
-                    .when_some(account_section, |this, section| this.child(section)),
+                    // The grid is meant to end well short of the bottom, so it
+                    // does not need the scrolling column's run-out.
+                    .pb(px(if compact { 16. } else { 148. }))
+                    .map(|scroll_body| match compact {
+                        // Columns are top-aligned rather than stretched: a
+                        // short column ending level with a tall one would draw
+                        // a card taller than its own contents.
+                        //
+                        // The scroll stays on the body as a last resort. A
+                        // window too short for the grid is still a window the
+                        // page has to be usable in, and clipping the bottom
+                        // card is worse than the setting not quite keeping its
+                        // promise there.
+                        true => {
+                            scroll_body.child(
+                                h_flex()
+                                    .items_start()
+                                    // The grid is laid out at the width it wants
+                                    // rather than the window's, so a wide window
+                                    // leaves it centred instead of stretching
+                                    // the cards across the whole page.
+                                    .justify_center()
+                                    .gap(px(COMPACT_GAP))
+                                    .children(grid.iter().map(|column| {
+                                        v_flex()
+                                            .flex_none()
+                                            .w(px(column.width))
+                                            .gap(px(COMPACT_GAP))
+                                            .children(
+                                                column
+                                                    .sections
+                                                    .iter()
+                                                    .filter_map(|&i| cards[i].take()),
+                                            )
+                                    })),
+                            )
+                        }
+                        // The sections have to stay *direct* children here:
+                        // `bounds_for_item` is what tells the pills where each
+                        // one sits.
+                        false => scroll_body.children(cards.iter_mut().filter_map(Option::take)),
+                    }),
             );
 
         self.vi_count = self.vi_actions.len();
@@ -2123,6 +2494,222 @@ mod tests {
     #[test]
     fn nothing_measured_yet_marks_the_first_section() {
         assert_eq!(section_for_scroll(&[], VIEWPORT_TOP, 0., 0.), 0);
+    }
+
+    /// Every section present, i.e. signed in.
+    fn weights() -> Vec<u16> {
+        COMPACT_SECTIONS.iter().map(|(_, w)| *w).collect()
+    }
+
+    fn placed(grid: &[GridColumn]) -> Vec<usize> {
+        grid.iter()
+            .flat_map(|c| c.sections.iter().copied())
+            .collect()
+    }
+
+    fn column_heights(grid: &[GridColumn], weights: &[u16]) -> Vec<f32> {
+        grid.iter()
+            .map(|c| c.sections.iter().map(|&i| card_height(weights[i])).sum())
+            .collect()
+    }
+
+    /// A content area tall enough to hold the page in two columns.
+    const TALL: f32 = 1150.;
+
+    #[test]
+    fn the_grid_places_every_section_in_page_order() {
+        for (body, height) in [(1200., TALL), (2600., TALL), (2600., 900.)] {
+            let grid = compact_grid(&weights(), body, height);
+            assert!(!grid.is_empty(), "{body}x{height} planned no grid");
+            // Flattened column by column, the grid *is* the page in order:
+            // read down one column and on to the next and the sections come in
+            // the order the scrolling page has them.
+            assert_eq!(
+                placed(&grid),
+                (0..COMPACT_SECTIONS.len()).collect::<Vec<_>>(),
+                "{body}x{height} reordered, dropped or duplicated a section"
+            );
+        }
+        // Signed out, the Account card is absent and the rest still fit.
+        let grid = compact_grid(&weights()[..6], 1200., TALL);
+        assert_eq!(placed(&grid), (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_window_decides_the_layout_on_its_own() {
+        let w = weights();
+        // Room for the whole page at once: the grid.
+        assert!(!compact_grid(&w, 1200., TALL).is_empty());
+        // Too short for any column count to fit — the scrolling page, captions
+        // and all, rather than a grid that has given up the one thing it is
+        // for.
+        assert!(compact_grid(&w, 2600., 520.).is_empty());
+        // Too narrow for a second column. One column is not a grid: it is the
+        // scrolling page with its captions taken away.
+        assert!(compact_grid(&w, 700., 4000.).is_empty());
+        // Nothing measured yet: neither answer is known.
+        assert!(compact_grid(&w, 0., TALL).is_empty());
+        assert!(compact_grid(&w, 1200., 0.).is_empty());
+    }
+
+    #[test]
+    fn a_grid_is_never_a_single_column() {
+        for body in [400., 700., 900., 1200., 2600.] {
+            for height in [300., 700., TALL, 4000.] {
+                let grid = compact_grid(&weights(), body, height);
+                assert!(
+                    grid.len() != 1,
+                    "{body}x{height} produced a one-column grid"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_grid_comes_out_closest_to_square() {
+        // The two failures the aspect rule sits between: the widest count the
+        // window allows leaves every card in the top strip of a tall window,
+        // and the fewest that fit leave one column down the middle of a wide
+        // one. Neither end is picked here.
+        let w = weights();
+        let heights: Vec<f32> = w.iter().copied().map(card_height).collect();
+        for (body, height) in [(1200., TALL), (2600., TALL), (1500., 2200.)] {
+            let cols = compact_grid(&w, body, height).len();
+            assert!(cols >= 2, "{body}x{height} planned no grid");
+            let usable = body - 2. * SECTION_BODY_PAD;
+            let aspect = |c: usize| {
+                let wide = columns_width(c, usable) + COMPACT_GAP * (c - 1) as f32;
+                (wide / tallest_run(&heights, c)).ln().abs()
+            };
+            for other in 2..=COMPACT_COL_MAX {
+                if other != cols && tallest_run(&heights, other) <= height {
+                    assert!(
+                        aspect(cols) <= aspect(other),
+                        "{body}x{height} took {cols} columns over a squarer {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_taller_window_takes_fewer_columns() {
+        let w = weights();
+        let tall = compact_grid(&w, 2600., TALL);
+        let short = compact_grid(&w, 2600., 900.);
+        assert!(
+            tall.len() < short.len(),
+            "{} columns in a tall window against {} in a shorter one",
+            tall.len(),
+            short.len()
+        );
+        // And every column of either is inside the height it was given —
+        // fitting comes before the aspect.
+        for (grid, height) in [(&tall, TALL), (&short, 900.)] {
+            for h in column_heights(grid, &w) {
+                assert!(h <= height, "a column came out {h}px tall in {height}px");
+            }
+        }
+    }
+
+    #[test]
+    fn the_columns_come_out_close_to_the_same_height() {
+        // A contiguous split cannot balance as well as packing by size, but it
+        // must not leave one column half again its neighbour either.
+        let w = weights();
+        let heights = column_heights(&compact_grid(&w, 2600., 900.), &w);
+        let min = heights.iter().copied().fold(f32::MAX, f32::min);
+        let max = heights.iter().copied().fold(0., f32::max);
+        assert!(max <= 1.5 * min, "columns came out at {heights:?}");
+    }
+
+    #[test]
+    fn the_grid_never_overruns_the_page_and_is_not_stretched_across_it() {
+        for (body, height) in [(1000., 4000.), (1200., TALL), (1600., 900.), (2600., 900.)] {
+            let grid = compact_grid(&weights(), body, height);
+            let cols = grid.len();
+            assert!(cols >= 2, "{body}x{height} planned no grid");
+            let spent: f32 = grid.iter().map(|c| c.width).sum::<f32>()
+                + COMPACT_GAP * (cols - 1) as f32
+                + 2. * SECTION_BODY_PAD;
+            assert!(
+                spent <= body + 0.5,
+                "{cols} columns spent {spent} of a {body}px body"
+            );
+            for column in &grid {
+                // Past the target the cards read as pages side by side; the
+                // leftover width is left as margin and the grid is centred in
+                // it instead. A single column may still run over it by the
+                // asymmetry's share, which only moves width between columns.
+                assert!(
+                    column.width <= COMPACT_COL_TARGET * COMPACT_SHARE_MAX + 0.5,
+                    "{body}x{height} produced a {}px column",
+                    column.width
+                );
+            }
+        }
+        // A window wide enough to stretch into leaves the grid centred: it
+        // spends the target and no more.
+        let wide = compact_grid(&weights(), 2600., 900.);
+        let spent: f32 = wide.iter().map(|c| c.width).sum();
+        assert!(spent <= COMPACT_COL_TARGET * wide.len() as f32 + 0.5);
+    }
+
+    #[test]
+    fn the_columns_are_asymmetric_but_not_lopsided() {
+        let grid = compact_grid(&weights(), 2600., TALL);
+        let widths: Vec<f32> = grid.iter().map(|c| c.width).collect();
+        let min = widths.iter().copied().fold(f32::MAX, f32::min);
+        let max = widths.iter().copied().fold(0., f32::max);
+        assert!(max > min, "the columns came out even: {widths:?}");
+        assert!(
+            max / min <= COMPACT_SHARE_MAX / COMPACT_SHARE_MIN,
+            "{widths:?} is wider apart than the clamp allows"
+        );
+    }
+
+    #[test]
+    fn columns_never_go_under_the_label_floor() {
+        // A column under `COMPACT_COL_MIN` pushes its switch labels out through
+        // the card, so the asymmetry gives way to an even split rather than
+        // taking one column below it.
+        for (body, height) in [(1000., 4000.), (1200., TALL), (1600., 900.), (2600., 700.)] {
+            for column in compact_grid(&weights(), body, height) {
+                assert!(
+                    column.width >= COMPACT_COL_MIN,
+                    "{body}x{height} produced a {}px column",
+                    column.width
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn never_more_columns_than_sections() {
+        // Two sections cannot fill four columns, and an empty column would be
+        // a gap in the middle of the grid.
+        let grid = compact_grid(&weights()[..2], 2600., 900.);
+        assert_eq!(grid.len(), 2);
+        assert!(grid.iter().all(|c| !c.sections.is_empty()));
+    }
+
+    #[test]
+    fn a_split_keeps_its_runs_contiguous_and_full() {
+        // `split_runs` is what the page order rests on: every run a block of
+        // consecutive cards, no run empty, however the cap lands.
+        let heights: Vec<f32> = weights().iter().copied().map(card_height).collect();
+        for cols in 1..=heights.len() {
+            let runs = split_runs(&heights, cols);
+            assert_eq!(runs.len(), cols, "{cols} columns produced {}", runs.len());
+            let mut next = 0;
+            for run in &runs {
+                assert!(!run.is_empty(), "empty run in {runs:?}");
+                assert_eq!(run[0], next, "run does not continue the page: {runs:?}");
+                assert!(run.windows(2).all(|w| w[1] == w[0] + 1));
+                next = run.last().expect("a non-empty run") + 1;
+            }
+            assert_eq!(next, heights.len());
+        }
     }
 
     #[test]
