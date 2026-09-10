@@ -77,6 +77,10 @@ pub struct Settings {
     pub default_repeat: RepeatMode,
     /// On-disk artwork cache cap in megabytes.
     pub artwork_cache_mb: u32,
+    /// Pull every album and artist cover into the artwork cache in the
+    /// background, instead of downloading them as the grids scroll past.
+    #[serde(default)]
+    pub precache_art: bool,
     /// Page shown right after connecting.
     pub default_page: DefaultPage,
     /// Last selected album list filter, restored across sessions.
@@ -428,6 +432,7 @@ impl Default for Settings {
             default_shuffle: false,
             default_repeat: RepeatMode::Off,
             artwork_cache_mb: 256,
+            precache_art: false,
             default_page: DefaultPage::default(),
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),

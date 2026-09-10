@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use crate::config::{DefaultPage, ThemePref};
 use crate::services::{
-    artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync, runtime,
+    art_precache, artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync,
+    runtime,
 };
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
@@ -176,6 +177,10 @@ pub struct RootView {
     sync_started: bool,
     /// A manual library refresh is in flight (sidebar row is disabled).
     refreshing: bool,
+    /// An artwork precache pass is in flight, so a second trigger (a refresh
+    /// finishing while the startup pass still runs) doesn't start another walk
+    /// competing with it for the same fetch permits.
+    precaching: bool,
     /// What that refresh is doing right now, for the sidebar's progress bar.
     refresh_stage: RefreshStage,
     /// Folded rail only: whether the playlist dropdown is showing. The vi
@@ -428,7 +433,9 @@ impl RootView {
                         .await
                     })
                     .await;
-                    let _ = this.update(cx, |_, _| {});
+                    // The catalog is as fresh as it gets this session; warm its
+                    // art if the user asked for that.
+                    let _ = this.update(cx, |this, cx| this.maybe_precache_art(cx));
                 })
                 .detach();
             }
@@ -494,6 +501,7 @@ impl RootView {
             scan_started: false,
             sync_started: false,
             refreshing: false,
+            precaching: false,
             refresh_stage: RefreshStage::Idle,
             last_libraries: Vec::new(),
             libraries_collapsed,
@@ -581,6 +589,36 @@ impl RootView {
     /// The steps run in sequence — the local scan is blocking work and the
     /// import issues one `getAlbum` per changed album, and letting them overlap
     /// starves the two IO workers.
+    /// Pull the whole catalog's cover art into the artwork cache, if
+    /// `Settings::precache_art` is on.
+    ///
+    /// Silent by design — background work with no deadline, whose progress line
+    /// lives next to the switch in Settings. Triggered *after* a sync rather
+    /// than on startup so it sees the albums that sync just wrote, and it skips
+    /// covers already on disk, so on a warm cache the whole pass is a walk of
+    /// the album and artist tables and no requests at all.
+    fn maybe_precache_art(&mut self, cx: &mut Context<Self>) {
+        if self.precaching || !self.session.read(cx).settings.precache_art {
+            return;
+        }
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        // The rung the grids ask for, so what lands is what they look up.
+        let size = artwork::bucket(self.session.read(cx).settings.cover_size.art_px());
+        self.precaching = true;
+        let db = self.library_db.clone();
+        cx.spawn(async move |this, cx| {
+            let progress = Arc::new(art_precache::PrecacheProgress::default());
+            let _ = runtime::spawn_io(async move {
+                art_precache::precache_art(db, client, size, progress).await
+            })
+            .await;
+            let _ = this.update(cx, |this, _| this.precaching = false);
+        })
+        .detach();
+    }
+
     fn refresh_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.refreshing {
             return;
@@ -652,6 +690,8 @@ impl RootView {
                 if on_catalog_page && let Some(section) = this.section {
                     this.navigate(section, Some(window), cx);
                 }
+                // Covers for whatever the refresh just added.
+                this.maybe_precache_art(cx);
                 cx.notify();
             });
         })

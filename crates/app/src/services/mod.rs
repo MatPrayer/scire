@@ -1,3 +1,4 @@
+pub mod art_precache;
 pub mod artwork;
 pub mod library_db;
 pub mod local_library;

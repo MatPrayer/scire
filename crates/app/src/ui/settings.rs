@@ -19,7 +19,7 @@ use crate::config::{
     CoverSize, DefaultPage, FullscreenBackground, QueueEndBehavior, ReplayGainMode, ThemePref,
 };
 use crate::services::library_db::LibraryDb;
-use crate::services::{artwork, navidrome_sync, runtime};
+use crate::services::{art_precache, artwork, navidrome_sync, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
@@ -119,7 +119,7 @@ impl TaskState {
     }
 }
 
-/// Which of the 16 on/off switches this is — enough to toggle it through the
+/// Which of the 17 on/off switches this is — enough to toggle it through the
 /// same `set_*` method the mouse path uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsSwitch {
@@ -139,6 +139,7 @@ enum SettingsSwitch {
     ShowQueueButton,
     ViMode,
     ReducedMotion,
+    PrecacheArt,
 }
 
 /// A button-group entry or a standalone settings button.
@@ -216,6 +217,9 @@ pub struct SettingsView {
     library_db: Arc<LibraryDb>,
     server_scan: TaskState,
     rebuild: TaskState,
+    /// Cover-art preload, when it was started from this page. A pass the root
+    /// view starts after a sync runs silently and leaves this Idle.
+    precache: TaskState,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
     vi_cursor: Option<usize>,
@@ -258,6 +262,7 @@ impl SettingsView {
             library_db,
             server_scan: TaskState::default(),
             rebuild: TaskState::default(),
+            precache: TaskState::default(),
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
@@ -375,6 +380,74 @@ impl SettingsView {
             });
         })
         .detach();
+    }
+
+    /// Download every album and artist cover the artwork cache is missing.
+    ///
+    /// Started when the switch is turned on, and by the root view after each
+    /// sync while it stays on. The grids otherwise only ever cache what has
+    /// been scrolled past, so a jump into the middle of the library downloads
+    /// a screenful before it can draw one.
+    fn precache_art(&mut self, cx: &mut Context<Self>) {
+        if self.precache.is_running() {
+            return;
+        }
+        let Some(client) = self.session.read(cx).client.clone() else {
+            self.precache = TaskState::Failed("Not connected to a server".into());
+            cx.notify();
+            return;
+        };
+        // The rung the grids ask for, so what lands is what they look up.
+        let size = artwork::bucket(self.session.read(cx).settings.cover_size.art_px());
+        self.precache = TaskState::Running("Checking cache…".into());
+        cx.notify();
+
+        let db = self.library_db.clone();
+        let progress = Arc::new(art_precache::PrecacheProgress::default());
+        let watched = progress.clone();
+        cx.spawn(async move |this, cx| {
+            let work = runtime::spawn_io(async move {
+                art_precache::precache_art(db, client, size, progress).await
+            });
+            let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, work, |cx| {
+                let (done, total) = watched.snapshot();
+                let _ = this.update(cx, |this, cx| {
+                    // `total` is 0 until the catalog walk finishes, and a walk
+                    // over a warm cache never leaves that state.
+                    this.precache = TaskState::Running(if total == 0 {
+                        "Checking cache…".into()
+                    } else {
+                        format!("Caching {done}/{total} covers")
+                    });
+                    cx.notify();
+                });
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.precache = match result {
+                    Ok(outcome) => TaskState::Done(art_precache::outcome_message(outcome)),
+                    Err(e) => TaskState::Failed(format!("Cover preload failed: {e}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Toggling this on starts a pass right away; the root view starts one
+    /// after every sync for as long as it stays on. Turning it off stops the
+    /// next pass — a download already in flight finishes, since abandoning a
+    /// half-written cache entry buys nothing.
+    fn set_precache_art(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.precache_art = enabled);
+        self.persist(cx);
+        if enabled {
+            self.precache_art(cx);
+        } else if !self.precache.is_running() {
+            self.precache = TaskState::Idle;
+        }
+        cx.notify();
     }
 
     fn persist(&self, cx: &Context<Self>) {
@@ -668,6 +741,7 @@ impl SettingsView {
             SettingsSwitch::ShowQueueButton => s.show_queue_button,
             SettingsSwitch::ViMode => s.vi_mode,
             SettingsSwitch::ReducedMotion => s.reduced_motion,
+            SettingsSwitch::PrecacheArt => s.precache_art,
         }
     }
 
@@ -710,6 +784,7 @@ impl SettingsView {
             SettingsSwitch::ShowQueueButton => self.set_show_queue_button(value, cx),
             SettingsSwitch::ViMode => self.set_vi_mode(value, cx),
             SettingsSwitch::ReducedMotion => self.set_reduced_motion(value, cx),
+            SettingsSwitch::PrecacheArt => self.set_precache_art(value, cx),
         }
     }
 
@@ -1146,6 +1221,8 @@ impl Render for SettingsView {
         let selection_glow = self.session.read(cx).settings.selection_glow;
         let server_scan_state = self.server_scan.clone();
         let rebuild_state = self.rebuild.clone();
+        let precache_art = self.session.read(cx).settings.precache_art;
+        let precache_state = self.precache.clone();
 
         // Rebuilt from scratch each render: `section` re-registers every card
         // it opens, in the order they are laid out.
@@ -1826,7 +1903,36 @@ impl Render for SettingsView {
                         artwork_cache_mb == 1024,
                         cx,
                     )),
-            );
+            )
+            .child(crate::ui::divider())
+            .child(self.vi_switch(
+                SettingsSwitch::PrecacheArt,
+                "precache-art",
+                precache_art,
+                false,
+                "Preload all cover art",
+                cx,
+            ))
+            .child(self.note(
+                "Download every album and artist cover in the background, so the \
+                 grids draw from disk instead of fetching as you scroll. Runs \
+                 after each library sync and only fetches what is missing. Large \
+                 libraries will fill the cache above — raise it if covers start \
+                 reappearing.",
+                cx,
+            ))
+            .when_some(precache_state.message().map(str::to_string), |this, msg| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(if matches!(precache_state, TaskState::Failed(_)) {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(msg),
+                )
+            });
 
         // Account (only when connected, so it stays the last section).
         let account_section = account.map(|(url, user)| {
