@@ -125,6 +125,10 @@ pub struct AlbumDetailView {
     /// High-res cover for the lightbox (fetched lazily on first open).
     full_art_path: Option<PathBuf>,
     scroll: ScrollHandle,
+    /// Window width the page lays out at, bridged from the last frame's
+    /// measurement. The header card is sized from it rather than left to
+    /// stretch — see `header_width`.
+    live_width: crate::ui::LiveWidth,
     focus_anchor: ScrollAnchor,
     /// Track index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
@@ -193,6 +197,7 @@ impl AlbumDetailView {
             show_full_art: false,
             full_art_path: None,
             scroll: scroll.clone(),
+            live_width: crate::ui::LiveWidth::default(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
             vi_scroll_synced: None,
@@ -768,6 +773,34 @@ fn fmt_added(created: &str) -> String {
     created.split('T').next().unwrap_or(created).to_string()
 }
 
+/// Horizontal padding the scrolling column lays its cards out within (`p_4`
+/// either side).
+const PAGE_PADDING_X: f32 = 32.;
+
+impl AlbumDetailView {
+    /// Width to draw the header card at, or `0.` on the first frame — before
+    /// anything has been measured — where it falls back to stretching.
+    ///
+    /// The card has to carry an explicit width because its height is measured
+    /// before the stretch that gives it one: the chip row wraps, so the height
+    /// taffy arrives at is the header's height at whatever narrower width that
+    /// pass used, and a window with vertical room to spare keeps it. The result
+    /// is a header card several hundred pixels taller than its contents, with
+    /// the album's colour washing down through the gap — visible on any page
+    /// short enough not to fill the window (an EP, say), and absent on the same
+    /// page in a window too short to leave slack, since there the card is
+    /// shrunk back to its real height.
+    ///
+    /// Width comes from the viewport rather than the scroll handle's own bounds
+    /// for the reason `ui::LiveWidth` exists: the bounds are the previous
+    /// frame's, so a resize would leave the card a frame behind the drag.
+    fn header_width(&mut self, window: &Window) -> f32 {
+        let measured = f32::from(self.scroll.bounds().size.width);
+        let width = self.live_width.resolve(measured, window);
+        (width - PAGE_PADDING_X).max(0.)
+    }
+}
+
 impl Render for AlbumDetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Scroll-into-view runs here, not in `vi_move`: the anchor's origin
@@ -781,6 +814,7 @@ impl Render for AlbumDetailView {
             window,
             cx,
         );
+        let header_w = self.header_width(window);
         let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
         // This album's own colour, when the page is set to carry one. The
         // playing-track highlight below deliberately keeps the theme's accent:
@@ -905,7 +939,17 @@ impl Render for AlbumDetailView {
                 )
                 .child(
                     v_flex()
-                        .flex_1()
+                        // Grow and shrink, but *not* `flex_1`: that sets the
+                        // flex basis to 0%, and the column's height is then
+                        // measured at its min-content width, where the chip
+                        // row below stacks one chip per line. The card takes
+                        // that height (see `header_width`), so in a narrow
+                        // window it kept a gap even with the card's own width
+                        // pinned. An auto basis measures at the content's
+                        // natural width instead, and the shrink brings it back
+                        // to the room the cover leaves.
+                        .flex_grow()
+                        .flex_shrink()
                         .min_w(px(260.))
                         .gap_2()
                         .child(
@@ -1324,6 +1368,7 @@ impl Render for AlbumDetailView {
             // Header card matches the artist page framing.
             .child(
                 v_flex()
+                    .when(header_w > 0., |this| this.w(px(header_w)))
                     .rounded_2xl()
                     .p_4()
                     .gap_4()
