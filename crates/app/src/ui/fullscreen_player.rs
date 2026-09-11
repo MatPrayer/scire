@@ -18,7 +18,9 @@ use gpui_component::{
 use subsonic::SubsonicClient;
 
 use crate::assets::{app_icon, icons};
-use crate::config::{FullscreenBackground, VisualizerMode, VisualizerSettings};
+use crate::config::{
+    FullscreenBackground, FullscreenCoverSize, VisualizerMode, VisualizerSettings,
+};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
@@ -48,18 +50,12 @@ const ART_MIN: f32 = 140.;
 /// Its cap in the stacked layout, where it has the whole width to itself: the
 /// side-by-side cap leaves it looking small under a tall window's card.
 const ART_MAX_STACKED: f32 = 560.;
-/// Caps for a window with room to spare. `ART_MAX`/`ART_MAX_STACKED` are what a
-/// window that only just holds the overlay draws; a bigger one has the room to
-/// make the cover the subject of the page instead of a fixed square sitting in
-/// the middle of a mostly empty window, so past those the cap grows with the
-/// window up to these.
-const ART_MAX_ROOMY: f32 = 780.;
-const ART_MAX_STACKED_ROOMY: f32 = 880.;
-/// What the grown cover is allowed to take: a share of the window's height
-/// beside the card (the card sets the width it can have), and a share of the
-/// content width stacked (the column has height to spare, width is the limit).
-const ART_ROOMY_SHARE: f32 = 0.62;
-const ART_ROOMY_STACK_SHARE: f32 = 0.82;
+/// How far past those a window with room to spare grows the cover — a share of
+/// the room and a ceiling, both from `Settings::fullscreen_cover`. A bigger
+/// window has the room to make the cover the subject of the page instead of a
+/// fixed square sitting in the middle of a mostly empty one; how much of that
+/// room it should take is a matter of taste, so it is a setting, and
+/// `FullscreenCoverSize::Fixed` gives up the growth entirely.
 /// Share of the cover's width the card is drawn at in the stacked layout, so
 /// the column reads cover-first instead of as two equal blocks.
 const CARD_STACKED_SHARE: f32 = 0.85;
@@ -204,15 +200,19 @@ impl CardDensity {
 }
 /// Cover cap beside the card once the window has height to spare. Below the
 /// point where the share reaches `ART_MAX` this is exactly the old cap, so a
-/// window that only just fits the overlay is laid out as it always was.
-fn roomy_art_cap(height: f32) -> f32 {
-    (height * ART_ROOMY_SHARE).clamp(ART_MAX, ART_MAX_ROOMY)
+/// window that only just fits the overlay is laid out as it always was — and
+/// `Fixed`, whose share and ceiling are both zero, is clamped back to that cap
+/// at every size, which is what "no growth" means here.
+fn roomy_art_cap(height: f32, size: FullscreenCoverSize) -> f32 {
+    let (share, max) = size.beside_card();
+    (height * share).clamp(ART_MAX, max.max(ART_MAX))
 }
 
 /// The same, stacked: there the column has the height and the content width is
 /// what the cover has to stay inside.
-fn stacked_art_cap(content: f32) -> f32 {
-    (content * ART_ROOMY_STACK_SHARE).clamp(ART_MAX_STACKED, ART_MAX_STACKED_ROOMY)
+fn stacked_art_cap(content: f32, size: FullscreenCoverSize) -> f32 {
+    let (share, max) = size.stacked();
+    (content * share).clamp(ART_MAX_STACKED, max.max(ART_MAX_STACKED))
 }
 
 /// How many whole queue rows a panel of `max_h` holds — at least one, and never
@@ -251,7 +251,13 @@ struct Layout {
 }
 
 impl Layout {
-    fn resolve(width: f32, height: f32, panel_open: bool, want_volume: bool) -> Self {
+    fn resolve(
+        width: f32,
+        height: f32,
+        panel_open: bool,
+        want_volume: bool,
+        cover: FullscreenCoverSize,
+    ) -> Self {
         let density = CardDensity::for_window(width, height);
         // Width left for the cover and the card once padding, gaps and the
         // optional columns are taken out.
@@ -314,7 +320,8 @@ impl Layout {
                     let art = if room < ART_MIN {
                         0.
                     } else {
-                        room.min(content).clamp(ART_MIN, stacked_art_cap(content))
+                        room.min(content)
+                            .clamp(ART_MIN, stacked_art_cap(content, cover))
                     };
                     // The cover leads this layout — it has the whole width to
                     // itself, and a card drawn just as wide turns the column
@@ -394,7 +401,8 @@ impl Layout {
             // only into width the card does not want: taking it out of the card
             // instead would push it toward `CARD_MIN` and cost the toggles their
             // labels, which is a trade a roomy window never has to make.
-            let roomy = (free - CARD_MAX).min((height - 2. * pad).min(roomy_art_cap(height)));
+            let roomy =
+                (free - CARD_MAX).min((height - 2. * pad).min(roomy_art_cap(height, cover)));
             let art = art.max(roomy);
             let card = (free - art).clamp(CARD_MIN, CARD_MAX);
             Self {
@@ -1736,7 +1744,13 @@ impl Render for FullscreenPlayer {
         // was drawn for.
         let viewport = window.viewport_size();
         let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
-        let layout = Layout::resolve(vw, vh, self.panel.is_some(), show_volume && !is_radio);
+        let layout = Layout::resolve(
+            vw,
+            vh,
+            self.panel.is_some(),
+            show_volume && !is_radio,
+            self.session.read(cx).settings.fullscreen_cover,
+        );
         // Follow the playing track in the queue panel, now that the room the
         // panel gets — and so how many rows it holds — is known.
         self.sync_queue_scroll(layout.panel_max_h, cx);
@@ -2634,10 +2648,23 @@ impl Render for FullscreenPlayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        ART_LEAD, ART_MAX, ART_MAX_ROOMY, ART_MAX_STACKED, ART_MAX_STACKED_ROOMY, ART_MIN,
-        BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity, EDGE, GAP, Layout, QUEUE_CHROME_H,
-        QUEUE_ROW_H, VOLUME_W, blob_base, blob_field, hash01, queue_visible_rows,
+        ART_LEAD, ART_MAX, ART_MAX_STACKED, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity,
+        EDGE, GAP, Layout, QUEUE_CHROME_H, QUEUE_ROW_H, VOLUME_W, blob_base, blob_field, hash01,
+        queue_visible_rows,
     };
+    use crate::config::FullscreenCoverSize;
+
+    /// The layout at the default cover size — every case that is not about the
+    /// setting itself.
+    fn resolve(width: f32, height: f32, panel_open: bool, want_volume: bool) -> Layout {
+        Layout::resolve(
+            width,
+            height,
+            panel_open,
+            want_volume,
+            FullscreenCoverSize::default(),
+        )
+    }
 
     fn rgba(r: f32, g: f32, b: f32) -> gpui::Rgba {
         gpui::Rgba { r, g, b, a: 1.0 }
@@ -2796,7 +2823,7 @@ mod tests {
 
     #[test]
     fn a_roomy_window_keeps_the_full_size_layout() {
-        let l = Layout::resolve(1400., 900., false, false);
+        let l = resolve(1400., 900., false, false);
         assert!(!l.stacked);
         assert!(l.art >= ART_MAX);
         assert_eq!(l.card, CARD_MAX);
@@ -2805,22 +2832,25 @@ mod tests {
     #[test]
     fn a_big_window_grows_the_cover_without_costing_the_card() {
         // The window that only just holds the overlay is laid out as before…
-        assert_eq!(Layout::resolve(1000., 640., false, false).art, ART_MAX);
+        assert_eq!(resolve(1000., 640., false, false).art, ART_MAX);
         // …and past that the cover grows with the window rather than leaving
         // the room around it empty — never by taking width off the card.
         let mut last = ART_MAX;
         for &(w, h) in &[(1400., 900.), (1920., 1080.), (2560., 1440.)] {
-            let l = Layout::resolve(w, h, false, false);
+            let l = resolve(w, h, false, false);
             assert!(!l.stacked, "{w}x{h} should not stack");
             assert!(l.art > last, "{w}x{h} did not grow the cover: {l:?}");
             assert_eq!(l.card, CARD_MAX, "{w}x{h} squeezed the card: {l:?}");
-            assert!(l.art <= ART_MAX_ROOMY + 0.5, "{w}x{h}: {l:?}");
+            assert!(
+                l.art <= FullscreenCoverSize::default().beside_card().1 + 0.5,
+                "{w}x{h}: {l:?}"
+            );
             assert!(row_width(&l, 0.) <= w + 0.5, "{w}x{h} overruns: {l:?}");
             assert!(content_height(&l) <= h + 0.5, "{w}x{h} overruns: {l:?}");
             last = l.art;
         }
         // With the panel and the volume column open too, on the same window.
-        let l = Layout::resolve(2560., 1440., true, true);
+        let l = resolve(2560., 1440., true, true);
         assert!(l.volume && l.panel > 0.);
         assert!(l.art > ART_MAX && l.card == CARD_MAX, "{l:?}");
         assert!(row_width(&l, VOLUME_W) <= 2560. + 0.5, "{l:?}");
@@ -2830,14 +2860,80 @@ mod tests {
     fn a_big_portrait_window_grows_the_cover_too() {
         let mut last = ART_MAX_STACKED;
         for &(w, h) in &[(800., 1200.), (1100., 1700.), (1440., 2560.)] {
-            let l = Layout::resolve(w, h, false, false);
+            let l = resolve(w, h, false, false);
             assert!(l.stacked, "{w}x{h} should stack");
             assert!(l.art > last, "{w}x{h} did not grow the cover: {l:?}");
-            assert!(l.art <= ART_MAX_STACKED_ROOMY + 0.5, "{w}x{h}: {l:?}");
+            assert!(
+                l.art <= FullscreenCoverSize::default().stacked().1 + 0.5,
+                "{w}x{h}: {l:?}"
+            );
             assert!(l.art <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
             assert!(l.art >= l.card + ART_LEAD, "{w}x{h}: {l:?}");
             assert!(content_height(&l) <= h + 0.5, "{w}x{h} overruns: {l:?}");
             last = l.art;
+        }
+    }
+
+    #[test]
+    fn the_cover_size_setting_orders_the_sizes_and_fixed_gives_up_the_growth() {
+        use FullscreenCoverSize::{Fixed, Huge, Large, Medium};
+        for &(w, h) in &[(1920., 1080.), (2560., 1440.), (3840., 2160.)] {
+            let sizes: Vec<f32> = [Fixed, Medium, Large, Huge]
+                .iter()
+                .map(|&s| Layout::resolve(w, h, false, false, s).art)
+                .collect();
+            // Fixed draws the cover a window that only just holds the overlay
+            // draws, however much room this one has.
+            assert_eq!(sizes[0], ART_MAX, "{w}x{h}: {sizes:?}");
+            for pair in sizes.windows(2) {
+                assert!(pair[1] > pair[0], "{w}x{h}: {sizes:?}");
+            }
+            // Whatever the size, the row still fits the window and the card
+            // keeps its full width.
+            for &size in &[Fixed, Medium, Large, Huge] {
+                let l = Layout::resolve(w, h, false, false, size);
+                assert_eq!(l.card, CARD_MAX, "{w}x{h} {size:?}: {l:?}");
+                assert!(row_width(&l, 0.) <= w + 0.5, "{w}x{h} {size:?}: {l:?}");
+                assert!(content_height(&l) <= h + 0.5, "{w}x{h} {size:?}: {l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_cover_size_setting_applies_to_the_stacked_layout_too() {
+        use FullscreenCoverSize::{Fixed, Huge, Large, Medium};
+        for &(w, h) in &[(1100., 1700.), (1440., 2560.)] {
+            let sizes: Vec<f32> = [Fixed, Medium, Large, Huge]
+                .iter()
+                .map(|&s| Layout::resolve(w, h, false, false, s).art)
+                .collect();
+            assert_eq!(sizes[0], ART_MAX_STACKED, "{w}x{h}: {sizes:?}");
+            for pair in sizes.windows(2) {
+                assert!(pair[1] >= pair[0], "{w}x{h}: {sizes:?}");
+            }
+            for &size in &[Fixed, Medium, Large, Huge] {
+                let l = Layout::resolve(w, h, false, false, size);
+                assert!(l.stacked, "{w}x{h} {size:?}: {l:?}");
+                assert!(l.art <= w - 2. * EDGE + 0.5, "{w}x{h} {size:?}: {l:?}");
+                assert!(content_height(&l) <= h + 0.5, "{w}x{h} {size:?}: {l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_with_no_room_to_spare_ignores_the_cover_size() {
+        // The setting governs the room *above* what the overlay needs, so a
+        // window that only just fits it draws the same cover at every size.
+        use FullscreenCoverSize::{Fixed, Huge, Large, Medium};
+        for &(w, h) in &[(1000., 640.), (760., 600.), (700., 500.)] {
+            let base = Layout::resolve(w, h, false, false, Fixed);
+            for &size in &[Medium, Large, Huge] {
+                assert_eq!(
+                    Layout::resolve(w, h, false, false, size),
+                    base,
+                    "{w}x{h} {size:?}"
+                );
+            }
         }
     }
 
@@ -2874,7 +2970,7 @@ mod tests {
             (820., 520.),
         ] {
             for &panel in &[false, true] {
-                let l = Layout::resolve(w, h, panel, false);
+                let l = resolve(w, h, panel, false);
                 if l.stacked {
                     continue;
                 }
@@ -2891,10 +2987,10 @@ mod tests {
     #[test]
     fn the_volume_column_is_dropped_before_the_cover_is_squeezed() {
         // Wide enough for cover + card + volume, panel open or not.
-        assert!(Layout::resolve(1400., 900., false, true).volume);
-        assert!(Layout::resolve(1400., 900., true, true).volume);
+        assert!(resolve(1400., 900., false, true).volume);
+        assert!(resolve(1400., 900., true, true).volume);
         // Not wide enough: the column goes, the row survives.
-        let tight = Layout::resolve(760., 600., false, true);
+        let tight = resolve(760., 600., false, true);
         assert!(!tight.volume);
         assert!(!tight.stacked);
         assert!(tight.art >= ART_MIN && tight.card >= CARD_MIN);
@@ -2902,7 +2998,7 @@ mod tests {
 
     #[test]
     fn a_window_taller_than_it_is_wide_stacks() {
-        let l = Layout::resolve(800., 1200., false, true);
+        let l = resolve(800., 1200., false, true);
         assert!(l.stacked);
         // One column, both pieces inside the window's width.
         assert!(l.card <= 800. - 2. * EDGE);
@@ -2920,7 +3016,7 @@ mod tests {
             (900., 1400.),
             (1000., 1300.),
         ] {
-            let l = Layout::resolve(w, h, false, false);
+            let l = resolve(w, h, false, false);
             assert!(l.stacked, "{w}x{h} should stack");
             assert!(
                 l.art >= l.card + ART_LEAD,
@@ -2935,19 +3031,19 @@ mod tests {
     fn a_window_too_narrow_for_two_columns_stacks_as_well() {
         // Still room for a small cover beside the card: keep the row, since
         // stacking this would leave the cover no vertical room at all.
-        let row = Layout::resolve(700., 500., false, false);
+        let row = resolve(700., 500., false, false);
         assert!(!row.stacked);
         assert!(row.art >= ART_MIN);
         // Below that the row cannot hold both columns.
-        assert!(Layout::resolve(560., 500., false, false).stacked);
-        assert!(Layout::resolve(500., 460., false, false).stacked);
+        assert!(resolve(560., 500., false, false).stacked);
+        assert!(resolve(500., 460., false, false).stacked);
     }
 
     #[test]
     fn a_tight_window_with_a_panel_open_drops_the_cover_not_the_panel() {
         // Cover + card + panel does not fit; card + panel does. The panel was
         // asked for, the cover was not.
-        let l = Layout::resolve(760., 520., true, false);
+        let l = resolve(760., 520., true, false);
         assert!(!l.stacked);
         assert_eq!(l.art, 0.);
         assert!(l.panel > 0. && l.card >= CARD_MIN);
@@ -2956,7 +3052,7 @@ mod tests {
 
     #[test]
     fn a_short_window_drops_the_cover_rather_than_the_controls() {
-        let l = Layout::resolve(420., 460., false, false);
+        let l = resolve(420., 460., false, false);
         assert!(l.stacked);
         assert_eq!(l.art, 0.);
         assert!(l.card > 0.);
@@ -2973,7 +3069,7 @@ mod tests {
             (700., 1100.),
             (480., 900.),
         ] {
-            let l = Layout::resolve(w, h, false, false);
+            let l = resolve(w, h, false, false);
             assert!(
                 content_height(&l) <= h + 0.5,
                 "{w}x{h} overruns the height: {l:?}"
@@ -2981,7 +3077,7 @@ mod tests {
             // With a panel open the same has to hold wherever the window can
             // hold the panel at all; below that the wrapper scrolls, and the
             // panel keeps a usable height instead of being squeezed to nothing.
-            let l = Layout::resolve(w, h, true, false);
+            let l = resolve(w, h, true, false);
             assert!(l.panel_max_h >= 140., "{w}x{h} squeezed the panel: {l:?}");
             if content_height(&l) > h + 0.5 {
                 assert!(l.art == 0., "{w}x{h} overruns with a cover still on: {l:?}");
@@ -2993,21 +3089,18 @@ mod tests {
     fn spacing_is_given_up_before_the_track_details_are() {
         // Room for the full card.
         assert_eq!(
-            Layout::resolve(1400., 900., false, false).density,
+            resolve(1400., 900., false, false).density,
             CardDensity::Full
         );
-        assert_eq!(
-            Layout::resolve(760., 520., false, false).density,
-            CardDensity::Full
-        );
+        assert_eq!(resolve(760., 520., false, false).density, CardDensity::Full);
         // Too short for the full card, but the tight one still fits: the album
         // and stream-info lines stay, the padding goes.
-        let short = Layout::resolve(1150., 380., false, false);
+        let short = resolve(1150., 380., false, false);
         assert_eq!(short.density, CardDensity::Tight);
         assert!(short.density.secondary_lines());
         // Too short for even that: now the lines go.
         assert_eq!(
-            Layout::resolve(1150., 300., false, false).density,
+            resolve(1150., 300., false, false).density,
             CardDensity::Compact
         );
     }
@@ -3017,7 +3110,7 @@ mod tests {
         // The stacked layout frees height for the cover by tightening the
         // card's spacing, never by dropping what the card says.
         for &(w, h) in &[(520., 860.), (480., 900.), (700., 1100.), (760., 880.)] {
-            let l = Layout::resolve(w, h, false, false);
+            let l = resolve(w, h, false, false);
             assert!(l.stacked, "{w}x{h} should stack");
             assert!(
                 l.density.secondary_lines(),
@@ -3031,7 +3124,7 @@ mod tests {
     fn the_stacked_column_fits_its_width() {
         for &(w, h) in &[(700., 1100.), (480., 900.), (1000., 1400.)] {
             for &panel in &[false, true] {
-                let l = Layout::resolve(w, h, panel, false);
+                let l = resolve(w, h, panel, false);
                 assert!(l.stacked, "{w}x{h} should stack");
                 assert!(l.card <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
                 assert!(l.art <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");

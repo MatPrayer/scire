@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    CoverSize, DefaultPage, FullscreenBackground, QueueEndBehavior, ReplayGainMode, ThemePref,
+    CoverSize, DefaultPage, FullscreenBackground, FullscreenCoverSize, QueueEndBehavior,
+    ReplayGainMode, ThemePref,
 };
 use crate::services::library_db::LibraryDb;
 use crate::services::{art_precache, artwork, navidrome_sync, runtime};
@@ -116,7 +117,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 /// makes "the sections that are present" a prefix of this list.
 const COMPACT_SECTIONS: [(&str, u16); 7] = [
     ("Window", 4),
-    ("Appearance", 13),
+    ("Appearance", 14),
     ("Playback", 14),
     ("Browsing", 11),
     ("Streaming", 5),
@@ -369,6 +370,7 @@ enum SettingsSwitch {
 enum SettingsButton {
     Theme(ThemePref),
     FullscreenBg(FullscreenBackground),
+    FullscreenCover(FullscreenCoverSize),
     ReplayGain(ReplayGainMode),
     QueueEnd(QueueEndBehavior),
     Repeat(RepeatMode),
@@ -919,6 +921,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_fullscreen_cover(&mut self, size: FullscreenCoverSize, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.fullscreen_cover = size);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_fullscreen_volume(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.fullscreen_volume = enabled);
@@ -1029,6 +1038,7 @@ impl SettingsView {
         match button {
             SettingsButton::Theme(p) => self.set_theme(p, window, cx),
             SettingsButton::FullscreenBg(m) => self.set_fullscreen_bg(m, cx),
+            SettingsButton::FullscreenCover(s) => self.set_fullscreen_cover(s, cx),
             SettingsButton::ReplayGain(m) => self.set_replay_gain(m, cx),
             SettingsButton::QueueEnd(m) => self.set_queue_end(m, cx),
             SettingsButton::Repeat(m) => self.set_default_repeat(m, cx),
@@ -1501,6 +1511,7 @@ impl Render for SettingsView {
         let queue_end = self.session.read(cx).settings.queue_end;
         let fullscreen_bg = self.session.read(cx).settings.fullscreen_bg;
         let fullscreen_volume = self.session.read(cx).settings.fullscreen_volume;
+        let fullscreen_cover = self.session.read(cx).settings.fullscreen_cover;
         let vi_mode = self.session.read(cx).settings.vi_mode;
         let reduced_motion = self.session.read(cx).settings.reduced_motion;
         let selection_glow = self.session.read(cx).settings.selection_glow;
@@ -1714,7 +1725,47 @@ impl Render for SettingsView {
                 false,
                 "Volume slider in fullscreen player",
                 cx,
-            ));
+            ))
+            .child(self.subheading("Fullscreen cover size", cx))
+            .child(self.note(
+                "How far the cover grows on a big window. Fixed keeps it at the \
+                 size a small window draws; the controls beside it keep their \
+                 room whichever you pick.",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(self.label_btn(
+                        SettingsButton::FullscreenCover(FullscreenCoverSize::Fixed),
+                        "Fixed",
+                        FullscreenCoverSize::Fixed.label(),
+                        fullscreen_cover == FullscreenCoverSize::Fixed,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::FullscreenCover(FullscreenCoverSize::Medium),
+                        "Medium",
+                        FullscreenCoverSize::Medium.label(),
+                        fullscreen_cover == FullscreenCoverSize::Medium,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::FullscreenCover(FullscreenCoverSize::Large),
+                        "Large",
+                        FullscreenCoverSize::Large.label(),
+                        fullscreen_cover == FullscreenCoverSize::Large,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::FullscreenCover(FullscreenCoverSize::Huge),
+                        "Huge",
+                        FullscreenCoverSize::Huge.label(),
+                        fullscreen_cover == FullscreenCoverSize::Huge,
+                        cx,
+                    )),
+            );
 
         // Playback
         let playback_section = self

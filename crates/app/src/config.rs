@@ -115,6 +115,11 @@ pub struct Settings {
     pub local_music_dirs: Vec<PathBuf>,
     /// Show the vertical volume slider in the fullscreen now-playing overlay.
     pub fullscreen_volume: bool,
+    /// How far the fullscreen overlay's cover art grows on a window with room
+    /// to spare. `Fixed` keeps the size a window that only just holds the
+    /// overlay draws.
+    #[serde(default)]
+    pub fullscreen_cover: FullscreenCoverSize,
     /// Scene drawn by the fullscreen visualizer; Off hides it. Persisted so the
     /// overlay comes back the way it was left.
     pub visualizer: VisualizerMode,
@@ -238,6 +243,62 @@ pub enum FullscreenBackground {
     BlurredArt,
     /// Slowly rotating album-palette gradient.
     Animated,
+}
+
+/// How big the fullscreen overlay's cover art is allowed to get on a window
+/// with room to spare.
+///
+/// A window that only just holds the overlay draws the same cover whatever this
+/// says — the setting only governs the room *above* that, which is why `Fixed`
+/// is a size rather than an on/off flag: it pins the cover to what a small
+/// window draws instead of letting it grow into a big one.
+///
+/// The pair per size is a share of the room and a ceiling, and both matter:
+/// the ceiling alone leaves every size looking identical on a 1080p screen,
+/// where the share is what the cover actually hits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenCoverSize {
+    /// Never grows: the cover a window that only just fits the overlay draws.
+    Fixed,
+    Medium,
+    #[default]
+    Large,
+    Huge,
+}
+
+impl FullscreenCoverSize {
+    /// Share of the window's height the cover may take beside the info card,
+    /// and the most it is drawn at. `Fixed` returns a share of zero, which the
+    /// layout's own clamp lifts back to the no-room-to-spare cover.
+    pub fn beside_card(self) -> (f32, f32) {
+        match self {
+            Self::Fixed => (0., 0.),
+            Self::Medium => (0.52, 620.),
+            Self::Large => (0.62, 780.),
+            Self::Huge => (0.72, 980.),
+        }
+    }
+
+    /// The same, stacked: there the cover has the whole width to itself, so the
+    /// share is of the content width and both numbers are larger.
+    pub fn stacked(self) -> (f32, f32) {
+        match self {
+            Self::Fixed => (0., 0.),
+            Self::Medium => (0.70, 720.),
+            Self::Large => (0.82, 880.),
+            Self::Huge => (0.92, 1100.),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fixed => "Fixed",
+            Self::Medium => "Medium",
+            Self::Large => "Large",
+            Self::Huge => "Huge",
+        }
+    }
 }
 
 /// Scene drawn by the fullscreen 3D audio visualizer. The fullscreen player's
@@ -450,6 +511,7 @@ impl Default for Settings {
             fullscreen_bg: FullscreenBackground::Gradient,
             local_music_dirs: Vec::new(),
             fullscreen_volume: false,
+            fullscreen_cover: FullscreenCoverSize::default(),
             visualizer: VisualizerMode::Off,
             visualizer_tuning: VisualizerSettings::default(),
             resume_playback: false,
