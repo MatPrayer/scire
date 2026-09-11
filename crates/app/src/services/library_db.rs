@@ -128,6 +128,60 @@ CREATE INDEX IF NOT EXISTS idx_artists_source ON artists(source);
 ";
 
 // ---------------------------------------------------------------------------
+// Query matching
+// ---------------------------------------------------------------------------
+
+/// Words of a query honoured before the LIKE chain costs more than the
+/// precision it buys.
+const MAX_QUERY_TERMS: usize = 6;
+
+/// Neutralise the LIKE wildcards a typed query may contain, so `_` searches
+/// for an underscore rather than for any character at all.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// One `%word%` pattern per word of the query.
+///
+/// Requiring *every* word, rather than the whole query as one run, is what
+/// lets "dark side moon" find "The Dark Side of the Moon" — a single LIKE only
+/// matches contiguous text, which is exactly what the words a user
+/// half-remembers are not.
+fn like_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .take(MAX_QUERY_TERMS)
+        .map(|w| format!("%{}%", escape_like(w)))
+        .collect()
+}
+
+/// `(a LIKE ?n ESCAPE … OR b LIKE ?n …)` for each term, AND-ed together: every
+/// word must appear somewhere in the row, not necessarily in the same column.
+fn like_clause(columns: &[&str], terms: usize) -> String {
+    (1..=terms)
+        .map(|i| {
+            let any = columns
+                .iter()
+                .map(|c| format!("{c} LIKE ?{i} ESCAPE '\\'"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!("({any})")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// What one query found in the cache, before ranking.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogSearch {
+    pub artists: Vec<ArtistRow>,
+    pub albums: Vec<AlbumRow>,
+    pub tracks: Vec<TrackRow>,
+}
+
+// ---------------------------------------------------------------------------
 // LibraryDb
 // ---------------------------------------------------------------------------
 
@@ -289,7 +343,7 @@ impl LibraryDb {
     pub fn get_track(&self, id: &str) -> Result<Option<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
              FROM tracks WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![id], |row| {
@@ -304,6 +358,7 @@ impl LibraryDb {
                 cover_art: row.get(7)?,
                 track_no: row.get(8)?,
                 file_modified: row.get(9)?,
+                album_id: row.get(10)?,
             })
         })?;
         match rows.next() {
@@ -319,14 +374,69 @@ impl LibraryDb {
         limit: usize,
     ) -> Result<Vec<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let pattern = format!("%{query}%");
-        let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified
+        Self::search_tracks_on(&conn, query, limit)
+    }
+
+    /// Matching albums, ordered alphabetically — callers rank the results
+    /// themselves, so the order here only has to be stable.
+    pub fn search_albums(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<AlbumRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        Self::search_albums_on(&conn, query, limit)
+    }
+
+    /// Matching artists, ordered alphabetically.
+    pub fn search_artists(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ArtistRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        Self::search_artists_on(&conn, query, limit)
+    }
+
+    /// Everything one query finds, across both sources, under a single lock.
+    ///
+    /// This is what backs the search palette's first frame: the cache holds the
+    /// last sync's whole catalog plus every locally scanned file, so a query can
+    /// be answered without the server — and is answered before a request to it
+    /// would even have left the machine.
+    pub fn search_catalog(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<CatalogSearch, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        Ok(CatalogSearch {
+            artists: Self::search_artists_on(&conn, query, limit)?,
+            albums: Self::search_albums_on(&conn, query, limit)?,
+            tracks: Self::search_tracks_on(&conn, query, limit)?,
+        })
+    }
+
+    fn search_tracks_on(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TrackRow>, rusqlite::Error> {
+        let terms = like_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let where_clause = like_clause(&["title", "artist", "album"], terms.len());
+        // `limit` is a usize, so interpolating it cannot inject anything; the
+        // query's own words are all bound.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
              FROM tracks
-             WHERE title LIKE ?1 OR artist LIKE ?1 OR album LIKE ?1
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+             WHERE {where_clause}
+             ORDER BY title COLLATE NOCASE
+             LIMIT {limit}",
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), |row| {
             Ok(TrackRow {
                 id: row.get(0)?,
                 source: row.get(1)?,
@@ -338,6 +448,74 @@ impl LibraryDb {
                 cover_art: row.get(7)?,
                 track_no: row.get(8)?,
                 file_modified: row.get(9)?,
+                album_id: row.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    fn search_albums_on(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<AlbumRow>, rusqlite::Error> {
+        let terms = like_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let where_clause = like_clause(&["title", "artist"], terms.len());
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
+                    created, play_count, starred_at, library_id
+             FROM albums
+             WHERE {where_clause}
+             ORDER BY title COLLATE NOCASE
+             LIMIT {limit}",
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), |row| {
+            Ok(AlbumRow {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                title: row.get(2)?,
+                artist: row.get(3)?,
+                artist_id: row.get(4)?,
+                year: row.get(5)?,
+                cover_art: row.get(6)?,
+                song_count: row.get(7)?,
+                duration: row.get(8)?,
+                created: row.get(9)?,
+                play_count: row.get(10)?,
+                starred: row.get(11)?,
+                library_id: row.get(12)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    fn search_artists_on(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ArtistRow>, rusqlite::Error> {
+        let terms = like_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let where_clause = like_clause(&["name"], terms.len());
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, source, name, cover_art, library_id
+             FROM artists
+             WHERE {where_clause}
+             ORDER BY name COLLATE NOCASE
+             LIMIT {limit}",
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), |row| {
+            Ok(ArtistRow {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                name: row.get(2)?,
+                cover_art: row.get(3)?,
+                library_id: row.get(4)?,
             })
         })?;
         rows.collect()
@@ -347,7 +525,7 @@ impl LibraryDb {
     pub fn tracks_by_album(&self, album_id: &str) -> Result<Vec<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
              FROM tracks WHERE album_id = ?1
              ORDER BY disc_number, track_no",
         )?;
@@ -363,6 +541,7 @@ impl LibraryDb {
                 cover_art: row.get(7)?,
                 track_no: row.get(8)?,
                 file_modified: row.get(9)?,
+                album_id: row.get(10)?,
             })
         })?;
         rows.collect()
@@ -382,7 +561,7 @@ impl LibraryDb {
     pub fn tracks_by_source(&self, source: &str) -> Result<Vec<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
              FROM tracks WHERE source = ?1
              ORDER BY album, track_no",
         )?;
@@ -398,6 +577,7 @@ impl LibraryDb {
                 cover_art: row.get(7)?,
                 track_no: row.get(8)?,
                 file_modified: row.get(9)?,
+                album_id: row.get(10)?,
             })
         })?;
         rows.collect()
@@ -869,6 +1049,10 @@ pub struct TrackRow {
     pub cover_art: Option<String>,
     pub track_no: Option<i32>,
     pub file_modified: Option<i64>,
+    /// Namespaced album id (`navidrome:album:<id>`, or the scanner's key),
+    /// which is what lets a track's cover be addressed per *album* rather than
+    /// per song — see `artwork::song_cover`.
+    pub album_id: Option<String>,
 }
 
 impl TrackRow {
@@ -878,7 +1062,7 @@ impl TrackRow {
             id: self.id,
             title: self.title,
             album: self.album,
-            album_id: None,
+            album_id: self.album_id,
             artist: self.artist,
             artist_id: None,
             track: self.track_no.map(|t| t as u32),
@@ -1168,6 +1352,74 @@ mod tests {
         let results = db.search_tracks("Beatles", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "t1");
+    }
+
+    #[test]
+    fn search_matches_words_out_of_order_and_apart() {
+        let db = test_db();
+        insert_minimal(&db, "t1", "local", "The Dark Side of the Moon");
+        insert_minimal(&db, "t2", "local", "Dark Horse");
+        // Neither word run is contiguous in the title, and they arrive in the
+        // wrong order — a single LIKE over the whole query finds nothing.
+        let results = db.search_tracks("moon dark", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "t1");
+    }
+
+    #[test]
+    fn search_words_may_match_different_columns() {
+        let db = test_db();
+        db.upsert_track(
+            "t1",
+            "local",
+            "Come Together",
+            Some("The Beatles"),
+            None,
+            Some("Abbey Road"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Artist in one column, album in another.
+        assert_eq!(db.search_tracks("beatles abbey", 10).unwrap().len(), 1);
+        assert!(db.search_tracks("beatles zeppelin", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_treats_like_wildcards_as_literal_text() {
+        let db = test_db();
+        insert_minimal(&db, "t1", "local", "Nothing Special");
+        // Unescaped, `%` matches everything and `_` any single character.
+        assert!(db.search_tracks("%", 10).unwrap().is_empty());
+        assert!(db.search_tracks("N_thing", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_catalog_spans_albums_and_artists() {
+        let db = test_db();
+        insert_minimal(&db, "t1", "local", "Bohemian Rhapsody");
+        let mut album = AlbumRow::new("alb1", "local", "A Night at the Opera");
+        album.artist = Some("Queen".into());
+        db.upsert_album(&album).unwrap();
+        db.upsert_artist("ar1", "local", "Queen", None, None)
+            .unwrap();
+
+        let hits = db.search_catalog("queen", 10).unwrap();
+        assert_eq!(hits.artists.len(), 1);
+        // Matched on the album's artist column, not its title.
+        assert_eq!(hits.albums.len(), 1);
+        assert!(hits.tracks.is_empty());
+
+        let empty = db.search_catalog("   ", 10).unwrap();
+        assert!(empty.artists.is_empty() && empty.albums.is_empty() && empty.tracks.is_empty());
     }
 
     #[test]

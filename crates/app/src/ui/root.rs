@@ -257,10 +257,19 @@ impl RootView {
         let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), cx));
         let radio = crate::state::radio::init(session.clone(), cx);
         let fullscreen = cx.new(|cx| FullscreenPlayer::new(player.clone(), session.clone(), cx));
-        let search_bar = cx.new(|cx| SearchBar::new(session.clone(), player.clone(), window, cx));
+        let search_bar = cx.new(|cx| {
+            SearchBar::new(
+                session.clone(),
+                player.clone(),
+                library_db.clone(),
+                window,
+                cx,
+            )
+        });
 
         cx.subscribe(&search_bar, |this: &mut Self, _, event, cx| match event {
             SearchBarEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
+            SearchBarEvent::OpenLocalAlbum(id) => this.open_local_album(id.clone(), cx),
             SearchBarEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
         })
         .detach();
