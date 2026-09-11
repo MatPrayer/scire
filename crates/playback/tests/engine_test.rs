@@ -277,6 +277,248 @@ async fn local_file_missing_errors() {
     }
 }
 
+/// Longer WAV, so there is somewhere to seek to: 16-bit mono 8kHz silence.
+fn wav_bytes_secs(secs: u32) -> Vec<u8> {
+    let sample_rate: u32 = 8000;
+    let samples: u32 = sample_rate * secs;
+    let data_len = samples * 2;
+    let mut buf = Vec::with_capacity(44 + data_len as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(b"WAVEfmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&16u16.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    buf.resize(44 + data_len as usize, 0);
+    buf
+}
+
+/// Resuming a saved position seeks the instant the track reports `Playing` —
+/// which is what the app does on the first press of play after a restart. The
+/// track must actually arrive there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seek_at_playing_moves_the_track() {
+    let dir = std::env::temp_dir().join("scire-test-resume-seek");
+    let _ = std::fs::create_dir_all(&dir);
+    let wav_path = dir.join("resume.wav");
+    let mut f = std::fs::File::create(&wav_path).unwrap();
+    f.write_all(&wav_bytes_secs(10)).unwrap();
+    drop(f);
+
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    player.play(TrackSource {
+        url: String::new(),
+        duration_hint: Some(Duration::from_secs(10)),
+        path: Some(wav_path.clone()),
+        id: Some("resume-song".into()),
+        live: false,
+    });
+
+    let target = Duration::from_secs(8);
+    let mut seeked = false;
+    let mut reached = false;
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Playing if !seeked => {
+                        seeked = true;
+                        player.seek(target);
+                    }
+                    Event::Position(p) => reached |= p >= target,
+                    Event::TrackEnded { .. } => break,
+                    Event::Failed(msg) => {
+                        if msg.contains("audio output unavailable") {
+                            eprintln!("skipping: no audio device ({msg})");
+                            let _ = std::fs::remove_file(&wav_path);
+                            return;
+                        }
+                        panic!("resume playback failed: {msg}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("engine wedged after seeking at Playing"),
+        }
+    }
+    assert!(seeked, "never saw Playing event");
+    assert!(
+        reached,
+        "never reported a position at or past the seek target"
+    );
+    let _ = std::fs::remove_file(&wav_path);
+}
+
+/// An HTTP server that trickles the body after the first `fast_bytes` and
+/// delays every ranged request by `range_delay`. That is what a seek costs
+/// against a real server — the bytes are not downloaded yet, so the decoder has
+/// to re-request them — and it is the only way to catch an engine that waits for
+/// the seek with the control loop in its hand.
+fn slow_range_server(body: Vec<u8>, fast_bytes: usize, range_delay: Duration) -> String {
+    use std::io::{BufRead, BufReader};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut range_start = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(spec) = lower.strip_prefix("range: bytes=") {
+                        range_start = spec
+                            .trim()
+                            .split('-')
+                            .next()
+                            .and_then(|s| s.parse::<usize>().ok());
+                    }
+                    if line.trim_end().is_empty() {
+                        break;
+                    }
+                }
+
+                let start = range_start.unwrap_or(0).min(body.len());
+                let slice = &body[start..];
+                let head = if range_start.is_some() {
+                    std::thread::sleep(range_delay);
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\n\
+                         Accept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\n\
+                         Content-Length: {}\r\n\r\n",
+                        start,
+                        body.len() - 1,
+                        body.len(),
+                        slice.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n\
+                         Accept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                };
+                if stream.write_all(head.as_bytes()).is_err() {
+                    return;
+                }
+                let mut sent = 0;
+                for chunk in slice.chunks(32 * 1024) {
+                    // Enough to get playback going, then slow enough that a seek
+                    // lands well ahead of what has been downloaded.
+                    if sent >= fast_bytes {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    if stream.write_all(chunk).is_err() {
+                        return;
+                    }
+                    sent += chunk.len();
+                }
+            });
+        }
+    });
+    format!("http://{addr}/rest/stream")
+}
+
+/// Seeking a stream is a blocking decode plus however many ranged re-requests
+/// the decoder needs — seconds, against a server that is not on this machine,
+/// and worst of all right after a track opens, which is exactly when a restored
+/// playback position is applied. Waiting for it inside the control loop stopped
+/// the engine answering anything at all: the app froze on the first press of
+/// play after a restart. The loop must stay live, and it must report where
+/// playback is going rather than where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_seek_does_not_stop_the_engine_answering() {
+    let url = slow_range_server(wav_bytes_secs(300), 512 * 1024, Duration::from_secs(2));
+
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    player.play(TrackSource {
+        url,
+        duration_hint: Some(Duration::from_secs(300)),
+        path: None,
+        id: Some("slow-seek".into()),
+        live: false,
+    });
+
+    let target = Duration::from_secs(250);
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
+
+    // Wait for playback, then seek and immediately ask for a pause: both the
+    // reported destination and the pause have to come back while the seek is
+    // still running.
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Playing => break,
+                    Event::Failed(msg) => {
+                        if msg.contains("audio output unavailable") {
+                            eprintln!("skipping: no audio device ({msg})");
+                            return;
+                        }
+                        panic!("playback failed: {msg}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("timed out waiting for playback to start"),
+        }
+    }
+
+    let asked_at = std::time::Instant::now();
+    player.seek(target);
+    player.pause();
+
+    let mut saw_target = false;
+    let mut pauses = 0;
+    let mut answered = None;
+    // The second `Paused` is the engine reporting the seek has landed (the
+    // first is the pause itself). Waiting for it keeps the blocking seek from
+    // outliving the audio output this test is about to drop.
+    while !(saw_target && pauses >= 2) {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Position(p) if p >= target => saw_target = true,
+                    Event::Paused => pauses += 1,
+                    Event::Failed(msg) => panic!("playback failed: {msg}"),
+                    _ => {}
+                }
+                if saw_target && pauses >= 1 && answered.is_none() {
+                    answered = Some(asked_at.elapsed());
+                }
+            }
+            _ = &mut deadline => panic!(
+                "engine stopped answering during a seek (target reported: {saw_target}, \
+                 pauses: {pauses})"
+            ),
+        }
+    }
+    let answered = answered.expect("both answers seen");
+    assert!(
+        answered < Duration::from_secs(2),
+        "the engine took {answered:?} to answer, so it was waiting out the seek",
+    );
+}
+
 /// A one-shot HTTP server that answers every request with `body`, optionally
 /// without a `Content-Length` (chunked), and reports the request headers it
 /// saw. wiremock always sets a length, and the length is exactly what decides

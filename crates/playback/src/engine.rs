@@ -76,7 +76,10 @@ async fn control_loop(
     // rodio output must outlive all players; created lazily on first Play so
     // a missing audio device only fails playback, not app startup.
     let mut output: Option<rodio::MixerDeviceSink> = None;
-    let mut sink: Option<rodio::Player> = None;
+    // Shared rather than owned outright because a seek runs on the blocking
+    // pool and has to keep the player alive for as long as it takes (see
+    // `spawn_seek`).
+    let mut sink: Option<Arc<rodio::Player>> = None;
     let mut volume: f32 = 1.0;
     // Chosen output device name (None = OS default) and the currently-loaded
     // track, retained so a device switch can reopen and resume in place.
@@ -105,6 +108,14 @@ async fn control_loop(
         mpsc::unbounded_channel::<(u64, Option<String>, Result<Prepared, PlaybackError>)>();
     // Track-exhaustion signals from appended sources.
     let (end_tx, mut end_rx) = mpsc::unbounded_channel::<u64>();
+    // Where a seek running on the blocking pool is headed, the generation that
+    // asked for it (so a result landing after the sink was replaced is thrown
+    // away), and whether the wait has been long enough to tell the consumer the
+    // player is stalled.
+    let mut seek_target: Option<Duration> = None;
+    let mut seek_gen: u64 = 0;
+    let mut seek_announced = false;
+    let (seek_done_tx, mut seek_done_rx) = mpsc::unbounded_channel::<(u64, SeekOutcome)>();
     let mut serials: u64 = 0;
     let mut ticker = tokio::time::interval(TICK);
     // Ticks since the output route was last checked. Asking the OS costs a
@@ -125,6 +136,7 @@ async fn control_loop(
                 match cmd {
                     Command::Play(track) => {
                         drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
+                        cancel_seek(&mut seek_target, &mut seek_gen);
                         queued = None;
                         current = None;
                         if let Some(s) = sink.take() {
@@ -168,7 +180,7 @@ async fn control_loop(
                                     let _ = event_tx.send(Event::StationInfo(station));
                                 }
                                 current = Some(loaded);
-                                sink = Some(new_sink);
+                                sink = Some(Arc::new(new_sink));
                                 playing = true;
                                 let _ = event_tx.send(Event::Playing);
                             }
@@ -200,6 +212,7 @@ async fn control_loop(
                     }
                     Command::Stop => {
                         drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
+                        cancel_seek(&mut seek_target, &mut seek_gen);
                         queued = None;
                         if let Some(s) = sink.take() {
                             s.stop();
@@ -218,7 +231,11 @@ async fn control_loop(
                             // Reopen on the new device, resuming the current
                             // track at its position (paused stays paused).
                             let resume = playing;
-                            let pos = sink.as_ref().map(|s| s.get_pos());
+                            // A seek still on its way is where playback is
+                            // going, so that is the position to reopen at —
+                            // the player itself still reports the old one.
+                            let pos = seek_target.or_else(|| sink.as_ref().map(|s| s.get_pos()));
+                            cancel_seek(&mut seek_target, &mut seek_gen);
                             // An already-appended next track dies with the old
                             // player; re-prepare it so gapless survives.
                             let requeue = queued.take().map(|l| l.track);
@@ -241,15 +258,25 @@ async fn control_loop(
                                 .await
                                 {
                                     Ok((new_sink, loaded)) => {
-                                        if let Some(p) = pos
-                                            && let Err(e) = new_sink.try_seek(p)
-                                        {
-                                            tracing::warn!("seek after device switch failed: {e}");
-                                        }
                                         if !resume {
                                             new_sink.pause();
                                         }
                                         current = Some(loaded);
+                                        let new_sink = Arc::new(new_sink);
+                                        // The reopened track starts at zero, so
+                                        // this is the same long seek a restored
+                                        // position is — off the loop it goes.
+                                        if let Some(p) = pos {
+                                            spawn_seek(
+                                                &new_sink,
+                                                p,
+                                                &mut seek_target,
+                                                &mut seek_gen,
+                                                &mut seek_announced,
+                                                &seek_done_tx,
+                                                &event_tx,
+                                            );
+                                        }
                                         sink = Some(new_sink);
                                         playing = resume;
                                         let _ = event_tx.send(if resume {
@@ -278,11 +305,15 @@ async fn control_loop(
                     }
                     Command::Seek(pos) => {
                         if let Some(s) = &sink {
-                            if let Err(e) = s.try_seek(pos) {
-                                tracing::warn!("seek failed: {e}");
-                            } else {
-                                let _ = event_tx.send(Event::Position(pos));
-                            }
+                            spawn_seek(
+                                s,
+                                pos,
+                                &mut seek_target,
+                                &mut seek_gen,
+                                &mut seek_announced,
+                                &seek_done_tx,
+                                &event_tx,
+                            );
                         }
                     }
                     Command::SetVolume(v) => {
@@ -324,7 +355,7 @@ async fn control_loop(
                             commit_next(
                                 &mut pending,
                                 &mut queued,
-                                &sink,
+                                sink.as_deref(),
                                 current.as_ref(),
                                 &mut serials,
                                 &end_tx,
@@ -342,6 +373,23 @@ async fn control_loop(
                                 error: e.to_string(),
                             });
                         }
+                    }
+                }
+            }
+            Some((generation, result)) = seek_done_rx.recv() => {
+                // A seek for a sink that has since been replaced says nothing
+                // about the one playing now.
+                if generation == seek_gen {
+                    seek_target = None;
+                    if let Err(e) = result {
+                        tracing::warn!("seek failed: {e}");
+                    }
+                    // Only undo a stall that was announced; a seek quick enough
+                    // to finish inside one tick never showed the consumer
+                    // anything to take back.
+                    if seek_announced {
+                        seek_announced = false;
+                        let _ = event_tx.send(if playing { Event::Playing } else { Event::Paused });
                     }
                 }
             }
@@ -376,6 +424,20 @@ async fn control_loop(
                 }
             }
             _ = ticker.tick() => {
+                // A seek in flight owns the sink: the player reports the
+                // position the seek is leaving until it lands, `empty()` is not
+                // a finished track, and the route check would tear the output
+                // down under a blocking seek still holding it. Hold the
+                // destination up instead, and say the player is stalled once it
+                // is clear this is not one of the instant ones.
+                if let Some(target) = seek_target {
+                    let _ = event_tx.send(Event::Position(target));
+                    if !seek_announced {
+                        seek_announced = true;
+                        let _ = event_tx.send(Event::Buffering);
+                    }
+                    continue;
+                }
                 // Route watch first: a dead output makes rodio's player look
                 // drained, and the `empty()` branch below would report that as
                 // a finished track and advance the queue onto the speakers.
@@ -422,15 +484,22 @@ async fn control_loop(
                         .await
                         {
                             Ok((new_sink, loaded)) => {
-                                if let Some(p) = pos
-                                    && let Err(e) = new_sink.try_seek(p)
-                                {
-                                    tracing::warn!("seek after route change failed: {e}");
-                                }
                                 if !resume {
                                     new_sink.pause();
                                 }
                                 current = Some(loaded);
+                                let new_sink = Arc::new(new_sink);
+                                if let Some(p) = pos {
+                                    spawn_seek(
+                                        &new_sink,
+                                        p,
+                                        &mut seek_target,
+                                        &mut seek_gen,
+                                        &mut seek_announced,
+                                        &seek_done_tx,
+                                        &event_tx,
+                                    );
+                                }
                                 sink = Some(new_sink);
                                 playing = resume;
                                 let _ = event_tx.send(if resume {
@@ -488,7 +557,7 @@ async fn control_loop(
                         commit_next(
                             &mut pending,
                             &mut queued,
-                            &sink,
+                            sink.as_deref(),
                             current.as_ref(),
                             &mut serials,
                             &end_tx,
@@ -499,6 +568,51 @@ async fn control_loop(
             }
         }
     }
+}
+
+/// Result of a seek that ran on the blocking pool.
+type SeekOutcome = Result<(), rodio::source::SeekError>;
+
+/// Move `sink` to `pos` on the blocking pool, remembering where it is headed.
+///
+/// Seeking is not a pointer move: symphonia binary-searches the container, and
+/// every probe landing outside what stream-download already has on disk is a
+/// ranged re-request. Right after a track opens — which is exactly when a
+/// restored playback position is applied — that is several round trips, tens of
+/// seconds against a remote server. Run inline it held the whole control loop:
+/// no pause, no next, no position ticks, and with only a couple of IO workers in
+/// the app it was also competing with the very requests it was waiting on. The
+/// loop stays free instead, and the seek reports back through `done_tx`.
+fn spawn_seek(
+    sink: &Arc<rodio::Player>,
+    pos: Duration,
+    seek_target: &mut Option<Duration>,
+    seek_gen: &mut u64,
+    seek_announced: &mut bool,
+    done_tx: &mpsc::UnboundedSender<(u64, SeekOutcome)>,
+    event_tx: &mpsc::UnboundedSender<Event>,
+) {
+    *seek_gen += 1;
+    *seek_target = Some(pos);
+    *seek_announced = false;
+    let generation = *seek_gen;
+    // Report the destination straight away. Until the decoder arrives the
+    // player still reports where the track used to be, and a consumer that
+    // believes it has clobbered the position it just asked for (the app writes
+    // it to the resume file every second) is worse off than one told early.
+    let _ = event_tx.send(Event::Position(pos));
+    let sink = sink.clone();
+    let done_tx = done_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = done_tx.send((generation, sink.try_seek(pos)));
+    });
+}
+
+/// Forget a seek in flight: its result belongs to a sink that is on its way out,
+/// and bumping the generation is what makes the late answer harmless.
+fn cancel_seek(seek_target: &mut Option<Duration>, seek_gen: &mut u64) {
+    *seek_gen += 1;
+    *seek_target = None;
 }
 
 /// Has the output route moved out from under an open sink?
@@ -627,7 +741,7 @@ fn drop_prefetch(
 fn commit_next(
     pending: &mut Option<Prepared>,
     queued: &mut Option<Loaded>,
-    sink: &Option<rodio::Player>,
+    sink: Option<&rodio::Player>,
     current: Option<&Loaded>,
     serials: &mut u64,
     end_tx: &mpsc::UnboundedSender<u64>,
