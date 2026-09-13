@@ -258,6 +258,12 @@ const SIDE_PANEL_ART_SHARE: f32 = 0.52;
 /// A cover smaller than this is not worth the panel — the stacked page draws a
 /// bigger one.
 const SIDE_PANEL_ART_MIN: f32 = 200.;
+/// Top padding the track column takes in the side-panel layout, in place of its
+/// `p_4`. Half of `SIDE_PANEL_PADDING`, and for the same reason: the cover
+/// starts a header card's padding *inside* the panel's own, so a track list
+/// padded like the panel begins above the cover it sits beside — which reads as
+/// the two columns being out of step rather than as a list with room over it.
+pub const SIDE_PANEL_TRACKS_TOP: f32 = SIDE_PANEL_PADDING / 2.;
 
 /// The album page's side panel: its width, and the cover size inside it.
 #[derive(Debug, Clone, Copy, PartialEq)]

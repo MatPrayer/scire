@@ -1459,7 +1459,12 @@ impl Render for AlbumDetailView {
                     .h_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    .p_4()
+                    .px_4()
+                    .pb_4()
+                    // Not `p_4`: the panel's cover sits a header card's padding
+                    // inside the panel's own, so a track list padded the same
+                    // starts above the cover beside it (`SIDE_PANEL_TRACKS_TOP`).
+                    .pt(px(crate::ui::SIDE_PANEL_TRACKS_TOP))
                     .gap_4()
                     .children(error_line)
                     .child(track_list);

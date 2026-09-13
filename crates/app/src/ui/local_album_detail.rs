@@ -486,7 +486,12 @@ impl Render for LocalAlbumDetailView {
                     .h_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    .p_4()
+                    .px_4()
+                    .pb_4()
+                    // Not `p_4`: lines the first track up with the cover beside
+                    // it rather than with the card the cover is padded inside —
+                    // see `SIDE_PANEL_TRACKS_TOP`.
+                    .pt(px(crate::ui::SIDE_PANEL_TRACKS_TOP))
                     .gap_4()
                     .child(track_list);
                 let side = v_flex()
