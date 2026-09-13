@@ -311,6 +311,92 @@ pub fn square_crop(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Edge length the blurred background rendition is built and stored at.
+///
+/// The background used to be the 32px rendition stretched over the whole
+/// window, on the theory that a big enough upscale *is* a blur. It is not: a
+/// 32px source scaled 40× is a grid of soft squares, and on anything above a
+/// laptop screen it reads as a broken image rather than as a blurred one. A
+/// real gaussian over a 512 source is smooth at any window size, and the file
+/// is one more cache entry per album.
+const BLUR_EDGE: u32 = 512;
+
+/// Blur radius as a fraction of the edge, so the look is the same whatever
+/// [`BLUR_EDGE`] is. 1/12 of 512 ≈ 43px — past the point where any detail of
+/// the cover survives, which is what the background wants.
+const BLUR_SIGMA_RATIO: f32 = 1. / 12.;
+
+/// Path of the blurred rendition of `key`, if it has already been built.
+///
+/// Its own entry rather than a rung of the size ladder: it is a different
+/// *image*, not a different size of the same one, and nothing but the
+/// fullscreen background ever wants it.
+pub fn blurred_cached(key: &str) -> Option<PathBuf> {
+    let path = blurred_path(key)?;
+    path.exists().then_some(path)
+}
+
+fn blurred_path(key: &str) -> Option<PathBuf> {
+    let dir = config::artwork_cache_dir().ok()?;
+    Some(dir.join(format!("{}-blur.img", config::sanitize(stable_key(key)))))
+}
+
+/// Fetch the cover at [`BLUR_EDGE`] and return a blurred rendition of it.
+///
+/// The plain art is cached as usual on the way through, so an album whose
+/// cover is already held at that rung costs the blur alone.
+pub async fn fetch_blurred(
+    client: SubsonicClient,
+    cover_id: String,
+    key: String,
+) -> Result<PathBuf> {
+    if let Some(path) = blurred_cached(&key) {
+        return Ok(path);
+    }
+    let source = fetch_as(client, cover_id, key.clone(), BLUR_EDGE).await?;
+    blur_file(&source, &key).await
+}
+
+/// Blurred rendition of an image already on disk (a local track's art), cached
+/// under `key` like the server path's.
+pub async fn blur_file(source: &Path, key: &str) -> Result<PathBuf> {
+    if let Some(path) = blurred_cached(key) {
+        return Ok(path);
+    }
+    let out = blurred_path(key).ok_or_else(|| anyhow::anyhow!("no artwork cache dir"))?;
+    let source = source.to_path_buf();
+    runtime::spawn_blocking_io(move || blur_into(&source, &out)).await
+}
+
+/// Decode, downscale, blur and write — CPU-bound, hence the blocking pool.
+fn blur_into(source: &Path, out: &Path) -> Result<PathBuf> {
+    let image = image::ImageReader::open(source)?
+        .with_guessed_format()?
+        .decode()?;
+    // The source is normally already at BLUR_EDGE (`fetch_as` asked for it),
+    // but a cover the server published smaller — or a local file's art, which
+    // is whatever the tag held — can be any size, and the blur's cost is per
+    // pixel.
+    let image = if image.width().max(image.height()) > BLUR_EDGE {
+        image.resize(BLUR_EDGE, BLUR_EDGE, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
+    let sigma = image.width().max(image.height()) as f32 * BLUR_SIGMA_RATIO;
+    let blurred = image::imageops::fast_blur(&image.to_rgb8(), sigma);
+    let mut bytes = Vec::new();
+    // JPEG throughout: a blurred image has no detail to lose and compresses to
+    // a few KB, where PNG of the same gradients is an order of magnitude more.
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90).encode_image(&blurred)?;
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = out.with_extension("part");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, out)?;
+    Ok(out.to_path_buf())
+}
+
 /// Marker written into a cache directory once its art has been squared.
 const SQUARED_MARKER: &str = ".squared-v1";
 

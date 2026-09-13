@@ -1915,7 +1915,10 @@ impl FullscreenPlayer {
             FullscreenBackground::BlurredArt => base()
                 .bg(cx.theme().muted)
                 .overflow_hidden()
-                // The tiny 32px art scaled to full size reads as a soft blur.
+                // A real gaussian over a 512 source (`artwork::fetch_blurred`),
+                // not the 32px rendition upscaled — that is a grid of soft
+                // squares on any sizeable window, which is what "the blurred
+                // background is low res" was.
                 // Square art in a landscape window would otherwise sit between
                 // two bands of bare `muted` — cover the window and let the
                 // parent's `overflow_hidden` clip what hangs over.
@@ -1966,9 +1969,21 @@ impl FullscreenPlayer {
             crate::services::local_library::local_art_path(&cover_id).filter(|p| p.exists())
         {
             self.art_path = Some(path.clone());
-            self.bg_art_path = Some(path.clone());
+            self.bg_art_path = artwork::blurred_cached(&key);
             self.gradient_palette = extract_palette(&path);
             cx.notify();
+            if self.bg_art_path.is_none() {
+                let source = path.clone();
+                cx.spawn(async move |this, cx| {
+                    if let Ok(blurred) = artwork::blur_file(&source, &key).await {
+                        let _ = this.update(cx, |view, cx| {
+                            view.bg_art_path = Some(blurred);
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
             return;
         }
         let Some(client) = self.client(cx) else {
@@ -1987,18 +2002,39 @@ impl FullscreenPlayer {
             }
         })
         .detach();
-        // Tiny version for color extraction.
+        // Tiny version for color extraction — a low-res average is a fast
+        // palette sample, and it is *only* a palette sample: the blurred
+        // background is its own rendition below.
+        let client3 = client2.clone();
+        let cover_id3 = cover_id2.clone();
+        let key3 = key2.clone();
         cx.spawn(async move |this, cx| {
             if let Ok(path) = artwork::fetch_as(client2, cover_id2, key2, BG_ART_SIZE).await {
                 let colors = extract_palette(&path);
                 let _ = this.update(cx, |view, cx| {
-                    view.bg_art_path = Some(path);
                     view.gradient_palette = colors;
                     cx.notify();
                 });
             }
         })
         .detach();
+        // Blurred background. Painted from cache with no await when it is
+        // already built, so switching tracks does not flash the bare `muted`
+        // behind the overlay.
+        if let Some(path) = artwork::blurred_cached(&key3) {
+            self.bg_art_path = Some(path);
+            cx.notify();
+        } else {
+            cx.spawn(async move |this, cx| {
+                if let Ok(path) = artwork::fetch_blurred(client3, cover_id3, key3).await {
+                    let _ = this.update(cx, |view, cx| {
+                        view.bg_art_path = Some(path);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
     }
 }
 
