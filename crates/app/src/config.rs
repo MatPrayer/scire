@@ -178,6 +178,11 @@ pub struct Settings {
     /// switch disabled — under `Stacked`.
     #[serde(default)]
     pub album_panel_right: bool,
+    /// Drop the star buttons from the album page — the one beside the title and
+    /// the one on each track row. Starring stays available from a track's
+    /// context menu, so this hides the buttons rather than the feature.
+    #[serde(default)]
+    pub hide_album_stars: bool,
     /// Disable non-essential UI animations (tab transitions, hover effects, panel slides).
     /// Useful on lower-end GPUs or for users sensitive to motion.
     #[serde(default)]
@@ -587,6 +592,7 @@ impl Default for Settings {
             adaptive_page_gradient: false,
             album_layout: AlbumPageLayout::default(),
             album_panel_right: false,
+            hide_album_stars: false,
             reduced_motion: false,
             selection_glow: false,
         }

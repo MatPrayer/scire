@@ -117,7 +117,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 /// makes "the sections that are present" a prefix of this list.
 const COMPACT_SECTIONS: [(&str, u16); 7] = [
     ("Window", 4),
-    ("Appearance", 17),
+    ("Appearance", 18),
     ("Playback", 15),
     ("Browsing", 11),
     ("Streaming", 5),
@@ -360,6 +360,7 @@ enum SettingsSwitch {
     AdaptiveFromPage,
     AdaptivePageGradient,
     AlbumPanelRight,
+    HideAlbumStars,
     SelectionGlow,
     FullscreenVolume,
     Scrobble,
@@ -968,6 +969,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_hide_album_stars(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.hide_album_stars = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_fullscreen_volume(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.fullscreen_volume = enabled);
@@ -1012,6 +1020,7 @@ impl SettingsView {
             SettingsSwitch::AdaptiveFromPage => s.adaptive_from_page,
             SettingsSwitch::AdaptivePageGradient => s.adaptive_page_gradient,
             SettingsSwitch::AlbumPanelRight => s.album_panel_right,
+            SettingsSwitch::HideAlbumStars => s.hide_album_stars,
             SettingsSwitch::SelectionGlow => s.selection_glow,
             SettingsSwitch::FullscreenVolume => s.fullscreen_volume,
             SettingsSwitch::Scrobble => s.scrobble_enabled,
@@ -1060,6 +1069,7 @@ impl SettingsView {
             SettingsSwitch::AdaptiveFromPage => self.set_adaptive_from_page(value, cx),
             SettingsSwitch::AdaptivePageGradient => self.set_adaptive_page_gradient(value, cx),
             SettingsSwitch::AlbumPanelRight => self.set_album_panel_right(value, cx),
+            SettingsSwitch::HideAlbumStars => self.set_hide_album_stars(value, cx),
             SettingsSwitch::SelectionGlow => self.set_selection_glow(value, cx),
             SettingsSwitch::FullscreenVolume => self.set_fullscreen_volume(value, cx),
             SettingsSwitch::Scrobble => self.set_scrobble(value, cx),
@@ -1557,6 +1567,7 @@ impl Render for SettingsView {
         let adaptive_page_gradient = self.session.read(cx).settings.adaptive_page_gradient;
         let album_layout = self.session.read(cx).settings.album_layout;
         let album_panel_right = self.session.read(cx).settings.album_panel_right;
+        let hide_album_stars = self.session.read(cx).settings.hide_album_stars;
         let resume_playback = self.session.read(cx).settings.resume_playback;
         let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
         let replay_gain = self.session.read(cx).settings.replay_gain;
@@ -1727,6 +1738,19 @@ impl Render for SettingsView {
                 album_panel_right,
                 !album_layout.wants_side_panel(),
                 "Cover panel on the right",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::HideAlbumStars,
+                "hide-album-stars",
+                hide_album_stars,
+                false,
+                "Hide star buttons on album pages",
+                cx,
+            ))
+            .child(self.note(
+                "Drops the star beside the album title and the one on each \
+                 track row. A track's context menu still stars it.",
                 cx,
             ))
             .child(self.vi_switch(

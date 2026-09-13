@@ -1143,6 +1143,7 @@ impl Render for AlbumDetailView {
         let show_album = loading_album && placeholding(self.album_since);
         let show_info = loading_info && placeholding(self.info_since);
 
+        let hide_stars = self.session.read(cx).settings.hide_album_stars;
         let (album_starred, album_rating) = self
             .album
             .as_ref()
@@ -1294,17 +1295,21 @@ impl Render for AlbumDetailView {
                                     false => this.child(name),
                                 }),
                         )
-                        .child(
-                            Button::new("album-star")
-                                .ghost()
-                                .xsmall()
-                                .icon(app_icon(if album_starred {
-                                    icons::STAR_FILLED
-                                } else {
-                                    icons::STAR_OUTLINE
-                                }))
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_album_star(cx))),
-                        ),
+                        .when(!hide_stars, |this| {
+                            this.child(
+                                Button::new("album-star")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(app_icon(if album_starred {
+                                        icons::STAR_FILLED
+                                    } else {
+                                        icons::STAR_OUTLINE
+                                    }))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_album_star(cx)),
+                                    ),
+                            )
+                        }),
                 )
                 // One link per credited artist: a collaboration lists every
                 // artist, and each opens its own page. Vanilla servers send a
@@ -1546,20 +1551,22 @@ impl Render for AlbumDetailView {
                                         cx.stop_propagation();
                                     })),
                             )
-                            .child(
-                                Button::new(("t-star", i))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(app_icon(if starred {
-                                        icons::STAR_FILLED
-                                    } else {
-                                        icons::STAR_OUTLINE
-                                    }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_song_star(i, cx);
-                                        cx.stop_propagation();
-                                    })),
-                            )
+                            .when(!hide_stars, |this| {
+                                this.child(
+                                    Button::new(("t-star", i))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(app_icon(if starred {
+                                            icons::STAR_FILLED
+                                        } else {
+                                            icons::STAR_OUTLINE
+                                        }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_song_star(i, cx);
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                            })
                             .child(self.playlist_popover(i, song, cx)),
                     )
                     // Play count and duration: fixed right-aligned columns,
