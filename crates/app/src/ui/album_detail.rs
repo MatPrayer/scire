@@ -3,10 +3,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle, Window, div,
-    img, linear_color_stop, linear_gradient, prelude::*, px,
+    AnimationExt as _, AnyElement, App, Context, Entity, EventEmitter, IntoElement, Render,
+    ScrollAnchor, ScrollHandle, Window, div, img, linear_color_stop, linear_gradient, prelude::*,
+    px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::link::Link;
@@ -101,6 +103,160 @@ fn cached_album(db: &LibraryDb, album_id: &str) -> Option<AlbumWithSongs> {
     })
 }
 
+/// How many tracks the last sync recorded for this album, for the case
+/// `cached_album` refuses: an album row whose tracks never landed still knows
+/// its own `song_count`, and a skeleton list of the right length is the
+/// difference between a track list that fills in and one that grows or
+/// collapses under the pointer.
+fn cached_song_count(db: &LibraryDb, album_id: &str) -> Option<usize> {
+    let row = db
+        .album_by_id("navidrome", &format!("{ALBUM_NS}{album_id}"))
+        .ok()
+        .flatten()?;
+    (row.song_count > 0).then_some(row.song_count as usize)
+}
+
+/// How long a request runs before its placeholders become *visible*.
+///
+/// The space is reserved from the first frame either way — that is the whole
+/// point of the placeholders, and a gate on the space itself only moved the
+/// shift it exists to prevent back to wherever the gate opened. What the delay
+/// gates is the grey: the cache seeds the page instantly and a warm server
+/// answers in well under a tenth of a second, so bars *painted* the moment a
+/// request is issued are on screen for two frames and gone, which reads as a
+/// flash. Below the delay the placeholder is an empty hole of exactly the right
+/// size, so the words land in silence; past it the request is slow enough that
+/// the page should say so.
+const PLACEHOLDER_DELAY: Duration = Duration::from_millis(220);
+
+/// True once a request has been in flight long enough to be worth showing.
+fn placeholding(since: Option<Instant>) -> bool {
+    since.is_some_and(|t| t.elapsed() >= PLACEHOLDER_DELAY)
+}
+
+/// The pulse every placeholder here shares, over gpui-component's `Skeleton`
+/// colour. Not `Skeleton` itself: that is a bare `div` with no children, so a
+/// placeholder built from it can only be given a size in px, which is the one
+/// thing that must not be guessed.
+///
+/// `show` decides whether anything is painted, never whether anything is laid
+/// out: an unshown placeholder keeps its element, its sample text and so its
+/// exact size, and only loses the fill and the animation.
+fn skeleton_pulse(
+    id: impl Into<gpui::ElementId>,
+    show: bool,
+    el: gpui::Div,
+    cx: &App,
+) -> AnyElement {
+    // Whatever text is inside is there for its metrics alone.
+    let el = el.rounded_md().text_color(gpui::transparent_black());
+    if !show {
+        return el.into_any_element();
+    }
+    el.bg(cx.theme().skeleton)
+        .with_animation(
+            id,
+            gpui::Animation::new(Duration::from_secs(2))
+                .repeat()
+                .with_easing(gpui::bounce(gpui::ease_in_out)),
+            |this, delta| this.opacity(1. - delta * 0.5),
+        )
+        .into_any_element()
+}
+
+/// A placeholder standing in for a line of text the server has not answered for
+/// yet, shaped by a *sample string* laid out in the surrounding type styles.
+///
+/// The field it replaces is text, so the only height guaranteed to match the
+/// line that lands is the one the text engine produces for the same styles —
+/// hard-coded px were a few off in every place they were used, and the page
+/// still stepped when the words arrived.
+fn skeleton_text(id: impl Into<gpui::ElementId>, show: bool, sample: &str, cx: &App) -> AnyElement {
+    // Wrapped in a row because a column stretches its children: on its own the
+    // bar would be the width of the page rather than of its own sample.
+    h_flex()
+        .child(skeleton_pulse(
+            id,
+            show,
+            div().child(sample.to_string()),
+            cx,
+        ))
+        .into_any_element()
+}
+
+/// Same, at an explicit width: prose fills the column it sits in and so has no
+/// sample to take a width from. The non-breaking space is what gives it the
+/// line's height.
+fn skeleton_line(
+    id: impl Into<gpui::ElementId>,
+    show: bool,
+    w: gpui::DefiniteLength,
+    cx: &App,
+) -> AnyElement {
+    skeleton_pulse(id, show, div().w(w).child("\u{a0}"), cx)
+}
+
+/// A placeholder chip: the real chip's padding and type, so the row it is in is
+/// exactly as tall as the one that replaces it.
+fn skeleton_chip(id: impl Into<gpui::ElementId>, show: bool, sample: &str, cx: &App) -> AnyElement {
+    skeleton_pulse(
+        id,
+        show,
+        div().px_2().py_0p5().text_xs().child(sample.to_string()),
+        cx,
+    )
+}
+
+/// Samples for the quality chips, the header's three lines and the ReplayGain
+/// line — each the shape of what actually lands there, so the placeholders are
+/// the width of a plausible answer rather than of a round number.
+/// One per chip `quality_chips` can add — format, bitrate, rate/depth, channels
+/// and total size, in that order. The count is what matters more than the
+/// widths: the row wraps, so reserving four where five land pushes the header a
+/// line taller when they arrive, and in the stacked layout the header sits on
+/// top of the track list, which is why the whole page was seen to step. The
+/// genre and "Added" chips are not here — the cache carries both, so a seeded
+/// page already draws them.
+const CHIP_SAMPLES: [&str; 5] = [
+    "FLAC",
+    "1004 kbps",
+    "44.1 kHz · 16 bit",
+    "Stereo",
+    "612.4 MB",
+];
+const TITLE_SAMPLE: &str = "The Dark Side of the Moon";
+const CREDITS_SAMPLE: &str = "Pink Floyd";
+const META_SAMPLE: &str = "1973 · 10 tracks · 42:59";
+const REPLAYGAIN_SAMPLE: &str = "ReplayGain −7.2 dB album · −7.4 dB track";
+const TRACK_SKELETONS: usize = 8;
+
+/// The About card's prose placeholder: `NOTES_PREVIEW_CHARS` of sample text,
+/// laid out in the card's own width and type styles.
+///
+/// A fixed number of bars cannot work here. The card is as wide as whatever
+/// column it lands in, so how many lines 400 characters wrap to is a property
+/// of the window — three bars stood in for six lines on a narrow one, and the
+/// card grew by half its height when the notes arrived. Wrapping the same
+/// character count the collapsed view shows gives the text engine the same job
+/// it is about to do for real.
+fn notes_sample() -> String {
+    const WORDS: &str = "the album was recorded over several sessions and mixed \
+                         the following spring by a band that had been touring it \
+                         for the better part of a year ";
+    WORDS.chars().cycle().take(NOTES_PREVIEW_CHARS).collect()
+}
+
+/// A placeholder for a block of prose: fills its column and takes its height
+/// from the wrapped sample, where `skeleton_line` is one line at a given width.
+fn skeleton_block(
+    id: impl Into<gpui::ElementId>,
+    show: bool,
+    sample: &str,
+    cx: &App,
+) -> AnyElement {
+    skeleton_pulse(id, show, div().w_full().child(sample.to_string()), cx)
+}
+
 pub enum AlbumDetailEvent {
     OpenArtist(String),
 }
@@ -162,6 +318,21 @@ pub struct AlbumDetailView {
     /// than a client — and a shared flag would let a repaint respawn one of
     /// them every frame.
     accent_seed_for: Option<String>,
+    /// A `getAlbum` is in flight, and `getAlbum` has never answered for this
+    /// page. Both halves are needed: the request is re-issued whenever playback
+    /// enters or leaves the album, and swapping the chips a user is reading for
+    /// placeholders is worse than the shift the placeholders exist to prevent.
+    album_pending: bool,
+    album_loaded: bool,
+    /// When the request in flight was issued, for `PLACEHOLDER_DELAY`.
+    album_since: Option<Instant>,
+    /// Same, for `getAlbumInfo2` behind the About card.
+    info_pending: bool,
+    info_loaded: bool,
+    info_since: Option<Instant>,
+    /// The cache's track count for an album it could not seed rows for, so the
+    /// skeleton list is as long as the real one.
+    expected_tracks: Option<usize>,
 }
 
 impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
@@ -221,6 +392,13 @@ impl AlbumDetailView {
             accent: None,
             accent_for: None,
             accent_seed_for: None,
+            album_pending: false,
+            album_loaded: false,
+            album_since: None,
+            info_pending: false,
+            info_loaded: false,
+            info_since: None,
+            expected_tracks: None,
         };
         this.seed_from_cache(&db, cx);
         this.load(cx);
@@ -237,6 +415,9 @@ impl AlbumDetailView {
     /// drawn immediately and `load` overwrites it in place.
     fn seed_from_cache(&mut self, db: &LibraryDb, cx: &mut Context<Self>) {
         let Some(seed) = cached_album(db, &self.album_id) else {
+            // Nothing to paint, but the count is worth having anyway — it is
+            // the skeleton track list's length.
+            self.expected_tracks = cached_song_count(db, &self.album_id);
             return;
         };
         let cover = seed.album.cover_art.clone();
@@ -279,17 +460,39 @@ impl AlbumDetailView {
         self.session.read(cx).client.clone()
     }
 
+    /// Repaint once `PLACEHOLDER_DELAY` has elapsed.
+    ///
+    /// The placeholders appear on a *deadline* rather than on an event, and a
+    /// clock running out dirties nothing — without this the page would only
+    /// start holding its shape at whatever unrelated repaint happened next,
+    /// which for an album page nobody is touching is the response itself.
+    fn wake_at_placeholder_delay(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PLACEHOLDER_DELAY).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
         let id = self.album_id.clone();
+        // Set here rather than at the top of the function: with no client there
+        // is nothing in flight, and a page that will never be filled in must not
+        // draw placeholders forever.
+        self.album_pending = true;
+        self.album_since = Some(Instant::now());
+        Self::wake_at_placeholder_delay(cx);
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 client.get_album(&id).await.map_err(anyhow::Error::from)
             })
             .await;
             let _ = this.update(cx, |view, cx| {
+                view.album_pending = false;
+                view.album_loaded = true;
                 match result {
                     Ok(album) => {
                         // The seed already started this download when the
@@ -324,6 +527,9 @@ impl AlbumDetailView {
             return;
         };
         let id = self.album_id.clone();
+        self.info_pending = true;
+        self.info_since = Some(Instant::now());
+        Self::wake_at_placeholder_delay(cx);
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 client
@@ -332,14 +538,18 @@ impl AlbumDetailView {
                     .map_err(anyhow::Error::from)
             })
             .await;
-            // A server without the metadata agent answers with an empty element
-            // rather than an error; either way there is simply nothing to show.
-            if let Ok(info) = result {
-                let _ = this.update(cx, |view, cx| {
+            let _ = this.update(cx, |view, cx| {
+                view.info_pending = false;
+                // Marked loaded either way: a server without the metadata agent
+                // answers with an empty element rather than an error, and in
+                // both cases there is nothing more coming to hold a placeholder
+                // open for.
+                view.info_loaded = true;
+                if let Ok(info) = result {
                     view.info = Some(info);
-                    cx.notify();
-                });
-            }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -919,6 +1129,20 @@ impl Render for AlbumDetailView {
         let page_accent = self.page_accent(cx);
         let header_tint = self.header_tint(cx);
 
+        // Everything this page gets from the server arrives after the frame it
+        // is opened on — and for an album the cache has never seen, that is the
+        // whole page. Where a field is still on its way it is drawn as a
+        // placeholder of the size it will be, so the page fills in rather than
+        // growing a piece at a time under the pointer.
+        // Two separate questions: whether the space is held (from the first
+        // frame, or the shift is merely postponed to whenever the gate opens)
+        // and whether the grey is painted in it (only once the request is slow
+        // enough to be worth remarking on).
+        let loading_album = self.album_pending && !self.album_loaded;
+        let loading_info = self.info_pending && !self.info_loaded;
+        let show_album = loading_album && placeholding(self.album_since);
+        let show_info = loading_info && placeholding(self.info_since);
+
         let (album_starred, album_rating) = self
             .album
             .as_ref()
@@ -944,10 +1168,16 @@ impl Render for AlbumDetailView {
                 None => ("…".into(), Vec::new(), String::new()),
             };
             let has_songs = self.album.as_ref().is_some_and(|a| !a.song.is_empty());
+            // The cache seed answers for the title, the credits and the summary
+            // line, so these only stand in for an album the last sync has never
+            // seen — and with no request in flight (no client at all) the page
+            // shows what it has rather than waiting on nothing.
+            let header_pending = self.album.is_none() && loading_album;
 
             // Chips: genre / added date first (album-level), then the file
             // facts derived from the tracks.
             let mut chips: Vec<String> = Vec::new();
+            let mut has_quality = false;
             if let Some(a) = &self.album {
                 if let Some(genre) = a
                     .album
@@ -967,26 +1197,45 @@ impl Render for AlbumDetailView {
                 if discs > 1 {
                     chips.push(format!("{discs} discs"));
                 }
-                chips.extend(quality_chips(&a.song));
+                let quality = quality_chips(&a.song);
+                has_quality = !quality.is_empty();
+                chips.extend(quality);
                 if let Some(created) = a.album.created.as_deref().filter(|c| !c.is_empty()) {
                     chips.push(format!("Added {}", fmt_added(created)));
                 }
             }
-            let chip_row = h_flex().gap_1p5().flex_wrap().children(
-                chips
-                    .into_iter()
-                    .map(|text| {
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .bg(cx.theme().muted)
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(text)
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            // The quality chips are the clearest case of the whole problem: the
+            // cache stores no per-file fields at all (`Track::into_song` leaves
+            // every one of them `None`), so a seeded page has the album's genre
+            // and nothing else until `getAlbum` lands, and the row then grows
+            // by four chips under a header that has already been read.
+            let chips_pending = loading_album && !has_quality;
+            let chip_row = h_flex()
+                .gap_1p5()
+                .flex_wrap()
+                .when(chips_pending, |this| {
+                    this.children(
+                        CHIP_SAMPLES
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| skeleton_chip(("chip-sk", i), show_album, s, cx)),
+                    )
+                })
+                .children(
+                    chips
+                        .into_iter()
+                        .map(|text| {
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .bg(cx.theme().muted)
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(text)
+                        })
+                        .collect::<Vec<_>>(),
+                );
             let replaygain = self.album.as_ref().and_then(|a| replaygain_line(&a.song));
 
             let rating_stars = h_flex().gap_0p5().children((1..=5u8).map(|r| {
@@ -1035,7 +1284,15 @@ impl Render for AlbumDetailView {
                                 .min_w_0()
                                 .text_2xl()
                                 .font_medium()
-                                .child(name),
+                                .map(|this| match header_pending {
+                                    true => this.child(skeleton_text(
+                                        "al-title-sk",
+                                        show_album,
+                                        TITLE_SAMPLE,
+                                        cx,
+                                    )),
+                                    false => this.child(name),
+                                }),
                         )
                         .child(
                             Button::new("album-star")
@@ -1053,11 +1310,19 @@ impl Render for AlbumDetailView {
                 // artist, and each opens its own page. Vanilla servers send a
                 // single credit and this renders exactly as it used to.
                 .child(
-                    h_flex().flex_wrap().items_center().children(
-                        credits
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(i, (artist, artist_id))| {
+                    h_flex()
+                        .flex_wrap()
+                        .items_center()
+                        .when(header_pending, |this| {
+                            this.child(skeleton_text(
+                                "al-credits-sk",
+                                show_album,
+                                CREDITS_SAMPLE,
+                                cx,
+                            ))
+                        })
+                        .children(credits.into_iter().enumerate().flat_map(
+                            |(i, (artist, artist_id))| {
                                 let sep = (i > 0).then(|| {
                                     div()
                                         .text_color(cx.theme().muted_foreground)
@@ -1077,23 +1342,42 @@ impl Render for AlbumDetailView {
                                     None => div().child(artist).into_any_element(),
                                 };
                                 sep.into_iter().chain(std::iter::once(link))
-                            }),
-                    ),
+                            },
+                        )),
                 )
                 .child(
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(meta),
+                        .map(|this| match header_pending {
+                            true => {
+                                this.child(skeleton_text("al-meta-sk", show_album, META_SAMPLE, cx))
+                            }
+                            false => this.child(meta),
+                        }),
                 )
                 .child(chip_row)
-                .when_some(replaygain, |this, line| {
-                    this.child(
+                .map(|this| match &replaygain {
+                    Some(line) => this.child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(line),
-                    )
+                            .child(line.clone()),
+                    ),
+                    // Reserved whether or not this album turns out to carry gain
+                    // tags. They live on the songs, which the cache does not
+                    // keep, so the line is `getAlbum`-only — and a line that
+                    // *disappears* when the response says "no tags" moves the
+                    // page exactly as much as one that appears. Past the delay
+                    // it is grey; loaded, it is an empty line of the same
+                    // metrics, which costs an album without gain tags one faint
+                    // blank row and costs every album the step.
+                    None => this.child(div().text_xs().child(skeleton_text(
+                        "al-rg-sk",
+                        show_album,
+                        REPLAYGAIN_SAMPLE,
+                        cx,
+                    ))),
                 })
                 .child(rating_stars)
                 .child(
@@ -1462,6 +1746,63 @@ impl Render for AlbumDetailView {
                             }),
                     )
                 })
+                .into_any_element()
+        });
+        // `getAlbumInfo2` is a second round trip, and the card it fills cannot
+        // be placeheld accurately even in principle: the prose is an unknown
+        // number of words wrapped in an unknown column, the More button exists
+        // only when it runs past `NOTES_PREVIEW_CHARS`, the links exist only
+        // when the server has them, and a server with no metadata agent answers
+        // with nothing at all and the card never appears. Every one of those is
+        // a height nothing can predict — so in the **stacked** layout the card
+        // is drawn *below* the track list instead (see `scroll`), where its
+        // arrival has nothing above it to push and no placeholder is needed.
+        // The panel layout keeps it in the panel, where it has always been and
+        // where it can only push itself, and there the placeholder is still
+        // worth holding.
+        let about = about.or_else(|| {
+            (loading_info && panel.is_some()).then(|| {
+                v_flex()
+                    .rounded_2xl()
+                    .p_4()
+                    .gap_2()
+                    .bg(cx.theme().sidebar)
+                    .child(skeleton_text("al-about-head-sk", show_info, "About", cx))
+                    .child(
+                        // The notes are text_sm prose, so the block is laid out
+                        // in the same styles and at the same character count
+                        // the collapsed paragraph will be.
+                        div().text_sm().child(skeleton_block(
+                            "al-about-sk",
+                            show_info,
+                            &notes_sample(),
+                            cx,
+                        )),
+                    )
+                    // The two rows under the prose are the rest of the card's
+                    // height, and leaving them out meant the card still grew by
+                    // a button and a line of links when the request landed —
+                    // which in the stacked layout is the track list stepping
+                    // down. Held as invisible copies of the real controls,
+                    // since it is their own metrics that are wanted.
+                    .child(
+                        h_flex().invisible().child(
+                            Button::new("notes-toggle-sk")
+                                .ghost()
+                                .xsmall()
+                                .label("More")
+                                .icon(Icon::new(IconName::ChevronDown)),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .text_sm()
+                            .child(skeleton_text("al-mb-link-sk", show_info, "MusicBrainz", cx))
+                            .child(skeleton_text("al-lastfm-link-sk", show_info, "Last.fm", cx)),
+                    )
+                    .into_any_element()
+            })
         });
 
         // Header card matches the artist page framing.
@@ -1488,7 +1829,56 @@ impl Render for AlbumDetailView {
             .error
             .clone()
             .map(|e| div().text_color(cx.theme().danger).text_sm().child(e));
-        let track_list = v_flex().gap_0p5().children(rows);
+        // Rows of the same height and columns as the real ones, for the album
+        // the cache could not seed: an empty page that sprouts a track list
+        // reads as a failure until it does.
+        let track_list = match rows.is_empty() && loading_album {
+            true => v_flex().gap_0p5().children(
+                (0..self.expected_tracks.unwrap_or(TRACK_SKELETONS)).map(|i| {
+                    // The real row's padding, gaps and columns, down to an
+                    // invisible copy of its hover buttons: those are what set its
+                    // height, and a row guessed at in px was a pixel or two off
+                    // every one of them — eight rows of which is a visible jump.
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_3()
+                        .items_center()
+                        .child(div().w(px(28.)).text_sm().child(skeleton_text(
+                            ("t-no-sk", i),
+                            show_album,
+                            "1",
+                            cx,
+                        )))
+                        .child(div().flex_1().min_w_0().child(skeleton_line(
+                            ("t-title-sk", i),
+                            show_album,
+                            // Varied so the column reads as titles rather than
+                            // as a block; deterministic so it does not
+                            // reshuffle on every repaint.
+                            relative(0.35 + ((i * 37) % 40) as f32 / 100.),
+                            cx,
+                        )))
+                        .child(
+                            div().invisible().child(
+                                Button::new(("t-sk-h", i))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(app_icon(icons::STAR_OUTLINE)),
+                            ),
+                        )
+                        .child(
+                            h_flex()
+                                .w(px(44.))
+                                .flex_none()
+                                .justify_end()
+                                .text_sm()
+                                .child(skeleton_text(("t-dur-sk", i), show_album, "3:41", cx)),
+                        )
+                }),
+            ),
+            false => v_flex().gap_0p5().children(rows),
+        };
 
         let scroll = match panel {
             // Track list on one side, cover and details in their own column on
@@ -1539,9 +1929,13 @@ impl Render for AlbumDetailView {
                 .p_4()
                 .gap_4()
                 .child(header_card)
-                .children(about)
                 .children(error_line)
                 .child(track_list)
+                // Last, not under the header: this card's height is unknowable
+                // until `getAlbumInfo2` lands, and anything of unknowable height
+                // above the track list is the track list stepping down. At the
+                // end of the column it grows into empty page.
+                .children(about)
                 .into_any_element(),
         };
 
