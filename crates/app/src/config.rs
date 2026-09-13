@@ -110,6 +110,10 @@ pub struct Settings {
     pub detailed_volume: bool,
     /// Show the queue-toggle button in the bottom player bar.
     pub show_queue_button: bool,
+    /// Drop the bottom player bar entirely while there is nothing to play: an
+    /// empty queue, no radio and no playback. A bar with no track in it is a
+    /// strip of disabled buttons, and the content above it gets its height.
+    pub hide_idle_player_bar: bool,
     /// ReplayGain loudness-normalization mode.
     pub replay_gain: ReplayGainMode,
     /// Chosen audio output device, named as `playback::output_devices` reports
@@ -563,6 +567,7 @@ impl Default for Settings {
             stream_info_bar: false,
             detailed_volume: false,
             show_queue_button: true,
+            hide_idle_player_bar: true,
             replay_gain: ReplayGainMode::Off,
             output_device: None,
             queue_end: QueueEndBehavior::Keep,

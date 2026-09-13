@@ -23,6 +23,11 @@ use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
 use crate::ui::format_duration;
 
+/// The bar's own height. Public because the root animates the bar in and out
+/// (`Settings::hide_idle_player_bar`) by shrinking a clip around it, and a box
+/// sized off anything but the bar's real height clips it in the wrong place.
+pub const BAR_H: f32 = 124.;
+
 /// Widest the now-playing and volume columns flanking the transport are drawn.
 const SIDE_WIDTH: f32 = 348.;
 /// Narrowest they shrink to: the cover, its gap, and enough room for a title
@@ -406,7 +411,7 @@ impl Render for PlayerBar {
 
         h_flex()
             .w_full()
-            .h(px(124.))
+            .h(px(BAR_H))
             .flex_none()
             .px_4()
             .gap_4()

@@ -1279,6 +1279,21 @@ impl Reveal {
         }
     }
 
+    /// A reveal that is already fully open, with no travel to play.
+    ///
+    /// For an element whose *closed* state is the exceptional one — the player
+    /// bar is on screen the moment the window is, and a bar sliding up on
+    /// every launch is an animation nobody asked for.
+    pub fn opened(enter_ms: u64, exit_ms: u64) -> Self {
+        Self {
+            open: true,
+            from: 1.,
+            since: Instant::now(),
+            enter_ms,
+            exit_ms,
+        }
+    }
+
     /// Point the reveal at `open`. A no-op unless that is a change, so it can
     /// be called unconditionally from `render`.
     ///

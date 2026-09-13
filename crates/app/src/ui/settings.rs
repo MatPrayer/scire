@@ -118,7 +118,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 const COMPACT_SECTIONS: [(&str, u16); 7] = [
     ("Window", 4),
     ("Appearance", 17),
-    ("Playback", 14),
+    ("Playback", 15),
     ("Browsing", 11),
     ("Streaming", 5),
     ("Library", 13),
@@ -369,6 +369,7 @@ enum SettingsSwitch {
     StreamInfoBar,
     DetailedVolume,
     ShowQueueButton,
+    HideIdlePlayerBar,
     ViMode,
     ReducedMotion,
     PrecacheArt,
@@ -896,6 +897,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_hide_idle_player_bar(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.hide_idle_player_bar = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_adaptive_from_page(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.adaptive_from_page = enabled);
@@ -1013,6 +1021,7 @@ impl SettingsView {
             SettingsSwitch::StreamInfoBar => s.stream_info_bar,
             SettingsSwitch::DetailedVolume => s.detailed_volume,
             SettingsSwitch::ShowQueueButton => s.show_queue_button,
+            SettingsSwitch::HideIdlePlayerBar => s.hide_idle_player_bar,
             SettingsSwitch::ViMode => s.vi_mode,
             SettingsSwitch::ReducedMotion => s.reduced_motion,
             SettingsSwitch::PrecacheArt => s.precache_art,
@@ -1060,6 +1069,7 @@ impl SettingsView {
             SettingsSwitch::StreamInfoBar => self.set_stream_info(value, cx),
             SettingsSwitch::DetailedVolume => self.set_detailed_volume(value, cx),
             SettingsSwitch::ShowQueueButton => self.set_show_queue_button(value, cx),
+            SettingsSwitch::HideIdlePlayerBar => self.set_hide_idle_player_bar(value, cx),
             SettingsSwitch::ViMode => self.set_vi_mode(value, cx),
             SettingsSwitch::ReducedMotion => self.set_reduced_motion(value, cx),
             SettingsSwitch::PrecacheArt => self.set_precache_art(value, cx),
@@ -1541,6 +1551,7 @@ impl Render for SettingsView {
             )
         };
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
+        let hide_idle_player_bar = self.session.read(cx).settings.hide_idle_player_bar;
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
         let adaptive_from_page = self.session.read(cx).settings.adaptive_from_page;
         let adaptive_page_gradient = self.session.read(cx).settings.adaptive_page_gradient;
@@ -1900,6 +1911,14 @@ impl Render for SettingsView {
                 show_queue_button,
                 false,
                 "Queue button in player bar",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::HideIdlePlayerBar,
+                "hide-idle-player-bar",
+                hide_idle_player_bar,
+                false,
+                "Hide player bar when idle",
                 cx,
             ))
             .child(self.note(

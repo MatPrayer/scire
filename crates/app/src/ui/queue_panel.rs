@@ -1,8 +1,8 @@
 //! Right-side play-queue panel: jump / remove / reorder / clear.
 
 use gpui::{
-    Context, Entity, IntoElement, Render, SharedString, UniformListScrollHandle, Window, div,
-    prelude::*, px, uniform_list,
+    Context, Entity, EventEmitter, IntoElement, Render, SharedString, UniformListScrollHandle,
+    Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{
@@ -29,6 +29,16 @@ struct Row {
     title: SharedString,
     artist: SharedString,
     duration: SharedString,
+}
+
+/// What the panel asks the root to do; it does not own its own visibility.
+pub enum QueuePanelEvent {
+    /// Close the panel. The panel carries its own close button because the
+    /// player bar's queue toggle is not always on screen — it is hidden with
+    /// the bar itself when nothing is playing
+    /// (`Settings::hide_idle_player_bar`), which would otherwise leave a panel
+    /// open with no way back out short of the keyboard.
+    Close,
 }
 
 pub struct QueuePanel {
@@ -217,6 +227,8 @@ impl QueuePanel {
     }
 }
 
+impl EventEmitter<QueuePanelEvent> for QueuePanel {}
+
 impl Render for QueuePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Straight off the queue: an integer read, and the header is stating
@@ -248,14 +260,29 @@ impl Render for QueuePanel {
                     .items_center()
                     .child(div().text_sm().child(format!("Queue ({len})")))
                     .child(
-                        Button::new("clear-queue")
-                            .ghost()
-                            .xsmall()
-                            .label("Clear")
-                            .disabled(len == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.player.update(cx, |p, cx| p.clear_queue(cx));
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new("clear-queue")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Clear")
+                                    .disabled(len == 0)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.player.update(cx, |p, cx| p.clear_queue(cx));
+                                    })),
+                            )
+                            .child(
+                                Button::new("close-queue")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Close))
+                                    .tooltip("Close queue")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(QueuePanelEvent::Close);
+                                    })),
+                            ),
                     ),
             )
             .child(list)

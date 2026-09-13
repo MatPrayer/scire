@@ -34,9 +34,9 @@ use crate::ui::favorites::{FavoritesEvent, FavoritesView};
 use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
 use crate::ui::local_album_detail::LocalAlbumDetailView;
 use crate::ui::local_music::{LocalMusicEvent, LocalMusicView};
-use crate::ui::player_bar::{PlayerBar, PlayerBarEvent};
+use crate::ui::player_bar::{BAR_H, PlayerBar, PlayerBarEvent};
 use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
-use crate::ui::queue_panel::QueuePanel;
+use crate::ui::queue_panel::{QueuePanel, QueuePanelEvent};
 use crate::ui::radio::RadioView;
 use crate::ui::recent::RecentView;
 use crate::ui::search_bar::{SearchBar, SearchBarEvent};
@@ -151,6 +151,15 @@ pub struct RootView {
     /// Open/close travel of the queue panel, driven from `show_queue` in
     /// `render` so the two cannot drift apart.
     queue_reveal: crate::ui::Reveal,
+    /// Open/close travel of the bottom player bar, behind
+    /// `Settings::hide_idle_player_bar`. Driven from the same idle test the bar
+    /// is drawn off, so the two cannot drift apart.
+    player_bar_reveal: crate::ui::Reveal,
+    /// Whether the first frame has set `player_bar_reveal` to match what the
+    /// window opens on. Without it the launch state is a *change* from closed
+    /// and the bar slides in — or, on an idle launch, slides out — of a window
+    /// the user has only just seen.
+    player_bar_primed: bool,
     /// Open/close travel of the new-playlist dialog.
     new_playlist_reveal: crate::ui::Reveal,
     /// Open/close travel of the vi-mode help overlay.
@@ -280,6 +289,14 @@ impl RootView {
             SearchBarEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
             SearchBarEvent::OpenLocalAlbum(id) => this.open_local_album(id.clone(), cx),
             SearchBarEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+        })
+        .detach();
+
+        cx.subscribe(&queue_panel, |this: &mut Self, _, event, cx| match event {
+            QueuePanelEvent::Close => {
+                this.show_queue = false;
+                cx.notify();
+            }
         })
         .detach();
 
@@ -520,6 +537,8 @@ impl RootView {
             in_history_restore: false,
             show_queue: false,
             queue_reveal: crate::ui::Reveal::new(220, 150),
+            player_bar_reveal: crate::ui::Reveal::new(220, 160),
+            player_bar_primed: false,
             // A dialog is read the moment it lands, so it is given a little
             // less time than a panel that slides in beside the content.
             new_playlist_reveal: crate::ui::Reveal::new(170, 120),
@@ -2395,6 +2414,30 @@ impl Render for RootView {
         let minimal_titlebar = self.session.read(cx).settings.minimal_titlebar;
         let reduced_motion = self.session.read(cx).settings.reduced_motion;
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
+        // A bar with no track in it is a strip of disabled buttons; the content
+        // above it gets the height instead. `RootView` observes the player, so
+        // the first track queued brings it straight back.
+        let show_player_bar = {
+            let p = self.player.read(cx);
+            !self.session.read(cx).settings.hide_idle_player_bar
+                || !player_bar_idle(p.playing, p.now_playing().is_some(), p.queue.is_empty())
+        };
+        // The bar slides down out of a shrinking clip rather than vanishing:
+        // its height is the content's, so a cut would jump the page under the
+        // pointer either way — this way the movement says where it went.
+        if self.player_bar_primed {
+            self.player_bar_reveal.set(show_player_bar, reduced_motion);
+        } else {
+            self.player_bar_primed = true;
+            if show_player_bar {
+                self.player_bar_reveal = crate::ui::Reveal::opened(220, 160);
+            }
+        }
+        let bar_open = self.player_bar_reveal.openness(reduced_motion);
+        let bar_visible = self.player_bar_reveal.visible(reduced_motion);
+        if self.player_bar_reveal.settling(reduced_motion) {
+            window.request_animation_frame();
+        }
 
         // Queue panel: the travel is state, not a `with_animation` wrapper, so
         // it plays in both directions — an element dropped from the tree on
@@ -2643,7 +2686,28 @@ impl Render for RootView {
                         )
                     }),
             )
-            .child(self.player_bar.clone())
+            .when(bar_visible, |this| {
+                // The clip is what animates; the bar keeps its own height
+                // inside it, translated down by whatever the clip has given
+                // up, so it leaves through the bottom edge rather than being
+                // squashed flat.
+                this.child(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .h(px(BAR_H * bar_open))
+                        .relative()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(BAR_H * (1. - bar_open)))
+                                .w_full()
+                                .h(px(BAR_H))
+                                .child(self.player_bar.clone()),
+                        ),
+                )
+            })
             // Fullscreen overlay — rendered last so it sits on top.
             .when(show_fullscreen, |this| this.child(fullscreen))
             // New-playlist dialog on top of everything.
@@ -2701,10 +2765,31 @@ impl Render for RootView {
     }
 }
 
+/// Whether the bottom player bar has nothing to say, behind
+/// `Settings::hide_idle_player_bar`.
+///
+/// Idle is all three at once: nothing playing, nothing loaded (`now_playing`
+/// covers radio as well as the queue's current song) and an empty queue. A
+/// paused track still has a bar — it is what resumes it — and a queue with
+/// tracks in it but no current song keeps one too, since the transport can
+/// still start it.
+fn player_bar_idle(playing: bool, has_now_playing: bool, queue_empty: bool) -> bool {
+    !playing && !has_now_playing && queue_empty
+}
+
 #[cfg(test)]
 mod tests {
-    use super::RefreshStage;
+    use super::{RefreshStage, player_bar_idle};
     use crate::ui::sidebar::{NavSection, SidebarFocus, sidebar_targets};
+
+    #[test]
+    fn player_bar_is_idle_only_with_nothing_playing_loaded_or_queued() {
+        assert!(player_bar_idle(false, false, true));
+        // Paused on a track, mid-radio, or a queue waiting to be started.
+        assert!(!player_bar_idle(false, true, true));
+        assert!(!player_bar_idle(true, false, true));
+        assert!(!player_bar_idle(false, false, false));
+    }
 
     #[test]
     fn sidebar_targets_expanded_walk_sections_playlists_refresh_settings() {
