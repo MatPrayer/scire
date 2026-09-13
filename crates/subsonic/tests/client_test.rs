@@ -122,6 +122,50 @@ async fn get_album_parses_songs() {
 }
 
 #[tokio::test]
+async fn get_album_parses_every_credited_artist() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getAlbum"))
+        .and(query_param("id", "al-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            // OpenSubsonic: `artist`/`artistId` still name one primary artist,
+            // and `artists` is the only place the collaboration is spelled out.
+            r#""album":{"id":"al-2","name":"Watch the Throne","artist":"Jay-Z",
+                "artistId":"ar-1","artists":[
+                    {"id":"ar-1","name":"Jay-Z"},{"id":"ar-2","name":"Kanye West"}
+                ],"song":[]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let album = client(&server.uri()).get_album("al-2").await.unwrap();
+    let credits: Vec<_> = album
+        .album
+        .artists
+        .iter()
+        .map(|a| (a.id.as_str(), a.name.as_str()))
+        .collect();
+    assert_eq!(credits, [("ar-1", "Jay-Z"), ("ar-2", "Kanye West")]);
+}
+
+#[tokio::test]
+async fn get_album_without_artists_array_stays_empty() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getAlbum"))
+        .and(query_param("id", "al-3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""album":{"id":"al-3","name":"Solo","artist":"One","artistId":"ar-1","song":[]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    // A vanilla server sends no array at all; the field must default rather
+    // than fail the whole response.
+    let album = client(&server.uri()).get_album("al-3").await.unwrap();
+    assert!(album.album.artists.is_empty());
+    assert_eq!(album.album.artist.as_deref(), Some("One"));
+}
+
+#[tokio::test]
 async fn get_artists_flattens_index() {
     let server = MockServer::start().await;
     Mock::given(path("/rest/getArtists"))

@@ -1,6 +1,6 @@
 //! Artist list (grouped by index letter) and artist detail (their albums).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,9 +19,13 @@ use crate::services::library_db::{LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
+use crate::ui::albums::album_from_row;
 use crate::ui::{strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor};
 
 const ART_SIZE: u32 = 320;
+/// Resolution the hero image is re-fetched at for the lightbox, matching the
+/// album page's full-size cover.
+const FULL_ART_SIZE: u32 = 1500;
 
 /// Card text metrics — matched to the album grid so the two pages line up.
 /// Fixed height because the virtualized rows must all be the same size.
@@ -634,14 +638,25 @@ impl ArtistsView {
 pub struct ArtistDetailView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
+    /// The synced catalog: where the albums' library provenance and the
+    /// artist's guest appearances come from — neither is in `getArtist`.
+    library_db: Arc<LibraryDb>,
     artist_id: String,
     artist: Option<ArtistWithAlbums>,
+    /// Albums the artist only plays on, read from the cache.
+    appears_on: Vec<(Album, i64)>,
     art_paths: HashMap<String, PathBuf>,
     /// In-flight album-cover downloads, cancelled when the view is dropped.
     art_tasks: Vec<gpui::Task<()>>,
     /// A coalesced repaint is scheduled (batches cover arrivals).
     art_repaint_pending: bool,
     artist_image_path: Option<PathBuf>,
+    /// Cover id (or remote URL) the hero image came from, so the lightbox can
+    /// ask for it again at full resolution.
+    artist_image_source: Option<String>,
+    /// The hero image is open full-window.
+    show_full_art: bool,
+    full_art_path: Option<PathBuf>,
     error: Option<String>,
     /// Biography + image URLs from getArtistInfo2 (Navidrome's agents).
     info: Option<ArtistInfo2>,
@@ -674,6 +689,7 @@ impl ArtistDetailView {
     pub fn new(
         session: Entity<Session>,
         player: Entity<PlayerState>,
+        library_db: Arc<LibraryDb>,
         artist_id: String,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -681,12 +697,17 @@ impl ArtistDetailView {
         let mut this = Self {
             session,
             player,
+            library_db,
             artist_id,
             artist: None,
+            appears_on: Vec::new(),
             art_paths: HashMap::new(),
             art_tasks: Vec::new(),
             art_repaint_pending: false,
             artist_image_path: None,
+            artist_image_source: None,
+            show_full_art: false,
+            full_art_path: None,
             error: None,
             info: None,
             image_requested: false,
@@ -698,12 +719,61 @@ impl ArtistDetailView {
             vi_cursor: None,
             vi_scroll_synced: None,
         };
+        this.load_appears_on(cx);
         this.load(cx);
         this
     }
 
     fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
         self.session.read(cx).client.clone()
+    }
+
+    /// Re-apply the library selection to the page in place.
+    ///
+    /// Both sections that depend on it are rebuilt: "Appears on" is filtered
+    /// out of the cache and is up immediately, while the discography needs the
+    /// `getArtist` round trip again — `keep_selected_libraries` can narrow the
+    /// list it already has but never widen it, so the old albums stay on screen
+    /// until the fetch lands rather than being dropped and re-added.
+    pub fn reload_libraries(&mut self, cx: &mut Context<Self>) {
+        self.load_appears_on(cx);
+        self.load(cx);
+        cx.notify();
+    }
+
+    /// The artist's id as the sync namespaces it in the cache.
+    fn cache_artist_id(&self) -> String {
+        if self.artist_id.starts_with("navidrome:artist:") {
+            self.artist_id.clone()
+        } else {
+            format!("navidrome:artist:{}", self.artist_id)
+        }
+    }
+
+    /// Albums the artist plays on without being credited with them. Cache-only:
+    /// no Subsonic endpoint answers this, and reading it here means the section
+    /// is up on the first frame rather than after `getArtist` lands.
+    fn load_appears_on(&mut self, cx: &mut Context<Self>) {
+        let libraries = self.session.read(cx).library_ids.clone();
+        let Ok(rows) = self
+            .library_db
+            .appears_on("navidrome", &self.cache_artist_id())
+        else {
+            return;
+        };
+        self.appears_on = rows
+            .into_iter()
+            .filter(|(row, _)| in_libraries(row.library_id.as_deref(), &libraries))
+            .map(|(row, tracks)| (album_from_row(row), tracks))
+            .collect();
+        let art: Vec<_> = self
+            .appears_on
+            .iter()
+            .map(|(album, _)| (album.id.clone(), album.cover_art.clone()))
+            .collect();
+        for (id, cover) in art {
+            self.fetch_art(id, cover, cx);
+        }
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -719,6 +789,7 @@ impl ArtistDetailView {
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(mut artist) => {
+                        view.keep_selected_libraries(&mut artist.album, cx);
                         sort_discography(&mut artist.album);
                         let artist_id = artist.artist.id.clone();
                         for album in &artist.album {
@@ -735,6 +806,30 @@ impl ArtistDetailView {
             });
         })
         .detach();
+    }
+
+    /// Drop the albums that belong to a library the user isn't browsing.
+    ///
+    /// `getArtist` takes no `musicFolderId`, so the server answers with the
+    /// artist's whole discography however narrow the selection is; the sync's
+    /// recorded provenance is the only thing that can narrow it. An album the
+    /// cache has never seen is kept rather than hidden — a cold cache must not
+    /// empty the page.
+    fn keep_selected_libraries(&self, albums: &mut Vec<Album>, cx: &Context<Self>) {
+        let libraries = self.session.read(cx).library_ids.clone();
+        if libraries.is_empty() {
+            return;
+        }
+        let Ok(provenance) = self.library_db.album_libraries("navidrome") else {
+            return;
+        };
+        albums.retain(|album| {
+            match provenance.get(&format!("navidrome:album:{}", album.id)) {
+                Some(library) => in_libraries(library.as_deref(), &libraries),
+                // Never synced: nothing to judge it by, so leave it alone.
+                None => true,
+            }
+        });
     }
 
     /// Fetch an album's songs and start playing them.
@@ -821,6 +916,7 @@ impl ArtistDetailView {
             return;
         };
         self.image_requested = true;
+        self.artist_image_source = Some(source.clone());
         let is_remote = source.starts_with("http://") || source.starts_with("https://");
         // Synchronous cache hit: no empty-frame flash on revisit.
         if !is_remote && let Some(path) = artwork::cached(&source, ART_SIZE) {
@@ -845,6 +941,34 @@ impl ArtistDetailView {
             }
         })
         .detach();
+    }
+
+    /// Open the hero image full-window, fetching it at full resolution behind
+    /// the thumbnail already on screen — same as the album page's cover.
+    ///
+    /// A remote photo (info2's URL) is already cached at whatever the source
+    /// published, so only a server-hosted cover has a larger version to ask for.
+    fn open_full_art(&mut self, cx: &mut Context<Self>) {
+        if self.artist_image_path.is_none() {
+            return;
+        }
+        self.show_full_art = true;
+        if self.full_art_path.is_none()
+            && let Some(source) = self.artist_image_source.clone()
+            && !source.starts_with("http")
+            && let Some(client) = self.client(cx)
+        {
+            cx.spawn(async move |this, cx| {
+                if let Ok(path) = artwork::fetch(client, source, FULL_ART_SIZE).await {
+                    let _ = this.update(cx, |view, cx| {
+                        view.full_art_path = Some(path);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     /// Biography and artist image from Navidrome (getArtistInfo2). Falls back
@@ -922,15 +1046,21 @@ impl ArtistDetailView {
     fn render_album_card(
         &self,
         album: &Album,
-        play_index: usize,
+        // Index of this card across every section, unique per page: the vi
+        // cursor's target, and with it the play button's element id.
         flat: usize,
         focused: bool,
+        subtitle: Option<String>,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = album.id.clone();
         let art = self.art_paths.get(&album.id).cloned();
-        let year = album.year.map(|y| y.to_string()).unwrap_or_default();
+        // The discography is sorted by year and says so under each cover; an
+        // "Appears on" card is about someone else's album, so it names them
+        // instead.
+        let year =
+            subtitle.unwrap_or_else(|| album.year.map(|y| y.to_string()).unwrap_or_default());
         let anchor = self.focus_anchor.clone();
         let glow = self.session.read(cx).settings.selection_glow;
         let card = v_flex()
@@ -970,7 +1100,7 @@ impl ArtistDetailView {
                             .opacity(0.)
                             .group_hover("aacard", |s| s.opacity(1.))
                             .child(
-                                Button::new(("artist-album-play", play_index))
+                                Button::new(("artist-album-play", flat))
                                     .primary()
                                     .icon(app_icon(icons::PLAY))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1083,24 +1213,45 @@ impl Render for ArtistDetailView {
         let mut album_cards: Vec<gpui::AnyElement> = Vec::new();
         let mut single_cards: Vec<gpui::AnyElement> = Vec::new();
         if let Some(artist) = self.artist.as_ref() {
-            for (index, album) in artist.album.iter().enumerate() {
+            for album in artist.album.iter() {
                 if is_single_or_ep(album) {
                     continue;
                 }
                 let flat = self.discography_ids.len();
                 self.discography_ids.push(album.id.clone());
                 let focused = self.vi_cursor == Some(flat);
-                album_cards.push(self.render_album_card(album, index, flat, focused, cx));
+                album_cards.push(self.render_album_card(album, flat, focused, None, cx));
             }
-            for (index, album) in artist.album.iter().enumerate() {
+            for album in artist.album.iter() {
                 if !is_single_or_ep(album) {
                     continue;
                 }
                 let flat = self.discography_ids.len();
                 self.discography_ids.push(album.id.clone());
                 let focused = self.vi_cursor == Some(flat);
-                single_cards.push(self.render_album_card(album, index, flat, focused, cx));
+                single_cards.push(self.render_album_card(album, flat, focused, None, cx));
             }
+        }
+        // Guest appearances last: they are someone else's records, and the
+        // cursor walks them after the artist's own. Anything the discography
+        // above already shows is not one of them.
+        let own = own_album_ids(self.artist.as_ref().map(|a| a.album.as_slice()));
+        let mut appears_cards: Vec<gpui::AnyElement> = Vec::new();
+        for (album, tracks) in self
+            .appears_on
+            .iter()
+            .filter(|(album, _)| !own.contains(&album.id))
+        {
+            let flat = self.discography_ids.len();
+            self.discography_ids.push(album.id.clone());
+            let focused = self.vi_cursor == Some(flat);
+            appears_cards.push(self.render_album_card(
+                album,
+                flat,
+                focused,
+                Some(appearance_line(album, *tracks)),
+                cx,
+            ));
         }
         // The bio More/Less toggle is the last target when it exists.
         self.bio_toggle_focusable = bio_long;
@@ -1124,7 +1275,7 @@ impl Render for ArtistDetailView {
             section.into_any_element()
         };
 
-        v_flex()
+        let page = v_flex()
             .id("artist-detail-scroll")
             .size_full()
             .overflow_y_scroll()
@@ -1144,12 +1295,21 @@ impl Render for ArtistDetailView {
                             .flex_wrap()
                             .child(
                                 div()
+                                    .id("artist-hero")
                                     .size(px(220.))
                                     .rounded_2xl()
                                     .overflow_hidden()
                                     .bg(cx.theme().muted)
+                                    // Only an image is worth enlarging; the
+                                    // empty placeholder stays inert.
                                     .when_some(hero_art, |this, path| {
-                                        this.child(img(path).size(px(220.)).rounded_2xl())
+                                        this.cursor_pointer()
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.open_full_art(cx)
+                                                }),
+                                            )
+                                            .child(img(path).size(px(220.)).rounded_2xl())
                                     }),
                             )
                             .child(
@@ -1230,7 +1390,90 @@ impl Render for ArtistDetailView {
             })
             .child(make_section("Albums".to_string(), album_cards))
             .child(make_section("Singles / EPs".to_string(), single_cards))
+            // Unlike the other two, this section is dropped when it is empty:
+            // it answers a question nobody asked, and an artist who guests on
+            // nothing should not be told so.
+            .when(!appears_cards.is_empty(), |this| {
+                this.child(make_section("Appears on".to_string(), appears_cards))
+            });
+
+        div()
+            .relative()
+            .size_full()
+            .child(page)
+            // Full-resolution artist photo; click anywhere to dismiss, same as
+            // the album page's cover.
+            .when(self.show_full_art, |this| {
+                this.child(
+                    div()
+                        .id("artist-lightbox")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_8()
+                        .occlude()
+                        .cursor_pointer()
+                        .bg(gpui::hsla(0., 0., 0., 0.88))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_full_art = false;
+                            cx.notify();
+                        }))
+                        .when_some(
+                            self.full_art_path
+                                .clone()
+                                .or_else(|| self.artist_image_path.clone()),
+                            |this, path| {
+                                this.child(img(path).max_w(px(820.)).max_h(px(820.)).rounded_lg())
+                            },
+                        ),
+                )
+            })
     }
+}
+
+/// What an "Appears on" card says under the cover: whose record it is, and how
+/// much of it is this artist's.
+fn appearance_line(album: &Album, tracks: i64) -> String {
+    let who = album.artist.as_deref().map(str::trim).unwrap_or_default();
+    let count = if tracks == 1 {
+        "1 track".to_string()
+    } else {
+        format!("{tracks} tracks")
+    };
+    if who.is_empty() {
+        count
+    } else {
+        format!("{who} · {count}")
+    }
+}
+
+/// The albums the discography sections already show.
+///
+/// `LibraryDb::appears_on` answers the same question from the cache's album
+/// credits, but a cache synced before those were recorded has none — an album
+/// by two artists then reads as a guest spot for the second of them and the
+/// record is drawn under Singles / EPs and Appears on at once. `getArtist` is
+/// the authority and it is already on screen: anything it lists is the
+/// artist's own, whatever the cache still believes.
+fn own_album_ids(discography: Option<&[Album]>) -> HashSet<String> {
+    discography
+        .unwrap_or(&[])
+        .iter()
+        .map(|a| a.id.clone())
+        .collect()
+}
+
+/// Whether a row synced from `library` belongs to what the user is browsing.
+///
+/// An empty selection is every library. A row with no recorded provenance —
+/// synced before the column existed — is kept: it is unknown rather than
+/// foreign, and dropping it would empty an artist page until the next sync.
+fn in_libraries(library: Option<&str>, selected: &[String]) -> bool {
+    selected.is_empty() || library.is_none_or(|id| selected.iter().any(|s| s == id))
 }
 
 /// Collapsed-bio length; roughly four lines at typical window widths.
@@ -1285,6 +1528,7 @@ mod tests {
             starred: None,
             user_rating: None,
             play_count: None,
+            artists: Vec::new(),
         };
         let album = Album {
             id: "2".into(),
@@ -1300,6 +1544,7 @@ mod tests {
             starred: None,
             user_rating: None,
             play_count: None,
+            artists: Vec::new(),
         };
         assert!(is_single_or_ep(&single));
         assert!(!is_single_or_ep(&album));
@@ -1380,6 +1625,7 @@ mod grid_tests {
             starred: None,
             user_rating: None,
             play_count: None,
+            artists: Vec::new(),
         }
     }
 
@@ -1394,5 +1640,151 @@ mod grid_tests {
         sort_discography(&mut albums);
         let names: Vec<_> = albums.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Later", "Split B", "Debut", "Unknown"]);
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+    use crate::services::library_db::{AlbumRow, LibraryDb};
+
+    fn album(name: &str, artist: Option<&str>) -> Album {
+        let mut album = album_from_row(AlbumRow::new(
+            &format!("navidrome:album:{name}"),
+            "navidrome",
+            name,
+        ));
+        album.artist = artist.map(str::to_string);
+        album
+    }
+
+    #[test]
+    fn an_empty_selection_is_every_library() {
+        assert!(in_libraries(Some("1"), &[]));
+        assert!(in_libraries(None, &[]));
+    }
+
+    #[test]
+    fn a_selection_keeps_its_own_libraries_and_drops_the_rest() {
+        let selected = ["1".to_string(), "3".to_string()];
+        assert!(in_libraries(Some("3"), &selected));
+        assert!(!in_libraries(Some("2"), &selected));
+    }
+
+    /// Rows synced before the provenance column exist with no library at all.
+    /// Unknown is not foreign: dropping them would empty an artist page for
+    /// anyone who hasn't resynced since.
+    #[test]
+    fn a_row_with_no_recorded_library_is_kept() {
+        assert!(in_libraries(None, &["1".to_string()]));
+    }
+
+    /// A record by two artists is in both their discographies, and a cache with
+    /// no album credits yet reads it as a guest spot for the one the server's
+    /// `artistId` does not name. The page drew it in both sections at once.
+    #[test]
+    fn an_album_the_discography_lists_is_not_an_appearance() {
+        let own = vec![album("Sancu", Some("Nico Arezzo • Amore Audio"))];
+        let ids = own_album_ids(Some(&own));
+        // `album_from_row` strips the sync's namespace, so both sides of the
+        // comparison are the server's own ids.
+        assert!(ids.contains("Sancu"));
+        assert!(!ids.contains("Potomac"));
+    }
+
+    /// Before `getArtist` lands there is no discography to compare against, and
+    /// the cached appearances are shown as they are rather than all dropped.
+    #[test]
+    fn nothing_is_excluded_while_the_discography_is_still_loading() {
+        assert!(own_album_ids(None).is_empty());
+    }
+
+    #[test]
+    fn an_appearance_names_the_album_artist_and_counts_the_tracks() {
+        assert_eq!(
+            appearance_line(&album("Blue Note", Some("Art Blakey")), 2),
+            "Art Blakey · 2 tracks"
+        );
+        assert_eq!(
+            appearance_line(&album("Blue Note", Some("Art Blakey")), 1),
+            "Art Blakey · 1 track"
+        );
+        // A compilation row the sync never got an artist for still says how
+        // much of it belongs to this artist.
+        assert_eq!(appearance_line(&album("Blue Note", None), 3), "3 tracks");
+    }
+
+    /// An album is "appeared on" when the artist plays on it but is credited to
+    /// someone else — the artist's own albums are `getArtist`'s job, and
+    /// listing them twice is what the section must not do.
+    #[test]
+    fn appears_on_finds_guest_spots_and_skips_the_artists_own_albums() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let mut own = AlbumRow::new("navidrome:album:own", "navidrome", "Own Record");
+        own.artist_id = Some("navidrome:artist:me".into());
+        let mut guest = AlbumRow::new("navidrome:album:guest", "navidrome", "Their Record");
+        guest.artist = Some("Them".into());
+        guest.artist_id = Some("navidrome:artist:them".into());
+        db.upsert_album(&own).unwrap();
+        db.upsert_album(&guest).unwrap();
+        // `primary` is what the server leads with (`artistId`); `credits` is
+        // everyone OpenSubsonic names on the track.
+        let track = |id: &str, album: &str, primary: &str, credits: &[&str]| {
+            db.upsert_track(
+                id,
+                "navidrome",
+                "Song",
+                None,
+                Some(primary),
+                None,
+                Some(album),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let credits: Vec<String> = credits.iter().map(|c| (*c).to_string()).collect();
+            db.set_track_artists(id, &credits).unwrap();
+        };
+        let me = "navidrome:artist:me";
+        let them = "navidrome:artist:them";
+        track("navidrome:track:1", "navidrome:album:own", me, &[me]);
+        track("navidrome:track:2", "navidrome:album:guest", me, &[me]);
+        // The case the whole table exists for: the server files the collaboration
+        // under the album artist, and only the credits name the guest.
+        track(
+            "navidrome:track:3",
+            "navidrome:album:guest",
+            them,
+            &[them, me],
+        );
+        track("navidrome:track:4", "navidrome:album:guest", them, &[them]);
+
+        let found = db.appears_on("navidrome", me).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.id, "navidrome:album:guest");
+        // Only the tracks they are credited on are counted, not the album's.
+        assert_eq!(found[0].1, 2);
+
+        // Their own record with a co-artist: the album row carries the other
+        // artist's id and both names joined, so only the album credits can say
+        // it is theirs — and an album that is theirs is not an appearance.
+        db.upsert_catalog(
+            "navidrome",
+            &[],
+            &[],
+            &[(
+                "navidrome:album:guest".to_string(),
+                vec![them.to_string(), me.to_string()],
+            )],
+        )
+        .unwrap();
+        assert!(db.appears_on("navidrome", me).unwrap().is_empty());
     }
 }

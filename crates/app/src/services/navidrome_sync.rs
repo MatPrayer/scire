@@ -192,6 +192,7 @@ pub async fn sync_navidrome(
     let mut stale: Vec<(subsonic::Album, Option<String>)> = Vec::new();
     let mut album_rows: Vec<AlbumRow> = Vec::with_capacity(listed.len());
     let mut artist_rows: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut album_credit_rows: Vec<(String, Vec<String>)> = Vec::with_capacity(listed.len());
     let mut artists_seen: HashSet<String> = HashSet::new();
 
     for (album, folder_id) in listed {
@@ -201,12 +202,20 @@ pub async fn sync_navidrome(
             .as_ref()
             .map(|id| format!("navidrome:artist:{id}"));
 
-        if let Some(artist_name) = &album.artist
-            && let Some(aid) = &artist_id
-            && artists_seen.insert(aid.clone())
-        {
-            artist_rows.push((aid.clone(), artist_name.clone(), folder_id.clone()));
+        // Every artist the album is credited to, each under its *own* name.
+        // `album.artist` is the server's display string — two artists come back
+        // as "A • B" with the id of A alone, so taking the pair at face value
+        // filed A's name as "A • B" and left B out of the artist table.
+        let credits = album_credits(&album);
+        for (aid, name) in &credits {
+            if artists_seen.insert(aid.clone()) {
+                artist_rows.push((aid.clone(), name.clone(), folder_id.clone()));
+            }
         }
+        album_credit_rows.push((
+            album_id.clone(),
+            credits.iter().map(|(id, _)| id.clone()).collect(),
+        ));
 
         // The album row is rewritten either way: `play_count` and `starred` are
         // the New/Frequent/Starred tabs' sort keys and move without the track
@@ -236,7 +245,7 @@ pub async fn sync_navidrome(
     // One transaction for the lot. Row-at-a-time autocommits dominated the
     // whole incremental sync — a thousand commits against a library where
     // nothing had changed.
-    db.upsert_catalog("navidrome", &album_rows, &artist_rows)?;
+    db.upsert_catalog("navidrome", &album_rows, &artist_rows, &album_credit_rows)?;
 
     // Albums the server no longer lists. `seen` holds bare server ids; the
     // cache keys are namespaced, so compare on the namespaced form.
@@ -310,12 +319,22 @@ async fn fetch_album_tracks(
     // songs deleted from the album since the last sync — under a full sync the
     // wipe covered that, but an incremental one re-fetches in place.
     let _ = db.delete_tracks_for_album(&album_id);
-    let artist_id = album
+    let album_artist_id = album
         .artist_id
         .as_ref()
         .map(|id| format!("navidrome:artist:{id}"));
     for song in &album_with.song {
         let track_id = format!("navidrome:track:{}", song.id);
+        // The song's *own* artist, not the album's: writing the album artist
+        // onto every track made a featured artist indistinguishable from the
+        // credited one, which is what the artist page's "Appears on" section
+        // reads. Songs without one fall back to the album artist so the column
+        // is still populated for servers that omit it.
+        let artist_id = song
+            .artist_id
+            .as_ref()
+            .map(|id| format!("navidrome:artist:{id}"))
+            .or_else(|| album_artist_id.clone());
         let _ = db.upsert_track(
             &track_id,
             "navidrome",
@@ -324,7 +343,7 @@ async fn fetch_album_tracks(
             artist_id.as_deref(),
             song.album.as_deref(),
             Some(&album_id),
-            None, // album_artist
+            album.artist.as_deref(),
             song.track.map(|t| t as i32),
             song.disc_number.map(|d| d as i32),
             song.year,
@@ -334,7 +353,47 @@ async fn fetch_album_tracks(
             song.cover_art.as_deref(),
             Some(now),
         );
+        let _ = db.set_track_artists(&track_id, &song_credits(song, artist_id.as_deref()));
     }
+}
+
+/// Every artist an album is credited to, as `(namespaced id, name)`.
+///
+/// OpenSubsonic's `artists` array is the only place the second album artist
+/// appears: `artist` is a display string joining every name and `artistId` is
+/// the first credit alone, so a record by two artists is one artist's own album
+/// and looks like a guest spot to the other. A vanilla server sends no array,
+/// and then the single pair is all there is.
+fn album_credits(album: &subsonic::Album) -> Vec<(String, String)> {
+    if !album.artists.is_empty() {
+        return album
+            .artists
+            .iter()
+            .map(|a| (format!("navidrome:artist:{}", a.id), a.name.clone()))
+            .collect();
+    }
+    match (&album.artist_id, &album.artist) {
+        (Some(id), Some(name)) => vec![(format!("navidrome:artist:{id}"), name.clone())],
+        _ => Vec::new(),
+    }
+}
+
+/// Every artist id credited on a song, namespaced for the cache.
+///
+/// OpenSubsonic's `artists` array is the only place a collaboration is spelled
+/// out — `artistId` carries whichever participant the server leads with, so a
+/// remix credited to "irossa • Amore Audio" looks like an irossa track and the
+/// guest cannot be found at all. A vanilla server sends no array, and then the
+/// single id (already falling back to the album artist) is the whole truth.
+fn song_credits(song: &subsonic::Song, primary: Option<&str>) -> Vec<String> {
+    if !song.artists.is_empty() {
+        return song
+            .artists
+            .iter()
+            .map(|a| format!("navidrome:artist:{}", a.id))
+            .collect();
+    }
+    primary.map(str::to_string).into_iter().collect()
 }
 
 /// How often the server scan is polled while it runs.
@@ -402,6 +461,78 @@ mod tests {
         Arc::new(LibraryDb::open_in_memory().unwrap())
     }
 
+    fn song(json: serde_json::Value) -> subsonic::Song {
+        let mut base = serde_json::json!({ "id": "s1", "title": "Song" });
+        let map = base.as_object_mut().unwrap();
+        for (k, v) in json.as_object().unwrap() {
+            map.insert(k.clone(), v.clone());
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    /// `artist` is a display string joining both names and `artistId` names
+    /// only the first, so taking the pair at face value filed the first artist
+    /// under "A • B" and never recorded the second at all.
+    #[test]
+    fn an_album_by_two_artists_credits_each_under_its_own_name() {
+        let mut album = listed_album(1, 100);
+        album.artist = Some("Nico Arezzo • Amore Audio".into());
+        album.artist_id = Some("na".into());
+        album.artists = vec![
+            subsonic::ArtistRef {
+                id: "na".into(),
+                name: "Nico Arezzo".into(),
+            },
+            subsonic::ArtistRef {
+                id: "aa".into(),
+                name: "Amore Audio".into(),
+            },
+        ];
+        assert_eq!(
+            album_credits(&album),
+            vec![
+                ("navidrome:artist:na".to_string(), "Nico Arezzo".to_string()),
+                ("navidrome:artist:aa".to_string(), "Amore Audio".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_server_without_the_album_array_credits_its_one_artist() {
+        let album = listed_album(1, 100);
+        assert_eq!(
+            album_credits(&album),
+            vec![("navidrome:artist:ar1".to_string(), "Artist".to_string())]
+        );
+    }
+
+    #[test]
+    fn every_credited_artist_is_recorded_not_only_the_primary() {
+        let s = song(serde_json::json!({
+            "artistId": "ir",
+            "artists": [{ "id": "ir", "name": "irossa" }, { "id": "aa", "name": "Amore Audio" }],
+        }));
+        assert_eq!(
+            song_credits(&s, Some("navidrome:artist:ir")),
+            vec!["navidrome:artist:ir", "navidrome:artist:aa"]
+        );
+    }
+
+    #[test]
+    fn a_server_without_the_array_credits_the_one_artist() {
+        let s = song(serde_json::json!({ "artistId": "ir" }));
+        assert_eq!(
+            song_credits(&s, Some("navidrome:artist:ir")),
+            vec!["navidrome:artist:ir"]
+        );
+    }
+
+    #[test]
+    fn a_song_with_no_artist_at_all_is_credited_to_nobody() {
+        let s = song(serde_json::json!({}));
+        assert!(song_credits(&s, None).is_empty());
+    }
+
     fn listed_album(song_count: u32, duration: u32) -> subsonic::Album {
         subsonic::Album {
             id: "a1".into(),
@@ -417,6 +548,7 @@ mod tests {
             starred: None,
             user_rating: None,
             play_count: None,
+            artists: Vec::new(),
         }
     }
 

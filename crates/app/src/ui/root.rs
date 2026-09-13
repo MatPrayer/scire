@@ -369,9 +369,18 @@ impl RootView {
             } else if connected && libraries != this.last_libraries {
                 // Library selection changed: rebuild the current catalog view.
                 this.last_libraries = libraries;
+                let on_catalog_page = this.on_catalog_page();
                 this.invalidate_catalog_views();
-                if let Some(section) = this.section {
-                    this.navigate(section, None, cx);
+                // Only re-navigate when a listing is showing. `self.section`
+                // survives into the detail pages opened from it, so navigating
+                // unconditionally threw the user off an artist page and back to
+                // the grid every time they ticked a library checkbox.
+                if on_catalog_page {
+                    if let Some(section) = this.section {
+                        this.navigate(section, None, cx);
+                    }
+                } else {
+                    this.reload_content_libraries(cx);
                 }
             }
 
@@ -683,15 +692,7 @@ impl RootView {
                 // The catalog views hold the rows they were built from and
                 // never reload on their own; drop them so the next visit
                 // re-seeds from what the refresh just wrote.
-                let on_catalog_page = matches!(
-                    this.content,
-                    Some(
-                        Content::Albums(_)
-                            | Content::Artists(_)
-                            | Content::Recent(_)
-                            | Content::LocalMusic(_)
-                    )
-                );
+                let on_catalog_page = this.on_catalog_page();
                 this.invalidate_catalog_views();
                 // Redraw the current page only if it is one of those listings —
                 // a detail page the user opened meanwhile must not be replaced
@@ -859,6 +860,34 @@ impl RootView {
         self.albums_view = None;
         self.artists_view = None;
         self.recent_view = None;
+    }
+
+    /// Whether the page showing is one of the listings `invalidate_catalog_views`
+    /// drops — i.e. one that can be replaced by re-navigating to `self.section`.
+    /// A detail page keeps the section it was opened from, so this is the only
+    /// thing that tells the two apart.
+    fn on_catalog_page(&self) -> bool {
+        matches!(
+            self.content,
+            Some(
+                Content::Albums(_)
+                    | Content::Artists(_)
+                    | Content::Recent(_)
+                    | Content::LocalMusic(_)
+            )
+        )
+    }
+
+    /// Re-apply the library selection to a detail page in place.
+    ///
+    /// The artist page is the only one the selection reaches — `getArtist`
+    /// takes no `musicFolderId`, so the filtering happens client-side and has
+    /// to be redone — and the rest depend on an id the selection cannot change.
+    fn reload_content_libraries(&mut self, cx: &mut Context<Self>) {
+        if let Some(Content::ArtistDetail(view)) = &self.content {
+            let view = view.clone();
+            view.update(cx, |v, cx| v.reload_libraries(cx));
+        }
     }
 
     /// Tell the retained catalog views a client exists now. They fetch once at
@@ -1144,8 +1173,15 @@ impl RootView {
     fn open_artist(&mut self, id: String, cx: &mut Context<Self>) {
         self.push_history();
         self.current_entry = Some(NavEntry::Artist(id.clone()));
-        let view =
-            cx.new(|cx| ArtistDetailView::new(self.session.clone(), self.player.clone(), id, cx));
+        let view = cx.new(|cx| {
+            ArtistDetailView::new(
+                self.session.clone(),
+                self.player.clone(),
+                self.library_db.clone(),
+                id,
+                cx,
+            )
+        });
         cx.subscribe(&view, |this: &mut Self, _, event, cx| {
             let ArtistDetailEvent::OpenAlbum(id) = event;
             this.open_album(id.clone(), cx);

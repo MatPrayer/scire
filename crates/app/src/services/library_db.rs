@@ -127,6 +127,71 @@ CREATE INDEX IF NOT EXISTS idx_albums_source ON albums(source);
 CREATE INDEX IF NOT EXISTS idx_artists_source ON artists(source);
 ";
 
+/// Re-fetch every synced track, and index the column the artist page's
+/// "Appears on" section reads.
+///
+/// Until now the sync wrote the *album's* artist id onto every one of its
+/// tracks, so a featured artist was indistinguishable from the album artist and
+/// a guest appearance could not be found at all. The fix is in the sync, but the
+/// rows already on disk carry the wrong value and an incremental sync only
+/// re-fetches albums whose count or duration moved — which is none of them.
+/// Dropping the synced tracks takes `album_fingerprints`' `track_rows` to zero,
+/// and that is exactly the "tracks never landed" case `needs_track_fetch`
+/// already treats as stale, so the next ordinary sync refills them. Local rows
+/// are left alone: the scanner writes each file's own artist already.
+const SCHEMA_V5: &str = "
+DELETE FROM tracks WHERE source = 'navidrome';
+CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist_id);
+";
+
+/// Every artist credited on a track, not only the one the server leads with.
+///
+/// `tracks.artist_id` holds a single id, and Subsonic's `artistId` is the
+/// *primary* credit: a remix released as "irossa • Amore Audio" carries
+/// irossa's id and nothing else, so the guest is unfindable however the track
+/// rows are queried. OpenSubsonic's `artists` array spells the collaboration
+/// out, and this table is where it lands — one row per credit, so "Appears on"
+/// can ask "which albums hold a track this artist is on" instead of "…a track
+/// the server happened to file under them".
+///
+/// The synced tracks are dropped again for the same reason as [`SCHEMA_V5`]:
+/// the credits only exist in `getAlbum` responses, and an incremental sync
+/// re-fetches nothing whose count and duration have not moved. An empty track
+/// table makes every album stale, and the next sync refills both tables.
+const SCHEMA_V6: &str = "
+CREATE TABLE IF NOT EXISTS track_artists (
+    track_id  TEXT NOT NULL,
+    artist_id TEXT NOT NULL,
+    PRIMARY KEY (track_id, artist_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_track_artists_artist ON track_artists(artist_id);
+DELETE FROM track_artists;
+DELETE FROM tracks WHERE source = 'navidrome';
+";
+
+/// Every artist an album is credited to, for the same reason as
+/// [`SCHEMA_V6`] one level up.
+///
+/// `albums.artist_id` is one id and `albums.artist` is the server's *display*
+/// string: an album by two artists comes back as `artist: "A • B"` with the
+/// `artistId` of A alone. So "the album is credited to someone else" — which is
+/// what separates a guest appearance from the artist's own record — cannot be
+/// asked of the album row, and B's own album was listed as an appearance on it.
+///
+/// No wipe is needed: `getAlbumList2` carries the credits, and the sync
+/// rewrites every album row it lists on every pass, so these fill on the next
+/// ordinary sync without a single extra request.
+const SCHEMA_V7: &str = "
+CREATE TABLE IF NOT EXISTS album_artists (
+    album_id  TEXT NOT NULL,
+    artist_id TEXT NOT NULL,
+    PRIMARY KEY (album_id, artist_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_album_artists_artist ON album_artists(artist_id);
+";
+
 // ---------------------------------------------------------------------------
 // Query matching
 // ---------------------------------------------------------------------------
@@ -282,6 +347,18 @@ impl LibraryDb {
         if version < 4 {
             conn.execute_batch(SCHEMA_V4)?;
             conn.execute("INSERT INTO _schema_version (version) VALUES (4)", [])?;
+        }
+        if version < 5 {
+            conn.execute_batch(SCHEMA_V5)?;
+            conn.execute("INSERT INTO _schema_version (version) VALUES (5)", [])?;
+        }
+        if version < 6 {
+            conn.execute_batch(SCHEMA_V6)?;
+            conn.execute("INSERT INTO _schema_version (version) VALUES (6)", [])?;
+        }
+        if version < 7 {
+            conn.execute_batch(SCHEMA_V7)?;
+            conn.execute("INSERT INTO _schema_version (version) VALUES (7)", [])?;
         }
         Ok(())
     }
@@ -586,7 +663,35 @@ impl LibraryDb {
     /// Delete a track by id.
     pub fn delete_track(&self, id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM track_artists WHERE track_id = ?1",
+            rusqlite::params![id],
+        )?;
         conn.execute("DELETE FROM tracks WHERE id = ?1", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    /// Record every artist credited on a track, replacing what was there.
+    ///
+    /// Only the ids are stored: names live on the artist rows, and a credit
+    /// whose artist was never synced is still worth keeping — the join that
+    /// reads this goes through the album table, not the artist one.
+    pub fn set_track_artists(
+        &self,
+        track_id: &str,
+        artist_ids: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM track_artists WHERE track_id = ?1",
+            rusqlite::params![track_id],
+        )?;
+        for artist_id in artist_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO track_artists (track_id, artist_id) VALUES (?1, ?2)",
+                rusqlite::params![track_id, artist_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -625,12 +730,15 @@ impl LibraryDb {
     ///
     /// SQLite autocommits every statement, so a thousand single upserts is a
     /// thousand commits — that alone was ~3s of an otherwise ~1s incremental
-    /// sync. `artists` is `(id, name, library_id)`, deduplicated by the caller.
+    /// sync. `artists` is `(id, name, library_id)`, deduplicated by the caller;
+    /// `album_credits` is `(album id, every artist credited on it)`, replacing
+    /// whatever those albums had.
     pub fn upsert_catalog(
         &self,
         source: &str,
         albums: &[AlbumRow],
         artists: &[(String, String, Option<String>)],
+        album_credits: &[(String, Vec<String>)],
     ) -> Result<(), rusqlite::Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -666,6 +774,18 @@ impl LibraryDb {
                     album.starred,
                     album.library_id,
                 ])?;
+            }
+        }
+        {
+            let mut clear = tx.prepare("DELETE FROM album_artists WHERE album_id = ?1")?;
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO album_artists (album_id, artist_id) VALUES (?1, ?2)",
+            )?;
+            for (album_id, credits) in album_credits {
+                clear.execute(rusqlite::params![album_id])?;
+                for artist_id in credits {
+                    stmt.execute(rusqlite::params![album_id, artist_id])?;
+                }
             }
         }
         tx.commit()
@@ -735,6 +855,86 @@ impl LibraryDb {
         rows.next().transpose()
     }
 
+    /// Which music folder each album was synced from, keyed by album id.
+    ///
+    /// The artist page's album list comes from `getArtist`, and that endpoint
+    /// takes no `musicFolderId` — the sync's recorded provenance is the only
+    /// thing that can tell a browsing subset which of an artist's albums belong
+    /// to it. Two columns over one indexed table, so it is cheap enough to read
+    /// per page open.
+    pub fn album_libraries(
+        &self,
+        source: &str,
+    ) -> Result<HashMap<String, Option<String>>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, library_id FROM albums WHERE source = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Albums the artist plays on without being their album artist, newest
+    /// first, with how many of their tracks each one holds.
+    ///
+    /// Answered from the cache rather than the server because no Subsonic
+    /// endpoint asks this question: `getArtist` returns the albums an artist is
+    /// *credited* with, and a guest appearance is only visible in the track
+    /// rows. An album is "appeared on" when it holds a track this artist is
+    /// credited on and the album itself is credited to someone else.
+    ///
+    /// Both sides need the credit tables rather than the `artist_id` columns,
+    /// which hold the server's *primary* credit only. A track's guest is not in
+    /// `tracks.artist_id`, so the join goes through `track_artists`; and an
+    /// album by two artists carries the first one's id with both names joined
+    /// into the display string, so "credited to someone else" is asked of
+    /// `album_artists` — without it the second artist's own record came back as
+    /// an appearance on it.
+    pub fn appears_on(
+        &self,
+        source: &str,
+        artist_id: &str,
+    ) -> Result<Vec<(AlbumRow, i64)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.source, a.title, a.artist, a.artist_id, a.year, a.cover_art,
+                    a.song_count, a.duration, a.created, a.play_count, a.starred_at, a.library_id,
+                    COUNT(DISTINCT t.id)
+             FROM albums a
+             JOIN tracks t ON t.album_id = a.id
+             JOIN track_artists ta ON ta.track_id = t.id AND ta.artist_id = ?2
+             WHERE a.source = ?1
+               AND (a.artist_id IS NULL OR a.artist_id <> ?2)
+               AND NOT EXISTS (
+                   SELECT 1 FROM album_artists aa
+                   WHERE aa.album_id = a.id AND aa.artist_id = ?2
+               )
+             GROUP BY a.id
+             ORDER BY a.year DESC, a.title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source, artist_id], |row| {
+            Ok((
+                AlbumRow {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    title: row.get(2)?,
+                    artist: row.get(3)?,
+                    artist_id: row.get(4)?,
+                    year: row.get(5)?,
+                    cover_art: row.get(6)?,
+                    song_count: row.get(7)?,
+                    duration: row.get(8)?,
+                    created: row.get(9)?,
+                    play_count: row.get(10)?,
+                    starred: row.get(11)?,
+                    library_id: row.get(12)?,
+                },
+                row.get(13)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// What the cache already holds for every album of `source`, keyed by id.
     ///
     /// This is what makes an incremental sync possible: the listing endpoint
@@ -771,6 +971,11 @@ impl LibraryDb {
     pub fn delete_tracks_for_album(&self, album_id: &str) -> Result<usize, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
+            "DELETE FROM track_artists
+             WHERE track_id IN (SELECT id FROM tracks WHERE album_id = ?1)",
+            rusqlite::params![album_id],
+        )?;
+        conn.execute(
             "DELETE FROM tracks WHERE album_id = ?1",
             rusqlite::params![album_id],
         )
@@ -780,6 +985,10 @@ impl LibraryDb {
     pub fn delete_album_with_tracks(&self, album_id: &str) -> Result<(), rusqlite::Error> {
         self.delete_tracks_for_album(album_id)?;
         let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM album_artists WHERE album_id = ?1",
+            rusqlite::params![album_id],
+        )?;
         conn.execute(
             "DELETE FROM albums WHERE id = ?1",
             rusqlite::params![album_id],
@@ -1229,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_4() {
+    fn schema_version_is_7() {
         let db = test_db();
         let conn = db.conn.lock().unwrap();
         let version: i32 = conn
@@ -1237,7 +1446,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 7);
     }
 
     #[test]

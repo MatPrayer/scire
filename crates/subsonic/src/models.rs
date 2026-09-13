@@ -61,6 +61,11 @@ pub struct Album {
     pub starred: Option<String>,
     pub user_rating: Option<u8>,
     pub play_count: Option<u64>,
+    /// OpenSubsonic per-artist credits (id + name). Empty on vanilla servers,
+    /// which carry only the single `artist`/`artist_id` pair — an album credited
+    /// to several artists then collapses to whichever one the server picked.
+    #[serde(default)]
+    pub artists: Vec<ArtistRef>,
 }
 
 /// Album detail: header + track list (getAlbum).

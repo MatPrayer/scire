@@ -182,6 +182,7 @@ pub(crate) fn album_from_row(row: AlbumRow) -> Album {
         // Not stored by the sync; nothing on a card reads them.
         genre: None,
         user_rating: None,
+        artists: Vec::new(),
     }
 }
 
@@ -1163,6 +1164,7 @@ mod tests {
             starred: None,
             user_rating: None,
             play_count: None,
+            artists: Vec::new(),
         }
     }
 

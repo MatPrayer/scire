@@ -640,6 +640,32 @@ impl AlbumDetailView {
     }
 }
 
+/// Every artist the album is credited to, as `(name, id)` pairs.
+///
+/// OpenSubsonic's `artists` array is the only place a collaboration is spelled
+/// out — `artist`/`artistId` collapse it to the one artist the server picked as
+/// primary, so linking the whole display string sent *every* name on the line
+/// to that first artist's page. Vanilla servers send no array and fall back to
+/// the single pair, which renders exactly as it did before.
+fn album_credits(album: &subsonic::Album) -> Vec<(String, Option<String>)> {
+    if !album.artists.is_empty() {
+        return album
+            .artists
+            .iter()
+            .map(|a| (a.name.clone(), Some(a.id.clone())))
+            .collect();
+    }
+    match album
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        Some(name) => vec![(name.to_string(), album.artist_id.clone())],
+        None => Vec::new(),
+    }
+}
+
 /// Technical summary of the album's files, as short chip strings: formats,
 /// bitrate, sample rate / bit depth, channels, total size. Everything here is
 /// OpenSubsonic-only except the bitrate, so vanilla servers yield fewer chips
@@ -900,7 +926,7 @@ impl Render for AlbumDetailView {
             .unwrap_or((false, 0));
 
         let header = {
-            let (name, artist, artist_id, meta) = match &self.album {
+            let (name, credits, meta) = match &self.album {
                 Some(a) => {
                     let songs = a.album.song_count.unwrap_or(a.song.len() as u32);
                     let dur = a
@@ -911,12 +937,11 @@ impl Render for AlbumDetailView {
                     let year = a.album.year.map(|y| format!("{y} · ")).unwrap_or_default();
                     (
                         a.album.name.clone(),
-                        a.album.artist.clone().unwrap_or_default(),
-                        a.album.artist_id.clone(),
+                        album_credits(&a.album),
                         format!("{year}{songs} tracks · {dur}"),
                     )
                 }
-                None => ("…".into(), String::new(), None, String::new()),
+                None => ("…".into(), Vec::new(), String::new()),
             };
             let has_songs = self.album.as_ref().is_some_and(|a| !a.song.is_empty());
 
@@ -1024,19 +1049,37 @@ impl Render for AlbumDetailView {
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_album_star(cx))),
                         ),
                 )
-                .child(match artist_id {
-                    // Artist name links to the artist page.
-                    Some(id) => div()
-                        .id("album-artist")
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(cx.theme().accent))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(AlbumDetailEvent::OpenArtist(id.clone()));
-                        }))
-                        .child(artist)
-                        .into_any_element(),
-                    None => div().child(artist).into_any_element(),
-                })
+                // One link per credited artist: a collaboration lists every
+                // artist, and each opens its own page. Vanilla servers send a
+                // single credit and this renders exactly as it used to.
+                .child(
+                    h_flex().flex_wrap().items_center().children(
+                        credits
+                            .into_iter()
+                            .enumerate()
+                            .flat_map(|(i, (artist, artist_id))| {
+                                let sep = (i > 0).then(|| {
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(", ")
+                                        .into_any_element()
+                                });
+                                let link = match artist_id {
+                                    Some(id) => div()
+                                        .id(("album-artist", i))
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(cx.theme().accent))
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.emit(AlbumDetailEvent::OpenArtist(id.clone()));
+                                        }))
+                                        .child(artist)
+                                        .into_any_element(),
+                                    None => div().child(artist).into_any_element(),
+                                };
+                                sep.into_iter().chain(std::iter::once(link))
+                            }),
+                    ),
+                )
                 .child(
                     div()
                         .text_sm()
@@ -1576,9 +1619,61 @@ impl AlbumDetailView {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_album, fmt_bytes, fmt_khz, quality_chips, replaygain_line};
+    use super::{
+        album_credits, album_from_row, cached_album, fmt_bytes, fmt_khz, quality_chips,
+        replaygain_line,
+    };
     use crate::services::library_db::{AlbumRow, LibraryDb};
-    use subsonic::Song;
+    use subsonic::{ArtistRef, Song};
+
+    fn album(artist: Option<&str>, artists: Vec<(&str, &str)>) -> subsonic::Album {
+        let mut album = album_from_row(AlbumRow::new("navidrome:album:a1", "navidrome", "Album"));
+        album.artist = artist.map(str::to_string);
+        album.artist_id = artist.map(|_| "ar-1".to_string());
+        album.artists = artists
+            .into_iter()
+            .map(|(id, name)| ArtistRef {
+                id: id.into(),
+                name: name.into(),
+            })
+            .collect();
+        album
+    }
+
+    /// The whole point: a collaboration gets one link per artist. Linking the
+    /// display string instead sent every name on the line to `artistId`, i.e.
+    /// to whichever artist the server happened to list first.
+    #[test]
+    fn each_credited_artist_gets_its_own_id() {
+        let credits = album_credits(&album(
+            Some("Jay-Z"),
+            vec![("ar-1", "Jay-Z"), ("ar-2", "Ye")],
+        ));
+        assert_eq!(
+            credits,
+            [
+                ("Jay-Z".to_string(), Some("ar-1".to_string())),
+                ("Ye".to_string(), Some("ar-2".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_server_without_the_array_still_links_its_one_artist() {
+        let credits = album_credits(&album(Some("The Beatles"), vec![]));
+        assert_eq!(
+            credits,
+            [("The Beatles".to_string(), Some("ar-1".to_string()))]
+        );
+    }
+
+    /// No artist at all renders nothing, rather than an empty link sitting in
+    /// the header waiting to be clicked.
+    #[test]
+    fn an_uncredited_album_yields_no_links() {
+        assert!(album_credits(&album(None, vec![])).is_empty());
+        assert!(album_credits(&album(Some("  "), vec![])).is_empty());
+    }
 
     /// The sync writes `navidrome:album:<id>` / `navidrome:track:<id>`, the
     /// grid navigates with the bare id — so the seed has to qualify its lookup
