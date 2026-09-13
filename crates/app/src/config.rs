@@ -151,6 +151,17 @@ pub struct Settings {
     /// default — the accent surfaces alone are the quiet version of
     /// `adaptive_from_page`, and the gradient is the loud one.
     pub adaptive_page_gradient: bool,
+    /// How an album page arranges its cover and details against its track
+    /// list. `SidePanel` only applies where the window has the room for it;
+    /// see `ui::album_side_panel`.
+    #[serde(default)]
+    pub album_layout: AlbumPageLayout,
+    /// Put the cover-and-details panel on the *right* and the track list on
+    /// the left; the layout's default is the other way round. Only the
+    /// `SidePanel` layout has two columns to swap, so this is ignored — and the
+    /// switch disabled — under `Stacked`.
+    #[serde(default)]
+    pub album_panel_right: bool,
     /// Disable non-essential UI animations (tab transitions, hover effects, panel slides).
     /// Useful on lower-end GPUs or for users sensitive to motion.
     #[serde(default)]
@@ -298,6 +309,40 @@ impl FullscreenCoverSize {
             Self::Large => "Large",
             Self::Huge => "Huge",
         }
+    }
+}
+
+/// How an album page arranges the cover and its details against the track
+/// list.
+///
+/// `SidePanel` is a preference, not a promise: the page only takes that shape
+/// on a window wide enough to hold a full-width track list *and* a panel worth
+/// drawing a cover in (`ui::album_side_panel` decides), and falls back to
+/// `Stacked` everywhere else — a narrow or portrait window would otherwise get
+/// a squeezed track list beside a thumbnail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlbumPageLayout {
+    /// Cover and details across the top, track list underneath.
+    #[default]
+    Stacked,
+    /// Track list down the left, cover and details in a tall panel on the
+    /// right.
+    SidePanel,
+}
+
+impl AlbumPageLayout {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stacked => "Stacked",
+            Self::SidePanel => "Side panel",
+        }
+    }
+
+    /// Whether the page should *try* for the side panel; the window still has
+    /// the final say.
+    pub fn wants_side_panel(self) -> bool {
+        self == Self::SidePanel
     }
 }
 
@@ -522,6 +567,8 @@ impl Default for Settings {
             show_nav_buttons: true,
             adaptive_from_page: false,
             adaptive_page_gradient: false,
+            album_layout: AlbumPageLayout::default(),
+            album_panel_right: false,
             reduced_motion: false,
             selection_glow: false,
         }

@@ -22,6 +22,12 @@ use crate::state::player::PlayerState;
 use crate::state::session::Session;
 use crate::ui::{format_duration, sync_focus_scroll, with_focus_cursor};
 
+/// Cover edge in the stacked header; the side panel sizes its own.
+const HEADER_ART: f32 = 220.;
+
+/// Horizontal padding the columns lay their cards out within (`p_4` a side).
+const PAGE_PADDING_X: f32 = 32.;
+
 pub struct LocalAlbumDetailView {
     db: Arc<LibraryDb>,
     player: Entity<PlayerState>,
@@ -31,6 +37,15 @@ pub struct LocalAlbumDetailView {
     tracks: Vec<crate::services::library_db::TrackRow>,
     art_path: Option<PathBuf>,
     scroll: ScrollHandle,
+    /// The side panel's own scroll; see `AlbumDetailView`.
+    panel_scroll: ScrollHandle,
+    /// Width the side panel was drawn at last frame, added back to the track
+    /// list's measurement so the content width doesn't shrink by the panel it
+    /// is used to size (see `AlbumDetailView::panel_w`).
+    panel_w: f32,
+    /// Content width bridged from the last frame's measurement, for the
+    /// side-panel decision.
+    live_width: crate::ui::LiveWidth,
     focus_anchor: ScrollAnchor,
     /// Track index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
@@ -62,6 +77,9 @@ impl LocalAlbumDetailView {
             tracks: Vec::new(),
             art_path: None,
             scroll: scroll.clone(),
+            panel_scroll: ScrollHandle::new(),
+            panel_w: 0.,
+            live_width: crate::ui::LiveWidth::default(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
             vi_scroll_synced: None,
@@ -180,6 +198,28 @@ impl Render for LocalAlbumDetailView {
             window,
             cx,
         );
+        // The side panel, when the setting asks for it and the window can hold
+        // it — same decision, same fallback, as the server album page.
+        let measured = f32::from(self.scroll.bounds().size.width) + self.panel_w;
+        let content_w = self.live_width.resolve(measured, window);
+        let viewport = window.viewport_size();
+        let panel = self
+            .session
+            .read(cx)
+            .settings
+            .album_layout
+            .wants_side_panel()
+            .then(|| {
+                crate::ui::album_side_panel(
+                    content_w,
+                    f32::from(viewport.width),
+                    f32::from(viewport.height),
+                )
+            })
+            .flatten();
+        self.panel_w = panel.map_or(0., |p| p.width);
+        let panel_right = self.session.read(cx).settings.album_panel_right;
+        let art_px = panel.map_or(HEADER_ART, |p| p.art);
         let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
         // This album's own colour, when the page is set to carry one; the
         // playing-track highlight below keeps the theme's accent. Kicked off
@@ -212,63 +252,64 @@ impl Render for LocalAlbumDetailView {
             };
             let has_songs = !self.tracks.is_empty();
 
-            h_flex()
-                .gap_4()
-                .items_start()
-                .flex_wrap()
+            let cover = div()
+                .id("local-album-cover")
+                .flex_none()
+                .size(px(art_px))
+                .rounded_2xl()
+                .bg(cx.theme().muted)
+                .overflow_hidden()
+                .when_some(self.art_path.clone(), |this, path| {
+                    this.child(img(path).size(px(art_px)).rounded_2xl())
+                });
+
+            let info = v_flex()
+                .gap_2()
+                .child(div().text_2xl().font_medium().child(name))
+                .child(div().child(artist))
                 .child(
                     div()
-                        .id("local-album-cover")
-                        .size(px(220.))
-                        .rounded_2xl()
-                        .bg(cx.theme().muted)
-                        .overflow_hidden()
-                        .when_some(self.art_path.clone(), |this, path| {
-                            this.child(img(path).size(px(220.)).rounded_2xl())
-                        }),
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(meta),
                 )
                 .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w(px(260.))
+                    h_flex()
                         .gap_2()
-                        .child(div().text_2xl().font_medium().child(name))
-                        .child(div().child(artist))
+                        .mt_1()
+                        .child({
+                            let play = Button::new("local-album-play")
+                                .icon(app_icon(icons::PLAY))
+                                .label("Play")
+                                .disabled(!has_songs)
+                                .on_click(cx.listener(|this, _, _, cx| this.play_from(0, cx)));
+                            match page_accent {
+                                Some(a) => play.custom(crate::ui::accent_button(a, cx)),
+                                None => play.primary(),
+                            }
+                        })
                         .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(meta),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .mt_1()
-                                .child({
-                                    let play = Button::new("local-album-play")
-                                        .icon(app_icon(icons::PLAY))
-                                        .label("Play")
-                                        .disabled(!has_songs)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.play_from(0, cx)),
-                                        );
-                                    match page_accent {
-                                        Some(a) => play.custom(crate::ui::accent_button(a, cx)),
-                                        None => play.primary(),
-                                    }
-                                })
-                                .child(
-                                    Button::new("local-album-shuffle")
-                                        .ghost()
-                                        .icon(app_icon(icons::SHUFFLE))
-                                        .label("Shuffle")
-                                        .disabled(!has_songs)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.play_shuffled(cx)),
-                                        ),
-                                ),
+                            Button::new("local-album-shuffle")
+                                .ghost()
+                                .icon(app_icon(icons::SHUFFLE))
+                                .label("Shuffle")
+                                .disabled(!has_songs)
+                                .on_click(cx.listener(|this, _, _, cx| this.play_shuffled(cx))),
                         ),
-                )
+                );
+
+            match panel.is_some() {
+                // In the panel the cover leads and the details read down under
+                // it; the flex props below belong to the row layout only.
+                true => v_flex().gap_4().child(cover).child(info).into_any_element(),
+                false => h_flex()
+                    .gap_4()
+                    .items_start()
+                    .flex_wrap()
+                    .child(cover)
+                    .child(info.flex_1().min_w(px(260.)))
+                    .into_any_element(),
+            }
         };
 
         let glow = self.session.read(cx).settings.selection_glow;
@@ -399,32 +440,71 @@ impl Render for LocalAlbumDetailView {
             })
             .collect();
 
-        v_flex()
-            .id("local-album-detail-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
+        let header_card = v_flex()
+            // In the panel the card's width is its column's; the scrolling page
+            // leaves it to stretch as it always has.
+            .when_some(panel, |this, panel| {
+                this.w(px(panel.width - PAGE_PADDING_X))
+            })
+            .flex_none()
+            .rounded_2xl()
             .p_4()
             .gap_4()
-            .child(
-                v_flex()
-                    .rounded_2xl()
+            // Album's colour washing back into the normal surface; see
+            // the server album page for the reasoning.
+            .map(|this| match header_tint {
+                Some(accent) => this.bg(linear_gradient(
+                    160.,
+                    linear_color_stop(crate::ui::page_tint(accent), 0.),
+                    linear_color_stop(cx.theme().sidebar, 0.85),
+                )),
+                None => this.bg(cx.theme().sidebar),
+            })
+            .child(header);
+        let track_list = v_flex().gap_0p5().children(rows);
+
+        match panel {
+            // Track list on one side, cover and details in their own scrolling
+            // column on the other; `Settings::album_panel_right` picks which.
+            Some(panel) => {
+                let tracks = v_flex()
+                    .id("local-album-detail-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
                     .p_4()
                     .gap_4()
-                    // Album's colour washing back into the normal surface; see
-                    // the server album page for the reasoning.
-                    .map(|this| match header_tint {
-                        Some(accent) => this.bg(linear_gradient(
-                            160.,
-                            linear_color_stop(crate::ui::page_tint(accent), 0.),
-                            linear_color_stop(cx.theme().sidebar, 0.85),
-                        )),
-                        None => this.bg(cx.theme().sidebar),
-                    })
-                    .child(header),
-            )
-            .child(v_flex().gap_0p5().children(rows))
-            .into_any_element()
+                    .child(track_list);
+                let side = v_flex()
+                    .id("local-album-side-panel")
+                    .w(px(panel.width))
+                    .flex_none()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.panel_scroll)
+                    .p_4()
+                    .gap_4()
+                    .child(header_card);
+                let row = h_flex().size_full().items_start();
+                match panel_right {
+                    true => row.child(tracks).child(side),
+                    false => row.child(side).child(tracks),
+                }
+                .into_any_element()
+            }
+            None => v_flex()
+                .id("local-album-detail-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .p_4()
+                .gap_4()
+                .child(header_card)
+                .child(track_list)
+                .into_any_element(),
+        }
     }
 }
 

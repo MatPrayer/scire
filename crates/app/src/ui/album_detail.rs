@@ -125,9 +125,24 @@ pub struct AlbumDetailView {
     /// High-res cover for the lightbox (fetched lazily on first open).
     full_art_path: Option<PathBuf>,
     scroll: ScrollHandle,
+    /// The side panel's own scroll, in the layout that has one: it holds the
+    /// cover, the details and the About card, which on a tall album are more
+    /// than a panel's height, and it must scroll without taking the track list
+    /// with it.
+    panel_scroll: ScrollHandle,
+    /// Width the side panel was drawn at last frame, or `0.` in the stacked
+    /// layout.
+    ///
+    /// `scroll` tracks the *track list*, which in the side-panel layout is only
+    /// part of the content area — measuring it alone would feed `live_width` a
+    /// width that the panel's own presence had already taken a bite out of, and
+    /// the panel would shrink itself every frame. The panel is a fixed-width
+    /// sibling with no gap between them, so their sum is the content width
+    /// exactly, in either layout.
+    panel_w: f32,
     /// Window width the page lays out at, bridged from the last frame's
     /// measurement. The header card is sized from it rather than left to
-    /// stretch — see `header_width`.
+    /// stretch — see `content_width`.
     live_width: crate::ui::LiveWidth,
     focus_anchor: ScrollAnchor,
     /// Track index under the vi-mode cursor (None = cursor hidden).
@@ -197,6 +212,8 @@ impl AlbumDetailView {
             show_full_art: false,
             full_art_path: None,
             scroll: scroll.clone(),
+            panel_scroll: ScrollHandle::new(),
+            panel_w: 0.,
             live_width: crate::ui::LiveWidth::default(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
@@ -777,9 +794,14 @@ fn fmt_added(created: &str) -> String {
 /// either side).
 const PAGE_PADDING_X: f32 = 32.;
 
+/// Cover edge in the stacked header. The side panel draws a much larger one —
+/// `ui::album_side_panel` sizes it from the panel it fits in.
+const HEADER_ART: f32 = 220.;
+
 impl AlbumDetailView {
-    /// Width to draw the header card at, or `0.` on the first frame — before
-    /// anything has been measured — where it falls back to stretching.
+    /// Width the page has to lay out in, or `0.` on the first frame — before
+    /// anything has been measured — where the header card falls back to
+    /// stretching.
     ///
     /// The card has to carry an explicit width because its height is measured
     /// before the stretch that gives it one: the chip row wraps, so the height
@@ -794,10 +816,11 @@ impl AlbumDetailView {
     /// Width comes from the viewport rather than the scroll handle's own bounds
     /// for the reason `ui::LiveWidth` exists: the bounds are the previous
     /// frame's, so a resize would leave the card a frame behind the drag.
-    fn header_width(&mut self, window: &Window) -> f32 {
-        let measured = f32::from(self.scroll.bounds().size.width);
-        let width = self.live_width.resolve(measured, window);
-        (width - PAGE_PADDING_X).max(0.)
+    fn content_width(&mut self, window: &Window) -> f32 {
+        // Plus the panel: `scroll` measures the track list, which is the whole
+        // content area only in the stacked layout (see `panel_w`).
+        let measured = f32::from(self.scroll.bounds().size.width) + self.panel_w;
+        self.live_width.resolve(measured, window)
     }
 }
 
@@ -814,7 +837,35 @@ impl Render for AlbumDetailView {
             window,
             cx,
         );
-        let header_w = self.header_width(window);
+        let content_w = self.content_width(window);
+        // The side panel, when the setting asks for it *and* the window can
+        // hold it; everything else falls back to the stacked page. Recorded on
+        // the view because next frame's content width is measured through it.
+        let viewport = window.viewport_size();
+        let panel = self
+            .session
+            .read(cx)
+            .settings
+            .album_layout
+            .wants_side_panel()
+            .then(|| {
+                crate::ui::album_side_panel(
+                    content_w,
+                    f32::from(viewport.width),
+                    f32::from(viewport.height),
+                )
+            })
+            .flatten();
+        self.panel_w = panel.map_or(0., |p| p.width);
+        let panel_right = self.session.read(cx).settings.album_panel_right;
+        // Card width, in the layout that knows one: the panel's inner width, or
+        // the page's own. Zero means nothing has been measured yet, where the
+        // card stretches as it always did.
+        let header_w = match panel {
+            Some(p) => p.width - PAGE_PADDING_X,
+            None => (content_w - PAGE_PADDING_X).max(0.),
+        };
+        let art_px = panel.map_or(HEADER_ART, |p| p.art);
         let playing_id = self.player.read(cx).current_song().map(|s| s.id.clone());
         // This album's own colour, when the page is set to carry one. The
         // playing-track highlight below deliberately keeps the theme's accent:
@@ -914,133 +965,129 @@ impl Render for AlbumDetailView {
                     }))
             }));
 
-            h_flex()
-                .gap_4()
+            let cover = div()
+                .id("album-cover")
+                .flex_none()
+                .size(px(art_px))
+                .rounded_2xl()
+                .bg(cx.theme().muted)
+                .overflow_hidden()
+                .when_some(self.art_path.clone(), |this, path| {
+                    // Click to view the cover at full resolution.
+                    this.cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.open_full_art(cx)))
+                        .child(img(path).size(px(art_px)).rounded_2xl())
+                });
+
+            let info = v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            // flex_1 + min_w_0 so a long title wraps
+                            // inside the header instead of pushing the
+                            // star button off the row.
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_2xl()
+                                .font_medium()
+                                .child(name),
+                        )
+                        .child(
+                            Button::new("album-star")
+                                .ghost()
+                                .xsmall()
+                                .icon(app_icon(if album_starred {
+                                    icons::STAR_FILLED
+                                } else {
+                                    icons::STAR_OUTLINE
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_album_star(cx))),
+                        ),
+                )
+                .child(match artist_id {
+                    // Artist name links to the artist page.
+                    Some(id) => div()
+                        .id("album-artist")
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(cx.theme().accent))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(AlbumDetailEvent::OpenArtist(id.clone()));
+                        }))
+                        .child(artist)
+                        .into_any_element(),
+                    None => div().child(artist).into_any_element(),
+                })
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(meta),
+                )
+                .child(chip_row)
+                .when_some(replaygain, |this, line| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(line),
+                    )
+                })
+                .child(rating_stars)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .mt_1()
+                        .child({
+                            let play = Button::new("album-play")
+                                .icon(app_icon(icons::PLAY))
+                                .label("Play")
+                                .disabled(!has_songs)
+                                .on_click(cx.listener(|this, _, _, cx| this.play_from(0, cx)));
+                            match page_accent {
+                                Some(a) => play.custom(crate::ui::accent_button(a, cx)),
+                                None => play.primary(),
+                            }
+                        })
+                        .child(
+                            Button::new("album-shuffle")
+                                .ghost()
+                                .icon(app_icon(icons::SHUFFLE))
+                                .label("Shuffle")
+                                .disabled(!has_songs)
+                                .on_click(cx.listener(|this, _, _, cx| this.play_shuffled(cx))),
+                        ),
+                );
+
+            match panel.is_some() {
+                // In the panel the cover leads and the details read down under
+                // it: there is no width to put them side by side in, and the
+                // cover is the reason the layout was chosen.
+                true => v_flex().gap_4().child(cover).child(info).into_any_element(),
                 // Centred, not top-aligned: the info column's height depends on
                 // how many chips and lines this album has, so a fixed-height
                 // cover pinned to the top leaves the card visibly lopsided —
                 // most of all against the header's colour wash.
-                .items_center()
-                .flex_wrap()
-                .child(
-                    div()
-                        .id("album-cover")
-                        .flex_none()
-                        .size(px(220.))
-                        .rounded_2xl()
-                        .bg(cx.theme().muted)
-                        .overflow_hidden()
-                        .when_some(self.art_path.clone(), |this, path| {
-                            // Click to view the cover at full resolution.
-                            this.cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| this.open_full_art(cx)))
-                                .child(img(path).size(px(220.)).rounded_2xl())
-                        }),
-                )
-                .child(
-                    v_flex()
-                        // Grow and shrink, but *not* `flex_1`: that sets the
-                        // flex basis to 0%, and the column's height is then
-                        // measured at its min-content width, where the chip
-                        // row below stacks one chip per line. The card takes
-                        // that height (see `header_width`), so in a narrow
-                        // window it kept a gap even with the card's own width
-                        // pinned. An auto basis measures at the content's
-                        // natural width instead, and the shrink brings it back
-                        // to the room the cover leaves.
-                        .flex_grow()
-                        .flex_shrink()
-                        .min_w(px(260.))
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    // flex_1 + min_w_0 so a long title wraps
-                                    // inside the header instead of pushing the
-                                    // star button off the row.
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_2xl()
-                                        .font_medium()
-                                        .child(name),
-                                )
-                                .child(
-                                    Button::new("album-star")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(app_icon(if album_starred {
-                                            icons::STAR_FILLED
-                                        } else {
-                                            icons::STAR_OUTLINE
-                                        }))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.toggle_album_star(cx)
-                                            }),
-                                        ),
-                                ),
-                        )
-                        .child(match artist_id {
-                            // Artist name links to the artist page.
-                            Some(id) => div()
-                                .id("album-artist")
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(cx.theme().accent))
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(AlbumDetailEvent::OpenArtist(id.clone()));
-                                }))
-                                .child(artist)
-                                .into_any_element(),
-                            None => div().child(artist).into_any_element(),
-                        })
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(meta),
-                        )
-                        .child(chip_row)
-                        .when_some(replaygain, |this, line| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(line),
-                            )
-                        })
-                        .child(rating_stars)
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .mt_1()
-                                .child({
-                                    let play = Button::new("album-play")
-                                        .icon(app_icon(icons::PLAY))
-                                        .label("Play")
-                                        .disabled(!has_songs)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.play_from(0, cx)),
-                                        );
-                                    match page_accent {
-                                        Some(a) => play.custom(crate::ui::accent_button(a, cx)),
-                                        None => play.primary(),
-                                    }
-                                })
-                                .child(
-                                    Button::new("album-shuffle")
-                                        .ghost()
-                                        .icon(app_icon(icons::SHUFFLE))
-                                        .label("Shuffle")
-                                        .disabled(!has_songs)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.play_shuffled(cx)),
-                                        ),
-                                ),
-                        ),
-                )
+                false => h_flex()
+                    .gap_4()
+                    .items_center()
+                    .flex_wrap()
+                    .child(cover)
+                    // Grow and shrink, but *not* `flex_1`: that sets the flex
+                    // basis to 0%, and the column's height is then measured at
+                    // its min-content width, where the chip row stacks one chip
+                    // per line. The card takes that height (see
+                    // `content_width`), so in a narrow window it kept a gap even
+                    // with the card's own width pinned. An auto basis measures
+                    // at the content's natural width instead, and the shrink
+                    // brings it back to the room the cover leaves. In the panel
+                    // the column has no row to share, so none of it applies.
+                    .child(info.flex_grow().flex_shrink().min_w(px(260.)))
+                    .into_any_element(),
+            }
         };
 
         let info_prefs = self.session.read(cx).settings.track_info.clone();
@@ -1358,38 +1405,81 @@ impl Render for AlbumDetailView {
                 })
         });
 
-        let scroll = v_flex()
-            .id("album-detail-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
+        // Header card matches the artist page framing.
+        let header_card = v_flex()
+            .when(header_w > 0., |this| this.w(px(header_w)))
+            .flex_none()
+            .rounded_2xl()
             .p_4()
             .gap_4()
-            // Header card matches the artist page framing.
-            .child(
-                v_flex()
-                    .when(header_w > 0., |this| this.w(px(header_w)))
-                    .rounded_2xl()
+            // The album's colour washes across the header card and fades back
+            // into the normal surface, so the page reads as this album's
+            // without the track list losing contrast.
+            .map(|this| match header_tint {
+                Some(accent) => this.bg(linear_gradient(
+                    160.,
+                    linear_color_stop(crate::ui::page_tint(accent), 0.),
+                    linear_color_stop(cx.theme().sidebar, 0.85),
+                )),
+                None => this.bg(cx.theme().sidebar),
+            })
+            .child(header);
+
+        let error_line = self
+            .error
+            .clone()
+            .map(|e| div().text_color(cx.theme().danger).text_sm().child(e));
+        let track_list = v_flex().gap_0p5().children(rows);
+
+        let scroll = match panel {
+            // Track list on one side, cover and details in their own column on
+            // the other. Two scrolling columns, not one: a long album scrolled
+            // under a panel that stays put is the reason for the layout.
+            Some(panel) => {
+                let tracks = v_flex()
+                    .id("album-detail-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
                     .p_4()
                     .gap_4()
-                    // The album's colour washes across the header card and
-                    // fades back into the normal surface, so the page reads as
-                    // this album's without the track list losing contrast.
-                    .map(|this| match header_tint {
-                        Some(accent) => this.bg(linear_gradient(
-                            160.,
-                            linear_color_stop(crate::ui::page_tint(accent), 0.),
-                            linear_color_stop(cx.theme().sidebar, 0.85),
-                        )),
-                        None => this.bg(cx.theme().sidebar),
-                    })
-                    .child(header),
-            )
-            .children(about)
-            .when_some(self.error.clone(), |this, e| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
-            })
-            .child(v_flex().gap_0p5().children(rows));
+                    .children(error_line)
+                    .child(track_list);
+                let side = v_flex()
+                    .id("album-side-panel")
+                    .w(px(panel.width))
+                    .flex_none()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.panel_scroll)
+                    .p_4()
+                    .gap_4()
+                    .child(header_card)
+                    .children(about);
+                let row = h_flex().size_full().items_start();
+                // Which column leads is `Settings::album_panel_right`, off by
+                // default; nothing else about either one changes with it.
+                match panel_right {
+                    true => row.child(tracks).child(side),
+                    false => row.child(side).child(tracks),
+                }
+                .into_any_element()
+            }
+            None => v_flex()
+                .id("album-detail-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .p_4()
+                .gap_4()
+                .child(header_card)
+                .children(about)
+                .children(error_line)
+                .child(track_list)
+                .into_any_element(),
+        };
 
         div()
             .relative()

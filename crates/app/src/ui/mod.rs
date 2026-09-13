@@ -231,6 +231,73 @@ pub fn grid_fit_padded(element_width: f32, min_tile: f32, max_tile: f32) -> Opti
     grid_fit(element_width - GRID_PADDING_X, min_tile, max_tile)
 }
 
+/// Narrowest window the album page's side panel is offered on. Under this the
+/// panel and a readable track list cannot both be had, whatever the ratio.
+const SIDE_PANEL_MIN_WINDOW_W: f32 = 1100.;
+/// How wide against its height the *window* has to be. "Landscape widescreen"
+/// is the condition the layout was asked for, and a 4:3 or portrait window
+/// keeps the stacked page even when it is wide enough in pixels.
+const SIDE_PANEL_MIN_ASPECT: f32 = 1.3;
+/// Room the track list keeps for itself: title, the hover actions, play count
+/// and duration all sit on one row, and below this they start colliding.
+const SIDE_PANEL_TRACKS_MIN: f32 = 520.;
+/// Share of the content width the panel takes, and the range it is held to —
+/// the cover is drawn at the panel's inner width, so this is really how big
+/// the art gets.
+const SIDE_PANEL_SHARE: f32 = 0.34;
+const SIDE_PANEL_MIN_W: f32 = 340.;
+const SIDE_PANEL_MAX_W: f32 = 560.;
+/// Everything between the panel's edge and the cover's: the panel's own `p_4`
+/// a side *and* the header card's `p_4` inside it. Counting only the panel's
+/// ran the cover through the card's right padding and out of the window.
+const SIDE_PANEL_PADDING: f32 = 64.;
+/// Share of the window height the cover may take. The details sit under it and
+/// the panel scrolls, but a cover taller than this pushes the play button off
+/// the bottom of a short window, which is the one thing the panel is for.
+const SIDE_PANEL_ART_SHARE: f32 = 0.52;
+/// A cover smaller than this is not worth the panel — the stacked page draws a
+/// bigger one.
+const SIDE_PANEL_ART_MIN: f32 = 200.;
+
+/// The album page's side panel: its width, and the cover size inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlbumSidePanel {
+    /// Panel width, padding included — the track list gets the rest.
+    pub width: f32,
+    /// Edge of the square cover drawn at the top of the panel.
+    pub art: f32,
+}
+
+/// Size the album page's side panel, or `None` where the window should keep the
+/// stacked page.
+///
+/// Pure so the fallbacks can be tested without a window: the layout is a
+/// *preference*, and every way it can fail to fit (too narrow, too square, a
+/// track list that would be squeezed, a cover too small to be worth the trade)
+/// has to come back as the stacked page rather than as a bad panel.
+///
+/// `content_w` is the width the page itself has (the window minus the sidebar
+/// and chrome), while the aspect test is on the whole window — folding the
+/// sidebar away should not change what shape the window is.
+pub fn album_side_panel(content_w: f32, window_w: f32, window_h: f32) -> Option<AlbumSidePanel> {
+    // Nothing measured yet: the caller's stacked fallback stands, as it does
+    // for every other first-frame layout here.
+    if content_w <= 0. || window_h <= 0. {
+        return None;
+    }
+    if window_w < SIDE_PANEL_MIN_WINDOW_W || window_w / window_h < SIDE_PANEL_MIN_ASPECT {
+        return None;
+    }
+    let width = (content_w * SIDE_PANEL_SHARE)
+        .clamp(SIDE_PANEL_MIN_W, SIDE_PANEL_MAX_W)
+        .min(content_w - SIDE_PANEL_TRACKS_MIN);
+    if width < SIDE_PANEL_MIN_W {
+        return None;
+    }
+    let art = (width - SIDE_PANEL_PADDING).min(window_h * SIDE_PANEL_ART_SHARE);
+    (art >= SIDE_PANEL_ART_MIN).then_some(AlbumSidePanel { width, art })
+}
+
 /// Frame-accurate width for a layout that reflows with the window.
 ///
 /// A `ScrollHandle`'s bounds are last frame's layout, so a grid whose column
@@ -1332,10 +1399,63 @@ mod tests {
     }
 
     use super::{
-        CARD_PADDING, GRID_GAP, GRID_PADDING_X, LiveWidth, accent_from_cover_bytes, format_count,
-        format_playtime, grid_columns, grid_columns_padded, grid_fit, grid_fit_padded, strip_html,
-        truncate_at_word,
+        CARD_PADDING, GRID_GAP, GRID_PADDING_X, LiveWidth, SIDE_PANEL_MAX_W, SIDE_PANEL_MIN_W,
+        SIDE_PANEL_PADDING, SIDE_PANEL_TRACKS_MIN, accent_from_cover_bytes, album_side_panel,
+        format_count, format_playtime, grid_columns, grid_columns_padded, grid_fit,
+        grid_fit_padded, strip_html, truncate_at_word,
     };
+
+    /// The layout the setting asks for, on the window it was asked for: a
+    /// 2560x1440 desktop with the sidebar open.
+    #[test]
+    fn the_side_panel_takes_a_third_of_a_widescreen_window() {
+        let panel = album_side_panel(2300., 2560., 1440.).expect("a 16:9 desktop fits the panel");
+        assert!(panel.width <= SIDE_PANEL_MAX_W, "{}", panel.width);
+        assert!(panel.width >= SIDE_PANEL_MIN_W);
+        // Cover at the panel's inner width, well past the 220px the stacked
+        // header draws — the whole point of the trade.
+        assert_eq!(panel.art, panel.width - SIDE_PANEL_PADDING);
+        assert!(panel.art > 220.);
+    }
+
+    /// Every way the window can fail to hold the panel comes back as the
+    /// stacked page, never as a squeezed one.
+    #[test]
+    fn a_window_without_the_room_keeps_the_stacked_page() {
+        // Nothing measured yet.
+        assert!(album_side_panel(0., 2560., 1440.).is_none());
+        // Wide enough in pixels, too square: the layout was asked for on a
+        // *widescreen* window.
+        assert!(album_side_panel(1300., 1400., 1400.).is_none());
+        // Portrait.
+        assert!(album_side_panel(1000., 1080., 1920.).is_none());
+        // Landscape but small.
+        assert!(album_side_panel(800., 1000., 700.).is_none());
+    }
+
+    /// The track list's floor outranks the panel: a content column that can't
+    /// give the panel its minimum without squeezing the rows gets neither.
+    #[test]
+    fn the_track_list_keeps_its_width() {
+        let content = SIDE_PANEL_TRACKS_MIN + SIDE_PANEL_MIN_W;
+        let panel = album_side_panel(content, 1600., 900.).expect("exactly enough");
+        assert_eq!(panel.width, SIDE_PANEL_MIN_W);
+        assert!(album_side_panel(content - 1., 1600., 900.).is_none());
+    }
+
+    /// A wide but short window (a half-height window on a 1440p screen) would
+    /// draw a cover taller than the panel's own room, so the art is capped
+    /// against the height — and where that leaves it smaller than the stacked
+    /// header's, the panel is dropped.
+    #[test]
+    fn a_short_window_caps_the_cover_and_then_gives_up() {
+        let panel = album_side_panel(2300., 2560., 700.).expect("still widescreen");
+        assert_eq!(panel.art, 700. * super::SIDE_PANEL_ART_SHARE);
+        assert!(panel.art < panel.width - SIDE_PANEL_PADDING);
+        // Shorter still: the cap puts the cover under `SIDE_PANEL_ART_MIN`, and
+        // the stacked page draws a bigger one than that.
+        assert!(album_side_panel(2300., 2560., 300.).is_none());
+    }
 
     /// Chrome between the window edge and the grid: sidebar plus the content
     /// column's own padding. Constant while the window is dragged, which is the
