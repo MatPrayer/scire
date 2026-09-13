@@ -121,7 +121,7 @@ const COMPACT_SECTIONS: [(&str, u16); 7] = [
     ("Playback", 14),
     ("Browsing", 11),
     ("Streaming", 5),
-    ("Library", 12),
+    ("Library", 13),
     ("Account", 3),
 ];
 
@@ -372,6 +372,7 @@ enum SettingsSwitch {
     ViMode,
     ReducedMotion,
     PrecacheArt,
+    OnlineLyrics,
 }
 
 /// A button-group entry or a standalone settings button.
@@ -694,6 +695,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_online_lyrics(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.online_lyrics = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn persist(&self, cx: &Context<Self>) {
         self.session.read(cx).persist_settings();
     }
@@ -1008,6 +1016,7 @@ impl SettingsView {
             SettingsSwitch::ViMode => s.vi_mode,
             SettingsSwitch::ReducedMotion => s.reduced_motion,
             SettingsSwitch::PrecacheArt => s.precache_art,
+            SettingsSwitch::OnlineLyrics => s.online_lyrics,
         }
     }
 
@@ -1054,6 +1063,7 @@ impl SettingsView {
             SettingsSwitch::ViMode => self.set_vi_mode(value, cx),
             SettingsSwitch::ReducedMotion => self.set_reduced_motion(value, cx),
             SettingsSwitch::PrecacheArt => self.set_precache_art(value, cx),
+            SettingsSwitch::OnlineLyrics => self.set_online_lyrics(value, cx),
         }
     }
 
@@ -1550,6 +1560,7 @@ impl Render for SettingsView {
         let rebuild_state = self.rebuild.clone();
         let precache_art = self.session.read(cx).settings.precache_art;
         let precache_state = self.precache.clone();
+        let online_lyrics = self.session.read(cx).settings.online_lyrics;
 
         // Rebuilt from scratch each render: `section` re-registers every card
         // it opens, in the order they are laid out.
@@ -2361,7 +2372,25 @@ impl Render for SettingsView {
                         })
                         .child(msg),
                 )
-            });
+            })
+            .child(crate::ui::divider())
+            .child(self.vi_switch(
+                SettingsSwitch::OnlineLyrics,
+                "online-lyrics",
+                online_lyrics,
+                false,
+                "Fetch missing lyrics online",
+                cx,
+            ))
+            .child(self.note(
+                "Lyrics come from a file's own tags or a sidecar .lrc — the \
+                 server's copy for streamed tracks, read off disk for local \
+                 ones. When there are none, look the song up on LRCLIB — often \
+                 with timings, which tagged lyrics rarely carry. Sends the track's \
+                 artist, title, album and length to lrclib.net, and only while \
+                 the lyrics panel is open. Answers are cached on disk.",
+                cx,
+            ));
 
         // Account (only when connected, so it stays the last section).
         let account_section = account.map(|(url, user)| {

@@ -31,6 +31,12 @@ pub fn waveform_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("waveform"))
 }
 
+/// Where online lyrics lookups are parked, so the panel does not re-ask for
+/// every song on every reopen.
+pub fn lyrics_cache_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("lyrics"))
+}
+
 pub fn queue_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("queue.json"))
 }
@@ -81,6 +87,12 @@ pub struct Settings {
     /// background, instead of downloading them as the grids scroll past.
     #[serde(default)]
     pub precache_art: bool,
+    /// Look missing lyrics up on LRCLIB when the server has none for a song.
+    /// Sends the track's artist, title, album and length to lrclib.net, and
+    /// only ever while the lyrics panel is open. The container's
+    /// `#[serde(default)]` fills it from `Settings::default()`, so an older
+    /// settings file comes back with it on.
+    pub online_lyrics: bool,
     /// Page shown right after connecting.
     pub default_page: DefaultPage,
     /// Last selected album list filter, restored across sessions.
@@ -539,6 +551,7 @@ impl Default for Settings {
             default_repeat: RepeatMode::Off,
             artwork_cache_mb: 256,
             precache_art: false,
+            online_lyrics: true,
             default_page: DefaultPage::default(),
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),

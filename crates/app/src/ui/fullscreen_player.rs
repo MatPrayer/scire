@@ -6,22 +6,23 @@ use std::time::{Duration, Instant};
 use gpui::{
     Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, ObjectFit,
     Render, StyledImage as _, Window, div, ease_out_quint, img, linear_color_stop, linear_gradient,
-    prelude::*, px,
+    prelude::*, px, relative, rems,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::popover::Popover;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
     v_flex,
 };
-use subsonic::SubsonicClient;
+use subsonic::{LyricLine, StructuredLyrics, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::config::{
     FullscreenBackground, FullscreenCoverSize, VisualizerMode, VisualizerSettings,
 };
-use crate::services::{artwork, runtime};
+use crate::services::{artwork, lyrics, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
@@ -87,9 +88,51 @@ const CARD_MIN_H_COMPACT: f32 = 280.;
 const INFO_ONE_LINE_MIN: f32 = 430.;
 /// That extra row, its gap included.
 const INFO_WRAP_H: f32 = 32.;
-/// Side panel (queue / lyrics) width, beside the card.
+/// Side panel width beside the card. The queue is a list of one-line rows and
+/// asks for no more than it takes to read a title.
 const PANEL_MAX: f32 = 320.;
 const PANEL_MIN: f32 = 220.;
+/// The lyrics panel is wider, because it is prose rather than a list: at the
+/// queue's width the large type this panel draws wraps most lines in half, and
+/// a verse broken across twice as many rows is harder to follow than one whose
+/// lines sit where the writer put them.
+const PANEL_LYRICS_MAX: f32 = 460.;
+const PANEL_LYRICS_MIN: f32 = 280.;
+/// Share of the window each takes before those bounds apply.
+const PANEL_SHARE: f32 = 0.26;
+const PANEL_LYRICS_SHARE: f32 = 0.34;
+/// How far a lyric line falls back at one, two, and three-or-more lines from
+/// the one being sung.
+///
+/// The look this follows (Apple Music's, and the pens that reproduce it) carries
+/// distance as a *blur* as much as a fade, and gpui has no element blur — its
+/// only `blur_radius` is on a `BoxShadow`, and transforms are svg-only. So the
+/// whole falloff rides on opacity, which is why it drops further and faster than
+/// a blurred sheet would need it to: the depth has to come from somewhere.
+const LYRIC_DIM: [f32; 3] = [0.5, 0.34, 0.22];
+/// Lyric type size in rems, at rest and on the line being sung.
+///
+/// The lit line *grows* into the second over [`LYRIC_GROW_MS`] rather than
+/// stepping between two size classes. `Styled::text_size` takes any length and
+/// `with_animation`'s animator runs inside `request_layout`, so interpolating it
+/// is a real, continuous scale — which is the nearest thing gpui has to the
+/// reference look's `transform: scale`, there being no transform on a div at all
+/// (`with_transformation` is svg-only).
+///
+/// The line being *left* runs the same interpolation backwards over the same
+/// duration, so the two read as one handover rather than as one line growing
+/// beside another that has already snapped back.
+const LYRIC_REM: f32 = 1.25;
+const LYRIC_REM_ACTIVE: f32 = 1.5;
+/// Length of that handover.
+///
+/// Paired with [`gpui::ease_in_out`] rather than the `ease_out_quint` the rest
+/// of the app's transitions use: quint is 90% done in the first 40% of its
+/// duration, which is right for something appearing (it wants to be *there*) and
+/// wrong for two lines trading places — the eye is following both, and a curve
+/// that spends its tail almost stationary reads as a jump however long the
+/// duration is. Symmetric easing is what lets the duration actually be felt.
+const LYRIC_GROW_MS: u64 = 420;
 /// Queue row height. `uniform_list` needs every row the same size, and a whole
 /// number of them is what keeps the panel from ending mid-row.
 const QUEUE_ROW_H: f32 = 44.;
@@ -254,10 +297,11 @@ impl Layout {
     fn resolve(
         width: f32,
         height: f32,
-        panel_open: bool,
+        panel: Option<SidePanel>,
         want_volume: bool,
         cover: FullscreenCoverSize,
     ) -> Self {
+        let panel_open = panel.is_some();
         let density = CardDensity::for_window(width, height);
         // Width left for the cover and the card once padding, gaps and the
         // optional columns are taken out.
@@ -269,10 +313,12 @@ impl Layout {
                 - panel
                 - if volume { VOLUME_W } else { 0. }
         };
-        let side_panel = if panel_open {
-            (width * 0.26).clamp(PANEL_MIN, PANEL_MAX)
-        } else {
-            0.
+        let side_panel = match panel {
+            Some(SidePanel::Lyrics) => {
+                (width * PANEL_LYRICS_SHARE).clamp(PANEL_LYRICS_MIN, PANEL_LYRICS_MAX)
+            }
+            Some(SidePanel::Queue) => (width * PANEL_SHARE).clamp(PANEL_MIN, PANEL_MAX),
+            None => 0.,
         };
         // The volume column is kept only while it costs neither the card its
         // full width nor the cover a reasonable size — the player bar carries a
@@ -569,6 +615,169 @@ fn pinned_scene_label(mode: VisualizerMode) -> Option<&'static str> {
         .then(|| mode.menu_label())
 }
 
+/// Pick the document to display out of everything the server holds for a song.
+///
+/// A song can carry several — a synced and an unsynced copy of the same words,
+/// or one per language. Synced wins, since it is the same text with timings
+/// attached and nothing is lost by taking it; otherwise the first one the
+/// server listed. Documents with no lines at all are dropped: Navidrome
+/// answers with an empty `lyricsList` for a song it has nothing for, but a
+/// stray empty entry would otherwise draw a blank panel instead of "no
+/// lyrics found".
+fn best_lyrics(docs: Vec<StructuredLyrics>) -> Option<StructuredLyrics> {
+    let mut docs: Vec<StructuredLyrics> = docs
+        .into_iter()
+        .filter(|d| d.lines.iter().any(|l| !l.value.trim().is_empty()))
+        .collect();
+    let pick = docs.iter().position(|d| d.synced).unwrap_or(0);
+    (pick < docs.len()).then(|| docs.swap_remove(pick))
+}
+
+/// Wrap classic getLyrics' one text blob as an unsynced document, so the panel
+/// has a single shape to draw whichever endpoint answered.
+fn plain_lyrics(text: String) -> StructuredLyrics {
+    StructuredLyrics {
+        lines: text
+            .lines()
+            .map(|l| LyricLine {
+                start: None,
+                value: l.to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Where the lyrics on screen came from.
+///
+/// Worth saying out loud: the two paths disagree about what a miss means. A
+/// library hit is the file's own words and will be there offline forever; an
+/// online hit is someone else's transcription of a track the library has
+/// nothing for, and is the one to doubt when it drifts or belongs to a
+/// different recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LyricsSource {
+    /// The file's own words: its tags or a sidecar `.lrc`, whether the server
+    /// indexed them or — for a local file — we read them off disk ourselves.
+    Library,
+    /// Looked up on LRCLIB, because nothing in the library had any.
+    Online,
+}
+
+impl LyricsSource {
+    fn badge(self) -> &'static str {
+        match self {
+            Self::Library => "Library",
+            Self::Online => "LRCLIB",
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Library => "From your library — the file's tags or a sidecar .lrc",
+            Self::Online => "Fetched from LRCLIB; your library has none for this track",
+        }
+    }
+}
+
+/// Where down the panel the line being sung is parked, as a share of its
+/// height. Above the middle, not at the top: the lines already sung are what
+/// places the one being sung, and a line pinned to the top edge arrives with
+/// nothing under it to read into.
+const LYRICS_LEAD: f32 = 0.35;
+
+/// Index of the line being sung at `position`.
+///
+/// The last line whose start has passed, which is `None` before the first one
+/// (an intro has no line to light) and for an unsynced document, whose lines
+/// carry no start at all. `offset` is the document's own correction, added
+/// rather than subtracted — OpenSubsonic defines it as the offset to *apply*,
+/// and `parse_lrc` converts an LRC `[offset:]` tag into that same sense.
+///
+/// A scan rather than a binary search: the list is a few dozen lines, it is
+/// consulted twice a second, and a server-supplied document is not guaranteed
+/// to be in order.
+fn active_line(lines: &[LyricLine], offset: i64, position: Duration) -> Option<usize> {
+    let pos = position.as_millis() as i64;
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.start.is_some_and(|start| start + offset <= pos))
+        .map(|(ix, _)| ix)
+        .next_back()
+}
+
+/// Where a click on a lyric line puts the playhead.
+///
+/// The inverse of what [`active_line`] does, and deliberately written next to
+/// it: that adds the document's `offset` to each line's start before comparing
+/// it against the position, so the point at which a line *becomes* the lit one
+/// is `start + offset` and seeking anywhere else would light a different line
+/// than the one clicked. A document whose offset drags the first line before
+/// zero seeks to the beginning instead, there being nowhere earlier to go.
+fn lyric_seek_target(start: i64, offset: i64) -> Duration {
+    Duration::from_millis(start.saturating_add(offset).max(0) as u64)
+}
+
+/// How present a lyric line is drawn, by how far it sits from the one being
+/// sung — see [`LYRIC_DIM`] for why the distance is carried by opacity alone.
+///
+/// An **unsynced** document is drawn flat at full strength: there is no line to
+/// be on, and a sheet where everything is faded reads as the panel being
+/// switched off rather than as lyrics. So does an intro, before the first line
+/// has arrived — there the whole sheet sits at the nearest tier, waiting, rather
+/// than at the bottom of the ramp where it would look switched off too.
+fn line_emphasis(active: Option<usize>, ix: usize, synced: bool) -> f32 {
+    if !synced {
+        return 1.;
+    }
+    let Some(active) = active else {
+        return LYRIC_DIM[0];
+    };
+    match active.abs_diff(ix) {
+        0 => 1.,
+        1 => LYRIC_DIM[0],
+        2 => LYRIC_DIM[1],
+        _ => LYRIC_DIM[2],
+    }
+}
+
+/// Fraction of the panel's width a lyric line is laid out in, at a given type
+/// size.
+///
+/// This is what stops the words rewrapping as a line grows. Where a line breaks
+/// is decided by its advance width against the width it has to fill, and advance
+/// width scales with the type size — so a line set at [`LYRIC_REM`] inside
+/// `LYRIC_REM / LYRIC_REM_ACTIVE` of the panel breaks at exactly the words it
+/// will break at once it has grown to [`LYRIC_REM_ACTIVE`] and the full width.
+/// Held across the whole interpolation, the break points never move at all, and
+/// the line simply gets bigger.
+///
+/// The cost is that a resting line wraps a word or two earlier than it strictly
+/// needs to — which is the trade: the alternative is the last word of a line
+/// dropping to a row of its own halfway through the animation and shoving the
+/// rest of the sheet down with it. Text is left-aligned, so the width the line
+/// gives up is on the right, where there is nothing to see.
+fn lyric_wrap(size_rem: f32) -> f32 {
+    size_rem / LYRIC_REM_ACTIVE
+}
+
+/// A lyric line's colour part-way through the handover, `t` of the way from
+/// `rest` to `lit`.
+///
+/// gpui has no colour interpolation of its own — `Hsla::blend` is alpha
+/// compositing — but compositing `lit` over `rest` at alpha `t` *is* the
+/// mix, and it runs through `Rgba`, so it takes the short way between two
+/// colours instead of the long way round the hue wheel that lerping H would.
+/// The endpoints are exact: `blend` returns `other` at alpha 1 and `self` at 0
+/// rather than a converted near-miss.
+///
+/// The result keeps `rest`'s alpha, which is 1 — the line's own fade is the
+/// element's `opacity`, and folding it in here would apply it twice.
+fn lyric_color(rest: gpui::Hsla, lit: gpui::Hsla, t: f32) -> gpui::Hsla {
+    rest.blend(lit.opacity(t))
+}
+
 pub enum FullscreenEvent {
     Close,
 }
@@ -600,11 +809,35 @@ pub struct FullscreenPlayer {
     /// a user reading further down the queue is not dragged back every frame;
     /// cleared when the panel closes, so reopening re-centres on the track.
     queue_followed: Option<usize>,
-    /// Lyrics text for the song in `lyrics_for`; None while loading or when
-    /// the server has none.
-    lyrics: Option<String>,
+    /// Lyrics for the song in `lyrics_for`; None while loading and when the
+    /// server has none.
+    lyrics: Option<StructuredLyrics>,
     lyrics_for: Option<String>,
     lyrics_loading: bool,
+    /// Which of the two paths answered, for the panel's badge. `Some` exactly
+    /// when `lyrics` is.
+    lyrics_source: Option<LyricsSource>,
+    /// Scroll handle of the lyrics list, so the line being sung can be kept on
+    /// screen. A plain `ScrollHandle` rather than a uniform list's: the lines
+    /// wrap, so they are not all the same height.
+    lyrics_scroll: gpui::ScrollHandle,
+    /// The line lit this frame, recomputed by `sync_lyrics_scroll`.
+    lyrics_active: Option<usize>,
+    /// The line that *was* lit before the highlight last moved, so it can be
+    /// animated back down instead of snapping. Held until the highlight moves
+    /// again — a line only ever draws its shrink once, since the wrapper id it
+    /// is drawn under (and so the animation behind it) is dropped the frame it
+    /// stops being the previous line.
+    lyrics_prev: Option<usize>,
+    /// Line the panel has already scrolled to — and *settled* on, since the
+    /// scroll is eased rather than jumped. Only a change scrolls, so between two
+    /// lines a user reading ahead is left alone; cleared when the panel closes
+    /// or the song changes, so either one re-centres.
+    lyrics_followed: Option<usize>,
+    /// The eased scroll in flight: where the list was when the highlight moved,
+    /// and when it moved. `None` between lines, which is what leaves a user
+    /// scrolling by hand alone.
+    lyrics_scroll_anim: Option<(gpui::Pixels, Instant)>,
     /// Waveform peaks for the track in `waveform_for` (when the waveform
     /// seek bar is enabled and the decode finished).
     waveform: Option<Vec<f32>>,
@@ -738,6 +971,12 @@ impl FullscreenPlayer {
             lyrics: None,
             lyrics_for: None,
             lyrics_loading: false,
+            lyrics_source: None,
+            lyrics_scroll: gpui::ScrollHandle::new(),
+            lyrics_active: None,
+            lyrics_prev: None,
+            lyrics_followed: None,
+            lyrics_scroll_anim: None,
             waveform: None,
             waveform_for: None,
             seek_hover: None,
@@ -847,8 +1086,12 @@ impl FullscreenPlayer {
             Some(panel)
         };
         // A reopened queue starts on the playing track again, wherever the
-        // list was left scrolled.
+        // list was left scrolled, and a reopened lyrics panel on the line
+        // being sung.
         self.queue_followed = None;
+        self.lyrics_followed = None;
+        self.lyrics_prev = None;
+        self.lyrics_scroll_anim = None;
         self.maybe_fetch_lyrics(cx);
         cx.notify();
     }
@@ -885,6 +1128,122 @@ impl FullscreenPlayer {
             .min(len.saturating_sub(visible));
         self.queue_scroll
             .scroll_to_item(top, gpui::ScrollStrategy::Top);
+    }
+
+    /// Light the line being sung and keep it on screen.
+    ///
+    /// Called from `render` for the same reason `sync_queue_scroll` is: a
+    /// `ScrollHandle`'s child bounds are the *last* paint's, so an offset
+    /// computed from a key handler or an event places the line the panel has
+    /// since moved past. Setting the offset here, before the tree is built,
+    /// means this frame paints at it — and unlike a `window.refresh()`, which
+    /// is a no-op while the window is drawing, that actually happens.
+    ///
+    /// The offset is computed rather than delegated to `scroll_to_item`, whose
+    /// only strategies are "first visible" and "at the top": lyrics want the
+    /// line part-way down with what came before it still readable, and the
+    /// lines wrap, so a lead counted in rows is not a lead in pixels.
+    ///
+    /// It is also **eased** rather than set, over the same [`LYRIC_GROW_MS`] and
+    /// with the same curve as the lines' own handover. A `ScrollHandle` has no
+    /// animated scroll — `set_offset` is a jump — and a jump is what the whole
+    /// transition is judged by: the type can ease as gently as it likes while
+    /// the sheet it is set on teleports under it. The two have to be one
+    /// movement. The target is recomputed from the live child bounds on every
+    /// frame rather than captured at the start, which is what keeps the eased
+    /// scroll honest while the lines either side of it are still changing size
+    /// underneath it.
+    fn sync_lyrics_scroll(&mut self, cx: &Context<Self>) {
+        let was = self.lyrics_active;
+        self.lyrics_active = None;
+        if self.panel != Some(SidePanel::Lyrics) {
+            self.lyrics_followed = None;
+            self.lyrics_prev = None;
+            self.lyrics_scroll_anim = None;
+            return;
+        }
+        let Some(doc) = &self.lyrics else { return };
+        // The smoothed position, not the engine's: its tick is 500ms, and a
+        // line lit off it arrives up to that late against words being sung.
+        // `lyrics_following` asks for the frames this resolution needs.
+        let position = self.player.read(cx).smooth_position();
+        self.lyrics_active = active_line(&doc.lines, doc.offset, position);
+        // The handover: the line being left keeps a claim on the frame after
+        // it, so it can shrink back rather than snap. This is recomputed every
+        // frame and only a *change* touches it, so the outgoing line holds its
+        // place for as long as it takes the highlight to move on — which is one
+        // line of the song, comfortably longer than the animation.
+        if self.lyrics_active != was {
+            if was.is_some() {
+                self.lyrics_prev = was;
+            }
+            // A travel still running when the highlight moves again is restarted
+            // from wherever the list has got to, not continued: its start offset
+            // and its clock both belong to the line before last, and easing
+            // toward the new target off those would cover the remaining distance
+            // in whatever was left of the old duration — a snap, at the one
+            // moment (two lines in quick succession) the movement is most
+            // visible.
+            self.lyrics_scroll_anim = None;
+        }
+        let Some(active) = self.lyrics_active else {
+            return;
+        };
+        if self.lyrics_followed == Some(active) {
+            return;
+        }
+        // Child bounds are empty until the list has been painted once, so the
+        // first frame with a panel open cannot place anything. Leaving
+        // `lyrics_followed` alone is what makes the next position tick retry
+        // instead of counting this as done.
+        let Some(line) = self.lyrics_scroll.bounds_for_item(active) else {
+            return;
+        };
+        // Child bounds are the unscrolled layout, and the painted position is
+        // `child.top() + offset.y` — so this is the offset that puts the line
+        // `lead` below the top of the panel.
+        let viewport = self.lyrics_scroll.bounds();
+        let lead = viewport.size.height * LYRICS_LEAD;
+        let y = viewport.top() + lead - line.top();
+        // Offsets run from 0 (the top) down to -max; without the clamp the last
+        // verse would be dragged up past the end of the list.
+        let mut offset = self.lyrics_scroll.offset();
+        let target = y.clamp(-self.lyrics_scroll.max_offset().height, px(0.));
+        // Where the list was when the highlight moved. Recorded once and eased
+        // *from*, so a frame that arrives late moves the list further rather
+        // than restarting the travel — a per-frame step off the current offset
+        // would make the duration depend on how many frames happened to land.
+        let (from, started) = *self
+            .lyrics_scroll_anim
+            .get_or_insert((offset.y, Instant::now()));
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        let span = crate::ui::transition(reduced_motion, LYRIC_GROW_MS).as_secs_f32();
+        let t = (started.elapsed().as_secs_f32() / span).clamp(0., 1.);
+        offset.y = from + (target - from) * gpui::ease_in_out(t);
+        self.lyrics_scroll.set_offset(offset);
+        // Only a finished travel counts as followed: until then this runs again
+        // next frame, and `lyrics_following` is what supplies them.
+        if t >= 1. {
+            self.lyrics_followed = Some(active);
+            self.lyrics_scroll_anim = None;
+        }
+    }
+
+    /// A timed lyrics document is up with audio moving under it — the one state
+    /// in which the panel is worth a frame per frame.
+    ///
+    /// Nothing else here runs off the wall clock: the engine's position tick is
+    /// what brings the overlay back the rest of the time, and twice a second is
+    /// plenty for a seek bar. An untimed document has no line to light, and a
+    /// paused one is not going anywhere.
+    /// An eased scroll counts too: it is driven from `render` rather than by
+    /// gpui's animation element (which asks for its own frames), so without this
+    /// a travel started by opening the panel on a paused track would stop
+    /// wherever the last frame left it.
+    fn lyrics_following(&self, cx: &Context<Self>) -> bool {
+        self.panel == Some(SidePanel::Lyrics)
+            && self.lyrics.as_ref().is_some_and(|doc| doc.synced)
+            && (self.player.read(cx).playing || self.lyrics_scroll_anim.is_some())
     }
 
     /// Advance the visualizer to the next scene (and off again), persisting the
@@ -1040,40 +1399,112 @@ impl FullscreenPlayer {
         if self.panel != Some(SidePanel::Lyrics) {
             return;
         }
-        let Some(client) = self.client(cx) else {
-            return;
-        };
-        let (id, artist, title) = {
+        let online = self.session.read(cx).settings.online_lyrics;
+        let (id, query, local_path) = {
             let p = self.player.read(cx);
             let Some(song) = p.current_song() else {
                 self.lyrics = None;
+                self.lyrics_source = None;
                 self.lyrics_for = None;
                 return;
             };
             (
                 song.id.clone(),
-                song.artist.clone(),
-                Some(song.title.clone()),
+                lyrics::Query {
+                    title: song.title.clone(),
+                    artist: song.artist.clone(),
+                    album: song.album.clone(),
+                    duration: song.duration,
+                },
+                song.local_path.clone(),
             )
         };
         if self.lyrics_for.as_deref() == Some(id.as_str()) {
             return;
         }
         self.lyrics = None;
+        self.lyrics_source = None;
         self.lyrics_for = Some(id.clone());
+        // A new song's lines are a new list; whatever line number the last one
+        // was on means nothing here.
+        self.lyrics_followed = None;
+        self.lyrics_prev = None;
+        self.lyrics_scroll_anim = None;
+        // A local file's id is the scanner's, not the server's — asking the
+        // server about it can only ever be a miss, so those read their own file
+        // instead.
+        let server = local_path.is_none().then(|| self.client(cx)).flatten();
+        if server.is_none() && local_path.is_none() && !online {
+            self.lyrics_loading = false;
+            cx.notify();
+            return;
+        }
         self.lyrics_loading = true;
         cx.spawn(async move |this, cx| {
-            let result = runtime::spawn_io(async move {
-                client
-                    .get_lyrics(artist.as_deref(), title.as_deref())
+            let by_id = id.clone();
+            let found = runtime::spawn_io(async move {
+                // A local file's own words: a sidecar .lrc beside it, or its
+                // LYRICS tag. This is the library lookup for a file no server
+                // has ever seen, so it is what the Library badge means here.
+                // On the blocking pool — it opens and parses a file, and the
+                // two IO workers must stay free for the requests below.
+                if let Some(path) = local_path {
+                    let docs = runtime::spawn_blocking_io(move || {
+                        anyhow::Ok(lyrics::from_file(std::path::Path::new(&path)))
+                    })
                     .await
-                    .map_err(anyhow::Error::from)
+                    .unwrap_or_default();
+                    if let Some(doc) = best_lyrics(docs) {
+                        return anyhow::Ok(Some((doc, LyricsSource::Library)));
+                    }
+                }
+                if let Some(client) = server {
+                    // getLyricsBySongId is what actually answers: Navidrome
+                    // collects lyrics at scan time out of the file's tags and
+                    // out of a sidecar .lrc, and only publishes them under the
+                    // song's own id. Classic getLyrics searches the library by
+                    // artist/title instead, which misses everything whose tags
+                    // don't match what we sent — most of the library. It is
+                    // kept as the fallback for servers without the songLyrics
+                    // extension, which answer the by-id call with error 70.
+                    let structured = client
+                        .get_lyrics_by_song_id(&by_id)
+                        .await
+                        .unwrap_or_default();
+                    if let Some(doc) = best_lyrics(structured) {
+                        return anyhow::Ok(Some((doc, LyricsSource::Library)));
+                    }
+                    let classic = client
+                        .get_lyrics(query.artist.as_deref(), Some(query.title.as_str()))
+                        .await
+                        .ok()
+                        .and_then(|l| l.value)
+                        .map(|text| vec![plain_lyrics(text)])
+                        .and_then(best_lyrics);
+                    if let Some(doc) = classic {
+                        return anyhow::Ok(Some((doc, LyricsSource::Library)));
+                    }
+                }
+                // Nothing in the library. LRCLIB has what was never tagged,
+                // and answers with an LRC document when it has one, so this
+                // fallback can come back better than the server's own copy.
+                if online {
+                    // A lookup that fails is not an answer — leave it uncached
+                    // and let the next open try again.
+                    let found = lyrics::fetch(query).await.ok().flatten();
+                    return anyhow::Ok(found.map(|doc| (doc, LyricsSource::Online)));
+                }
+                anyhow::Ok(None)
             })
-            .await;
+            .await
+            .ok()
+            .flatten();
             let _ = this.update(cx, |view, cx| {
                 if view.lyrics_for.as_deref() == Some(id.as_str()) {
                     view.lyrics_loading = false;
-                    view.lyrics = result.ok().and_then(|l| l.value).filter(|v| !v.is_empty());
+                    let (doc, source) = found.unzip();
+                    view.lyrics = doc;
+                    view.lyrics_source = source;
                     cx.notify();
                 }
             });
@@ -1193,34 +1624,181 @@ impl FullscreenPlayer {
             .into_any_element()
     }
 
-    /// Right-hand lyrics panel (classic getLyrics, unsynced text).
+    /// Right-hand lyrics panel. A timed document is followed line by line —
+    /// the one being sung is lit and the rest step back; an untimed one is the
+    /// same list drawn flat, since there is no line to be on.
+    ///
+    /// The lines are the scrolling element's own children rather than a column
+    /// inside it, because `sync_lyrics_scroll` places one of them by index and
+    /// a `ScrollHandle` only records the bounds of what it is tracking
+    /// directly.
     fn render_lyrics_panel(
         &self,
         width: f32,
         max_h: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let body: gpui::AnyElement = if self.lyrics_loading {
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child("Loading…")
-                .into_any_element()
-        } else {
-            match &self.lyrics {
-                Some(text) => v_flex()
-                    .gap_1()
-                    .children(text.lines().map(|line| {
-                        div()
-                            .text_sm()
-                            .child(if line.is_empty() { " " } else { line }.to_string())
-                    }))
-                    .into_any_element(),
-                None => div()
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        let body: Vec<gpui::AnyElement> = if self.lyrics_loading {
+            vec![
+                div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No lyrics found")
+                    .child("Loading…")
                     .into_any_element(),
+            ]
+        } else {
+            match &self.lyrics {
+                Some(doc) => doc
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, line)| {
+                        let text = line.value.trim_end();
+                        let is_active = self.lyrics_active == Some(ix);
+                        // The line the highlight has just left, which runs the
+                        // grow backwards. Without it the sheet only animates in
+                        // one direction: the incoming line eases up over
+                        // `LYRIC_GROW_MS` while the outgoing one is already back
+                        // at its resting size on the very first frame of it,
+                        // which is read as the new line shoving the old one
+                        // rather than as the two trading places.
+                        let is_prev = !is_active && self.lyrics_prev == Some(ix);
+                        let emphasis = line_emphasis(self.lyrics_active, ix, doc.synced);
+                        // Where each line comes to rest. The animated ones
+                        // override it every frame; it is what they are heading
+                        // for, and what they hold once they arrive.
+                        let rest = if is_active {
+                            LYRIC_REM_ACTIVE
+                        } else {
+                            LYRIC_REM
+                        };
+                        // Read out here rather than in the animators: those
+                        // closures outlive the borrow of `cx`, and an `Hsla` is
+                        // two words of `Copy`.
+                        let lit = cx.theme().primary;
+                        let unlit = cx.theme().foreground;
+                        // Where a click on this line moves the playhead. The
+                        // document's `offset` is applied here exactly as
+                        // `active_line` applies it, or a click would land at a
+                        // point that lights a *different* line — the correction
+                        // has to be in the same sense on both sides of the round
+                        // trip. A line with no start is inert: an untimed sheet
+                        // has no points to seek to, and a pointer cursor over one
+                        // promises something that cannot happen.
+                        let seek_to = line.start.map(|start| lyric_seek_target(start, doc.offset));
+                        let el = div()
+                            .id(("fs-lyric", ix))
+                            .when_some(seek_to, |this, to| {
+                                this.cursor_pointer().on_click(cx.listener(
+                                    move |this: &mut Self, _, _, cx| {
+                                        // Notify rather than lean on the
+                                        // per-frame repaint: that only runs while
+                                        // audio is moving, and clicking a line of
+                                        // a paused track has to light it too.
+                                        this.player.update(cx, |p, cx| {
+                                            p.seek(to);
+                                            cx.notify();
+                                        });
+                                    },
+                                ))
+                            })
+                            // Large and heavy throughout, the way a lyrics
+                            // sheet is set: these are words to be read from
+                            // across a room while something else plays, not a
+                            // list to be scanned. The panel is widened to
+                            // match — see `PANEL_LYRICS_MAX`. `BLACK` rather
+                            // than `BOLD` because a face that stops at 700 is
+                            // matched back to 700 anyway, so asking for the
+                            // heaviest weight costs nothing where there is none
+                            // and gets it wherever the font has one.
+                            .font_weight(gpui::FontWeight::BLACK)
+                            .line_height(relative(1.3))
+                            .text_size(rems(rest))
+                            // Laid out in the share of the panel that keeps the
+                            // words breaking where they will break at full size
+                            // — see `lyric_wrap`.
+                            .w(relative(lyric_wrap(rest)))
+                            // `primary` like every other playing-track mark —
+                            // it is playback this follows, and under the
+                            // Adaptive theme that is the cover's own colour.
+                            .text_color(if is_active { lit } else { unlit })
+                            .opacity(emphasis)
+                            // An empty line is a gap the timings asked for, so
+                            // it keeps its height instead of collapsing.
+                            .child(if text.is_empty() { " " } else { text }.to_string());
+                        // The two halves of the handover. Each animates under a
+                        // wrapper id of its own — the line's index *and* which
+                        // direction it is going — so the animation restarts as
+                        // the highlight steps, where one shared id would run
+                        // once per song and a single id per line would leave the
+                        // shrink holding the grow's finished state. gpui drops
+                        // the state behind an id that goes unrendered, so
+                        // changing it is what rewinds the clock.
+                        //
+                        // Both grow/shrink and brighten/fade together: the size
+                        // change costs the lines under it a few pixels of shift,
+                        // which `sync_lyrics_scroll` takes back out on the next
+                        // frame, and it is most of what makes the sheet read as
+                        // following the song rather than as a list with one row
+                        // coloured in.
+                        let anim = |ms| {
+                            Animation::new(crate::ui::transition(reduced_motion, ms))
+                                .with_easing(gpui::ease_in_out)
+                        };
+                        if is_active {
+                            el.with_animation(
+                                ElementId::Name(format!("fs-lyric-in-{ix}").into()),
+                                anim(LYRIC_GROW_MS),
+                                move |el, t| {
+                                    let size = LYRIC_REM + (LYRIC_REM_ACTIVE - LYRIC_REM) * t;
+                                    el.text_size(rems(size))
+                                        .w(relative(lyric_wrap(size)))
+                                        // Into the accent over the same curve as
+                                        // everything else, so the line is not
+                                        // already the colour of a line being sung
+                                        // while it is still on its way to being
+                                        // one.
+                                        .text_color(lyric_color(unlit, lit, t))
+                                        .opacity(LYRIC_DIM[0] + (1. - LYRIC_DIM[0]) * t)
+                                },
+                            )
+                            .into_any_element()
+                        } else if is_prev {
+                            el.with_animation(
+                                ElementId::Name(format!("fs-lyric-out-{ix}").into()),
+                                anim(LYRIC_GROW_MS),
+                                move |el, t| {
+                                    let size =
+                                        LYRIC_REM_ACTIVE + (LYRIC_REM - LYRIC_REM_ACTIVE) * t;
+                                    el.text_size(rems(size))
+                                        .w(relative(lyric_wrap(size)))
+                                        // And back out of it, so the two lines
+                                        // cross through each other's colour
+                                        // rather than swapping at a frame.
+                                        .text_color(lyric_color(lit, unlit, t))
+                                        // Down to whatever tier it has landed
+                                        // on, not to a fixed one: the highlight
+                                        // can step by more than a line after a
+                                        // seek, and fading to the wrong tier
+                                        // then snapping is the bug this whole
+                                        // branch exists to avoid.
+                                        .opacity(1. + (emphasis - 1.) * t)
+                                },
+                            )
+                            .into_any_element()
+                        } else {
+                            el.into_any_element()
+                        }
+                    })
+                    .collect(),
+                None => vec![
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No lyrics found")
+                        .into_any_element(),
+                ],
             }
         };
         v_flex()
@@ -1238,19 +1816,48 @@ impl FullscreenPlayer {
             .border_color(cx.theme().border.opacity(0.5))
             .shadow_xl()
             .child(
-                div()
-                    .text_sm()
-                    .font_medium()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Lyrics"),
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Lyrics"),
+                    )
+                    // Only once something has landed: a badge beside "Loading…"
+                    // or "No lyrics found" would be naming the source of
+                    // nothing.
+                    .when_some(self.lyrics_source, |this, source| {
+                        this.child(
+                            div()
+                                .id("fs-lyrics-source")
+                                .flex_none()
+                                .px_1p5()
+                                .rounded_sm()
+                                .bg(cx.theme().muted)
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(source.tooltip()).build(window, cx)
+                                })
+                                .child(source.badge()),
+                        )
+                    }),
             )
             .child(
                 v_flex()
                     .id("fs-lyrics-scroll")
+                    .track_scroll(&self.lyrics_scroll)
                     .flex_1()
                     .min_h_0()
+                    // Wider gap than a list wants: at this size the lines need
+                    // to read as separate lines rather than as a paragraph.
+                    .gap_3()
                     .overflow_y_scroll()
-                    .child(body),
+                    .children(body),
             )
             .into_any_element()
     }
@@ -1747,13 +2354,16 @@ impl Render for FullscreenPlayer {
         let layout = Layout::resolve(
             vw,
             vh,
-            self.panel.is_some(),
+            self.panel,
             show_volume && !is_radio,
             self.session.read(cx).settings.fullscreen_cover,
         );
         // Follow the playing track in the queue panel, now that the room the
         // panel gets — and so how many rows it holds — is known.
         self.sync_queue_scroll(layout.panel_max_h, cx);
+        // And the line being sung in the lyrics panel, which the position tick
+        // brings us back here for twice a second.
+        self.sync_lyrics_scroll(cx);
         // Labelled toggles stick out of a narrow card; the icons carry the
         // meaning on their own, and tooltips are not the point here.
         let toggle_labels = layout.card >= TOGGLE_LABEL_MIN;
@@ -1777,6 +2387,14 @@ impl Render for FullscreenPlayer {
         if viz_mode.is_on() && !closing {
             let tuning = self.session.read(cx).settings.visualizer_tuning;
             self.visualizer.tick(viz_mode, tuning);
+            window.request_animation_frame();
+        }
+
+        // The lit line is placed from the playback clock rather than from the
+        // engine's tick, which only pays off if the overlay is redrawn at
+        // something better than that tick's rate. Nothing is recomputed by the
+        // request itself — `sync_lyrics_scroll` above is the whole cost.
+        if !closing && self.lyrics_following(cx) {
             window.request_animation_frame();
         }
 
@@ -2649,18 +3267,160 @@ impl Render for FullscreenPlayer {
 mod tests {
     use super::{
         ART_LEAD, ART_MAX, ART_MAX_STACKED, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity,
-        EDGE, GAP, Layout, QUEUE_CHROME_H, QUEUE_ROW_H, VOLUME_W, blob_base, blob_field, hash01,
-        queue_visible_rows,
+        EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, PANEL_LYRICS_MAX, PANEL_MAX,
+        QUEUE_CHROME_H, QUEUE_ROW_H, SidePanel, VOLUME_W, active_line, best_lyrics, blob_base,
+        blob_field, hash01, line_emphasis, lyric_color, lyric_seek_target, lyric_wrap,
+        plain_lyrics, queue_visible_rows,
     };
     use crate::config::FullscreenCoverSize;
+    use std::time::Duration;
+    use subsonic::{LyricLine, StructuredLyrics};
+
+    fn doc(synced: bool, lines: &[&str]) -> StructuredLyrics {
+        StructuredLyrics {
+            synced,
+            lines: lines
+                .iter()
+                .enumerate()
+                .map(|(i, v)| LyricLine {
+                    start: synced.then_some(i as i64 * 1000),
+                    value: (*v).to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_lyrics_documents_means_none() {
+        assert!(best_lyrics(Vec::new()).is_none());
+    }
+
+    /// A document with nothing but blank lines must read as "no lyrics" rather
+    /// than drawing an empty panel.
+    #[test]
+    fn blank_documents_are_dropped() {
+        assert!(best_lyrics(vec![doc(false, &[]), doc(false, &["", "  "])]).is_none());
+    }
+
+    /// Synced and unsynced copies of the same words are both offered; the
+    /// synced one carries strictly more information.
+    #[test]
+    fn synced_wins_over_unsynced() {
+        let picked = best_lyrics(vec![doc(false, &["a"]), doc(true, &["a"])]).unwrap();
+        assert!(picked.synced);
+        assert_eq!(picked.lines[0].start, Some(0));
+    }
+
+    /// With no timings anywhere, the server's own order decides.
+    #[test]
+    fn first_listed_wins_when_none_are_synced() {
+        let picked = best_lyrics(vec![doc(false, &["first"]), doc(false, &["second"])]).unwrap();
+        assert_eq!(picked.lines[0].value, "first");
+    }
+
+    /// A blank document ahead of a real one must not be picked, and must not
+    /// shift which of the rest is.
+    #[test]
+    fn blanks_do_not_displace_the_pick() {
+        let picked = best_lyrics(vec![
+            doc(false, &[""]),
+            doc(false, &["real"]),
+            doc(true, &["timed"]),
+        ])
+        .unwrap();
+        assert_eq!(picked.lines[0].value, "timed");
+    }
+
+    #[test]
+    fn plain_text_becomes_one_line_per_line() {
+        let d = plain_lyrics("one\n\ntwo".to_string());
+        assert!(!d.synced);
+        assert_eq!(d.lines.len(), 3);
+        assert_eq!(d.lines[2].value, "two");
+        assert!(d.lines.iter().all(|l| l.start.is_none()));
+    }
+
+    #[test]
+    fn the_lit_line_is_the_last_one_that_has_started() {
+        let d = doc(true, &["a", "b", "c"]);
+        assert_eq!(active_line(&d.lines, 0, Duration::from_millis(0)), Some(0));
+        assert_eq!(
+            active_line(&d.lines, 0, Duration::from_millis(999)),
+            Some(0)
+        );
+        assert_eq!(
+            active_line(&d.lines, 0, Duration::from_millis(1000)),
+            Some(1)
+        );
+        // Past the last line it stays lit; there is nothing after it to move to.
+        assert_eq!(active_line(&d.lines, 0, Duration::from_secs(600)), Some(2));
+    }
+
+    #[test]
+    fn nothing_is_lit_before_the_first_line() {
+        let mut d = doc(true, &["a", "b"]);
+        // An intro: the words start well after the track does.
+        d.lines[0].start = Some(8_000);
+        d.lines[1].start = Some(12_000);
+        assert_eq!(active_line(&d.lines, 0, Duration::from_secs(3)), None);
+        assert_eq!(active_line(&d.lines, 0, Duration::from_secs(9)), Some(0));
+    }
+
+    #[test]
+    fn an_untimed_document_lights_nothing() {
+        let d = doc(false, &["a", "b"]);
+        assert_eq!(active_line(&d.lines, 0, Duration::from_secs(30)), None);
+        assert_eq!(active_line(&[], 0, Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn the_document_offset_shifts_every_line() {
+        let d = doc(true, &["a", "b"]);
+        // +500 delays the words, so at 1.2s the second line has not arrived.
+        assert_eq!(
+            active_line(&d.lines, 500, Duration::from_millis(1200)),
+            Some(0)
+        );
+        // -500 pulls them forward, and it has.
+        assert_eq!(
+            active_line(&d.lines, -500, Duration::from_millis(600)),
+            Some(1)
+        );
+    }
+
+    /// Clicking a line must light *that* line, at any offset — the seek and the
+    /// highlight both correct by `offset`, and they only agree if they correct
+    /// in the same direction.
+    #[test]
+    fn clicking_a_lyric_line_seeks_to_where_it_lights() {
+        let d = doc(true, &["a", "b", "c"]);
+        for offset in [0, 500, -500] {
+            for (ix, line) in d.lines.iter().enumerate() {
+                let to = lyric_seek_target(line.start.unwrap(), offset);
+                assert_eq!(
+                    active_line(&d.lines, offset, to),
+                    Some(ix),
+                    "line {ix} at offset {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lyric_seek_never_goes_before_the_start_of_the_song() {
+        assert_eq!(lyric_seek_target(200, -900), Duration::ZERO);
+        assert_eq!(lyric_seek_target(0, i64::MIN), Duration::ZERO);
+    }
 
     /// The layout at the default cover size — every case that is not about the
-    /// setting itself.
+    /// setting itself. The queue is the narrower of the two panels, so it is
+    /// what the room-for-a-panel cases are asked about.
     fn resolve(width: f32, height: f32, panel_open: bool, want_volume: bool) -> Layout {
         Layout::resolve(
             width,
             height,
-            panel_open,
+            panel_open.then_some(SidePanel::Queue),
             want_volume,
             FullscreenCoverSize::default(),
         )
@@ -2880,7 +3640,7 @@ mod tests {
         for &(w, h) in &[(1920., 1080.), (2560., 1440.), (3840., 2160.)] {
             let sizes: Vec<f32> = [Fixed, Medium, Large, Huge]
                 .iter()
-                .map(|&s| Layout::resolve(w, h, false, false, s).art)
+                .map(|&s| Layout::resolve(w, h, None, false, s).art)
                 .collect();
             // Fixed draws the cover a window that only just holds the overlay
             // draws, however much room this one has.
@@ -2891,7 +3651,7 @@ mod tests {
             // Whatever the size, the row still fits the window and the card
             // keeps its full width.
             for &size in &[Fixed, Medium, Large, Huge] {
-                let l = Layout::resolve(w, h, false, false, size);
+                let l = Layout::resolve(w, h, None, false, size);
                 assert_eq!(l.card, CARD_MAX, "{w}x{h} {size:?}: {l:?}");
                 assert!(row_width(&l, 0.) <= w + 0.5, "{w}x{h} {size:?}: {l:?}");
                 assert!(content_height(&l) <= h + 0.5, "{w}x{h} {size:?}: {l:?}");
@@ -2905,14 +3665,14 @@ mod tests {
         for &(w, h) in &[(1100., 1700.), (1440., 2560.)] {
             let sizes: Vec<f32> = [Fixed, Medium, Large, Huge]
                 .iter()
-                .map(|&s| Layout::resolve(w, h, false, false, s).art)
+                .map(|&s| Layout::resolve(w, h, None, false, s).art)
                 .collect();
             assert_eq!(sizes[0], ART_MAX_STACKED, "{w}x{h}: {sizes:?}");
             for pair in sizes.windows(2) {
                 assert!(pair[1] >= pair[0], "{w}x{h}: {sizes:?}");
             }
             for &size in &[Fixed, Medium, Large, Huge] {
-                let l = Layout::resolve(w, h, false, false, size);
+                let l = Layout::resolve(w, h, None, false, size);
                 assert!(l.stacked, "{w}x{h} {size:?}: {l:?}");
                 assert!(l.art <= w - 2. * EDGE + 0.5, "{w}x{h} {size:?}: {l:?}");
                 assert!(content_height(&l) <= h + 0.5, "{w}x{h} {size:?}: {l:?}");
@@ -2926,10 +3686,10 @@ mod tests {
         // window that only just fits it draws the same cover at every size.
         use FullscreenCoverSize::{Fixed, Huge, Large, Medium};
         for &(w, h) in &[(1000., 640.), (760., 600.), (700., 500.)] {
-            let base = Layout::resolve(w, h, false, false, Fixed);
+            let base = Layout::resolve(w, h, None, false, Fixed);
             for &size in &[Medium, Large, Huge] {
                 assert_eq!(
-                    Layout::resolve(w, h, false, false, size),
+                    Layout::resolve(w, h, None, false, size),
                     base,
                     "{w}x{h} {size:?}"
                 );
@@ -2960,6 +3720,86 @@ mod tests {
         assert_eq!(queue_visible_rows(620., 0), 1);
     }
 
+    /// The sheet falls away from the line being sung in both directions — a
+    /// verse already past is no more present than one still coming.
+    #[test]
+    fn the_sheet_falls_away_from_the_lit_line() {
+        let e = |ix| line_emphasis(Some(4), ix, true);
+        assert_eq!(e(4), 1.);
+        assert_eq!(e(3), e(5));
+        assert!(e(4) > e(3) && e(3) > e(2) && e(2) > e(1));
+        // Past three lines out it stops falling, or a long song fades to
+        // nothing and the sheet reads as ending.
+        assert_eq!(e(1), e(0));
+    }
+
+    /// A document with no timings has no line to be on, and an intro has not
+    /// reached its first — neither should look switched off.
+    #[test]
+    fn an_unfollowable_sheet_is_not_dimmed_to_nothing() {
+        assert_eq!(line_emphasis(None, 7, false), 1.);
+        assert_eq!(line_emphasis(Some(2), 7, false), 1.);
+        assert_eq!(line_emphasis(None, 7, true), LYRIC_DIM[0]);
+    }
+
+    /// The handover's colour has to land exactly on both ends — a lit line left
+    /// a shade off `primary`, or a resting one a shade off `foreground`, is a
+    /// sheet where no two lines are quite the same colour.
+    #[test]
+    fn a_lyric_line_crosses_cleanly_between_its_two_colours() {
+        let rest = gpui::hsla(0.6, 0.2, 0.9, 1.);
+        let lit = gpui::hsla(0.1, 0.8, 0.5, 1.);
+        assert_eq!(lyric_color(rest, lit, 0.), rest);
+        assert_eq!(lyric_color(rest, lit, 1.), lit);
+        // And travels: halfway is neither end, and is the same colour whichever
+        // direction it is approached from, so the two lines trading places meet
+        // rather than cross at an angle.
+        let mid = lyric_color(rest, lit, 0.5);
+        assert_ne!(mid, rest);
+        assert_ne!(mid, lit);
+        let back = lyric_color(lit, rest, 0.5);
+        for (a, b) in [(mid.h, back.h), (mid.s, back.s), (mid.l, back.l)] {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    /// The point of `lyric_wrap`: a line's advance width and the width it is
+    /// laid out in are scaled by the same factor at every size the grow passes
+    /// through, so the ratio between them — which is what decides where the
+    /// words break — never changes.
+    #[test]
+    fn a_growing_lyric_line_keeps_its_line_breaks() {
+        // The full panel is the lit line's, and every smaller size gives back
+        // exactly the width its type no longer needs.
+        assert_eq!(lyric_wrap(LYRIC_REM_ACTIVE), 1.);
+        assert!(lyric_wrap(LYRIC_REM) < 1.);
+        for step in 0..=10 {
+            let t = step as f32 / 10.;
+            let size = LYRIC_REM + (LYRIC_REM_ACTIVE - LYRIC_REM) * t;
+            let ratio = size / lyric_wrap(size);
+            assert!(
+                (ratio - LYRIC_REM_ACTIVE).abs() < 1e-5,
+                "size {size} wraps at a different width ratio ({ratio})"
+            );
+        }
+    }
+
+    /// Lyrics are prose set large; the queue is one-line rows. Sharing a width
+    /// meant either the verses wrapped in half or the list was padded out.
+    #[test]
+    fn the_lyrics_panel_is_wider_than_the_queue() {
+        let panel = |p| Layout::resolve(1920., 1080., p, false, FullscreenCoverSize::default());
+        let queue = panel(Some(SidePanel::Queue)).panel;
+        let lyrics = panel(Some(SidePanel::Lyrics)).panel;
+        assert!(lyrics > queue, "lyrics {lyrics} vs queue {queue}");
+        assert_eq!(panel(None).panel, 0.);
+        // Both are capped, or a wide window spends its width on the panel
+        // rather than on the cover the page is for.
+        let wide = |p| Layout::resolve(3840., 2160., p, false, FullscreenCoverSize::default());
+        assert_eq!(wide(Some(SidePanel::Queue)).panel, PANEL_MAX);
+        assert_eq!(wide(Some(SidePanel::Lyrics)).panel, PANEL_LYRICS_MAX);
+    }
+
     #[test]
     fn landscape_content_never_overruns_the_window() {
         for &(w, h) in &[
@@ -2969,14 +3809,16 @@ mod tests {
             (900., 600.),
             (820., 520.),
         ] {
-            for &panel in &[false, true] {
-                let l = resolve(w, h, panel, false);
+            // The lyrics panel is the wider of the two, so it is the one that
+            // can push the row past the window if the widths are wrong.
+            for panel in [None, Some(SidePanel::Queue), Some(SidePanel::Lyrics)] {
+                let l = Layout::resolve(w, h, panel, false, FullscreenCoverSize::default());
                 if l.stacked {
                     continue;
                 }
                 assert!(
                     row_width(&l, 0.) <= w + 0.5,
-                    "{w}x{h} panel={panel} overruns: {l:?}"
+                    "{w}x{h} panel={panel:?} overruns: {l:?}"
                 );
                 // The cover is square: it has to fit the height as well.
                 assert!(l.art <= h - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");

@@ -255,6 +255,59 @@ async fn get_lyrics_missing_is_empty() {
 }
 
 #[tokio::test]
+async fn get_lyrics_by_song_id_parses_synced_lines() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getLyricsBySongId"))
+        .and(query_param("id", "s-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""lyricsList":{"structuredLyrics":[
+                {"displayArtist":"Muse","displayTitle":"Uprising","lang":"eng","offset":-100,"synced":true,
+                 "line":[{"start":0,"value":"Paranoia is in bloom"},{"start":3200,"value":"The PR transmissions will resume"}]},
+                {"lang":"xxx","synced":false,"line":[{"value":"Paranoia is in bloom"}]}
+            ]}"#,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let docs = client(&server.uri())
+        .get_lyrics_by_song_id("s-1")
+        .await
+        .unwrap();
+    assert_eq!(docs.len(), 2);
+    assert!(docs[0].synced);
+    assert_eq!(docs[0].offset, -100);
+    assert_eq!(docs[0].lang.as_deref(), Some("eng"));
+    assert_eq!(docs[0].lines[1].start, Some(3200));
+    assert_eq!(docs[0].lines[1].value, "The PR transmissions will resume");
+    assert_eq!(
+        docs[0].text(),
+        "Paranoia is in bloom\nThe PR transmissions will resume"
+    );
+    // Unsynced document: no starts, offset defaults to 0.
+    assert!(!docs[1].synced);
+    assert_eq!(docs[1].offset, 0);
+    assert_eq!(docs[1].lines[0].start, None);
+}
+
+/// Navidrome answers with the wrapper present but empty when it has no lyrics
+/// for the song, which must parse as "none" rather than as a decode error.
+#[tokio::test]
+async fn get_lyrics_by_song_id_missing_is_empty() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getLyricsBySongId"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(r#""lyricsList":{}"#)))
+        .mount(&server)
+        .await;
+
+    let docs = client(&server.uri())
+        .get_lyrics_by_song_id("s-1")
+        .await
+        .unwrap();
+    assert!(docs.is_empty());
+}
+
+#[tokio::test]
 async fn get_artist_info2_parses_bio_and_images() {
     let server = MockServer::start().await;
     Mock::given(path("/rest/getArtistInfo2"))

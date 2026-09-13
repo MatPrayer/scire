@@ -13,7 +13,7 @@ pub use auth::Credentials;
 pub use client::SubsonicClient;
 pub use endpoints::annotation::Starred;
 pub use endpoints::browsing::{AlbumInfo2, ArtistInfo2};
-pub use endpoints::media::{Lyrics, StreamOptions};
+pub use endpoints::media::{LyricLine, Lyrics, StreamOptions, StructuredLyrics};
 pub use endpoints::system::{ScanStatus, ServerInfo};
 pub use error::{ApiErrorCode, Error};
 pub use models::*;

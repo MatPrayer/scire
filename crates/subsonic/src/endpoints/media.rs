@@ -1,5 +1,5 @@
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::client::SubsonicClient;
 use crate::error::Error;
@@ -18,6 +18,64 @@ pub struct Lyrics {
 struct LyricsWrapper {
     #[serde(default)]
     lyrics: Lyrics,
+}
+
+/// One line of a lyrics document. `start` is milliseconds from the start of
+/// the song, and is absent for unsynced lyrics.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LyricLine {
+    pub start: Option<i64>,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// One lyrics document for a song, from getLyricsBySongId (OpenSubsonic
+/// `songLyrics`). A song can carry several — different languages, and a synced
+/// and an unsynced copy of the same words.
+///
+/// `Serialize` as well, because the app's online-lookup fallback caches what it
+/// found on disk in this same shape.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuredLyrics {
+    pub display_artist: Option<String>,
+    pub display_title: Option<String>,
+    pub lang: Option<String>,
+    /// Milliseconds to add to every `start` before displaying.
+    #[serde(default)]
+    pub offset: i64,
+    #[serde(default)]
+    pub synced: bool,
+    #[serde(default, rename = "line")]
+    pub lines: Vec<LyricLine>,
+}
+
+impl StructuredLyrics {
+    /// The whole document as plain text, one line per entry.
+    pub fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(|l| l.value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LyricsListWrapper {
+    #[serde(default)]
+    lyrics_list: LyricsList,
+}
+
+/// Navidrome answers `"lyricsList":{}` — with no `structuredLyrics` key at all
+/// — for a song it has no lyrics for, so both levels default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LyricsList {
+    #[serde(default)]
+    structured_lyrics: Vec<StructuredLyrics>,
 }
 
 /// Options for building a stream URL.
@@ -70,6 +128,19 @@ impl SubsonicClient {
         }
         let w: LyricsWrapper = self.get("getLyrics", &params).await?;
         Ok(w.lyrics)
+    }
+
+    /// Song lyrics by id (OpenSubsonic `songLyrics` extension).
+    ///
+    /// This is the one worth asking. Navidrome collects lyrics at scan time
+    /// from the file's tags *and* from a sidecar `.lrc`, and only exposes what
+    /// it found under the song's own id; classic `getLyrics` searches the
+    /// library by artist/title instead, so anything whose tags don't match the
+    /// query exactly comes back empty. An empty list means "no lyrics", and a
+    /// server without the extension answers error 70 (not found).
+    pub async fn get_lyrics_by_song_id(&self, id: &str) -> Result<Vec<StructuredLyrics>, Error> {
+        let w: LyricsListWrapper = self.get("getLyricsBySongId", &[("id", id)]).await?;
+        Ok(w.lyrics_list.structured_lyrics)
     }
 
     /// Report playback to the server.

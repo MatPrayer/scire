@@ -2,7 +2,7 @@
 //! drives the play queue (shuffle/repeat/prefetch).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{AppContext as _, Context, Entity};
 use playback::{Event, Player, TrackSource};
@@ -24,10 +24,43 @@ const ART_SIZE: u32 = 300;
 /// the queue would only repeat the same failed request per track.
 const MAX_FAILED_STREAK: usize = 5;
 
+/// How far [`PlayerState::smooth_position`] will run ahead of the last position
+/// event on its own.
+///
+/// The engine ticks every 500ms, so two ticks' worth is already a tick that
+/// never came — the audio thread is blocked, a seek is in flight, or playback
+/// stopped without an event to say so. Past that the clock is guessing rather
+/// than filling in, and a lyric line lit on a guess is worse than one lit late.
+const SMOOTH_MAX: Duration = Duration::from_millis(1_000);
+
+/// Playback position filled in between engine ticks from the wall clock.
+///
+/// Pure so the clamping is testable: `elapsed` is the time since the position
+/// the engine last reported, and `running` means audio is actually moving —
+/// paused or buffering, the reported position *is* the position.
+fn smoothed(
+    position: Duration,
+    elapsed: Duration,
+    running: bool,
+    duration: Option<Duration>,
+) -> Duration {
+    if !running {
+        return position;
+    }
+    let pos = position + elapsed.min(SMOOTH_MAX);
+    // Running past the end would light the last line of a document early and,
+    // for anything reading this as a fraction, overshoot the seek bar.
+    duration.map_or(pos, |d| pos.min(d))
+}
+
 pub struct PlayerState {
     player: Player,
     pub queue: Queue,
     pub position: Duration,
+    /// When `position` was last set, for [`Self::smooth_position`]. The engine
+    /// only reports twice a second, which is coarse for anything drawn per
+    /// frame (the lyric highlight).
+    position_at: Instant,
     pub duration: Option<Duration>,
     pub playing: bool,
     pub buffering: bool,
@@ -147,6 +180,7 @@ impl PlayerState {
             player,
             queue: Queue::default(),
             position: Duration::ZERO,
+            position_at: Instant::now(),
             duration: None,
             playing: false,
             buffering: false,
@@ -308,7 +342,7 @@ impl PlayerState {
         self.radio_title = Some(name);
         self.radio_stream_title = None;
         self.radio_station = None;
-        self.position = Duration::ZERO;
+        self.set_position(Duration::ZERO);
         self.duration = None;
         self.last_error = None;
         self.failed_streak = 0;
@@ -472,7 +506,7 @@ impl PlayerState {
         self.pending_resume = None;
         self.resume_written_secs = 0;
         clear_resume();
-        self.position = Duration::ZERO;
+        self.set_position(Duration::ZERO);
         self.duration = None;
         self.clear_radio();
         self.scrobble.clear();
@@ -488,8 +522,43 @@ impl PlayerState {
         cx.notify();
     }
 
+    /// Move the playhead, and say so before the engine has confirmed it.
+    ///
+    /// The engine reports position every 500ms, so without the local write
+    /// anything reading it — the seek bar, the lit lyric line — keeps drawing
+    /// the point being left for up to half a second after the user asked for
+    /// another one. A tick landing mid-seek reports the *destination* anyway,
+    /// so this is the same number half a tick earlier rather than a guess; a
+    /// seek that lands short or is dropped is corrected by the first tick after
+    /// it. The restored-position path already does this for the same reason.
     pub fn seek(&mut self, position: Duration) {
+        self.set_position(position);
         self.player.seek(position);
+    }
+
+    /// Record a new position and restart the clock the smoothing runs off.
+    fn set_position(&mut self, position: Duration) {
+        self.position = position;
+        self.position_at = Instant::now();
+    }
+
+    /// Playback position at *this instant* rather than at the last engine tick.
+    ///
+    /// The engine reports every 500ms, which is what the player bar and the
+    /// scrobbler want — but a lyric line lit off it lands up to half a second
+    /// late, which is plainly visible against the words being sung. Everything
+    /// drawn per frame reads this instead; `position` stays the engine's own
+    /// number, so nothing that persists or reports it writes back a guess.
+    pub fn smooth_position(&self) -> Duration {
+        smoothed(
+            self.position,
+            self.position_at.elapsed(),
+            // Buffering included: the position the tick reports during a seek
+            // is the destination, and running a clock on top of it would race
+            // past a track that has not started moving yet.
+            self.playing && !self.buffering,
+            self.duration,
+        )
     }
 
     pub fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
@@ -882,7 +951,7 @@ impl PlayerState {
         if resume.is_none() {
             self.pending_resume = None;
         }
-        self.position = resume.unwrap_or(Duration::ZERO);
+        self.set_position(resume.unwrap_or(Duration::ZERO));
         self.resume_written_secs = self.position.as_secs();
         self.duration = duration;
         self.last_error = None;
@@ -966,7 +1035,7 @@ impl PlayerState {
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Position(pos) => {
-                self.position = pos;
+                self.set_position(pos);
                 let action = self.scrobble.on_position(pos, self.duration);
                 self.fire_scrobble(action, cx);
                 // Saved as playback goes rather than only on quit: a crash or a
@@ -987,7 +1056,7 @@ impl PlayerState {
                     && self.current_song().is_some_and(|s| s.id == id)
                 {
                     self.pending_resume = None;
-                    self.position = pos;
+                    self.set_position(pos);
                     self.player.seek(pos);
                 }
                 if let Some(c) = &mut self.media_controls {
@@ -1021,7 +1090,7 @@ impl PlayerState {
                         self.queue.advance_to(pos);
                         persist_queue(&self.queue);
                     }
-                    self.position = Duration::ZERO;
+                    self.set_position(Duration::ZERO);
                     self.duration = self
                         .queue
                         .current_song()
@@ -1144,7 +1213,7 @@ pub fn init(settings: &Settings, cx: &mut gpui::App) -> Entity<PlayerState> {
             let pos = Duration::from_secs_f64(saved.position_secs.max(0.0));
             // Shown in the player bar right away, so the restored track reads
             // as paused mid-way instead of at 0:00 until playback starts.
-            state.position = pos;
+            state.set_position(pos);
             state.resume_written_secs = pos.as_secs();
             state.pending_resume = Some((saved.song_id, pos));
         }
@@ -1282,7 +1351,41 @@ fn persist_recent(list: &[Song]) {
 mod tests {
     use std::time::Duration;
 
-    use super::{ResumeState, read_resume_at, resume_for, write_resume_at};
+    use super::{ResumeState, SMOOTH_MAX, read_resume_at, resume_for, smoothed, write_resume_at};
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn a_position_is_filled_in_between_ticks() {
+        assert_eq!(smoothed(MS(4_000), MS(320), true, None), MS(4_320));
+    }
+
+    /// Paused or buffering, what the engine reported *is* the position: there
+    /// is no audio moving for a clock to stand in for.
+    #[test]
+    fn a_stopped_clock_is_not_advanced() {
+        assert_eq!(smoothed(MS(4_000), MS(320), false, None), MS(4_000));
+    }
+
+    /// A tick that never came means the engine is blocked or gone, not that
+    /// playback carried on without it.
+    #[test]
+    fn a_missing_tick_stops_the_smoothing_rather_than_drifting() {
+        assert_eq!(
+            smoothed(MS(4_000), Duration::from_secs(30), true, None),
+            MS(4_000) + SMOOTH_MAX,
+        );
+    }
+
+    /// Past the end the last line would light early, and a fraction of the
+    /// track would run over 1.
+    #[test]
+    fn the_smoothed_position_stops_at_the_track_end() {
+        assert_eq!(
+            smoothed(MS(4_900), MS(400), true, Some(MS(5_000))),
+            MS(5_000),
+        );
+    }
 
     #[test]
     fn resume_state_round_trips_through_the_file() {
