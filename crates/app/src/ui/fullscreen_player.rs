@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, ObjectFit,
-    Render, StyledImage as _, Window, div, ease_out_quint, img, linear_color_stop, linear_gradient,
-    prelude::*, px, relative, rems,
+    Render, StyledImage as _, Window, div, img, linear_color_stop, linear_gradient, prelude::*, px,
+    relative, rems,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::popover::Popover;
@@ -851,6 +851,14 @@ pub struct FullscreenPlayer {
     viz_knobs: Vec<Entity<SliderState>>,
     /// Tuning card open over the mini player.
     viz_tuning_open: bool,
+    /// The side panel currently being *drawn*, which lags `panel` by the exit:
+    /// a panel dropped from the tree the moment it is closed plays no exit at
+    /// all, and the layout would hand its room back before it had left.
+    panel_drawn: Option<SidePanel>,
+    /// Open/close travel of the side panel, driven from `panel` in `render`.
+    panel_reveal: crate::ui::Reveal,
+    /// Open/close travel of the tuning card over the mini player.
+    viz_tuning_reveal: crate::ui::Reveal,
     /// Start of the entrance, reset on every open.
     opened_at: Instant,
     /// Set when the exit starts; `Some` also means "closing", i.e. the overlay
@@ -983,6 +991,9 @@ impl FullscreenPlayer {
             visualizer,
             viz_knobs,
             viz_tuning_open: false,
+            panel_drawn: None,
+            panel_reveal: crate::ui::Reveal::new(220, 150),
+            viz_tuning_reveal: crate::ui::Reveal::new(170, 120),
             opened_at: Instant::now(),
             closing_at: None,
         }
@@ -2351,10 +2362,45 @@ impl Render for FullscreenPlayer {
         // was drawn for.
         let viewport = window.viewport_size();
         let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+
+        // --- Side panel open/close ----------------------------------------
+        // The travel is state rather than a `with_animation` wrapper, so it
+        // plays in both directions: an element dropped from the tree on close
+        // animates nothing. `panel_drawn` is what is on screen, which lags
+        // `panel` by the exit — and it is what the layout is sized from, or
+        // the cover would grow into the panel's room while the panel is still
+        // in it.
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        // Switching Queue <-> Lyrics is a swap, not a re-open: the outgoing
+        // panel leaves first and the arriving one then plays its own entrance.
+        // Replacing the contents where they stand instead cuts the outgoing
+        // panel off mid-travel, which reads as a flicker rather than a swap.
+        if matches!((self.panel, self.panel_drawn), (Some(p), Some(d)) if p != d) {
+            self.panel_reveal.set(false, reduced_motion);
+            if self.panel_reveal.openness(reduced_motion) <= 0. {
+                self.panel_drawn = self.panel;
+                self.panel_reveal.replay();
+            }
+        } else {
+            if self.panel.is_some() {
+                self.panel_drawn = self.panel;
+            }
+            self.panel_reveal.set(self.panel.is_some(), reduced_motion);
+        }
+        let panel_open = self.panel_reveal.openness(reduced_motion);
+        let drawn_panel = self
+            .panel_reveal
+            .visible(reduced_motion)
+            .then_some(self.panel_drawn)
+            .flatten();
+        if self.panel_reveal.settling(reduced_motion) {
+            window.request_animation_frame();
+        }
+
         let layout = Layout::resolve(
             vw,
             vh,
-            self.panel,
+            drawn_panel,
             show_volume && !is_radio,
             self.session.read(cx).settings.fullscreen_cover,
         );
@@ -2450,7 +2496,17 @@ impl Render for FullscreenPlayer {
         // which is otherwise buried in the cycle button that just got hidden.
         // Built before the mini player's own closures: they borrow `cx`
         // immutably for their listeners, and the card needs it mutably.
-        let tuning_card = (viz_mode.is_on() && self.viz_tuning_open)
+        // Same clock as the side panel, for the same reason: dropped from the
+        // tree on close it would pop out where it slid in.
+        self.viz_tuning_reveal
+            .set(viz_mode.is_on() && self.viz_tuning_open, reduced_motion);
+        let tuning_t = self.viz_tuning_reveal.openness(reduced_motion);
+        if self.viz_tuning_reveal.settling(reduced_motion) {
+            window.request_animation_frame();
+        }
+        let tuning_card = self
+            .viz_tuning_reveal
+            .visible(reduced_motion)
             .then(|| self.viz_tuning_card(viz_mode, cx).into_any_element());
 
         let mini_player = viz_mode.is_on().then(|| {
@@ -2507,12 +2563,17 @@ impl Render for FullscreenPlayer {
                                 div()
                                     .absolute()
                                     .map(|this| {
+                                        // Slides in from whichever edge it
+                                        // hangs off, so the motion reads as the
+                                        // card coming out of the mini player.
+                                        let slide = px(12. + 14. * (1. - tuning_t));
                                         if beside {
-                                            this.left(gpui::relative(1.)).ml(px(12.)).bottom_0()
+                                            this.left(gpui::relative(1.)).ml(slide).bottom_0()
                                         } else {
-                                            this.left_0().bottom(gpui::relative(1.)).mb(px(12.))
+                                            this.left_0().bottom(gpui::relative(1.)).mb(slide)
                                         }
                                     })
+                                    .opacity(tuning_t)
                                     .child(card),
                             )
                         })
@@ -3208,14 +3269,15 @@ impl Render for FullscreenPlayer {
                         // Optional side panel — beside the card, or under it in
                         // the stacked layout, at whatever width and height the
                         // window leaves for it.
-                        .when_some(self.panel, |this, panel| {
-                            // Key by panel type so switching Queue <-> Lyrics
-                            // replays the slide-in. Margin + fade so the motion
-                            // is visible (gpui 0.2.2 has no translate/transform).
-                            let key = format!("fs-side-panel-{:?}", panel);
+                        .when_some(drawn_panel, |this, panel| {
+                            // Margin + fade so the motion is visible (gpui
+                            // 0.2.2 has no translate/transform), off the
+                            // reveal's clock so it plays on the way out too.
                             this.child(
                                 div()
                                     .h_full()
+                                    .opacity(panel_open)
+                                    .ml(px(28. * (1. - panel_open)))
                                     .child(match panel {
                                         SidePanel::Queue => self.render_queue_panel(
                                             layout.panel,
@@ -3227,16 +3289,7 @@ impl Render for FullscreenPlayer {
                                             layout.panel_max_h,
                                             cx,
                                         ),
-                                    })
-                                    .with_animation(
-                                        ElementId::Name(key.into()),
-                                        Animation::new(crate::ui::transition(
-                                            self.session.read(cx).settings.reduced_motion,
-                                            220,
-                                        ))
-                                        .with_easing(ease_out_quint()),
-                                        |el, t| el.opacity(t).ml(px(28. * (1. - t))),
-                                    ),
+                                    }),
                             )
                         });
 

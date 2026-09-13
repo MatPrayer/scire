@@ -2,9 +2,9 @@
 //! (sidebar | content | optional queue panel / player bar).
 
 use gpui::{
-    Animation, AnimationExt as _, App, AsyncWindowContext, Context, ElementId, Entity, FocusHandle,
-    Focusable, IntoElement, KeyDownEvent, MouseButton, NavigationDirection, Render, SharedString,
-    WeakEntity, Window, div, ease_out_quint, prelude::*, px,
+    App, AsyncWindowContext, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    MouseButton, NavigationDirection, Render, SharedString, WeakEntity, Window, div, prelude::*,
+    px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -148,6 +148,15 @@ pub struct RootView {
     current_entry: Option<NavEntry>,
     in_history_restore: bool,
     show_queue: bool,
+    /// Open/close travel of the queue panel, driven from `show_queue` in
+    /// `render` so the two cannot drift apart.
+    queue_reveal: crate::ui::Reveal,
+    /// Open/close travel of the new-playlist dialog.
+    new_playlist_reveal: crate::ui::Reveal,
+    /// Open/close travel of the vi-mode help overlay.
+    vi_help_reveal: crate::ui::Reveal,
+    /// Open/close travel of the `:` command bar.
+    command_reveal: crate::ui::Reveal,
     show_fullscreen: bool,
     was_connected: bool,
     /// Library selection at last render, to rebuild views on change.
@@ -510,6 +519,12 @@ impl RootView {
             current_entry: None,
             in_history_restore: false,
             show_queue: false,
+            queue_reveal: crate::ui::Reveal::new(220, 150),
+            // A dialog is read the moment it lands, so it is given a little
+            // less time than a panel that slides in beside the content.
+            new_playlist_reveal: crate::ui::Reveal::new(170, 120),
+            vi_help_reveal: crate::ui::Reveal::new(170, 120),
+            command_reveal: crate::ui::Reveal::new(150, 110),
             show_fullscreen: false,
             was_connected: false,
             library_db,
@@ -1811,13 +1826,25 @@ impl RootView {
             .child(label)
     }
 
-    fn render_command_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// `t` is the open/close travel (see [`Reveal`](crate::ui::Reveal)), `active`
+    /// the mode flag itself: a bar on its way out is still on screen and must
+    /// not keep capturing keys that now belong to the page behind it.
+    fn render_command_bar(
+        &self,
+        t: f32,
+        active: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         div()
             .absolute()
-            .bottom_0()
+            // Slides up out of the window's bottom edge rather than appearing
+            // on it; the fade alone reads as a flicker on a 40px strip.
+            .bottom(px(-40. * (1. - t)))
             .left_0()
             .w_full()
             .h(px(40.))
+            .opacity(t)
             .bg(cx.theme().background)
             .border_t_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
@@ -1825,24 +1852,26 @@ impl RootView {
             .items_center()
             .px_3()
             .gap_2()
-            .capture_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
-                match e.keystroke.key.as_str() {
-                    "enter" => {
-                        this.execute_command(cx);
-                        window.focus(&this.focus_handle);
-                        cx.stop_propagation();
+            .when(active, |this| {
+                this.capture_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                    match e.keystroke.key.as_str() {
+                        "enter" => {
+                            this.execute_command(cx);
+                            window.focus(&this.focus_handle);
+                            cx.stop_propagation();
+                        }
+                        "escape" => {
+                            this.mode = KeyboardMode::Normal;
+                            this.cmd_input
+                                .update(cx, |s, cx| s.set_value("", window, cx));
+                            window.focus(&this.focus_handle);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                        _ => {}
                     }
-                    "escape" => {
-                        this.mode = KeyboardMode::Normal;
-                        this.cmd_input
-                            .update(cx, |s, cx| s.set_value("", window, cx));
-                        window.focus(&this.focus_handle);
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                    _ => {}
-                }
-            }))
+                }))
+            })
             .child(
                 div()
                     .text_sm()
@@ -1854,7 +1883,9 @@ impl RootView {
             .into_any_element()
     }
 
-    fn render_vi_help(&self, cx: &Context<Self>) -> gpui::AnyElement {
+    /// `t` is the open/close travel. The overlay takes no input of its own, so
+    /// unlike the other two it needs no `active` flag.
+    fn render_vi_help(&self, t: f32, cx: &Context<Self>) -> gpui::AnyElement {
         let key = |k: SharedString, desc: SharedString| {
             h_flex()
                 .gap_4()
@@ -1877,13 +1908,17 @@ impl RootView {
             .flex()
             .items_center()
             .justify_center()
+            // Padding on a centred container moves the card by half of it, so
+            // the card rises into place while the backdrop dims behind it.
+            .pt(px(28. * (1. - t)))
             .occlude()
-            .bg(gpui::hsla(0., 0., 0., 0.6))
+            .bg(gpui::hsla(0., 0., 0., 0.6 * t))
             .child(
                 v_flex()
                     // Clamped so the dialog cannot overrun a narrow window.
                     .w(px(460.))
                     .max_w_full()
+                    .opacity(t)
                     .gap_3()
                     .p_5()
                     .rounded_xl()
@@ -2167,7 +2202,15 @@ impl RootView {
             .into_any_element()
     }
 
-    fn render_new_playlist_modal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// `t` is the open/close travel, `active` whether the dialog is still open:
+    /// its buttons keep working for the length of the exit otherwise, and a
+    /// click landing on "Create" after Cancel would create the playlist anyway.
+    fn render_new_playlist_modal(
+        &self,
+        t: f32,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let field = |label: &'static str, input: &Entity<InputState>| {
             v_flex()
                 .gap_1()
@@ -2187,13 +2230,17 @@ impl RootView {
             .flex()
             .items_center()
             .justify_center()
+            // Half of it, the container being centred: the card rises into
+            // place while the backdrop dims behind it.
+            .pt(px(28. * (1. - t)))
             .occlude()
-            .bg(gpui::hsla(0., 0., 0., 0.6))
+            .bg(gpui::hsla(0., 0., 0., 0.6 * t))
             .child(
                 v_flex()
                     // Clamped so the dialog cannot overrun a narrow window.
                     .w(px(440.))
                     .max_w_full()
+                    .opacity(t)
                     .gap_4()
                     .p_5()
                     .rounded_xl()
@@ -2207,11 +2254,21 @@ impl RootView {
                         h_flex()
                             .justify_end()
                             .gap_2()
-                            .child(Button::new("np-cancel").ghost().label("Cancel").on_click(
-                                cx.listener(|this, _, _, cx| this.cancel_new_playlist(cx)),
+                            .child(Button::new("np-cancel").ghost().label("Cancel").when(
+                                active,
+                                |b| {
+                                    b.on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_new_playlist(cx)),
+                                    )
+                                },
                             ))
-                            .child(Button::new("np-create").primary().label("Create").on_click(
-                                cx.listener(|this, _, _, cx| this.submit_new_playlist(cx)),
+                            .child(Button::new("np-create").primary().label("Create").when(
+                                active,
+                                |b| {
+                                    b.on_click(
+                                        cx.listener(|this, _, _, cx| this.submit_new_playlist(cx)),
+                                    )
+                                },
                             )),
                     ),
             )
@@ -2230,6 +2287,13 @@ impl Render for RootView {
         self.apply_orientation(window, cx);
         let connected = self.session.read(cx).status == ConnectionStatus::Connected;
         let palette_open = self.search_bar.read(cx).is_palette();
+        // The backdrop belongs to the palette and has to leave with it, so it
+        // is drawn off the search bar's own open/close travel rather than off
+        // the flag, which flips the instant Escape is pressed.
+        let palette_fade = self.search_bar.read(cx).palette_reveal(cx);
+        if self.search_bar.read(cx).palette_settling(cx) {
+            window.request_animation_frame();
+        }
         let modal_open = self.new_playlist_open
             || self.show_fullscreen
             || palette_open
@@ -2331,6 +2395,40 @@ impl Render for RootView {
         let minimal_titlebar = self.session.read(cx).settings.minimal_titlebar;
         let reduced_motion = self.session.read(cx).settings.reduced_motion;
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
+
+        // Queue panel: the travel is state, not a `with_animation` wrapper, so
+        // it plays in both directions — an element dropped from the tree on
+        // close animates nothing. gpui redraws on demand, so a travel in
+        // flight has to ask for its own next frame.
+        self.queue_reveal.set(self.show_queue, reduced_motion);
+        let queue_open = self.queue_reveal.openness(reduced_motion);
+        let queue_visible = self.queue_reveal.visible(reduced_motion);
+        if self.queue_reveal.settling(reduced_motion) {
+            window.request_animation_frame();
+        }
+
+        // The modals ride the same clock, for the same reason: dropped from
+        // the tree the moment their flag flips they would have no exit at all.
+        // `visible` keeps them up for the length of it, and the flag itself is
+        // passed alongside as `active` — one on its way out must not still take
+        // a click or swallow a keystroke.
+        self.new_playlist_reveal
+            .set(self.new_playlist_open, reduced_motion);
+        self.vi_help_reveal.set(self.show_vi_help, reduced_motion);
+        self.command_reveal
+            .set(self.mode == KeyboardMode::Command, reduced_motion);
+        let new_playlist_t = self.new_playlist_reveal.openness(reduced_motion);
+        let new_playlist_visible = self.new_playlist_reveal.visible(reduced_motion);
+        let vi_help_t = self.vi_help_reveal.openness(reduced_motion);
+        let vi_help_visible = self.vi_help_reveal.visible(reduced_motion);
+        let command_t = self.command_reveal.openness(reduced_motion);
+        let command_visible = self.command_reveal.visible(reduced_motion);
+        if self.new_playlist_reveal.settling(reduced_motion)
+            || self.vi_help_reveal.settling(reduced_motion)
+            || self.command_reveal.settling(reduced_motion)
+        {
+            window.request_animation_frame();
+        }
 
         v_flex()
             .size_full()
@@ -2529,7 +2627,7 @@ impl Render for RootView {
                                 )
                             }),
                     )
-                    .when(self.show_queue, |this| {
+                    .when(queue_visible, |this| {
                         // `h_full()` on the wrapper, not only on the panel:
                         // the row is an `h_flex`, which centres its children
                         // rather than stretching them, so without a definite
@@ -2539,13 +2637,9 @@ impl Render for RootView {
                             div()
                                 .h_full()
                                 .flex()
-                                .child(self.queue_panel.clone())
-                                .with_animation(
-                                    ElementId::Name("queue-slide-in".into()),
-                                    Animation::new(crate::ui::transition(reduced_motion, 220))
-                                        .with_easing(ease_out_quint()),
-                                    |this, t| this.opacity(t).ml(px(20. * (1. - t))),
-                                ),
+                                .opacity(queue_open)
+                                .ml(px(20. * (1. - queue_open)))
+                                .child(self.queue_panel.clone()),
                         )
                     }),
             )
@@ -2553,21 +2647,30 @@ impl Render for RootView {
             // Fullscreen overlay — rendered last so it sits on top.
             .when(show_fullscreen, |this| this.child(fullscreen))
             // New-playlist dialog on top of everything.
-            .when(self.new_playlist_open, |this| {
-                this.child(self.render_new_playlist_modal(cx))
+            .when(new_playlist_visible, |this| {
+                this.child(self.render_new_playlist_modal(
+                    new_playlist_t,
+                    self.new_playlist_open,
+                    cx,
+                ))
             })
             // Command-mode input bar at bottom.
-            .when(self.mode == KeyboardMode::Command, |this| {
-                this.child(self.render_command_bar(window, cx))
+            .when(command_visible, |this| {
+                this.child(self.render_command_bar(
+                    command_t,
+                    self.mode == KeyboardMode::Command,
+                    window,
+                    cx,
+                ))
             })
             // Vi-mode help overlay.
-            .when(self.show_vi_help, |this| {
-                this.child(self.render_vi_help(cx))
+            .when(vi_help_visible, |this| {
+                this.child(self.render_vi_help(vi_help_t, cx))
             })
             // Centered command palette (Ctrl/Cmd+K): dimmed full-window backdrop
             // with the search box near the top. Backdrop click dismisses; the
             // box itself occludes so inner clicks don't fall through.
-            .when(palette_open, |this| {
+            .when_some(palette_fade, |this, fade| {
                 this.child(
                     div()
                         .absolute()
@@ -2577,14 +2680,21 @@ impl Render for RootView {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .bg(gpui::hsla(0., 0., 0., 0.55))
+                        .bg(gpui::hsla(0., 0., 0., 0.55 * fade))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, window, cx| {
                                 this.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
                             }),
                         )
-                        .child(div().mt(px(96.)).child(self.search_bar.clone())),
+                        // Drops into place rather than only fading: the box is
+                        // the one thing on screen at that moment, and every
+                        // other panel in the app moves as it arrives.
+                        .child(
+                            div()
+                                .mt(px(96. - 14. * (1. - fade)))
+                                .child(self.search_bar.clone()),
+                        ),
                 )
             })
             .into_any_element()

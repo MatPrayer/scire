@@ -19,7 +19,7 @@ pub mod visualizer;
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use directories::ProjectDirs;
 use gpui::{
@@ -1223,6 +1223,126 @@ pub fn transition(reduced_motion: bool, ms: u64) -> Duration {
     Duration::from_millis(if reduced_motion { 1 } else { ms })
 }
 
+/// Eased openness of a [`Reveal`]: `from` toward its target, `elapsed` into a
+/// travel of `span`.
+///
+/// The easing is applied to the *travel*, not to the openness, which is what
+/// makes the exit the mirror of the entrance rather than a stall followed by a
+/// collapse: `ease_out_quint` spends 90% of its curve in the first 40% of its
+/// input, so reading it at a falling openness leaves a panel sitting still for
+/// half its exit and then vanishing.
+fn reveal_openness(from: f32, open: bool, elapsed: Duration, span: Duration) -> f32 {
+    let target = if open { 1. } else { 0. };
+    let t = (elapsed.as_secs_f32() / span.as_secs_f32()).clamp(0., 1.);
+    from + (target - from) * ease_out_quint()(t)
+}
+
+/// Open/close clock for an element that is only mounted while it is open.
+///
+/// `with_animation` runs only while its element is in the tree, so anything
+/// dropped from the tree on close plays no exit at all — which is why the
+/// panels in this app used to slide in and then simply blink out. A `Reveal`
+/// keeps the transition's state *outside* the element: the view asks it
+/// whether to draw at all ([`visible`](Reveal::visible)), how far along the
+/// travel is ([`openness`](Reveal::openness)) and whether another frame is
+/// owed ([`settling`](Reveal::settling)), then applies the styles itself.
+///
+/// Driving it from state is also what keeps nested animations alive. gpui keys
+/// an animation's start instant on the whole ancestor element-id path, so a
+/// `with_animation` wrapper swapped between an enter id and an exit id restarts
+/// every animated element underneath it.
+///
+/// Toggle it from `render` against whatever bool already owns the panel
+/// (`set` is a no-op unless that is a change) so the two cannot drift apart.
+#[derive(Debug, Clone, Copy)]
+pub struct Reveal {
+    /// Where the travel is headed.
+    open: bool,
+    /// Openness when the direction last changed — 0 closed, 1 fully open.
+    from: f32,
+    /// When it changed.
+    since: Instant,
+    enter_ms: u64,
+    exit_ms: u64,
+}
+
+impl Reveal {
+    /// A closed reveal. Exits are usually given less time than entrances: an
+    /// element arriving is being read, one leaving is already out of the way.
+    pub fn new(enter_ms: u64, exit_ms: u64) -> Self {
+        Self {
+            open: false,
+            from: 0.,
+            since: Instant::now(),
+            enter_ms,
+            exit_ms,
+        }
+    }
+
+    /// Point the reveal at `open`. A no-op unless that is a change, so it can
+    /// be called unconditionally from `render`.
+    ///
+    /// A reversal starts from where the travel had got to rather than from the
+    /// end it never reached, so a panel toggled twice in quick succession
+    /// turns around instead of jumping open and then closing.
+    pub fn set(&mut self, open: bool, reduced_motion: bool) {
+        if self.open == open {
+            return;
+        }
+        self.from = self.openness(reduced_motion);
+        self.open = open;
+        self.since = Instant::now();
+    }
+
+    /// Replay the entrance from nothing.
+    ///
+    /// For a panel whose *contents* are swapped while it is open: the new
+    /// contents should read as arriving, not as the old ones being overwritten
+    /// where they stand.
+    pub fn replay(&mut self) {
+        self.open = true;
+        self.from = 0.;
+        self.since = Instant::now();
+    }
+
+    /// 0 closed … 1 fully open, eased — the opacity, and the fraction of any
+    /// offset the transition slides through.
+    pub fn openness(&self, reduced_motion: bool) -> f32 {
+        reveal_openness(
+            self.from,
+            self.open,
+            self.since.elapsed(),
+            self.span(reduced_motion),
+        )
+    }
+
+    /// Whether the element belongs in the tree at all: open, or still leaving.
+    pub fn visible(&self, reduced_motion: bool) -> bool {
+        self.open || self.openness(reduced_motion) > 0.
+    }
+
+    /// Whether the travel still needs frames. gpui only redraws on demand, so
+    /// a view driving a `Reveal` must ask for the next frame while this holds.
+    pub fn settling(&self, reduced_motion: bool) -> bool {
+        self.since.elapsed() < self.span(reduced_motion)
+    }
+
+    /// The travel's duration, scaled by how far it actually has to go: a
+    /// reversal covering a third of the distance should not take as long as
+    /// the full trip, which reads as the panel crawling.
+    fn span(&self, reduced_motion: bool) -> Duration {
+        let ms = if self.open {
+            self.enter_ms
+        } else {
+            self.exit_ms
+        };
+        let target = if self.open { 1. } else { 0. };
+        // Never zero: `reveal_openness` divides by it.
+        let scaled = (ms as f32 * (target - self.from).abs()).round().max(1.);
+        transition(reduced_motion, scaled as u64)
+    }
+}
+
 /// Outer glow used by the vi-mode focus cursor.
 ///
 /// Private on purpose: [`with_focus_cursor`] is the only way in, so the glow
@@ -1388,6 +1508,89 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reveal_travels_between_its_two_ends_and_stops_there() {
+        use super::reveal_openness;
+        use std::time::Duration;
+        let span = Duration::from_millis(200);
+        // Both ends are exact: a panel left a shade short of 1 is one that
+        // never quite arrives, and one left a shade above 0 keeps its element
+        // in the tree forever.
+        assert_eq!(reveal_openness(0., true, Duration::ZERO, span), 0.);
+        assert_eq!(reveal_openness(0., true, span, span), 1.);
+        assert_eq!(reveal_openness(1., false, Duration::ZERO, span), 1.);
+        assert_eq!(reveal_openness(1., false, span, span), 0.);
+        // Past the end it stays put rather than overshooting.
+        assert_eq!(reveal_openness(1., false, span * 3, span), 0.);
+    }
+
+    #[test]
+    fn a_reveals_exit_mirrors_its_entrance() {
+        use super::reveal_openness;
+        use std::time::Duration;
+        let span = Duration::from_millis(200);
+        // Easing the travel rather than the openness is what makes the two
+        // directions the same movement: the exit at `t` is the entrance at
+        // `1 - t`. Read at a falling openness instead, the exit would barely
+        // move for half its duration and then drop.
+        for step in 0..=10 {
+            let at = span.mul_f32(step as f32 / 10.);
+            let entering = reveal_openness(0., true, at, span);
+            let leaving = reveal_openness(1., false, at, span);
+            assert!((entering + leaving - 1.).abs() < 1e-5, "at {step}");
+        }
+        // And it is front-loaded: over a third of the way in the first tenth.
+        assert!(reveal_openness(0., true, span.mul_f32(0.1), span) > 0.33);
+    }
+
+    #[test]
+    fn a_reversal_starts_from_where_the_travel_had_got_to() {
+        use super::reveal_openness;
+        use std::time::Duration;
+        let span = Duration::from_millis(200);
+        // Half-open and sent back: it leaves from 0.5, not from 1.
+        assert_eq!(reveal_openness(0.5, false, Duration::ZERO, span), 0.5);
+        assert_eq!(reveal_openness(0.5, false, span, span), 0.);
+        assert_eq!(reveal_openness(0.5, true, span, span), 1.);
+        assert!(reveal_openness(0.5, true, span.mul_f32(0.5), span) > 0.5);
+    }
+
+    #[test]
+    fn a_reveal_is_visible_while_it_is_still_leaving() {
+        use super::Reveal;
+        let mut r = Reveal::new(200, 120);
+        assert!(!r.visible(false));
+        r.set(true, false);
+        assert!(r.visible(false));
+        r.set(false, false);
+        // Closed as far as the flag driving it is concerned, but still drawn —
+        // that is the whole point of the type.
+        assert!(r.visible(false));
+        assert!(r.settling(false));
+        // Reduced motion collapses the travel to a single frame, so the very
+        // next read is already done with it.
+        let mut quick = Reveal::new(200, 120);
+        quick.set(true, true);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(quick.openness(true), 1.);
+        assert!(!quick.settling(true));
+    }
+
+    #[test]
+    fn a_replay_starts_the_entrance_over_from_nothing() {
+        use super::Reveal;
+        let mut r = Reveal::new(200, 120);
+        r.set(true, false);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let grown = r.openness(false);
+        assert!(grown > 0.);
+        // A panel whose contents were swapped arrives, rather than being
+        // overwritten where it stands: the travel goes back to the start.
+        r.replay();
+        assert!(r.openness(false) < grown);
+        assert!(r.settling(false));
+    }
+
     #[test]
     fn the_volume_taper_round_trips_and_keeps_its_ends() {
         use super::{volume_amplitude, volume_position};

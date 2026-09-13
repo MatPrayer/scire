@@ -13,9 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, Focusable as _,
-    IntoElement, KeyDownEvent, Render, ScrollHandle, Stateful, Window, div, ease_out_quint, img,
-    prelude::*, px,
+    Context, ElementId, Entity, EventEmitter, Focusable as _, IntoElement, KeyDownEvent, Render,
+    ScrollHandle, Stateful, Window, div, img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -397,6 +396,10 @@ pub struct SearchBar {
     open: bool,
     /// Centered command-palette mode (Ctrl/Cmd+K) vs. the inline top-right bar.
     palette: bool,
+    /// Open/close travel of the palette. Set from `open_palette`/`dismiss`
+    /// rather than from `render`, because root draws the backdrop and reads
+    /// this in *its* render, which runs before ours.
+    reveal: crate::ui::Reveal,
     /// Highlighted row for arrow-key navigation (palette mode).
     selected: usize,
     /// Scroll handle for the palette results, so arrow keys can scroll the
@@ -441,6 +444,7 @@ impl SearchBar {
             results: Hits::default(),
             open: false,
             palette: false,
+            reveal: crate::ui::Reveal::new(150, 110),
             selected: 0,
             results_scroll: ScrollHandle::new(),
             pending: false,
@@ -475,11 +479,35 @@ impl SearchBar {
         self.palette
     }
 
+    /// How far the palette's open/close travel has got, or `None` once it is
+    /// gone. Root draws the backdrop behind the box, so it has to be told the
+    /// palette is still leaving rather than reading [`is_palette`] and
+    /// pulling the backdrop out from under the exit.
+    ///
+    /// [`is_palette`]: Self::is_palette
+    pub fn palette_reveal(&self, cx: &gpui::App) -> Option<f32> {
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        self.reveal
+            .visible(reduced_motion)
+            .then(|| self.reveal.openness(reduced_motion))
+    }
+
+    /// Whether that travel still needs frames.
+    pub fn palette_settling(&self, cx: &gpui::App) -> bool {
+        self.reveal
+            .settling(self.session.read(cx).settings.reduced_motion)
+    }
+
     /// Open the centered command palette (Ctrl/Cmd+K) with a fresh query.
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = true;
+        self.reveal
+            .set(true, self.session.read(cx).settings.reduced_motion);
         self.selected = 0;
         self.results = Hits::default();
+        self.pending = false;
+        self.searching = false;
+        self.error = None;
         self.open = false;
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
@@ -487,17 +515,19 @@ impl SearchBar {
         cx.notify();
     }
 
-    /// Close the dropdown/palette and clear the query (root's Escape handler).
-    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Close the dropdown/palette (root's Escape handler).
+    ///
+    /// The query and its results are deliberately *not* cleared here: the box
+    /// is still on screen for the length of its exit, and a palette that
+    /// empties itself back to "Type to search…" on the way out reads as the
+    /// search being lost rather than as the palette closing. `open_palette`
+    /// resets all of it, so the next one still opens fresh.
+    pub fn dismiss(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
         self.palette = false;
+        self.reveal
+            .set(false, self.session.read(cx).settings.reduced_motion);
         self.selected = 0;
-        self.input
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.results = Hits::default();
-        self.pending = false;
-        self.searching = false;
-        self.error = None;
         cx.notify();
     }
 
@@ -1001,7 +1031,7 @@ impl SearchBar {
     /// Centered command-palette box: large input on top, scrollable results
     /// below. Arrow/Enter/Escape are handled in the capture phase so they
     /// drive selection instead of reaching the input or the root shortcuts.
-    fn render_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_palette(&self, fade: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
         let has_query = !self.input.read(cx).value().trim().is_empty();
         let rows = self.result_rows(cx);
         // The cache answers first, so a spinner belongs to the server pass
@@ -1082,24 +1112,22 @@ impl SearchBar {
                         .child("Type to search artists, albums and songs…"),
                 )
             })
-            .with_animation(
-                ElementId::Name("search-palette-anim".into()),
-                Animation::new(crate::ui::transition(
-                    self.session.read(cx).settings.reduced_motion,
-                    150,
-                ))
-                .with_easing(ease_out_quint()),
-                |this, t| this.opacity(t),
-            )
+            // Fade off the reveal's clock rather than a `with_animation`
+            // wrapper, so it plays on the way out too — an element dropped
+            // from the tree the moment it closes animates nothing.
+            .opacity(fade)
             .into_any_element()
     }
 }
 
 impl Render for SearchBar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.palette {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(fade) = self.palette_reveal(cx) {
+            if self.palette_settling(cx) {
+                window.request_animation_frame();
+            }
             // The centered box only; root supplies the full-window backdrop.
-            return self.render_palette(cx);
+            return self.render_palette(fade, cx);
         }
         // ponytail: inline search bar removed. Only palette mode (Ctrl+K) remains.
         div().into_any_element()
