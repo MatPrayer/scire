@@ -202,13 +202,21 @@ impl Render for LocalAlbumDetailView {
         // it — same decision, same fallback, as the server album page.
         let measured = f32::from(self.scroll.bounds().size.width) + self.panel_w;
         let content_w = self.live_width.resolve(measured, window);
-        let viewport = window.viewport_size();
-        let panel = self
+        let wants_panel = self
             .session
             .read(cx)
             .settings
             .album_layout
-            .wants_side_panel()
+            .wants_side_panel();
+        // First frame has no measurement, so the panel cannot be sized and the
+        // page would paint stacked until something else repaints it — see
+        // `AlbumDetailView::render`. Ask for the measured frame, hide this one.
+        let unmeasured = wants_panel && content_w <= 0.;
+        if unmeasured {
+            window.request_animation_frame();
+        }
+        let viewport = window.viewport_size();
+        let panel = wants_panel
             .then(|| {
                 crate::ui::album_side_panel(
                     content_w,
@@ -463,6 +471,10 @@ impl Render for LocalAlbumDetailView {
             .child(header);
         let track_list = v_flex().gap_0p5().children(rows);
 
+        // Opacity, not `hidden()`: the latter is `display: none`, which skips
+        // the layout pass the hidden frame exists to produce. Applied to each
+        // branch's own root rather than to a wrapper, since a wrapper would
+        // change the layout in every frame to spare one.
         match panel {
             // Track list on one side, cover and details in their own scrolling
             // column on the other; `Settings::album_panel_right` picks which.
@@ -487,7 +499,10 @@ impl Render for LocalAlbumDetailView {
                     .p_4()
                     .gap_4()
                     .child(header_card);
-                let row = h_flex().size_full().items_start();
+                let row = h_flex()
+                    .size_full()
+                    .items_start()
+                    .when(unmeasured, |this| this.opacity(0.));
                 match panel_right {
                     true => row.child(tracks).child(side),
                     false => row.child(side).child(tracks),
@@ -501,6 +516,7 @@ impl Render for LocalAlbumDetailView {
                 .track_scroll(&self.scroll)
                 .p_4()
                 .gap_4()
+                .when(unmeasured, |this| this.opacity(0.))
                 .child(header_card)
                 .child(track_list)
                 .into_any_element(),

@@ -838,16 +838,32 @@ impl Render for AlbumDetailView {
             cx,
         );
         let content_w = self.content_width(window);
-        // The side panel, when the setting asks for it *and* the window can
-        // hold it; everything else falls back to the stacked page. Recorded on
-        // the view because next frame's content width is measured through it.
-        let viewport = window.viewport_size();
-        let panel = self
+        let wants_panel = self
             .session
             .read(cx)
             .settings
             .album_layout
-            .wants_side_panel()
+            .wants_side_panel();
+        // Nothing has been measured on the view's first frame, so `content_w`
+        // is 0 and `album_side_panel` can only answer "stacked" — and the
+        // measurement landing dirties nothing, so that answer stays up until
+        // something else repaints the page. In practice that is `load`
+        // returning: the stacked layout flashes for a whole network round trip
+        // before the panel appears. Ask for the frame that carries the
+        // measurement and paint this one invisible — laid out (that is what it
+        // is for) but never seen. Same trade the settings page makes, and
+        // `request_animation_frame` for the same reason: `Window::refresh` is a
+        // no-op while the window is drawing, which is exactly when a view
+        // renders.
+        let unmeasured = wants_panel && content_w <= 0.;
+        if unmeasured {
+            window.request_animation_frame();
+        }
+        // The side panel, when the setting asks for it *and* the window can
+        // hold it; everything else falls back to the stacked page. Recorded on
+        // the view because next frame's content width is measured through it.
+        let viewport = window.viewport_size();
+        let panel = wants_panel
             .then(|| {
                 crate::ui::album_side_panel(
                     content_w,
@@ -1484,6 +1500,9 @@ impl Render for AlbumDetailView {
         div()
             .relative()
             .size_full()
+            // Opacity, not `hidden()`: the latter is `display: none`, which
+            // skips the very layout pass this frame exists to produce.
+            .when(unmeasured, |this| this.opacity(0.))
             .child(scroll)
             // Full-resolution cover lightbox; click anywhere to dismiss.
             .when(self.show_full_art, |this| {
