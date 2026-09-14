@@ -284,6 +284,11 @@ struct Layout {
     card: f32,
     /// Side panel width; 0 when no panel is open.
     panel: f32,
+    /// The panel shares a row with the card rather than sitting under it.
+    /// Always true in the side-by-side layout, and true in the stacked one
+    /// wherever the window is wide enough to hold the card and the panel beside
+    /// each other — see `panel_beside` in `resolve`.
+    panel_beside: bool,
     panel_max_h: f32,
     /// The opt-in volume column fits. It is the first thing dropped, being the
     /// one control the player bar already carries.
@@ -331,16 +336,57 @@ impl Layout {
         let panel_row_fits = side_panel > 0. && width - 2. * EDGE - GAP - side_panel >= CARD_MIN;
 
         if height > width || (!row_fits && !panel_row_fits) {
-            // Stacked: one column, so the panel goes under the card at the same
-            // width and the vertical volume slider has nowhere sensible to sit.
+            // Stacked: one column, so the vertical volume slider has nowhere
+            // sensible to sit.
             let content = (width - 2. * EDGE).max(0.);
-            let gaps = GAP * if panel_open { 2. } else { 1. };
+            // The panel does not have to go under the card, though. A portrait
+            // window wide enough to hold the two beside each other — a 4:3 or a
+            // 16:10 turned on its side, where the width is most of the height —
+            // was drawing both at the card's width, which is a share of the
+            // cover: a gutter down each side of the window, and the panel's
+            // height taken out of the cover above it for no reason. Where the
+            // width is there, the panel sits beside the card under the cover
+            // instead, at its own width and at whatever height the cover leaves.
+            let panel_beside = panel_open && content >= CARD_MIN + GAP + side_panel;
+            let gaps = GAP * if panel_open && !panel_beside { 2. } else { 1. };
             // The column for one form of the card. Called twice: the cover gets
             // the room the card gives up, so which form fits best is only
             // knowable by laying both out.
             let column = |density: CardDensity| {
                 let pad_top = density.stack_top();
                 let pad_bottom = density.edge_y();
+                if panel_beside {
+                    // Card and panel share a row, so the card's width comes from
+                    // what the panel leaves rather than from the cover, and its
+                    // height is known before anything else is placed.
+                    let card = (content - GAP - side_panel).clamp(CARD_MIN.min(content), CARD_MAX);
+                    let card_h = density.card_height(card);
+                    let left = (height - card_h - pad_bottom - pad_top - GAP).max(0.);
+                    let art = if left < ART_MIN {
+                        0.
+                    } else {
+                        left.min(content)
+                            .clamp(ART_MIN, stacked_art_cap(content, cover))
+                    };
+                    // Whatever height the cover does not want goes to the panel:
+                    // it is the one piece of the row that can use it, and a row
+                    // no taller than the card leaves the bottom of a tall window
+                    // empty. Floored like the stacked panel, since the wrapper
+                    // scrolls and a panel squeezed to nothing is no use.
+                    let panel_max_h = (card_h + (left - art).max(0.)).clamp(140., 620.);
+                    return Self {
+                        stacked: true,
+                        density,
+                        art,
+                        card,
+                        panel: side_panel,
+                        panel_beside: true,
+                        panel_max_h,
+                        volume: false,
+                        pad_top,
+                        pad_bottom,
+                    };
+                }
                 // Place the cover and the card given a card height. The card's
                 // own height depends on its width, and its width comes from the
                 // height left over, so this runs twice: once for a card that
@@ -396,6 +442,7 @@ impl Layout {
                     art,
                     card,
                     panel: if panel_open { card } else { 0. },
+                    panel_beside: false,
                     panel_max_h,
                     volume: false,
                     pad_top,
@@ -433,6 +480,7 @@ impl Layout {
                     art: 0.,
                     card: free.min(CARD_MAX),
                     panel: side_panel,
+                    panel_beside: true,
                     panel_max_h,
                     volume: false,
                     pad_top: pad,
@@ -457,6 +505,7 @@ impl Layout {
                 art,
                 card,
                 panel: side_panel,
+                panel_beside: true,
                 panel_max_h,
                 volume,
                 pad_top: pad,
@@ -2949,399 +2998,396 @@ impl Render for FullscreenPlayer {
                                             )
                                     }),
                             )
-                        })
-                        // Info + controls column — right of the cover. Same
-                        // card treatment as the mini player and the same
-                        // internal order (info, seek, transport, then a ruled
-                        // row of toggles), so the three players read as one
-                        // design at three sizes rather than three designs.
+                        });
+
+                    // Info + controls column — right of the cover, or under it.
+                    // Same
+                    // card treatment as the mini player and the same
+                    // internal order (info, seek, transport, then a ruled
+                    // row of toggles), so the three players read as one
+                    // design at three sizes rather than three designs.
+                    let card_el = v_flex()
+                        .flex_none()
+                        .w(px(layout.card))
+                        .justify_center()
+                        // Tighter in a short window: the card is the one
+                        // piece with a floor of its own, so its padding
+                        // and row gaps are part of what has to give.
+                        .gap(px(layout.density.card_gap()))
+                        .p(px(layout.density.card_pad()))
+                        .rounded_2xl()
+                        .bg(cx.theme().background.opacity(0.55))
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.5))
+                        .shadow_xl()
+                        // Track info.
                         .child(
                             v_flex()
-                                .flex_none()
-                                .w(px(layout.card))
-                                .justify_center()
-                                // Tighter in a short window: the card is the one
-                                // piece with a floor of its own, so its padding
-                                // and row gaps are part of what has to give.
-                                .gap(px(layout.density.card_gap()))
-                                .p(px(layout.density.card_pad()))
-                                .rounded_2xl()
-                                .bg(cx.theme().background.opacity(0.55))
-                                .border_1()
-                                .border_color(cx.theme().border.opacity(0.5))
-                                .shadow_xl()
-                                // Track info.
+                                // Bounded by the card, not by a wider
+                                // guess: a max wider than the card
+                                // lets `truncate` clip at the border
+                                // with no ellipsis, which reads as a
+                                // rendering fault rather than a long
+                                // title (radio titles are long).
+                                .w_full()
+                                .gap_1()
+                                // Scrolls when it does not fit the
+                                // card, rather than being cut off.
+                                .child(crate::ui::scrolling_line(
+                                    "fs-title-text",
+                                    title
+                                        .clone()
+                                        .unwrap_or_else(|| "Nothing playing".into())
+                                        .into(),
+                                    px(layout.card - CARD_TEXT_PAD),
+                                    window.rem_size() * 1.875,
+                                    gpui::FontWeight::SEMIBOLD,
+                                    (!has_track).then(|| cx.theme().muted_foreground),
+                                    window,
+                                ))
                                 .child(
-                                    v_flex()
-                                        // Bounded by the card, not by a wider
-                                        // guess: a max wider than the card
-                                        // lets `truncate` clip at the border
-                                        // with no ellipsis, which reads as a
-                                        // rendering fault rather than a long
-                                        // title (radio titles are long).
-                                        .w_full()
-                                        .gap_1()
-                                        // Scrolls when it does not fit the
-                                        // card, rather than being cut off.
-                                        .child(crate::ui::scrolling_line(
-                                            "fs-title-text",
-                                            title
-                                                .clone()
-                                                .unwrap_or_else(|| "Nothing playing".into())
-                                                .into(),
-                                            px(layout.card - CARD_TEXT_PAD),
-                                            window.rem_size() * 1.875,
-                                            gpui::FontWeight::SEMIBOLD,
-                                            (!has_track).then(|| cx.theme().muted_foreground),
-                                            window,
-                                        ))
-                                        .child(
+                                    div()
+                                        .text_lg()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .truncate()
+                                        .child(artist.unwrap_or_default()),
+                                )
+                                // Album line and the stream-info line
+                                // below are what a short window sheds
+                                // first: the title and artist name the
+                                // track, and the player bar still
+                                // carries both lines in full.
+                                .when_some(
+                                    album.filter(|_| layout.density.secondary_lines()),
+                                    |this, alb| {
+                                        this.child(
                                             div()
-                                                .text_lg()
+                                                .text_sm()
                                                 .text_color(cx.theme().muted_foreground)
                                                 .truncate()
-                                                .child(artist.unwrap_or_default()),
+                                                .child(alb),
                                         )
-                                        // Album line and the stream-info line
-                                        // below are what a short window sheds
-                                        // first: the title and artist name the
-                                        // track, and the player bar still
-                                        // carries both lines in full.
-                                        .when_some(
-                                            album.filter(|_| layout.density.secondary_lines()),
-                                            |this, alb| {
-                                                this.child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .truncate()
-                                                        .child(alb),
-                                                )
+                                    },
+                                ),
+                        )
+                        // Seek bar.
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .max_w(px(640.))
+                                .gap_3()
+                                .items_center()
+                                .when(is_radio, |this| {
+                                    this.justify_center().child(crate::ui::live_badge(
+                                        "fs-live",
+                                        cx.theme().primary,
+                                        Some(position),
+                                        cx,
+                                    ))
+                                })
+                                .when(!is_radio, |this| {
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(time_now),
+                                    )
+                                    .map(|this| {
+                                        let bar = match (waveform_enabled, self.waveform.clone()) {
+                                            (true, Some(peaks)) => crate::ui::waveform_seek_bar(
+                                                &peaks,
+                                                seek_fraction,
+                                                34.,
+                                                cx.theme().primary,
+                                                cx.theme().muted_foreground.opacity(0.35),
+                                                self.player.clone(),
+                                            ),
+                                            _ => div()
+                                                .flex_1()
+                                                .child(Slider::new(&self.seek))
+                                                .into_any_element(),
+                                        };
+                                        let view = cx.entity();
+                                        this.child(crate::ui::seek_hover_wrap(
+                                            "fs-seek-hover",
+                                            self.seek_hover,
+                                            duration,
+                                            bar,
+                                            move |fraction, cx| {
+                                                view.update(cx, |p: &mut Self, cx| {
+                                                    if p.seek_hover != fraction {
+                                                        p.seek_hover = fraction;
+                                                        cx.notify();
+                                                    }
+                                                });
                                             },
-                                        ),
-                                )
-                                // Seek bar.
-                                .child(
+                                            cx,
+                                        ))
+                                    })
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(time_total),
+                                    )
+                                }),
+                        )
+                        // Stream info + ReplayGain: quiet, centered line.
+                        // Wraps rather than running out of the card: the
+                        // codec line is long and the card is only as wide
+                        // as the window allows.
+                        .when(
+                            layout.density.secondary_lines()
+                                && (stream_info.is_some() || replay_gain.is_some()),
+                            |this| {
+                                this.child(
                                     h_flex()
                                         .w_full()
-                                        .max_w(px(640.))
+                                        .flex_wrap()
                                         .gap_3()
                                         .items_center()
-                                        .when(is_radio, |this| {
-                                            this.justify_center().child(crate::ui::live_badge(
-                                                "fs-live",
-                                                cx.theme().primary,
-                                                Some(position),
-                                                cx,
-                                            ))
+                                        .justify_center()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                        .when_some(stream_info, |this, info| {
+                                            this.child(div().child(info))
                                         })
-                                        .when(!is_radio, |this| {
+                                        .when_some(replay_gain, |this, (label, db)| {
+                                            let text = match db {
+                                                Some(db) => {
+                                                    format!("RG {db:+.1} dB · {label}")
+                                                }
+                                                None => format!("RG · {label}"),
+                                            };
+                                            this.child(div().child(text))
+                                        }),
+                                )
+                            },
+                        )
+                        // Transport controls. Wrapping is the last
+                        // resort in a window narrower than the row: a
+                        // second line of buttons beats a repeat button
+                        // clipped off the card's edge.
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .flex_wrap()
+                                .gap_4()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    icon_btn("fs-shuffle", icons::SHUFFLE, shuffle && !is_radio)
+                                        .disabled(is_radio)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.player.update(cx, |p, cx| p.toggle_shuffle(cx));
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    icon_btn("fs-prev", icons::SKIP_BACK, false)
+                                        .disabled(!has_track || is_radio)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.player.update(cx, |p, cx| p.previous(cx));
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("fs-play")
+                                        .primary()
+                                        .large()
+                                        .icon(if playing {
+                                            app_icon(icons::PAUSE)
+                                        } else {
+                                            app_icon(icons::PLAY)
+                                        })
+                                        .loading(buffering)
+                                        .disabled(!has_track)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.player.update(cx, |p, cx| p.toggle_play(cx));
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    icon_btn("fs-next", icons::SKIP_FORWARD, false)
+                                        .disabled(!has_track || is_radio)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.player.update(cx, |p, cx| p.next(cx));
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    icon_btn(
+                                        "fs-repeat",
+                                        if repeat == RepeatMode::One {
+                                            icons::REPEAT_1
+                                        } else {
+                                            icons::REPEAT
+                                        },
+                                        repeat != RepeatMode::Off && !is_radio,
+                                    )
+                                    .disabled(is_radio)
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.player.update(cx, |p, cx| p.cycle_repeat(cx));
+                                            cx.stop_propagation();
+                                        },
+                                    )),
+                                ),
+                        )
+                        // Queue / visualizer / lyrics toggles, ruled
+                        // off below the transport exactly as the mini
+                        // player rules off its scene picker.
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .flex_wrap()
+                                .gap_3()
+                                .items_center()
+                                .justify_center()
+                                .pt_4()
+                                .border_t_1()
+                                .border_color(cx.theme().border.opacity(0.4))
+                                .child(
+                                    Button::new("fs-queue-btn")
+                                        .ghost()
+                                        .large()
+                                        .icon(Icon::new(IconName::PanelRight))
+                                        .when(toggle_labels, |b| b.label("Queue"))
+                                        .when(self.panel == Some(SidePanel::Queue), |b| b.primary())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_panel(SidePanel::Queue, cx);
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("fs-viz-btn")
+                                        .ghost()
+                                        .large()
+                                        .icon(Icon::new(IconName::Frame))
+                                        .when(toggle_labels, |b| b.label(viz_mode.label()))
+                                        .when(viz_mode.is_on(), |b| b.primary())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cycle_visualizer(cx);
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("fs-lyrics-btn")
+                                        .ghost()
+                                        .large()
+                                        .icon(Icon::new(IconName::BookOpen))
+                                        .when(toggle_labels, |b| b.label("Lyrics"))
+                                        .when(self.panel == Some(SidePanel::Lyrics), |b| {
+                                            b.primary()
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_panel(SidePanel::Lyrics, cx);
+                                            cx.stop_propagation();
+                                        })),
+                                ),
+                        );
+
+                    // Optional side panel — beside the card, or under it in
+                    // the stacked layout, at whatever width and height the
+                    // window leaves for it.
+                    //
+                    // Margin + fade so the motion is visible (gpui 0.2.2 has no
+                    // translate/transform), off the reveal's clock so it plays
+                    // on the way out too.
+                    let panel_el = drawn_panel.map(|panel| {
+                        div()
+                            .h_full()
+                            .opacity(panel_open)
+                            .ml(px(28. * (1. - panel_open)))
+                            .child(match panel {
+                                SidePanel::Queue => {
+                                    self.render_queue_panel(layout.panel, layout.panel_max_h, cx)
+                                }
+                                SidePanel::Lyrics => {
+                                    self.render_lyrics_panel(layout.panel, layout.panel_max_h, cx)
+                                }
+                            })
+                    });
+
+                    // A portrait window wide enough for both puts the card and
+                    // the panel side by side under the cover, rather than
+                    // stacking all three: at the card's width the panel left a
+                    // gutter down each side of the window and took its height
+                    // out of the cover above it.
+                    let content = if layout.stacked && layout.panel_beside {
+                        content.child(
+                            h_flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_8()
+                                .child(card_el)
+                                .children(panel_el),
+                        )
+                    } else {
+                        content
+                            .child(card_el)
+                            // Short vertical volume slider, right of the controls —
+                            // off by default (the player bar already has one), opt-in
+                            // via settings; always hidden during live radio, and
+                            // dropped by the layout when the window is too narrow to
+                            // carry it beside the cover and the card.
+                            .when(layout.volume, |this| {
+                                this.child(
+                                    v_flex()
+                                        .h_full()
+                                        .flex_none()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_2()
+                                        .p_4()
+                                        // Same card as the info column and the
+                                        // side panels, so the slider reads as
+                                        // part of the player rather than as
+                                        // controls floating loose on the
+                                        // backdrop.
+                                        .rounded_2xl()
+                                        .bg(cx.theme().background.opacity(0.55))
+                                        .border_1()
+                                        .border_color(cx.theme().border.opacity(0.5))
+                                        .shadow_xl()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(app_icon(icons::VOLUME_HIGH)),
+                                        )
+                                        .child(
+                                            // gpui-component's vertical slider is a fixed
+                                            // 120px tall; match it so the high/low icons sit
+                                            // symmetrically at each end (no dead space).
+                                            div()
+                                                .h(px(120.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(Slider::new(&self.volume).vertical()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(app_icon(icons::VOLUME_LOW)),
+                                        )
+                                        .when(detailed_volume, |this| {
                                             this.child(
                                                 div()
-                                                    .text_sm()
+                                                    .text_xs()
                                                     .text_color(cx.theme().muted_foreground)
-                                                    .child(time_now),
-                                            )
-                                            .map(|this| {
-                                                let bar =
-                                                    match (waveform_enabled, self.waveform.clone())
-                                                    {
-                                                        (true, Some(peaks)) => {
-                                                            crate::ui::waveform_seek_bar(
-                                                                &peaks,
-                                                                seek_fraction,
-                                                                34.,
-                                                                cx.theme().primary,
-                                                                cx.theme()
-                                                                    .muted_foreground
-                                                                    .opacity(0.35),
-                                                                self.player.clone(),
-                                                            )
-                                                        }
-                                                        _ => div()
-                                                            .flex_1()
-                                                            .child(Slider::new(&self.seek))
-                                                            .into_any_element(),
-                                                    };
-                                                let view = cx.entity();
-                                                this.child(crate::ui::seek_hover_wrap(
-                                                    "fs-seek-hover",
-                                                    self.seek_hover,
-                                                    duration,
-                                                    bar,
-                                                    move |fraction, cx| {
-                                                        view.update(cx, |p: &mut Self, cx| {
-                                                            if p.seek_hover != fraction {
-                                                                p.seek_hover = fraction;
-                                                                cx.notify();
-                                                            }
-                                                        });
-                                                    },
-                                                    cx,
-                                                ))
-                                            })
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(time_total),
+                                                    .child(format!(
+                                                        "{}%",
+                                                        (volume_level * 100.).round() as u32
+                                                    )),
                                             )
                                         }),
                                 )
-                                // Stream info + ReplayGain: quiet, centered line.
-                                // Wraps rather than running out of the card: the
-                                // codec line is long and the card is only as wide
-                                // as the window allows.
-                                .when(
-                                    layout.density.secondary_lines()
-                                        && (stream_info.is_some() || replay_gain.is_some()),
-                                    |this| {
-                                        this.child(
-                                            h_flex()
-                                                .w_full()
-                                                .flex_wrap()
-                                                .gap_3()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_xs()
-                                                .text_color(
-                                                    cx.theme().muted_foreground.opacity(0.8),
-                                                )
-                                                .when_some(stream_info, |this, info| {
-                                                    this.child(div().child(info))
-                                                })
-                                                .when_some(replay_gain, |this, (label, db)| {
-                                                    let text = match db {
-                                                        Some(db) => {
-                                                            format!("RG {db:+.1} dB · {label}")
-                                                        }
-                                                        None => format!("RG · {label}"),
-                                                    };
-                                                    this.child(div().child(text))
-                                                }),
-                                        )
-                                    },
-                                )
-                                // Transport controls. Wrapping is the last
-                                // resort in a window narrower than the row: a
-                                // second line of buttons beats a repeat button
-                                // clipped off the card's edge.
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .flex_wrap()
-                                        .gap_4()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            icon_btn(
-                                                "fs-shuffle",
-                                                icons::SHUFFLE,
-                                                shuffle && !is_radio,
-                                            )
-                                            .disabled(is_radio)
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.player
-                                                        .update(cx, |p, cx| p.toggle_shuffle(cx));
-                                                    cx.stop_propagation();
-                                                }),
-                                            ),
-                                        )
-                                        .child(
-                                            icon_btn("fs-prev", icons::SKIP_BACK, false)
-                                                .disabled(!has_track || is_radio)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.player.update(cx, |p, cx| p.previous(cx));
-                                                    cx.stop_propagation();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("fs-play")
-                                                .primary()
-                                                .large()
-                                                .icon(if playing {
-                                                    app_icon(icons::PAUSE)
-                                                } else {
-                                                    app_icon(icons::PLAY)
-                                                })
-                                                .loading(buffering)
-                                                .disabled(!has_track)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.player
-                                                        .update(cx, |p, cx| p.toggle_play(cx));
-                                                    cx.stop_propagation();
-                                                })),
-                                        )
-                                        .child(
-                                            icon_btn("fs-next", icons::SKIP_FORWARD, false)
-                                                .disabled(!has_track || is_radio)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.player.update(cx, |p, cx| p.next(cx));
-                                                    cx.stop_propagation();
-                                                })),
-                                        )
-                                        .child(
-                                            icon_btn(
-                                                "fs-repeat",
-                                                if repeat == RepeatMode::One {
-                                                    icons::REPEAT_1
-                                                } else {
-                                                    icons::REPEAT
-                                                },
-                                                repeat != RepeatMode::Off && !is_radio,
-                                            )
-                                            .disabled(is_radio)
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.player
-                                                        .update(cx, |p, cx| p.cycle_repeat(cx));
-                                                    cx.stop_propagation();
-                                                }),
-                                            ),
-                                        ),
-                                )
-                                // Queue / visualizer / lyrics toggles, ruled
-                                // off below the transport exactly as the mini
-                                // player rules off its scene picker.
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .flex_wrap()
-                                        .gap_3()
-                                        .items_center()
-                                        .justify_center()
-                                        .pt_4()
-                                        .border_t_1()
-                                        .border_color(cx.theme().border.opacity(0.4))
-                                        .child(
-                                            Button::new("fs-queue-btn")
-                                                .ghost()
-                                                .large()
-                                                .icon(Icon::new(IconName::PanelRight))
-                                                .when(toggle_labels, |b| b.label("Queue"))
-                                                .when(self.panel == Some(SidePanel::Queue), |b| {
-                                                    b.primary()
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_panel(SidePanel::Queue, cx);
-                                                    cx.stop_propagation();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("fs-viz-btn")
-                                                .ghost()
-                                                .large()
-                                                .icon(Icon::new(IconName::Frame))
-                                                .when(toggle_labels, |b| b.label(viz_mode.label()))
-                                                .when(viz_mode.is_on(), |b| b.primary())
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.cycle_visualizer(cx);
-                                                    cx.stop_propagation();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("fs-lyrics-btn")
-                                                .ghost()
-                                                .large()
-                                                .icon(Icon::new(IconName::BookOpen))
-                                                .when(toggle_labels, |b| b.label("Lyrics"))
-                                                .when(self.panel == Some(SidePanel::Lyrics), |b| {
-                                                    b.primary()
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_panel(SidePanel::Lyrics, cx);
-                                                    cx.stop_propagation();
-                                                })),
-                                        ),
-                                ),
-                        )
-                        // Short vertical volume slider, right of the controls —
-                        // off by default (the player bar already has one), opt-in
-                        // via settings; always hidden during live radio, and
-                        // dropped by the layout when the window is too narrow to
-                        // carry it beside the cover and the card.
-                        .when(layout.volume, |this| {
-                            this.child(
-                                v_flex()
-                                    .h_full()
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_2()
-                                    .p_4()
-                                    // Same card as the info column and the
-                                    // side panels, so the slider reads as
-                                    // part of the player rather than as
-                                    // controls floating loose on the
-                                    // backdrop.
-                                    .rounded_2xl()
-                                    .bg(cx.theme().background.opacity(0.55))
-                                    .border_1()
-                                    .border_color(cx.theme().border.opacity(0.5))
-                                    .shadow_xl()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(app_icon(icons::VOLUME_HIGH)),
-                                    )
-                                    .child(
-                                        // gpui-component's vertical slider is a fixed
-                                        // 120px tall; match it so the high/low icons sit
-                                        // symmetrically at each end (no dead space).
-                                        div()
-                                            .h(px(120.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Slider::new(&self.volume).vertical()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(app_icon(icons::VOLUME_LOW)),
-                                    )
-                                    .when(detailed_volume, |this| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!(
-                                                    "{}%",
-                                                    (volume_level * 100.).round() as u32
-                                                )),
-                                        )
-                                    }),
-                            )
-                        })
-                        // Optional side panel — beside the card, or under it in
-                        // the stacked layout, at whatever width and height the
-                        // window leaves for it.
-                        .when_some(drawn_panel, |this, panel| {
-                            // Margin + fade so the motion is visible (gpui
-                            // 0.2.2 has no translate/transform), off the
-                            // reveal's clock so it plays on the way out too.
-                            this.child(
-                                div()
-                                    .h_full()
-                                    .opacity(panel_open)
-                                    .ml(px(28. * (1. - panel_open)))
-                                    .child(match panel {
-                                        SidePanel::Queue => self.render_queue_panel(
-                                            layout.panel,
-                                            layout.panel_max_h,
-                                            cx,
-                                        ),
-                                        SidePanel::Lyrics => self.render_lyrics_panel(
-                                            layout.panel,
-                                            layout.panel_max_h,
-                                            cx,
-                                        ),
-                                    }),
-                            )
-                        });
+                            })
+                            .children(panel_el)
+                    };
 
                     // Content trails the backdrop and travels further, so the
                     // overlay reads as art rising into place rather than one flat
@@ -3371,8 +3417,8 @@ mod tests {
     use super::{
         ART_LEAD, ART_MAX, ART_MAX_STACKED, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity,
         EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, PANEL_LYRICS_MAX, PANEL_MAX,
-        QUEUE_CHROME_H, QUEUE_ROW_H, SidePanel, VOLUME_W, active_line, best_lyrics, blob_base,
-        blob_field, hash01, line_emphasis, lyric_color, lyric_seek_target, lyric_wrap,
+        PANEL_MIN, QUEUE_CHROME_H, QUEUE_ROW_H, SidePanel, VOLUME_W, active_line, best_lyrics,
+        blob_base, blob_field, hash01, line_emphasis, lyric_color, lyric_seek_target, lyric_wrap,
         plain_lyrics, queue_visible_rows,
     };
     use crate::config::FullscreenCoverSize;
@@ -3676,8 +3722,14 @@ mod tests {
     /// Total height the content asks for.
     fn content_height(l: &Layout) -> f32 {
         let body = if l.stacked {
-            let gaps = GAP * if l.panel > 0. { 2. } else { 1. };
-            l.art + gaps + card_height(l) + l.panel_max_h
+            // The panel either sits under the card or shares its row, in which
+            // case the row is as tall as the taller of the two.
+            if l.panel_beside {
+                l.art + GAP + card_height(l).max(l.panel_max_h)
+            } else {
+                let gaps = GAP * if l.panel > 0. { 2. } else { 1. };
+                l.art + gaps + card_height(l) + l.panel_max_h
+            }
         } else {
             l.art.max(card_height(l))
         };
@@ -4062,6 +4114,55 @@ mod tests {
                 "{w}x{h} dropped the track details: {l:?}"
             );
             assert!(l.art >= l.card + ART_LEAD, "{w}x{h}: {l:?}");
+        }
+    }
+
+    /// A portrait window with the width for it draws the panel *beside* the
+    /// card under the cover. Stacked at the card's width — which is a share of
+    /// the cover's — it left a gutter down each side of the window and took its
+    /// height out of the cover for nothing.
+    #[test]
+    fn a_wide_portrait_window_puts_the_panel_beside_the_card() {
+        for &(w, h) in &[(1080., 1440.), (1200., 1600.), (1440., 2560.)] {
+            for panel in [Some(SidePanel::Queue), Some(SidePanel::Lyrics)] {
+                let l = Layout::resolve(w, h, panel, false, FullscreenCoverSize::default());
+                assert!(l.stacked, "{w}x{h} should stack");
+                assert!(l.panel_beside, "{w}x{h} {panel:?} stacked the panel: {l:?}");
+                // Its own width, not the card's, and the two fit the row.
+                assert!(l.card >= CARD_MIN, "{w}x{h} {panel:?}: {l:?}");
+                assert!(
+                    l.card + GAP + l.panel <= w - 2. * EDGE + 0.5,
+                    "{w}x{h} {panel:?} overruns: {l:?}"
+                );
+                assert!(content_height(&l) <= h + 0.5, "{w}x{h} {panel:?}: {l:?}");
+                // The cover keeps the room the panel is no longer taking under
+                // it, and the panel gets the height the cover does not want.
+                let stacked = Layout::resolve(w, h, None, false, FullscreenCoverSize::default());
+                assert_eq!(l.art, stacked.art, "{w}x{h} {panel:?}: {l:?}");
+                assert!(
+                    l.panel_max_h >= l.density.card_height(l.card),
+                    "{w}x{h} {panel:?}: {l:?}"
+                );
+            }
+        }
+    }
+
+    /// Below that width there is no room for two columns, so the panel goes
+    /// back under the card — and the column still fits its window.
+    #[test]
+    fn a_narrow_portrait_window_still_stacks_the_panel() {
+        for &(w, h) in &[(520., 860.), (480., 900.), (700., 1100.)] {
+            let l = resolve(w, h, true, false);
+            assert!(l.stacked, "{w}x{h} should stack");
+            if l.panel_beside {
+                assert!(
+                    w - 2. * EDGE >= CARD_MIN + GAP + PANEL_MIN,
+                    "{w}x{h} put the panel beside a card with no room for it: {l:?}"
+                );
+                continue;
+            }
+            assert_eq!(l.panel, l.card, "{w}x{h}: {l:?}");
+            assert!(content_height(&l) <= h + 0.5, "{w}x{h}: {l:?}");
         }
     }
 
