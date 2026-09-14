@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use directories::ProjectDirs;
 use gpui::{
     Animation, AnimationElement, AnimationExt as _, AnyElement, App, BoxShadow, ElementId, Hsla,
-    IntoElement, Pixels, ScrollAnchor, SharedString, Styled, Window, WindowBounds,
+    IntoElement, Pixels, ScrollAnchor, SharedString, StyleRefinement, Styled, Window, WindowBounds,
     WindowDecorations, WindowOptions, div, ease_out_quint, hsla, point, prelude::*, px,
 };
 use gpui_component::ActiveTheme as _;
@@ -1362,8 +1362,7 @@ impl Reveal {
 ///
 /// Private on purpose: [`with_focus_cursor`] is the only way in, so the glow
 /// cannot be painted somewhere that forgot to ask whether the user wants it.
-fn focus_glow(cx: &App) -> Vec<BoxShadow> {
-    let c = cx.theme().primary;
+fn focus_glow(c: Hsla) -> Vec<BoxShadow> {
     vec![BoxShadow {
         color: hsla(c.h, c.s, c.l, 0.28),
         offset: point(px(0.), px(0.)),
@@ -1379,9 +1378,8 @@ fn focus_glow(cx: &App) -> Vec<BoxShadow> {
 fn with_focus_animation<E: IntoElement + Styled + 'static>(
     id: impl Into<SharedString>,
     el: E,
-    cx: &App,
+    c: Hsla,
 ) -> AnimationElement<E> {
-    let c = cx.theme().primary;
     el.with_animation(
         ElementId::Name(id.into()),
         Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
@@ -1411,21 +1409,60 @@ fn with_focus_animation<E: IntoElement + Styled + 'static>(
 /// Scroll-into-view is *not* here: `anchor_scroll` belongs to the stateful
 /// element traits and takes a per-view anchor, so it stays at the call site,
 /// where it must run whether or not the glow is on.
+///
+/// `color` overrides the theme's primary colour — `Settings::selection_glow_album_color`
+/// passes the hovered/focused album's own accent where a call site has one;
+/// `None` keeps the theme colour, same as before that setting existed.
 pub fn with_focus_cursor<E: IntoElement + Styled + 'static>(
     id: impl Into<SharedString>,
     el: E,
     focused: bool,
     glow: bool,
+    color: Option<Hsla>,
     cx: &App,
 ) -> AnyElement {
     if !focused {
         return el.into_any_element();
     }
-    let el = el.border_1().border_color(cx.theme().primary);
+    let c = color.unwrap_or(cx.theme().primary);
+    let el = el.border_1().border_color(c);
     if !glow {
         return el.into_any_element();
     }
-    with_focus_animation(id, el.bg(cx.theme().muted).shadow(focus_glow(cx)), cx).into_any_element()
+    with_focus_animation(id, el.bg(cx.theme().muted).shadow(focus_glow(c)), c).into_any_element()
+}
+
+/// The same border + glow as [`with_focus_cursor`], behind
+/// `Settings::selection_glow_hover`, for whichever card or row the pointer is
+/// over — minus the entry animation, since the mouse doesn't jump onto an
+/// item the way j/k does, so there's no transition to animate.
+///
+/// Meant to be composed into a call site's existing `.hover` closure rather
+/// than added as a second `.hover`: gpui panics if `hover_style` is already
+/// set on an element, and every card/row already has one for its muted-bg
+/// hover fill. `color` is the same album-accent override as `with_focus_cursor`.
+pub fn hover_glow_style(s: StyleRefinement, color: Option<Hsla>, cx: &App) -> StyleRefinement {
+    let c = color.unwrap_or(cx.theme().primary);
+    s.border_1().border_color(c).shadow(focus_glow(c))
+}
+
+/// Lazily decodes and caches a per-item accent colour from cover-art bytes
+/// already on disk, for `Settings::selection_glow_album_color` in card grids
+/// (`albums.rs`, `local_music.rs`, `artists.rs`, `recent.rs`): the art is
+/// already cached by the time a card renders, so this costs nothing but a
+/// decode, and only on the first render of a given key.
+pub fn album_glow_accent(
+    cache: &mut std::collections::HashMap<String, Hsla>,
+    key: &str,
+    path: &std::path::Path,
+) -> Option<Hsla> {
+    if let Some(c) = cache.get(key) {
+        return Some(*c);
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let accent = accent_from_cover_bytes(&bytes)?;
+    cache.insert(key.to_string(), accent);
+    Some(accent)
 }
 
 /// Scroll the vi-focused element into view, from `render`.

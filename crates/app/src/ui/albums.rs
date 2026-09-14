@@ -1,5 +1,6 @@
 //! Album grid with cover art, pagination, and sort/filter tabs.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -260,6 +261,11 @@ pub struct AlbumsView {
     /// Playlist ids/names for the cards' context menu, shared by every card
     /// instead of collected per card per frame.
     menu_playlists: Rc<Vec<(String, String)>>,
+    /// Per-album accent colours for `Settings::selection_glow_album_color`.
+    /// `RefCell` because `render_card` only has `&self`/`&App` (it's called
+    /// from `uniform_list`'s item closure, which reads the entity rather than
+    /// updating it) — the cache is filled in lazily behind that shared ref.
+    glow_accents: RefCell<HashMap<String, gpui::Hsla>>,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
@@ -292,6 +298,7 @@ impl AlbumsView {
             stats: LibraryStats::default(),
             live_width: crate::ui::LiveWidth::default(),
             menu_playlists: Rc::new(Vec::new()),
+            glow_accents: RefCell::new(HashMap::new()),
         };
         this.refresh_stats(cx);
         this.seed_from_cache(active_tab, cx);
@@ -803,7 +810,15 @@ impl AlbumsView {
         // frame is a resize's worth of allocations for a menu that is usually
         // closed.
         let menu_pl_list = self.menu_playlists.clone();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
+        let accent = if self.session.read(cx).settings.selection_glow_album_color {
+            art.as_ref().and_then(|p| {
+                crate::ui::album_glow_accent(&mut self.glow_accents.borrow_mut(), &album.id, p)
+            })
+        } else {
+            None
+        };
 
         let card = v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
@@ -815,7 +830,14 @@ impl AlbumsView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted))
+            .hover(|s| {
+                let s = s.bg(cx.theme().muted);
+                if hover_glow {
+                    crate::ui::hover_glow_style(s, accent, cx)
+                } else {
+                    s
+                }
+            })
             .active(|s| s.opacity(0.8))
             .on_click(move |_, _, cx: &mut App| {
                 open_view.update(cx, |_, cx| cx.emit(AlbumsEvent::OpenAlbum(id.clone())));
@@ -939,7 +961,7 @@ impl AlbumsView {
                 }
                 menu
             });
-        with_focus_cursor(format!("vi-focus-{index}"), card, focused, glow, cx)
+        with_focus_cursor(format!("vi-focus-{index}"), card, focused, glow, accent, cx)
     }
 }
 

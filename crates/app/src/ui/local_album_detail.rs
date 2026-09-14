@@ -136,7 +136,10 @@ impl LocalAlbumDetailView {
     /// a rescan-triggered reload doesn't re-decode the same image.
     fn refresh_accent(&mut self, cx: &mut Context<Self>) {
         let settings = &self.session.read(cx).settings;
-        if settings.theme != ThemePref::Adaptive || !settings.adaptive_from_page {
+        // See `AlbumDetailView::refresh_accent`: also wanted, independently of
+        // the page tint, by the track rows' `selection_glow_album_color`.
+        let tint_wanted = settings.theme == ThemePref::Adaptive && settings.adaptive_from_page;
+        if !tint_wanted && !settings.selection_glow_album_color {
             return;
         }
         let Some(path) = self.art_path.clone() else {
@@ -320,7 +323,15 @@ impl Render for LocalAlbumDetailView {
             }
         };
 
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
+        let accent = self
+            .session
+            .read(cx)
+            .settings
+            .selection_glow_album_color
+            .then_some(self.accent)
+            .flatten();
         let rows: Vec<_> = self
             .tracks
             .iter()
@@ -344,7 +355,14 @@ impl Render for LocalAlbumDetailView {
                     .gap_3()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().muted))
+                    .hover(|s| {
+                        let s = s.bg(cx.theme().muted);
+                        if hover_glow {
+                            crate::ui::hover_glow_style(s, accent, cx)
+                        } else {
+                            s
+                        }
+                    })
                     .when(is_playing, |s| {
                         s.bg(cx.theme().muted)
                             .border_l_2()
@@ -444,7 +462,7 @@ impl Render for LocalAlbumDetailView {
                             )
                         }
                     });
-                with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, cx)
+                with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, accent, cx)
             })
             .collect();
 

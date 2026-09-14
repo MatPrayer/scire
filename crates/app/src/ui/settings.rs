@@ -361,7 +361,9 @@ enum SettingsSwitch {
     AdaptivePageGradient,
     AlbumPanelRight,
     HideAlbumStars,
-    SelectionGlow,
+    SelectionGlowVi,
+    SelectionGlowHover,
+    SelectionGlowAlbumColor,
     FullscreenVolume,
     Scrobble,
     ResumePlayback,
@@ -919,9 +921,23 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn set_selection_glow(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    fn set_selection_glow_vi(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
-            .update(cx, |s, _| s.settings.selection_glow = enabled);
+            .update(cx, |s, _| s.settings.selection_glow_vi = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_selection_glow_hover(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.selection_glow_hover = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_selection_glow_album_color(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.selection_glow_album_color = enabled);
         self.persist(cx);
         cx.notify();
     }
@@ -1021,7 +1037,9 @@ impl SettingsView {
             SettingsSwitch::AdaptivePageGradient => s.adaptive_page_gradient,
             SettingsSwitch::AlbumPanelRight => s.album_panel_right,
             SettingsSwitch::HideAlbumStars => s.hide_album_stars,
-            SettingsSwitch::SelectionGlow => s.selection_glow,
+            SettingsSwitch::SelectionGlowVi => s.selection_glow_vi,
+            SettingsSwitch::SelectionGlowHover => s.selection_glow_hover,
+            SettingsSwitch::SelectionGlowAlbumColor => s.selection_glow_album_color,
             SettingsSwitch::FullscreenVolume => s.fullscreen_volume,
             SettingsSwitch::Scrobble => s.scrobble_enabled,
             SettingsSwitch::ResumePlayback => s.resume_playback,
@@ -1070,7 +1088,11 @@ impl SettingsView {
             SettingsSwitch::AdaptivePageGradient => self.set_adaptive_page_gradient(value, cx),
             SettingsSwitch::AlbumPanelRight => self.set_album_panel_right(value, cx),
             SettingsSwitch::HideAlbumStars => self.set_hide_album_stars(value, cx),
-            SettingsSwitch::SelectionGlow => self.set_selection_glow(value, cx),
+            SettingsSwitch::SelectionGlowVi => self.set_selection_glow_vi(value, cx),
+            SettingsSwitch::SelectionGlowHover => self.set_selection_glow_hover(value, cx),
+            SettingsSwitch::SelectionGlowAlbumColor => {
+                self.set_selection_glow_album_color(value, cx)
+            }
             SettingsSwitch::FullscreenVolume => self.set_fullscreen_volume(value, cx),
             SettingsSwitch::Scrobble => self.set_scrobble(value, cx),
             SettingsSwitch::ResumePlayback => self.set_resume_playback(value, cx),
@@ -1138,7 +1160,8 @@ impl SettingsView {
             format!("vi-setting-fx-{index}"),
             frame,
             focused,
-            self.session.read(cx).settings.selection_glow,
+            self.session.read(cx).settings.selection_glow_vi,
+            None,
             cx,
         )
     }
@@ -1577,7 +1600,9 @@ impl Render for SettingsView {
         let fullscreen_cover = self.session.read(cx).settings.fullscreen_cover;
         let vi_mode = self.session.read(cx).settings.vi_mode;
         let reduced_motion = self.session.read(cx).settings.reduced_motion;
-        let selection_glow = self.session.read(cx).settings.selection_glow;
+        let selection_glow_vi = self.session.read(cx).settings.selection_glow_vi;
+        let selection_glow_hover = self.session.read(cx).settings.selection_glow_hover;
+        let selection_glow_album_color = self.session.read(cx).settings.selection_glow_album_color;
         let server_scan_state = self.server_scan.clone();
         let rebuild_state = self.rebuild.clone();
         let precache_art = self.session.read(cx).settings.precache_art;
@@ -1777,15 +1802,31 @@ impl Render for SettingsView {
             ))
             .child(self.subheading("Selection", cx))
             .child(self.vi_switch(
-                SettingsSwitch::SelectionGlow,
-                "selection-glow",
-                selection_glow,
+                SettingsSwitch::SelectionGlowVi,
+                "selection-glow-vi",
+                selection_glow_vi,
                 false,
-                "Glow focused cards",
+                "Glow the vi cursor's card",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::SelectionGlowHover,
+                "selection-glow-hover",
+                selection_glow_hover,
+                false,
+                "Glow the hovered card",
                 cx,
             ))
             .child(self.note(
                 "Off is just a primary border; on adds a filled background and glow.",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::SelectionGlowAlbumColor,
+                "selection-glow-album-color",
+                selection_glow_album_color,
+                !(selection_glow_vi || selection_glow_hover),
+                "Colour the glow from the album's own cover",
                 cx,
             ))
             .child(self.subheading("Fullscreen", cx))

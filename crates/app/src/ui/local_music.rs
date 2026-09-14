@@ -55,6 +55,9 @@ pub struct LocalMusicView {
     /// Catalog totals shown in the header; recomputed with `refresh`, so a
     /// finished scan updates them along with the grid.
     stats: LibraryStats,
+    /// Per-album accent colours for `Settings::selection_glow_album_color`,
+    /// decoded once from the already-cached cover and kept.
+    glow_accents: HashMap<String, gpui::Hsla>,
 }
 
 impl EventEmitter<LocalMusicEvent> for LocalMusicView {}
@@ -79,6 +82,7 @@ impl LocalMusicView {
             vi_scroll_synced: None,
             focus_anchor: ScrollAnchor::for_handle(scroll),
             stats: LibraryStats::default(),
+            glow_accents: HashMap::new(),
         };
         view.refresh(cx);
         view
@@ -160,6 +164,7 @@ impl LocalMusicView {
         album: &AlbumRow,
         tile: f32,
         focused: bool,
+        accent: Option<gpui::Hsla>,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let id = album.id.clone();
@@ -170,7 +175,8 @@ impl LocalMusicView {
         let year = album.year.map(|y| y.to_string()).unwrap_or_default();
         let sc = album.song_count;
         let view = cx.entity();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
 
         let card = v_flex()
             .id(SharedString::from(format!("local-album-{}", album.id)))
@@ -182,7 +188,14 @@ impl LocalMusicView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted))
+            .hover(|s| {
+                let s = s.bg(cx.theme().muted);
+                if hover_glow {
+                    crate::ui::hover_glow_style(s, accent, cx)
+                } else {
+                    s
+                }
+            })
             .active(|s| s.opacity(0.8))
             .when(focused, |s| {
                 s.anchor_scroll(Some(self.focus_anchor.clone()))
@@ -263,7 +276,7 @@ impl LocalMusicView {
                     .item(PopupMenuItem::new("Play next").on_click(act(QueueMode::PlayNext)))
                     .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
             });
-        with_focus_cursor(format!("vi-focus-{index}"), card, focused, glow, cx)
+        with_focus_cursor(format!("vi-focus-{index}"), card, focused, glow, accent, cx)
     }
 }
 
@@ -302,13 +315,30 @@ impl Render for LocalMusicView {
                 .into_any_element();
         }
 
+        let album_color_glow = self.session.read(cx).settings.selection_glow_album_color;
+        let accents: Vec<Option<gpui::Hsla>> = if album_color_glow {
+            let ids_paths: Vec<_> = self
+                .albums
+                .iter()
+                .map(|a| (a.id.clone(), self.art_paths.get(&a.id).cloned()))
+                .collect();
+            ids_paths
+                .into_iter()
+                .map(|(id, path)| {
+                    path.and_then(|p| crate::ui::album_glow_accent(&mut self.glow_accents, &id, &p))
+                })
+                .collect()
+        } else {
+            vec![None; self.albums.len()]
+        };
+
         let cards: Vec<_> = self
             .albums
             .iter()
             .enumerate()
             .map(|(i, a)| {
                 let focused = self.vi_cursor == Some(i);
-                self.render_card(i, a, tile, focused, cx)
+                self.render_card(i, a, tile, focused, accents[i], cx)
             })
             .collect();
 

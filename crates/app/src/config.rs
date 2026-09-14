@@ -191,7 +191,17 @@ pub struct Settings {
     /// outer glow, and a growing entry animation. Off, the cursor is just a
     /// primary border around the card.
     #[serde(default)]
-    pub selection_glow: bool,
+    pub selection_glow_vi: bool,
+    /// Same glow (fill + border, no entry animation — the mouse doesn't jump
+    /// the way j/k does) on whichever card or row the pointer is over.
+    #[serde(default)]
+    pub selection_glow_hover: bool,
+    /// Colour the glow (vi cursor and/or hover, whichever is on) from the
+    /// hovered/focused album's own cover instead of the theme's primary
+    /// colour. Falls back to primary wherever a card has no single album to
+    /// draw a colour from.
+    #[serde(default)]
+    pub selection_glow_album_color: bool,
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -594,7 +604,9 @@ impl Default for Settings {
             album_panel_right: false,
             hide_album_stars: false,
             reduced_motion: false,
-            selection_glow: false,
+            selection_glow_vi: false,
+            selection_glow_hover: false,
+            selection_glow_album_color: false,
         }
     }
 }

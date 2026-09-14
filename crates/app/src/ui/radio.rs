@@ -163,7 +163,8 @@ impl Render for RadioView {
             (r.stations.clone(), r.error.clone())
         };
 
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
         // The three add-station targets sit after the station rows in the same
         // flat vi index space `vi_move`/`vi_activate` walk.
         let station_count = stations.len();
@@ -184,7 +185,14 @@ impl Render for RadioView {
                     .gap_2()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().muted))
+                    .hover(|s| {
+                        let s = s.bg(cx.theme().muted);
+                        if hover_glow {
+                            crate::ui::hover_glow_style(s, None, cx)
+                        } else {
+                            s
+                        }
+                    })
                     .when(is_playing, |s| s.text_color(cx.theme().primary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let (name, url) = (name.clone(), url.clone());
@@ -225,7 +233,7 @@ impl Render for RadioView {
                                 cx.stop_propagation();
                             })),
                     );
-                with_focus_cursor(format!("vi-radio-{i}"), row, focused, glow, cx)
+                with_focus_cursor(format!("vi-radio-{i}"), row, focused, glow, None, cx)
             })
             .collect();
 
@@ -253,6 +261,7 @@ impl Render for RadioView {
                         div().w(px(200.)).child(Input::new(&self.name_input)),
                         self.vi_cursor == Some(station_count),
                         glow,
+                        None,
                         cx,
                     ))
                     .child(with_focus_cursor(
@@ -263,6 +272,7 @@ impl Render for RadioView {
                             .child(Input::new(&self.url_input)),
                         self.vi_cursor == Some(station_count + 1),
                         glow,
+                        None,
                         cx,
                     ))
                     .child(with_focus_cursor(
@@ -272,6 +282,7 @@ impl Render for RadioView {
                         )),
                         self.vi_cursor == Some(station_count + 2),
                         glow,
+                        None,
                         cx,
                     )),
             )

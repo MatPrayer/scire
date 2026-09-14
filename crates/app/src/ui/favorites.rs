@@ -152,7 +152,8 @@ impl Render for FavoritesView {
             cx,
         );
         let playing_id = self.playing_id.clone();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
 
         // Borrowed, not cloned: this view observes the player, so `render`
@@ -178,7 +179,14 @@ impl Render for FavoritesView {
                         .gap_2()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|s| s.bg(cx.theme().muted))
+                        .hover(|s| {
+                            let s = s.bg(cx.theme().muted);
+                            if hover_glow {
+                                crate::ui::hover_glow_style(s, None, cx)
+                            } else {
+                                s
+                            }
+                        })
                         .when(is_playing, |s| {
                             s.bg(cx.theme().muted)
                                 .border_l_2()
@@ -213,7 +221,8 @@ impl Render for FavoritesView {
                                     cx.stop_propagation();
                                 })),
                         );
-                    let row = with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, cx);
+                    let row =
+                        with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, None, cx);
                     rows.push(row);
                 }
             }
@@ -234,7 +243,14 @@ impl Render for FavoritesView {
                         .gap_2()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|s| s.bg(cx.theme().muted))
+                        .hover(|s| {
+                            let s = s.bg(cx.theme().muted);
+                            if hover_glow {
+                                crate::ui::hover_glow_style(s, None, cx)
+                            } else {
+                                s
+                            }
+                        })
                         .when(focused, |s| s.anchor_scroll(Some(anchor)))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(FavoritesEvent::OpenAlbum(open_id.clone()));
@@ -263,8 +279,14 @@ impl Render for FavoritesView {
                                     cx.stop_propagation();
                                 })),
                         );
-                    let row =
-                        with_focus_cursor(format!("vi-focus-{}", ns + i), row, focused, glow, cx);
+                    let row = with_focus_cursor(
+                        format!("vi-focus-{}", ns + i),
+                        row,
+                        focused,
+                        glow,
+                        None,
+                        cx,
+                    );
                     rows.push(row);
                 }
             }
@@ -283,7 +305,14 @@ impl Render for FavoritesView {
                         .gap_2()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|s| s.bg(cx.theme().muted))
+                        .hover(|s| {
+                            let s = s.bg(cx.theme().muted);
+                            if hover_glow {
+                                crate::ui::hover_glow_style(s, None, cx)
+                            } else {
+                                s
+                            }
+                        })
                         .when(focused, |s| s.anchor_scroll(Some(anchor)))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(FavoritesEvent::OpenArtist(open_id.clone()));
@@ -304,6 +333,7 @@ impl Render for FavoritesView {
                         row,
                         focused,
                         glow,
+                        None,
                         cx,
                     );
                     rows.push(row);

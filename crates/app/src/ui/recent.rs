@@ -95,6 +95,9 @@ pub struct RecentView {
     scroll: UniformListScrollHandle,
     /// Song index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
+    /// Per-album accent colours for `Settings::selection_glow_album_color`.
+    /// `RefCell`: `render_row` only has `&self`/`&App`.
+    glow_accents: std::cell::RefCell<HashMap<String, gpui::Hsla>>,
 }
 
 impl RecentView {
@@ -115,6 +118,7 @@ impl RecentView {
             fetching: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
             vi_cursor: None,
+            glow_accents: std::cell::RefCell::new(HashMap::new()),
         };
         this.refresh(cx);
         cx.observe(&this.player.clone(), |this, _, cx| {
@@ -203,7 +207,15 @@ impl RecentView {
             .and_then(|key| self.art_paths.get(key))
             .cloned();
         let view = entity.clone();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
+        let accent = if self.session.read(cx).settings.selection_glow_album_color {
+            row.art_key.as_ref().zip(art.as_ref()).and_then(|(key, p)| {
+                crate::ui::album_glow_accent(&mut self.glow_accents.borrow_mut(), key, p)
+            })
+        } else {
+            None
+        };
         let row_el = h_flex()
             .id(("recent-row", ix))
             // `uniform_list` sizes its items to their content, so without this
@@ -216,7 +228,14 @@ impl RecentView {
             .items_center()
             .rounded_lg()
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted))
+            .hover(|s| {
+                let s = s.bg(cx.theme().muted);
+                if hover_glow {
+                    crate::ui::hover_glow_style(s, accent, cx)
+                } else {
+                    s
+                }
+            })
             .on_click(move |_, _, cx: &mut gpui::App| {
                 view.update(cx, |this, cx| {
                     let Some(song) = this.songs.get(ix).cloned() else {
@@ -274,7 +293,7 @@ impl RecentView {
                     .text_right()
                     .child(row.duration.clone()),
             );
-        with_focus_cursor(format!("vi-focus-{ix}"), row_el, focused, glow, cx)
+        with_focus_cursor(format!("vi-focus-{ix}"), row_el, focused, glow, accent, cx)
     }
 }
 

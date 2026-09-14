@@ -1,5 +1,6 @@
 //! Artist list (grouped by index letter) and artist detail (their albums).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -123,6 +124,10 @@ pub struct ArtistsView {
     /// Tracks the grid's width against the window's, so the column count
     /// follows a resize on the same frame instead of one behind it.
     live_width: crate::ui::LiveWidth,
+    /// Per-artist accent colours for `Settings::selection_glow_album_color`
+    /// (extracted from the artist photo here). `RefCell`: `render_card` only
+    /// has `&self`/`&App`, called from `uniform_list`'s item closure.
+    glow_accents: RefCell<HashMap<String, gpui::Hsla>>,
 }
 
 impl EventEmitter<ArtistsEvent> for ArtistsView {}
@@ -151,6 +156,7 @@ impl ArtistsView {
             vi_cursor: None,
             stats: LibraryStats::default(),
             live_width: crate::ui::LiveWidth::default(),
+            glow_accents: RefCell::new(HashMap::new()),
         };
         this.refresh_stats(cx);
         this.seed_from_cache(cx);
@@ -403,7 +409,15 @@ impl ArtistsView {
         let art = self.art_paths.get(card.id.as_ref()).cloned();
         let id = card.id.clone();
         let view = entity.clone();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
+        let accent = if self.session.read(cx).settings.selection_glow_album_color {
+            art.as_ref().and_then(|p| {
+                crate::ui::album_glow_accent(&mut self.glow_accents.borrow_mut(), id.as_ref(), p)
+            })
+        } else {
+            None
+        };
         let card_el = v_flex()
             .id(card.id.clone())
             .w(px(tile + crate::ui::CARD_PADDING))
@@ -412,7 +426,14 @@ impl ArtistsView {
             .items_center()
             .rounded_lg()
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted))
+            .hover(|s| {
+                let s = s.bg(cx.theme().muted);
+                if hover_glow {
+                    crate::ui::hover_glow_style(s, accent, cx)
+                } else {
+                    s
+                }
+            })
             .active(|s| s.opacity(0.8))
             .on_click(move |_, _, cx: &mut gpui::App| {
                 let id = id.clone();
@@ -466,7 +487,7 @@ impl ArtistsView {
                             .child(card.albums.clone()),
                     ),
             );
-        with_focus_cursor(card.id.clone(), card_el, focused, glow, cx)
+        with_focus_cursor(card.id.clone(), card_el, focused, glow, accent, cx)
     }
 }
 
@@ -677,6 +698,8 @@ pub struct ArtistDetailView {
     /// Cursor position the scroll has caught up to, so `render` scrolls only
     /// when the cursor actually moved (`ui::sync_focus_scroll`).
     vi_scroll_synced: Option<usize>,
+    /// Per-album accent colours for `Settings::selection_glow_album_color`.
+    glow_accents: RefCell<HashMap<String, gpui::Hsla>>,
 }
 
 pub enum ArtistDetailEvent {
@@ -718,6 +741,7 @@ impl ArtistDetailView {
             bio_toggle_focusable: false,
             vi_cursor: None,
             vi_scroll_synced: None,
+            glow_accents: RefCell::new(HashMap::new()),
         };
         this.load_appears_on(cx);
         this.load(cx);
@@ -1062,7 +1086,15 @@ impl ArtistDetailView {
         let year =
             subtitle.unwrap_or_else(|| album.year.map(|y| y.to_string()).unwrap_or_default());
         let anchor = self.focus_anchor.clone();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
+        let accent = if self.session.read(cx).settings.selection_glow_album_color {
+            art.as_ref().and_then(|p| {
+                crate::ui::album_glow_accent(&mut self.glow_accents.borrow_mut(), &album.id, p)
+            })
+        } else {
+            None
+        };
         let card = v_flex()
             .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
             .group("aacard")
@@ -1073,7 +1105,14 @@ impl ArtistDetailView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().muted))
+            .hover(|s| {
+                let s = s.bg(cx.theme().muted);
+                if hover_glow {
+                    crate::ui::hover_glow_style(s, accent, cx)
+                } else {
+                    s
+                }
+            })
             .active(|s| s.opacity(0.8))
             .when(focused, |s| s.anchor_scroll(Some(anchor)))
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -1130,7 +1169,14 @@ impl ArtistDetailView {
                             .child(year),
                     ),
             );
-        with_focus_cursor(format!("vi-artist-card-{flat}"), card, focused, glow, cx)
+        with_focus_cursor(
+            format!("vi-artist-card-{flat}"),
+            card,
+            focused,
+            glow,
+            accent,
+            cx,
+        )
     }
 }
 fn sort_discography(albums: &mut [Album]) {
@@ -1328,7 +1374,7 @@ impl Render for ArtistDetailView {
                                     .when(bio_long, |this| {
                                         let expanded = self.bio_expanded;
                                         let focused = bio_focused;
-                                        let glow = self.session.read(cx).settings.selection_glow;
+                                        let glow = self.session.read(cx).settings.selection_glow_vi;
                                         let btn = Button::new("bio-toggle")
                                             .ghost()
                                             .xsmall()
@@ -1347,6 +1393,7 @@ impl Render for ArtistDetailView {
                                             btn,
                                             focused,
                                             glow,
+                                            None,
                                             cx,
                                         )))
                                     })

@@ -248,7 +248,8 @@ impl Render for PlaylistDetailView {
             );
 
         let info_prefs = self.session.read(cx).settings.track_info.clone();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
 
         let rows: Vec<_> = self
             .playlist
@@ -272,7 +273,14 @@ impl Render for PlaylistDetailView {
                     .gap_3()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().muted))
+                    .hover(|s| {
+                        let s = s.bg(cx.theme().muted);
+                        if hover_glow {
+                            crate::ui::hover_glow_style(s, None, cx)
+                        } else {
+                            s
+                        }
+                    })
                     .when(is_playing, |s| {
                         s.bg(cx.theme().muted)
                             .border_l_2()
@@ -329,7 +337,7 @@ impl Render for PlaylistDetailView {
                                 cx.stop_propagation();
                             })),
                     );
-                with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, cx)
+                with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, None, cx)
             })
             .collect();
 

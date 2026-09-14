@@ -602,7 +602,12 @@ impl AlbumDetailView {
     /// read the exact same file, and for the playing album it is already there.
     fn refresh_accent(&mut self, cx: &mut Context<Self>) {
         let settings = &self.session.read(cx).settings;
-        if settings.theme != ThemePref::Adaptive || !settings.adaptive_from_page {
+        // Also wanted, independently of the page tint, by the track rows'
+        // `Settings::selection_glow_album_color` — `page_accent`/`header_tint`
+        // still gate on `adaptive_from_page` alone, so populating it here for
+        // the glow doesn't paint a tint nobody asked for.
+        let tint_wanted = settings.theme == ThemePref::Adaptive && settings.adaptive_from_page;
+        if !tint_wanted && !settings.selection_glow_album_color {
             return;
         }
         let Some(cover_id) = self.album.as_ref().and_then(|a| a.album.cover_art.clone()) else {
@@ -1439,7 +1444,17 @@ impl Render for AlbumDetailView {
         };
 
         let info_prefs = self.session.read(cx).settings.track_info.clone();
-        let glow = self.session.read(cx).settings.selection_glow;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let hover_glow = self.session.read(cx).settings.selection_glow_hover;
+        // Every row is a track off the same album, so one already-computed
+        // accent (`refresh_accent`) covers the whole list — no per-row work.
+        let accent = self
+            .session
+            .read(cx)
+            .settings
+            .selection_glow_album_color
+            .then_some(self.accent)
+            .flatten();
 
         let rows: Vec<_> = self
             .album
@@ -1484,7 +1499,14 @@ impl Render for AlbumDetailView {
                     .gap_3()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|s| s.bg(cx.theme().muted))
+                    .hover(|s| {
+                        let s = s.bg(cx.theme().muted);
+                        if hover_glow {
+                            crate::ui::hover_glow_style(s, accent, cx)
+                        } else {
+                            s
+                        }
+                    })
                     .when(is_playing, |s| {
                         // `primary` is the vivid theme colour; `accent` is a
                         // background tint with poor text contrast.
@@ -1669,6 +1691,7 @@ impl Render for AlbumDetailView {
                     row,
                     self.vi_cursor == Some(i),
                     glow,
+                    accent,
                     cx,
                 )
             })
