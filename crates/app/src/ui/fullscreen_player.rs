@@ -136,9 +136,17 @@ const LYRIC_GROW_MS: u64 = 420;
 /// Queue row height. `uniform_list` needs every row the same size, and a whole
 /// number of them is what keeps the panel from ending mid-row.
 const QUEUE_ROW_H: f32 = 44.;
+/// Height the queue panel's header row is *pinned* to. gpui's default line
+/// height is `phi()` (1.618) of the font size, so a `text_sm` header draws at
+/// 23px rather than the 20 this arithmetic used to assume — the list then got
+/// three pixels less than a whole number of rows and the last one was clipped,
+/// which is exactly what the row snapping exists to prevent. The header is
+/// given the height (and the matching line height, so the text still centres in
+/// it) rather than measured, so `QUEUE_CHROME_H` is true by construction.
+const QUEUE_HEADER_H: f32 = 20.;
 /// The queue panel's own chrome around that list: `p_4` above and below, the
 /// "Queue" header, and the `gap_2` under it.
-const QUEUE_CHROME_H: f32 = 16. * 2. + 20. + 8.;
+const QUEUE_CHROME_H: f32 = 16. * 2. + QUEUE_HEADER_H + 8.;
 /// Window padding (`px_10`) and the gap between content columns (`gap_8`).
 const EDGE: f32 = 40.;
 /// Vertical window padding once compact.
@@ -1675,6 +1683,9 @@ impl FullscreenPlayer {
             .shadow_xl()
             .child(
                 div()
+                    .flex_none()
+                    .h(px(QUEUE_HEADER_H))
+                    .line_height(px(QUEUE_HEADER_H))
                     .text_sm()
                     .font_medium()
                     .text_color(cx.theme().muted_foreground)
