@@ -3269,6 +3269,17 @@ impl Render for FullscreenPlayer {
                                     .items_center()
                                     .justify_center()
                                     .gap_2()
+                                    .p_4()
+                                    // Same card as the info column and the
+                                    // side panels, so the slider reads as
+                                    // part of the player rather than as
+                                    // controls floating loose on the
+                                    // backdrop.
+                                    .rounded_2xl()
+                                    .bg(cx.theme().background.opacity(0.55))
+                                    .border_1()
+                                    .border_color(cx.theme().border.opacity(0.5))
+                                    .shadow_xl()
                                     .child(
                                         div()
                                             .text_xs()
