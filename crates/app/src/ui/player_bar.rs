@@ -75,7 +75,7 @@ const FLOAT_DARKEN: f32 = 0.22;
 /// survives it; only lightness and alpha move, which is what keeps a light
 /// theme's card light (a grey card rather than a white one) instead of turning
 /// it into a dark one.
-fn float_fill(base: Hsla, translucent: bool) -> Hsla {
+pub fn float_fill(base: Hsla, translucent: bool) -> Hsla {
     Hsla {
         l: base.l * (1. - FLOAT_DARKEN),
         a: if translucent { FLOAT_FILL_ALPHA } else { 1. },
@@ -112,6 +112,20 @@ fn side_width(window_width: f32) -> f32 {
 /// through the last of the fade.
 pub fn float_bottom(open: f32) -> f32 {
     FLOAT_MARGIN - (FLOAT_BAR_H + FLOAT_MARGIN) * (1. - open)
+}
+
+/// Where a panel floating *above* the player card sits, at a given bar
+/// openness.
+///
+/// The queue panel takes the floating style with the bar (a docked strip beside
+/// a page with a card hovering over it is two designs at once), and it has to
+/// clear the card underneath it — which is itself travelling. Tying the panel's
+/// bottom to the same `open` keeps the gap between the two constant for the
+/// whole of the bar's slide, and a hidden bar (`hide_idle_player_bar`) leaves
+/// the panel sitting on the window's own margin rather than on a gap held for
+/// something that is not there.
+pub fn float_panel_bottom(bar_open: f32) -> f32 {
+    FLOAT_MARGIN + (FLOAT_BAR_H + FLOAT_MARGIN) * bar_open
 }
 
 /// Width the floating card is drawn at, in a window of `window_width`.
@@ -1126,7 +1140,7 @@ impl Render for PlayerBar {
 mod tests {
     use super::{
         FLOAT_BAR_H, FLOAT_FILL_ALPHA, FLOAT_MARGIN, FLOAT_MAX_W, SIDE_MIN, SIDE_WIDTH,
-        float_bottom, float_fill, float_width, side_width,
+        float_bottom, float_fill, float_panel_bottom, float_width, side_width,
     };
     use gpui::hsla;
 
@@ -1170,6 +1184,23 @@ mod tests {
             bottom + FLOAT_BAR_H <= 0.,
             "top edge still on screen: {bottom}"
         );
+    }
+
+    #[test]
+    fn a_floating_panel_clears_the_card_and_falls_back_to_the_margin() {
+        // Open bar: the panel clears the whole card and the gap either side.
+        assert_eq!(
+            float_panel_bottom(1.),
+            FLOAT_MARGIN + FLOAT_BAR_H + FLOAT_MARGIN
+        );
+        // No bar on screen: the panel sits on the window's own margin rather
+        // than on a gap held for something that is not there.
+        assert_eq!(float_panel_bottom(0.), FLOAT_MARGIN);
+        // The gap between the two holds for the whole of the bar's travel.
+        for open in [0.25, 0.5, 0.75] {
+            let gap = float_panel_bottom(open) - (float_bottom(open) + FLOAT_BAR_H);
+            assert!((gap - FLOAT_MARGIN).abs() < 0.01, "{open}: {gap}");
+        }
     }
 
     #[test]

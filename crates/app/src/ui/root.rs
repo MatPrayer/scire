@@ -35,7 +35,7 @@ use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
 use crate::ui::local_album_detail::LocalAlbumDetailView;
 use crate::ui::local_music::{LocalMusicEvent, LocalMusicView};
 use crate::ui::player_bar::{
-    BAR_H, FLOAT_MARGIN, FLOAT_MAX_W, PlayerBar, PlayerBarEvent, float_bottom,
+    BAR_H, FLOAT_MARGIN, FLOAT_MAX_W, PlayerBar, PlayerBarEvent, float_bottom, float_panel_bottom,
 };
 use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
 use crate::ui::queue_panel::{QueuePanel, QueuePanelEvent};
@@ -274,7 +274,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let player_bar = cx.new(|cx| PlayerBar::new(player.clone(), session.clone(), window, cx));
-        let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), cx));
+        let queue_panel = cx.new(|cx| QueuePanel::new(player.clone(), session.clone(), cx));
         let radio = crate::state::radio::init(session.clone(), cx);
         let fullscreen = cx.new(|cx| FullscreenPlayer::new(player.clone(), session.clone(), cx));
         let search_bar = cx.new(|cx| {
@@ -2672,9 +2672,30 @@ impl Render for RootView {
                                             )
                                         }),
                                 )
+                            })
+                            // Floating style: the panel hovers over the page
+                            // like the bar it was opened from, clearing the
+                            // card below it by `float_panel_bottom`, and
+                            // travels in from the right edge rather than
+                            // pushing the content aside — nothing is reserved
+                            // for it, which is the point of the style.
+                            .when(queue_visible && floating_bar, |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(FLOAT_MARGIN))
+                                        // The travel is in `right`, not a
+                                        // margin: `left` is auto here, so a
+                                        // margin moves nothing.
+                                        .right(px(FLOAT_MARGIN - 20. * (1. - queue_open)))
+                                        .bottom(px(float_panel_bottom(bar_open)))
+                                        .flex()
+                                        .opacity(queue_open)
+                                        .child(self.queue_panel.clone()),
+                                )
                             }),
                     )
-                    .when(queue_visible, |this| {
+                    .when(queue_visible && !floating_bar, |this| {
                         // `h_full()` on the wrapper, not only on the panel:
                         // the row is an `h_flex`, which centres its children
                         // rather than stretching them, so without a definite

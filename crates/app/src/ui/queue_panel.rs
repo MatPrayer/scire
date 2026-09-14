@@ -10,8 +10,11 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::config::PlayerBarStyle;
 use crate::state::player::PlayerState;
+use crate::state::session::Session;
 use crate::ui::format_duration;
+use crate::ui::player_bar::float_fill;
 
 /// Fixed row height — `uniform_list` requires every row to be the same size.
 /// Two lines of text (title over artist) plus the row's vertical padding.
@@ -43,6 +46,9 @@ pub enum QueuePanelEvent {
 
 pub struct QueuePanel {
     player: Entity<PlayerState>,
+    /// Read for `player_bar_style` alone: the panel is opened from the bar and
+    /// sits against it, so a floating bar takes the panel with it.
+    session: Entity<Session>,
     rows: Vec<Row>,
     current: Option<usize>,
     /// Queue revision the rows were built from, so a position tick doesn't
@@ -52,9 +58,14 @@ pub struct QueuePanel {
 }
 
 impl QueuePanel {
-    pub fn new(player: Entity<PlayerState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        player: Entity<PlayerState>,
+        session: Entity<Session>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             player,
+            session,
             rows: Vec::new(),
             current: None,
             // The queue starts at revision 0, so seed the mismatch that makes
@@ -246,12 +257,34 @@ impl Render for QueuePanel {
         .px_2()
         .track_scroll(self.scroll.clone());
 
+        // A floating player bar takes the panel with it: the panel is opened
+        // from that bar and sits directly above it, so leaving it docked to the
+        // window's edge puts a full-height strip beside a card hovering over
+        // the page — two designs at once. Same card treatment as the bar and
+        // the fullscreen overlay's panels, including the darkened fill and the
+        // opt-in show-through, so the two read as one piece.
+        let settings = &self.session.read(cx).settings;
+        let floating = settings.player_bar_style == PlayerBarStyle::Floating;
+        let translucent = settings.player_bar_translucent;
+
         v_flex()
             .w(px(300.))
             .h_full()
-            .border_l_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().sidebar)
+            .map(|this| {
+                if floating {
+                    this.rounded_2xl()
+                        .shadow_xl()
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.6))
+                        .overflow_hidden()
+                        .occlude()
+                        .bg(float_fill(cx.theme().background, translucent))
+                } else {
+                    this.border_l_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().sidebar)
+                }
+            })
             .child(
                 h_flex()
                     .px_3()
