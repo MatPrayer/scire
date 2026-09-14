@@ -115,13 +115,16 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 ///
 /// Account is last because it is the one that may be absent (signed out), which
 /// makes "the sections that are present" a prefix of this list.
-const COMPACT_SECTIONS: [(&str, u16); 7] = [
+const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Window", 4),
-    ("Appearance", 18),
-    ("Playback", 17),
-    ("Browsing", 11),
+    ("Appearance", 10),
+    ("Album pages", 7),
+    ("Fullscreen", 7),
+    ("Player bar", 10),
+    ("Playback", 10),
+    ("Browsing", 13),
     ("Streaming", 5),
-    ("Library", 13),
+    ("Library", 14),
     ("Account", 3),
 ];
 
@@ -1769,7 +1772,53 @@ impl Render for SettingsView {
                         cx,
                     )),
             )
-            .child(self.subheading("Album page", cx))
+            .child(self.vi_switch(
+                SettingsSwitch::ReducedMotion,
+                "reduced-motion",
+                reduced_motion,
+                false,
+                "Reduce motion",
+                cx,
+            ))
+            .child(self.note(
+                "Panels, dialogs and the overlay appear in place instead of \
+                 sliding and fading in.",
+                cx,
+            ))
+            .child(self.subheading("Selection", cx))
+            .child(self.vi_switch(
+                SettingsSwitch::SelectionGlowVi,
+                "selection-glow-vi",
+                selection_glow_vi,
+                false,
+                "Glow the vi cursor's card",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::SelectionGlowHover,
+                "selection-glow-hover",
+                selection_glow_hover,
+                false,
+                "Glow the hovered card",
+                cx,
+            ))
+            .child(self.note(
+                "Off is just a primary border; on adds a filled background and glow.",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::SelectionGlowAlbumColor,
+                "selection-glow-album-color",
+                selection_glow_album_color,
+                !(selection_glow_vi || selection_glow_hover),
+                "Colour the glow from the album's own cover",
+                cx,
+            ));
+
+        // Album pages: the layout of the page itself and what it draws on it.
+        let album_pages_section = self
+            .section("Album pages", cx)
+            .child(self.subheading("Layout", cx))
             .child(self.note(
                 "Stacked puts the cover and details above the track list. Side \
                  panel moves them into a tall panel on the right, with a much \
@@ -1838,37 +1887,12 @@ impl Render for SettingsView {
                 theme != ThemePref::Adaptive || !adaptive_from_page,
                 "Wash the album header in that colour",
                 cx,
-            ))
-            .child(self.subheading("Selection", cx))
-            .child(self.vi_switch(
-                SettingsSwitch::SelectionGlowVi,
-                "selection-glow-vi",
-                selection_glow_vi,
-                false,
-                "Glow the vi cursor's card",
-                cx,
-            ))
-            .child(self.vi_switch(
-                SettingsSwitch::SelectionGlowHover,
-                "selection-glow-hover",
-                selection_glow_hover,
-                false,
-                "Glow the hovered card",
-                cx,
-            ))
-            .child(self.note(
-                "Off is just a primary border; on adds a filled background and glow.",
-                cx,
-            ))
-            .child(self.vi_switch(
-                SettingsSwitch::SelectionGlowAlbumColor,
-                "selection-glow-album-color",
-                selection_glow_album_color,
-                !(selection_glow_vi || selection_glow_hover),
-                "Colour the glow from the album's own cover",
-                cx,
-            ))
-            .child(self.subheading("Fullscreen", cx))
+            ));
+
+        // Fullscreen: the now-playing overlay.
+        let fullscreen_section = self
+            .section("Fullscreen", cx)
+            .child(self.subheading("Background", cx))
             .child(
                 h_flex()
                     .gap_2()
@@ -1917,7 +1941,7 @@ impl Render for SettingsView {
                 "Volume slider in fullscreen player",
                 cx,
             ))
-            .child(self.subheading("Fullscreen cover size", cx))
+            .child(self.subheading("Cover size", cx))
             .child(self.note(
                 "How far the cover grows on a big window. Fixed keeps it at the \
                  size a small window draws; the controls beside it keep their \
@@ -1958,39 +1982,83 @@ impl Render for SettingsView {
                     )),
             );
 
-        // Playback
-        let playback_section = self
-            .section("Playback", cx)
-            .child(self.vi_switch(
-                SettingsSwitch::Scrobble,
-                "scrobble",
-                scrobble_enabled,
-                false,
-                "Scrobble plays to server",
+        // Player bar: how the bar looks, then what it carries. The two
+        // switches that only apply to one style follow the style itself, so a
+        // disabled switch is read right under the button that enables it.
+        let player_bar_section = self
+            .section("Player bar", cx)
+            .child(self.subheading("Style", cx))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(self.label_btn(
+                        SettingsButton::PlayerBarStyle(PlayerBarStyle::Docked),
+                        "Docked",
+                        PlayerBarStyle::Docked.label(),
+                        player_bar_style == PlayerBarStyle::Docked,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::PlayerBarStyle(PlayerBarStyle::Floating),
+                        "Floating",
+                        PlayerBarStyle::Floating.label(),
+                        player_bar_style == PlayerBarStyle::Floating,
+                        cx,
+                    )),
+            )
+            .child(self.note(
+                "Floating draws the player bar as a rounded card hovering \
+                 over the content instead of a docked strip, matching the \
+                 fullscreen overlay's panels.",
                 cx,
             ))
             .child(self.vi_switch(
-                SettingsSwitch::ResumePlayback,
-                "resume-playback",
-                resume_playback,
-                false,
-                "Resume where you left off",
+                SettingsSwitch::PlayerBarTranslucent,
+                "player-bar-translucent",
+                player_bar_translucent,
+                translucent_disabled,
+                "See-through floating player bar",
+                cx,
+            ))
+            .child(self.note(
+                "Lets the page show through the floating card. Off is the \
+                 solid card, which stays readable over cover art.",
                 cx,
             ))
             .child(self.vi_switch(
-                SettingsSwitch::DefaultShuffle,
-                "default-shuffle",
-                default_shuffle,
-                false,
-                "Shuffle on by default",
+                SettingsSwitch::PlayerBarTint,
+                "player-bar-tint",
+                player_bar_tint,
+                tint_disabled,
+                "Cover tint behind player bar",
                 cx,
             ))
+            .child(self.note(
+                "The Adaptive theme washes the player bar with the playing \
+                 track's colour. Turn it off for the plain panel background — \
+                 the accent stays on the buttons, sliders and seek bar.",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::HideIdlePlayerBar,
+                "hide-idle-player-bar",
+                hide_idle_player_bar,
+                false,
+                "Hide player bar when idle",
+                cx,
+            ))
+            .child(self.subheading("Contents", cx))
             .child(self.vi_switch(
                 SettingsSwitch::WaveformSeekbar,
                 "waveform-seekbar",
                 waveform,
                 false,
                 "Waveform progress bar",
+                cx,
+            ))
+            .child(self.note(
+                "The waveform seek bar downloads each track a second time to \
+                 decode it, so it uses extra bandwidth.",
                 cx,
             ))
             .child(self.vi_switch(
@@ -2016,69 +2084,33 @@ impl Render for SettingsView {
                 false,
                 "Queue button in player bar",
                 cx,
-            ))
+            ));
+
+        // Playback: what happens to the audio and to the queue.
+        let playback_section = self
+            .section("Playback", cx)
             .child(self.vi_switch(
-                SettingsSwitch::HideIdlePlayerBar,
-                "hide-idle-player-bar",
-                hide_idle_player_bar,
+                SettingsSwitch::ResumePlayback,
+                "resume-playback",
+                resume_playback,
                 false,
-                "Hide player bar when idle",
+                "Resume where you left off",
                 cx,
             ))
             .child(self.vi_switch(
-                SettingsSwitch::PlayerBarTint,
-                "player-bar-tint",
-                player_bar_tint,
-                tint_disabled,
-                "Cover tint behind player bar",
-                cx,
-            ))
-            .child(self.note(
-                "The Adaptive theme washes the player bar with the playing \
-                 track's colour. Turn it off for the plain panel background — \
-                 the accent stays on the buttons, sliders and seek bar.",
+                SettingsSwitch::DefaultShuffle,
+                "default-shuffle",
+                default_shuffle,
+                false,
+                "Shuffle on by default",
                 cx,
             ))
             .child(self.vi_switch(
-                SettingsSwitch::PlayerBarTranslucent,
-                "player-bar-translucent",
-                player_bar_translucent,
-                translucent_disabled,
-                "See-through floating player bar",
-                cx,
-            ))
-            .child(self.note(
-                "Lets the page show through the floating card. Off is the \
-                 solid card, which stays readable over cover art.",
-                cx,
-            ))
-            .child(self.note(
-                "The waveform seek bar downloads each track a second time to \
-                 decode it, so it uses extra bandwidth.",
-                cx,
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.label_btn(
-                        SettingsButton::PlayerBarStyle(PlayerBarStyle::Docked),
-                        "Docked",
-                        PlayerBarStyle::Docked.label(),
-                        player_bar_style == PlayerBarStyle::Docked,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::PlayerBarStyle(PlayerBarStyle::Floating),
-                        "Floating",
-                        PlayerBarStyle::Floating.label(),
-                        player_bar_style == PlayerBarStyle::Floating,
-                        cx,
-                    )),
-            )
-            .child(self.note(
-                "Floating draws the player bar as a rounded card hovering \
-                 over the content instead of a docked strip, matching the \
-                 fullscreen overlay's panels.",
+                SettingsSwitch::Scrobble,
+                "scrobble",
+                scrobble_enabled,
+                false,
+                "Scrobble plays to server",
                 cx,
             ))
             .child(self.subheading("ReplayGain", cx))
@@ -2305,20 +2337,13 @@ impl Render for SettingsView {
                         cx,
                     )),
             )
+            .child(self.subheading("Keyboard", cx))
             .child(self.vi_switch(
                 SettingsSwitch::ViMode,
                 "vi-mode",
                 vi_mode,
                 false,
                 "Vi-style keyboard navigation",
-                cx,
-            ))
-            .child(self.vi_switch(
-                SettingsSwitch::ReducedMotion,
-                "reduced-motion",
-                reduced_motion,
-                false,
-                "Reduce motion",
                 cx,
             ))
             .child(self.note(
@@ -2426,6 +2451,7 @@ impl Render for SettingsView {
         }
 
         let library_section = library_card
+            .child(self.subheading("Maintenance", cx))
             .child(self.note(
                 "Refresh in the sidebar picks up albums the server already knows \
                  about. These two are slower and rarely needed.",
@@ -2518,7 +2544,8 @@ impl Render for SettingsView {
                         cx,
                     )),
             )
-            .child(crate::ui::divider())
+            // No divider: preloading fills the cache sized right above it, so
+            // the two are one block rather than two.
             .child(self.vi_switch(
                 SettingsSwitch::PrecacheArt,
                 "precache-art",
@@ -2548,6 +2575,7 @@ impl Render for SettingsView {
                 )
             })
             .child(crate::ui::divider())
+            .child(self.subheading("Lyrics", cx))
             .child(self.vi_switch(
                 SettingsSwitch::OnlineLyrics,
                 "online-lyrics",
@@ -2609,6 +2637,9 @@ impl Render for SettingsView {
         let mut cards: Vec<Option<gpui::AnyElement>> = vec![
             Some(window_section.into_any_element()),
             Some(appearance_section.into_any_element()),
+            Some(album_pages_section.into_any_element()),
+            Some(fullscreen_section.into_any_element()),
+            Some(player_bar_section.into_any_element()),
             Some(playback_section.into_any_element()),
             Some(browsing_section.into_any_element()),
             Some(streaming_section.into_any_element()),
@@ -2833,11 +2864,11 @@ mod tests {
     }
 
     /// A content area tall enough to hold the page in two columns. Tracks the
-    /// weights above: the two-column split of the current page comes to 1158px,
+    /// weights above: the two-column split of the current page comes to 1550px,
     /// and a `TALL` under that stops meaning what it says — the tall window
     /// takes the same column count as the short one and the test reads as a
     /// regression in the layout rather than a stale constant.
-    const TALL: f32 = 1250.;
+    const TALL: f32 = 1650.;
 
     #[test]
     fn the_grid_places_every_section_in_page_order() {
@@ -2854,8 +2885,9 @@ mod tests {
             );
         }
         // Signed out, the Account card is absent and the rest still fit.
-        let grid = compact_grid(&weights()[..6], 1200., TALL);
-        assert_eq!(placed(&grid), (0..6).collect::<Vec<_>>());
+        let signed_out = COMPACT_SECTIONS.len() - 1;
+        let grid = compact_grid(&weights()[..signed_out], 1200., TALL);
+        assert_eq!(placed(&grid), (0..signed_out).collect::<Vec<_>>());
     }
 
     #[test]
@@ -2980,7 +3012,11 @@ mod tests {
 
     #[test]
     fn the_columns_are_asymmetric_but_not_lopsided() {
-        let grid = compact_grid(&weights(), 2600., TALL);
+        // A tall window, where the two runs come out plainly uneven: the wider
+        // column is the one carrying more. Where the split is already even the
+        // nudge is either nothing or below the label floor, and the widths come
+        // back even by design — that is `columns_never_go_under_the_label_floor`.
+        let grid = compact_grid(&weights(), 1000., 4000.);
         let widths: Vec<f32> = grid.iter().map(|c| c.width).collect();
         let min = widths.iter().copied().fold(f32::MAX, f32::min);
         let max = widths.iter().copied().fold(0., f32::max);
