@@ -1035,20 +1035,59 @@ pub fn accent_from_cover_bytes(bytes: &[u8]) -> Option<Hsla> {
     )
 }
 
+/// Weight of the hues of the pixels above `min_sat`, bucketed into 24 bins
+/// (15° each) so a cover with two strong, separated hues (a split-tone
+/// sleeve) doesn't get averaged into a colour present in neither of them —
+/// a plain circular mean over both hues can land squarely between them,
+/// which reads as flat-out wrong. The dominant bin is found first, then the
+/// circular mean is taken only over pixels within one bin-width of it, which
+/// keeps the mean's sub-bin precision for a cover with one real peak while
+/// no longer blending two.
+const HUE_BINS: usize = 24;
+
 /// Weighted circular mean of the hues of the pixels above `min_sat`, with S/L
 /// pinned so the result reads cleanly on a dark background. `favour_mid`
 /// discounts near-black/near-white pixels — worth doing when there is colour to
 /// spare, worth skipping when there is barely any.
 fn dominant_hue(pixels: &[(f32, f32, f32)], min_sat: f32, favour_mid: bool) -> Option<Hsla> {
+    let weight = |s: f32, l: f32| {
+        let mut w = s * s;
+        if favour_mid {
+            w *= 1.0 - (2.0 * l - 1.0).powi(2);
+        }
+        w
+    };
+
+    let mut bins = [0.0f32; HUE_BINS];
+    for &(h, s, l) in pixels {
+        if s < min_sat {
+            continue;
+        }
+        let bin = ((h.rem_euclid(1.0) * HUE_BINS as f32) as usize).min(HUE_BINS - 1);
+        bins[bin] += weight(s, l);
+    }
+    let (peak_bin, &peak_w) = bins
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap();
+    if peak_w < 1e-3 {
+        return None;
+    }
+    let peak_hue = (peak_bin as f32 + 0.5) / HUE_BINS as f32;
+
     let (mut sin, mut cos, mut wsum, mut ssum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for &(h, s, l) in pixels {
         if s < min_sat {
             continue;
         }
-        let mut w = s * s;
-        if favour_mid {
-            w *= 1.0 - (2.0 * l - 1.0).powi(2);
+        // Shortest signed distance from the peak, in turns.
+        let mut d = h.rem_euclid(1.0) - peak_hue;
+        d -= d.round();
+        if d.abs() > 1.0 / HUE_BINS as f32 {
+            continue;
         }
+        let w = weight(s, l);
         let ang = h * std::f32::consts::TAU;
         sin += w * ang.sin();
         cos += w * ang.cos();
@@ -1068,6 +1107,71 @@ fn dominant_hue(pixels: &[(f32, f32, f32)], min_sat: f32, favour_mid: bool) -> O
         l: 0.55,
         a: 1.0,
     })
+}
+
+/// Like `dominant_hue`, but hands back the pixels' own colour instead of a
+/// fixed-S/L accent — for callers (the fullscreen background's per-band
+/// palette sample) that want a representative sample rather than a UI tint.
+/// A plain RGB mean has the same failure `dominant_hue` was fixed for: a band
+/// split between two strong, separated hues averages into a colour present in
+/// neither. Falls back to a plain mean when the pixels carry too little
+/// colour to bin (a band that is mostly grey, black or white).
+pub(crate) fn dominant_rgb(pixels: &[(f32, f32, f32)]) -> (f32, f32, f32) {
+    if pixels.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mean = || {
+        let n = pixels.len() as f32;
+        let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
+        for &(pr, pg, pb) in pixels {
+            r += pr;
+            g += pg;
+            b += pb;
+        }
+        (r / n, g / n, b / n)
+    };
+    let hsl: Vec<(f32, f32, f32)> = pixels
+        .iter()
+        .map(|&(r, g, b)| rgb_to_hsl(r, g, b))
+        .collect();
+    let mut bins = [0.0f32; HUE_BINS];
+    for &(h, s, _) in &hsl {
+        if s < 0.08 {
+            continue;
+        }
+        let bin = ((h.rem_euclid(1.0) * HUE_BINS as f32) as usize).min(HUE_BINS - 1);
+        bins[bin] += s * s;
+    }
+    let (peak_bin, &peak_w) = bins
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap();
+    if peak_w < 1e-3 {
+        return mean();
+    }
+    let peak_hue = (peak_bin as f32 + 0.5) / HUE_BINS as f32;
+    let (mut r, mut g, mut b, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for (i, &(h, s, _)) in hsl.iter().enumerate() {
+        if s < 0.08 {
+            continue;
+        }
+        let mut d = h.rem_euclid(1.0) - peak_hue;
+        d -= d.round();
+        if d.abs() > 1.0 / HUE_BINS as f32 {
+            continue;
+        }
+        let (pr, pg, pb) = pixels[i];
+        r += pr;
+        g += pg;
+        b += pb;
+        n += 1.0;
+    }
+    if n < 1.0 {
+        mean()
+    } else {
+        (r / n, g / n, b / n)
+    }
 }
 
 /// Accent for a cover with no hue at all. Greys can't be tinted without

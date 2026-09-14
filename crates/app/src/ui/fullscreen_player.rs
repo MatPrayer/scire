@@ -2245,23 +2245,26 @@ fn extract_palette(path: &std::path::Path) -> Option<Vec<gpui::Rgba>> {
     if w == 0 || h == 0 {
         return None;
     }
-    let mut acc = [[0u64; 3]; BANDS];
-    let mut n = [0u64; BANDS];
+    let mut bands: [Vec<(f32, f32, f32)>; BANDS] = Default::default();
     for (_, y, pixel) in img.enumerate_pixels() {
         let band = ((y as u64 * BANDS as u64) / h as u64).min(BANDS as u64 - 1) as usize;
-        acc[band][0] += pixel[0] as u64;
-        acc[band][1] += pixel[1] as u64;
-        acc[band][2] += pixel[2] as u64;
-        n[band] += 1;
+        bands[band].push((
+            pixel[0] as f32 / 255.0,
+            pixel[1] as f32 / 255.0,
+            pixel[2] as f32 / 255.0,
+        ));
     }
-    // Raw averages; the render darkens/brightens per background mode.
-    let palette: Vec<gpui::Rgba> = (0..BANDS)
-        .filter(|&i| n[i] > 0)
-        .map(|i| gpui::Rgba {
-            r: acc[i][0] as f32 / n[i] as f32 / 255.0,
-            g: acc[i][1] as f32 / n[i] as f32 / 255.0,
-            b: acc[i][2] as f32 / n[i] as f32 / 255.0,
-            a: 1.0,
+    // A plain mean blends a band split between two strong, separated hues
+    // (a split-tone sleeve) into a colour present in neither — the same
+    // failure `dominant_hue` was fixed for, here for the background's own
+    // sample rather than a UI accent. `crate::ui::dominant_rgb` picks the
+    // band's dominant hue cluster first and averages only that.
+    let palette: Vec<gpui::Rgba> = bands
+        .iter()
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let (r, g, b) = crate::ui::dominant_rgb(b);
+            gpui::Rgba { r, g, b, a: 1.0 }
         })
         .collect();
     if palette.is_empty() {
