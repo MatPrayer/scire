@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{
     AlbumPageLayout, CoverSize, DefaultPage, FullscreenBackground, FullscreenCoverSize,
-    QueueEndBehavior, ReplayGainMode, ThemePref,
+    PlayerBarStyle, QueueEndBehavior, ReplayGainMode, ThemePref,
 };
 use crate::services::library_db::LibraryDb;
 use crate::services::{art_precache, artwork, navidrome_sync, runtime};
@@ -118,7 +118,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 const COMPACT_SECTIONS: [(&str, u16); 7] = [
     ("Window", 4),
     ("Appearance", 18),
-    ("Playback", 15),
+    ("Playback", 17),
     ("Browsing", 11),
     ("Streaming", 5),
     ("Library", 13),
@@ -373,6 +373,8 @@ enum SettingsSwitch {
     DetailedVolume,
     ShowQueueButton,
     HideIdlePlayerBar,
+    PlayerBarTint,
+    PlayerBarTranslucent,
     ViMode,
     ReducedMotion,
     PrecacheArt,
@@ -386,6 +388,7 @@ enum SettingsButton {
     FullscreenBg(FullscreenBackground),
     FullscreenCover(FullscreenCoverSize),
     AlbumLayout(AlbumPageLayout),
+    PlayerBarStyle(PlayerBarStyle),
     ReplayGain(ReplayGainMode),
     QueueEnd(QueueEndBehavior),
     Repeat(RepeatMode),
@@ -907,6 +910,20 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_player_bar_tint(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.player_bar_tint = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_player_bar_translucent(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.player_bar_translucent = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_adaptive_from_page(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.adaptive_from_page = enabled);
@@ -974,6 +991,13 @@ impl SettingsView {
     fn set_album_layout(&mut self, layout: AlbumPageLayout, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.album_layout = layout);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_player_bar_style(&mut self, style: PlayerBarStyle, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.player_bar_style = style);
         self.persist(cx);
         cx.notify();
     }
@@ -1049,6 +1073,8 @@ impl SettingsView {
             SettingsSwitch::DetailedVolume => s.detailed_volume,
             SettingsSwitch::ShowQueueButton => s.show_queue_button,
             SettingsSwitch::HideIdlePlayerBar => s.hide_idle_player_bar,
+            SettingsSwitch::PlayerBarTint => s.player_bar_tint,
+            SettingsSwitch::PlayerBarTranslucent => s.player_bar_translucent,
             SettingsSwitch::ViMode => s.vi_mode,
             SettingsSwitch::ReducedMotion => s.reduced_motion,
             SettingsSwitch::PrecacheArt => s.precache_art,
@@ -1066,6 +1092,11 @@ impl SettingsView {
             SettingsSwitch::AdaptivePageGradient => {
                 s.theme != ThemePref::Adaptive || !s.adaptive_from_page
             }
+            // No other theme tints the bar, so there is nothing to turn off.
+            SettingsSwitch::PlayerBarTint => s.theme != ThemePref::Adaptive,
+            // The docked bar is opaque either way — there is no card to see
+            // through.
+            SettingsSwitch::PlayerBarTranslucent => s.player_bar_style != PlayerBarStyle::Floating,
             // Only the side-panel layout has two columns to swap.
             SettingsSwitch::AlbumPanelRight => !s.album_layout.wants_side_panel(),
             _ => false,
@@ -1102,6 +1133,8 @@ impl SettingsView {
             SettingsSwitch::DetailedVolume => self.set_detailed_volume(value, cx),
             SettingsSwitch::ShowQueueButton => self.set_show_queue_button(value, cx),
             SettingsSwitch::HideIdlePlayerBar => self.set_hide_idle_player_bar(value, cx),
+            SettingsSwitch::PlayerBarTint => self.set_player_bar_tint(value, cx),
+            SettingsSwitch::PlayerBarTranslucent => self.set_player_bar_translucent(value, cx),
             SettingsSwitch::ViMode => self.set_vi_mode(value, cx),
             SettingsSwitch::ReducedMotion => self.set_reduced_motion(value, cx),
             SettingsSwitch::PrecacheArt => self.set_precache_art(value, cx),
@@ -1120,6 +1153,7 @@ impl SettingsView {
             SettingsButton::FullscreenBg(m) => self.set_fullscreen_bg(m, cx),
             SettingsButton::FullscreenCover(s) => self.set_fullscreen_cover(s, cx),
             SettingsButton::AlbumLayout(l) => self.set_album_layout(l, cx),
+            SettingsButton::PlayerBarStyle(s) => self.set_player_bar_style(s, cx),
             SettingsButton::ReplayGain(m) => self.set_replay_gain(m, cx),
             SettingsButton::QueueEnd(m) => self.set_queue_end(m, cx),
             SettingsButton::Repeat(m) => self.set_default_repeat(m, cx),
@@ -1585,6 +1619,11 @@ impl Render for SettingsView {
         };
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
         let hide_idle_player_bar = self.session.read(cx).settings.hide_idle_player_bar;
+        let player_bar_style = self.session.read(cx).settings.player_bar_style;
+        let player_bar_tint = self.session.read(cx).settings.player_bar_tint;
+        let tint_disabled = self.switch_disabled(SettingsSwitch::PlayerBarTint, cx);
+        let player_bar_translucent = self.session.read(cx).settings.player_bar_translucent;
+        let translucent_disabled = self.switch_disabled(SettingsSwitch::PlayerBarTranslucent, cx);
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
         let adaptive_from_page = self.session.read(cx).settings.adaptive_from_page;
         let adaptive_page_gradient = self.session.read(cx).settings.adaptive_page_gradient;
@@ -1986,9 +2025,60 @@ impl Render for SettingsView {
                 "Hide player bar when idle",
                 cx,
             ))
+            .child(self.vi_switch(
+                SettingsSwitch::PlayerBarTint,
+                "player-bar-tint",
+                player_bar_tint,
+                tint_disabled,
+                "Cover tint behind player bar",
+                cx,
+            ))
+            .child(self.note(
+                "The Adaptive theme washes the player bar with the playing \
+                 track's colour. Turn it off for the plain panel background — \
+                 the accent stays on the buttons, sliders and seek bar.",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::PlayerBarTranslucent,
+                "player-bar-translucent",
+                player_bar_translucent,
+                translucent_disabled,
+                "See-through floating player bar",
+                cx,
+            ))
+            .child(self.note(
+                "Lets the page show through the floating card. Off is the \
+                 solid card, which stays readable over cover art.",
+                cx,
+            ))
             .child(self.note(
                 "The waveform seek bar downloads each track a second time to \
                  decode it, so it uses extra bandwidth.",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(self.label_btn(
+                        SettingsButton::PlayerBarStyle(PlayerBarStyle::Docked),
+                        "Docked",
+                        PlayerBarStyle::Docked.label(),
+                        player_bar_style == PlayerBarStyle::Docked,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::PlayerBarStyle(PlayerBarStyle::Floating),
+                        "Floating",
+                        PlayerBarStyle::Floating.label(),
+                        player_bar_style == PlayerBarStyle::Floating,
+                        cx,
+                    )),
+            )
+            .child(self.note(
+                "Floating draws the player bar as a rounded card hovering \
+                 over the content instead of a docked strip, matching the \
+                 fullscreen overlay's panels.",
                 cx,
             ))
             .child(self.subheading("ReplayGain", cx))

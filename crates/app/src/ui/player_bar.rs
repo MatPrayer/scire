@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, Render,
-    SharedString, Window, div, ease_out_quint, hsla, img, linear_color_stop, linear_gradient,
-    prelude::*, px,
+    Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, Hsla, IntoElement,
+    Render, SharedString, Window, div, ease_out_quint, hsla, img, linear_color_stop,
+    linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -16,7 +16,7 @@ use gpui_component::{
 };
 
 use crate::assets::{app_icon, icons};
-use crate::config::{ReplayGainMode, ThemePref};
+use crate::config::{PlayerBarStyle, ReplayGainMode, ThemePref};
 use crate::services::{runtime, waveform};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
@@ -27,6 +27,61 @@ use crate::ui::format_duration;
 /// (`Settings::hide_idle_player_bar`) by shrinking a clip around it, and a box
 /// sized off anything but the bar's real height clips it in the wrong place.
 pub const BAR_H: f32 = 124.;
+
+/// Gap the floating style leaves between the card and every window edge.
+/// Public because the root places the card by it.
+pub const FLOAT_MARGIN: f32 = 12.;
+
+/// The floating card's own height. Deliberately well under `BAR_H`: it is drawn
+/// *over* the page rather than beside it, so every pixel it takes is a pixel of
+/// the album grid it is standing on.
+pub const FLOAT_BAR_H: f32 = 84.;
+
+/// Widest the floating card is drawn. Stretched edge to edge it reads as a
+/// docked bar that has merely been rounded off; a card the window is visibly
+/// wider than is what makes it read as floating over the page.
+pub const FLOAT_MAX_W: f32 = 1040.;
+
+/// Fill alpha of the floating card with `Settings::player_bar_translucent` on.
+///
+/// The fullscreen panels are `background` at 0.72 and **look** darker and more
+/// solid than that number sounds, which is the trap: what is behind them is the
+/// overlay's own dimmed, blurred cover, so 28% of a near-black backdrop is
+/// composited into every one of them. The card here stands on an album grid at
+/// full brightness instead, so the same 0.72 lets cover art through at full
+/// strength and the title is set on top of it.
+///
+/// So the panels' *appearance* is reproduced rather than their constants: the
+/// backdrop they borrow their darkness from is folded into the fill
+/// (`float_fill`), and the alpha is raised to what is left of the show-through.
+/// Even that much show-through is a preference rather than the default, since
+/// what it shows through to is whatever cover art the grid happens to be
+/// scrolled to — see `player_bar_translucent`.
+const FLOAT_FILL_ALPHA: f32 = 0.92;
+
+/// How far the floating card's fill is pulled toward black, standing in for the
+/// dark backdrop the fullscreen panels composite in for free.
+///
+/// Applied in both modes, so turning the translucency on and off changes what
+/// shows through and nothing else — an opaque card of a different colour would
+/// read as a second style rather than as the same card with the glass taken
+/// out.
+const FLOAT_DARKEN: f32 = 0.22;
+
+/// The floating card's fill, from the colour the docked bar would use.
+///
+/// Darkened, and translucent only when asked for — see `FLOAT_FILL_ALPHA`. The
+/// hue and saturation are untouched, so the adaptive theme's cover accent
+/// survives it; only lightness and alpha move, which is what keeps a light
+/// theme's card light (a grey card rather than a white one) instead of turning
+/// it into a dark one.
+fn float_fill(base: Hsla, translucent: bool) -> Hsla {
+    Hsla {
+        l: base.l * (1. - FLOAT_DARKEN),
+        a: if translucent { FLOAT_FILL_ALPHA } else { 1. },
+        ..base
+    }
+}
 
 /// Widest the now-playing and volume columns flanking the transport are drawn.
 const SIDE_WIDTH: f32 = 348.;
@@ -48,6 +103,20 @@ const BAR_CHROME: f32 = 32. + 32.;
 fn side_width(window_width: f32) -> f32 {
     let free = window_width - TRANSPORT_MIN - BAR_CHROME;
     (free / 2.).clamp(SIDE_MIN, SIDE_WIDTH)
+}
+
+/// Where the floating card's bottom edge sits at a given reveal openness.
+///
+/// The travel is the card's whole height plus its margin, so a closed bar is
+/// off the window rather than a low, faint ghost of one still catching the eye
+/// through the last of the fade.
+pub fn float_bottom(open: f32) -> f32 {
+    FLOAT_MARGIN - (FLOAT_BAR_H + FLOAT_MARGIN) * (1. - open)
+}
+
+/// Width the floating card is drawn at, in a window of `window_width`.
+pub fn float_width(window_width: f32) -> f32 {
+    (window_width - FLOAT_MARGIN * 2.).min(FLOAT_MAX_W)
 }
 
 /// Bubbled to RootView.
@@ -390,7 +459,23 @@ impl Render for PlayerBar {
         // in between lands in the middle of the bar rather than 50px right of
         // it, of the volume block facing it. Long titles are handled by
         // scrolling them, not by widening the column.
-        let side_width = side_width(f32::from(window.viewport_size().width));
+        let floating = self.session.read(cx).settings.player_bar_style == PlayerBarStyle::Floating;
+        let translucent = self.session.read(cx).settings.player_bar_translucent;
+        // The columns are sized off the *bar's* width, not the window's: the
+        // floating card is inset by a margin on each side, and sizing it off
+        // the window overflows it by exactly that much in a narrow window.
+        let window_w = f32::from(window.viewport_size().width);
+        let bar_width = if floating {
+            float_width(window_w)
+        } else {
+            window_w
+        };
+        let side_width = side_width(bar_width);
+        // The floating card is over the page, not beside it: it is shorter,
+        // and everything sized off its height comes down with it.
+        let bar_h = if floating { FLOAT_BAR_H } else { BAR_H };
+        let cover_px = if floating { 56. } else { 76. };
+        let wave_h = if floating { 20. } else { 26. };
 
         // Small, quiet transport icon buttons; primary circular play.
         let icon_btn = |id: &'static str, icon_path: &'static str, active: bool| {
@@ -404,27 +489,57 @@ impl Render for PlayerBar {
         // Adaptive theme: tint the bar with the cover-derived accent fading to
         // black; other themes keep the flat sidebar colour. The tint is shared
         // with the fullscreen overlay's gradient (see `ui::player_tint`).
+        //
+        // `player_bar_tint` opts out of the backdrop alone — the accent stays
+        // on the buttons, the sliders and the seek bar, which is the rest of
+        // what the Adaptive theme does. A gradient under the bar is the one
+        // part of it that sits behind text all the time.
         let theme_pref = self.session.read(cx).settings.theme;
-        let is_adaptive = theme_pref == ThemePref::Adaptive;
+        let is_adaptive =
+            theme_pref == ThemePref::Adaptive && self.session.read(cx).settings.player_bar_tint;
         let sidebar = cx.theme().sidebar;
         let accent_bg = crate::ui::player_tint(theme_pref, cx);
 
         h_flex()
             .w_full()
-            .h(px(BAR_H))
+            .h(px(bar_h))
             .flex_none()
             .px_4()
             .gap_4()
             .items_center()
-            .border_t_1()
-            .border_color(hsla(0., 0., 0.5, 0.15))
             .map(|this| {
+                if floating {
+                    // Same translucent card as the fullscreen overlay's
+                    // panels (queue/lyrics/tuning card), so a bar hovering
+                    // over the UI reads as part of the same design rather
+                    // than a docked strip cut loose.
+                    this.rounded_2xl()
+                        .shadow_xl()
+                        .border_1()
+                        .border_color(cx.theme().border.opacity(0.6))
+                        .occlude()
+                } else {
+                    this.border_t_1().border_color(hsla(0., 0., 0.5, 0.15))
+                }
+            })
+            .map(|this| {
+                let fill = |c: Hsla| {
+                    if floating {
+                        float_fill(c, translucent)
+                    } else {
+                        c
+                    }
+                };
                 if is_adaptive {
                     this.bg(linear_gradient(
                         90.,
-                        linear_color_stop(accent_bg, 0.),
-                        linear_color_stop(hsla(0., 0., 0., 1.), 1.),
+                        linear_color_stop(fill(accent_bg), 0.),
+                        linear_color_stop(fill(hsla(0., 0., 0., 1.)), 1.),
                     ))
+                } else if floating {
+                    // The overlay panels' own fill, not the docked bar's
+                    // `sidebar`: a card hovering over the page is one of them.
+                    this.bg(fill(cx.theme().background))
                 } else {
                     this.bg(sidebar)
                 }
@@ -442,7 +557,7 @@ impl Render for PlayerBar {
                             .id("np-cover")
                             .group("np-cover")
                             .relative()
-                            .size(px(76.))
+                            .size(px(cover_px))
                             .flex_none()
                             .rounded_md()
                             .bg(cx.theme().muted)
@@ -462,7 +577,7 @@ impl Render for PlayerBar {
                                 let anim_id: SharedString =
                                     format!("np-cover-art-{}", path.display()).into();
                                 this.child(
-                                    img(path).size(px(76.)).rounded_md().with_animation(
+                                    img(path).size(px(cover_px)).rounded_md().with_animation(
                                         ElementId::Name(anim_id),
                                         Animation::new(crate::ui::transition(reduced_motion, 120))
                                             .with_easing(ease_out_quint()),
@@ -632,11 +747,16 @@ impl Render for PlayerBar {
             .child(
                 v_flex()
                     .flex_1()
-                    .gap(if waveform_enabled && self.waveform.is_some() {
-                        px(10.)
-                    } else {
-                        px(2.)
-                    })
+                    .gap(
+                        match (waveform_enabled && self.waveform.is_some(), floating) {
+                            // The waveform is a taller, busier shape than the
+                            // slider and wants room under the controls — room the
+                            // floating card does not have to give.
+                            (true, false) => px(10.),
+                            (true, true) => px(4.),
+                            (false, _) => px(2.),
+                        },
+                    )
                     .items_center()
                     .child(
                         h_flex()
@@ -729,7 +849,7 @@ impl Render for PlayerBar {
                                         (true, Some(peaks)) => crate::ui::waveform_seek_bar(
                                             &peaks,
                                             seek_fraction,
-                                            26.,
+                                            wave_h,
                                             cx.theme().primary,
                                             cx.theme().muted_foreground.opacity(0.35),
                                             self.player.clone(),
@@ -1004,7 +1124,63 @@ impl Render for PlayerBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{SIDE_MIN, SIDE_WIDTH, side_width};
+    use super::{
+        FLOAT_BAR_H, FLOAT_FILL_ALPHA, FLOAT_MARGIN, FLOAT_MAX_W, SIDE_MIN, SIDE_WIDTH,
+        float_bottom, float_fill, float_width, side_width,
+    };
+    use gpui::hsla;
+
+    #[test]
+    fn the_floating_fill_darkens_without_moving_the_colour() {
+        let accent = hsla(0.6, 0.5, 0.4, 1.);
+        let fill = float_fill(accent, true);
+        assert_eq!((fill.h, fill.s), (accent.h, accent.s));
+        assert!(fill.l < accent.l);
+        assert_eq!(fill.a, FLOAT_FILL_ALPHA);
+    }
+
+    #[test]
+    fn only_the_alpha_moves_with_the_translucency() {
+        // The two modes are the same card with and without show-through, so
+        // nothing but the alpha may differ between them.
+        let accent = hsla(0.6, 0.5, 0.4, 1.);
+        let glass = float_fill(accent, true);
+        let solid = float_fill(accent, false);
+        assert_eq!(solid.a, 1.);
+        assert_eq!((solid.h, solid.s, solid.l), (glass.h, glass.s, glass.l));
+    }
+
+    #[test]
+    fn a_light_theme_keeps_a_light_card() {
+        // Darkening is a shade off white, not a flip to a dark card.
+        assert!(float_fill(hsla(0., 0., 1., 1.), true).l > 0.7);
+        // And black has nothing to give up.
+        assert_eq!(float_fill(hsla(0., 0., 0., 1.), true).l, 0.);
+    }
+
+    #[test]
+    fn the_floating_card_rests_a_margin_off_the_bottom_edge() {
+        assert_eq!(float_bottom(1.), FLOAT_MARGIN);
+    }
+
+    #[test]
+    fn a_closed_floating_card_is_off_the_window() {
+        let bottom = float_bottom(0.);
+        assert!(
+            bottom + FLOAT_BAR_H <= 0.,
+            "top edge still on screen: {bottom}"
+        );
+    }
+
+    #[test]
+    fn the_floating_card_insets_a_narrow_window_and_caps_a_wide_one() {
+        assert_eq!(float_width(900.), 900. - FLOAT_MARGIN * 2.);
+        assert_eq!(float_width(2560.), FLOAT_MAX_W);
+        // Never wider than the window it is inset in.
+        for w in [400., 700., 1040., 1064., 1600.] {
+            assert!(float_width(w) <= w - FLOAT_MARGIN * 2. + 0.01, "{w}");
+        }
+    }
 
     #[test]
     fn wide_windows_keep_the_full_side_columns() {

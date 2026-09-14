@@ -172,6 +172,24 @@ pub struct Settings {
     /// see `ui::album_side_panel`.
     #[serde(default)]
     pub album_layout: AlbumPageLayout,
+    /// How the bottom player bar sits against the rest of the UI. `Docked`
+    /// (default) reserves its own row, same as every other panel. `Floating`
+    /// draws it as a translucent, rounded card hovering over the content
+    /// instead — the same card treatment as the fullscreen overlay's panels.
+    #[serde(default)]
+    pub player_bar_style: PlayerBarStyle,
+    /// Wash the bottom player bar with the playing track's colour under the
+    /// Adaptive theme. Off leaves it the flat panel fill every other theme
+    /// draws, while the accent itself stays on buttons, sliders and the seek
+    /// bar — this is the backdrop alone. No other theme tints the bar, so the
+    /// switch does nothing under them.
+    pub player_bar_tint: bool,
+    /// Let the page show through the `Floating` player bar's card. Off
+    /// (default) draws the same card fully opaque, which is the readable one
+    /// over a grid of cover art; on restores the show-through that makes it
+    /// read as glass over the page. The `Docked` bar is opaque either way, so
+    /// this does nothing under it.
+    pub player_bar_translucent: bool,
     /// Put the cover-and-details panel on the *right* and the track list on
     /// the left; the layout's default is the other way round. Only the
     /// `SidePanel` layout has two columns to swap, so this is ignored — and the
@@ -374,6 +392,27 @@ impl AlbumPageLayout {
     /// the final say.
     pub fn wants_side_panel(self) -> bool {
         self == Self::SidePanel
+    }
+}
+
+/// How the bottom player bar sits against the rest of the UI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerBarStyle {
+    /// Reserves its own row at the bottom, same as every other panel.
+    #[default]
+    Docked,
+    /// A translucent, rounded card floating over the content with a margin on
+    /// every side, matching the fullscreen overlay's panel look.
+    Floating,
+}
+
+impl PlayerBarStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Docked => "Docked",
+            Self::Floating => "Floating",
+        }
     }
 }
 
@@ -601,6 +640,9 @@ impl Default for Settings {
             adaptive_from_page: false,
             adaptive_page_gradient: false,
             album_layout: AlbumPageLayout::default(),
+            player_bar_style: PlayerBarStyle::default(),
+            player_bar_tint: true,
+            player_bar_translucent: false,
             album_panel_right: false,
             hide_album_stars: false,
             reduced_motion: false,

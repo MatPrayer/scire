@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{DefaultPage, ThemePref};
+use crate::config::{DefaultPage, PlayerBarStyle, ThemePref};
 use crate::services::{
     art_precache, artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync,
     runtime,
@@ -34,7 +34,9 @@ use crate::ui::favorites::{FavoritesEvent, FavoritesView};
 use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
 use crate::ui::local_album_detail::LocalAlbumDetailView;
 use crate::ui::local_music::{LocalMusicEvent, LocalMusicView};
-use crate::ui::player_bar::{BAR_H, PlayerBar, PlayerBarEvent};
+use crate::ui::player_bar::{
+    BAR_H, FLOAT_MARGIN, FLOAT_MAX_W, PlayerBar, PlayerBarEvent, float_bottom,
+};
 use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
 use crate::ui::queue_panel::{QueuePanel, QueuePanelEvent};
 use crate::ui::radio::RadioView;
@@ -2422,6 +2424,8 @@ impl Render for RootView {
             !self.session.read(cx).settings.hide_idle_player_bar
                 || !player_bar_idle(p.playing, p.now_playing().is_some(), p.queue.is_empty())
         };
+        let floating_bar =
+            self.session.read(cx).settings.player_bar_style == PlayerBarStyle::Floating;
         // The bar slides down out of a shrinking clip rather than vanishing:
         // its height is the content's, so a cut would jump the page under the
         // pointer either way — this way the movement says where it went.
@@ -2686,7 +2690,7 @@ impl Render for RootView {
                         )
                     }),
             )
-            .when(bar_visible, |this| {
+            .when(bar_visible && !floating_bar, |this| {
                 // The clip is what animates; the bar keeps its own height
                 // inside it, translated down by whatever the clip has given
                 // up, so it leaves through the bottom edge rather than being
@@ -2704,6 +2708,30 @@ impl Render for RootView {
                                 .top(px(BAR_H * (1. - bar_open)))
                                 .w_full()
                                 .h(px(BAR_H))
+                                .child(self.player_bar.clone()),
+                        ),
+                )
+            })
+            // Floating style: no row of its own and no room reserved for it —
+            // the page runs the full height of the window and the bar hovers
+            // over it as a translucent card, centred and inset by
+            // `FLOAT_MARGIN`, the same card treatment as the fullscreen
+            // overlay's panels. It leaves through the bottom edge on the same
+            // `bar_open`/`bar_visible` the docked bar uses.
+            .when(bar_visible && floating_bar, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(FLOAT_MARGIN))
+                        .right(px(FLOAT_MARGIN))
+                        .bottom(px(float_bottom(bar_open)))
+                        .flex()
+                        .justify_center()
+                        .opacity(bar_open)
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(px(FLOAT_MAX_W))
                                 .child(self.player_bar.clone()),
                         ),
                 )
