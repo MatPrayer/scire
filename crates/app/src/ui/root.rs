@@ -2822,7 +2822,7 @@ impl Render for RootView {
 /// paused track still has a bar — it is what resumes it — and a queue with
 /// tracks in it but no current song keeps one too, since the transport can
 /// still start it.
-fn player_bar_idle(playing: bool, has_now_playing: bool, queue_empty: bool) -> bool {
+pub fn player_bar_idle(playing: bool, has_now_playing: bool, queue_empty: bool) -> bool {
     !playing && !has_now_playing && queue_empty
 }
 

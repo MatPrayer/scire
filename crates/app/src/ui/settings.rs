@@ -94,6 +94,15 @@ const COMPACT_COL_TARGET: f32 = 460.;
 /// padding, and a column any narrower than this pushes it out through the
 /// card's edge instead of wrapping it.
 const COMPACT_COL_MIN: f32 = 380.;
+/// What the grid leaves under itself. The scrolling column's run-out is sized
+/// for the docked bar; the grid is meant to end short of the bottom anyway and
+/// only needs the page not to end flush against the window's edge.
+const COMPACT_RUNOUT: f32 = 16.;
+/// How far the drawn page may be allowed to run past the model before the
+/// calibration stops chasing it. A page a quarter taller than its weights say
+/// is a weights table that wants fixing, not a rounding error, and a scale
+/// beyond this only pushes every window onto the scrolling column.
+const COMPACT_SCALE_MAX: f32 = 1.25;
 /// Past four columns the cards are short and far apart — the page reads as a
 /// scattering rather than a grid.
 const COMPACT_COL_MAX: usize = 4;
@@ -120,7 +129,7 @@ const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Appearance", 10),
     ("Album pages", 7),
     ("Fullscreen", 7),
-    ("Player bar", 10),
+    ("Player bar", 11),
     ("Playback", 10),
     ("Browsing", 15),
     ("Streaming", 5),
@@ -496,6 +505,23 @@ pub struct SettingsView {
     /// column each section was placed in. All zero when the page is the
     /// ordinary scrolling column.
     compact_widths: Vec<f32>,
+    /// How much taller the grid draws than the model says it will, measured
+    /// from what it drew — see the calibration in `render`. Rises only.
+    compact_scale: f32,
+    /// The tallest the scroll body has been seen at `compact_viewport`: the
+    /// height the plan is made from, which must not depend on the layout the
+    /// plan picks.
+    compact_room: f32,
+    /// The window size `compact_room` was collected at.
+    compact_viewport: (f32, f32),
+    /// The `(width, room)` last frame's grid was planned from. `max_offset`
+    /// belongs to that frame's plan, so it only says anything about the model
+    /// when this frame plans from the same two numbers.
+    compact_plan: (f32, f32),
+    /// Whether the current `compact_scale` has been seen to draw a grid that
+    /// fits. Until it has, the grid is laid out but not painted — an
+    /// uncalibrated plan is exactly the frame that overflows.
+    compact_checked: bool,
 }
 
 impl SettingsView {
@@ -529,6 +555,11 @@ impl SettingsView {
             card_width: None,
             compact: false,
             compact_widths: Vec::new(),
+            compact_scale: 1.,
+            compact_room: 0.,
+            compact_viewport: (0., 0.),
+            compact_plan: (0., 0.),
+            compact_checked: false,
         }
     }
 
@@ -1687,13 +1718,114 @@ impl Render for SettingsView {
             .iter()
             .map(|(_, w)| *w)
             .collect();
+        // The floating player bar is drawn *over* the content area rather than
+        // beside it, so the bottom of the scroll body is behind the card. A
+        // page that scrolls can run out under it, but the grid is planned to
+        // fit the window exactly, and a plan made against the full height puts
+        // the tallest column's last card under the card. Take it off the height
+        // the plan is made from, and put it back as the grid's run-out.
+        let bar_reserve = {
+            let settings = &self.session.read(cx).settings;
+            let floating = settings.player_bar_style == PlayerBarStyle::Floating;
+            let hide_idle = settings.hide_idle_player_bar;
+            let player = self.player.read(cx);
+            let shown = !hide_idle
+                || !crate::ui::root::player_bar_idle(
+                    player.playing,
+                    player.now_playing().is_some(),
+                    player.queue.is_empty(),
+                );
+            crate::ui::player_bar::float_reserve(floating, shown)
+        };
         // The height is the scroll body's own, i.e. last frame's — it decides
         // how many columns the page wraps into, and a window resized vertically
         // re-plans a frame later. Only the *width* needs `LiveWidth`'s
         // same-frame treatment, since that is what the cards are laid out at.
-        let grid = compact_grid(&weights, body, f32::from(self.scroll.bounds().size.height));
+        //
+        // **The largest body height seen at this window size**, not simply the
+        // last one: the quick-nav pills are drawn in the scrolling column and
+        // not in the grid, so the body is a pill row shorter in one layout than
+        // in the other — and a plan made from the body it is *about to*
+        // change would decide the grid does not fit out of a height the grid
+        // would not have had. The two layouts then alternate frame by frame,
+        // which is exactly what a resize showed. The grid's body is always the
+        // taller of the two, so the maximum is the honest number for both, and
+        // it is forgotten when the window itself changes size.
+        let viewport = window.viewport_size();
+        let vp = (f32::from(viewport.width), f32::from(viewport.height));
+        if vp != self.compact_viewport {
+            self.compact_viewport = vp;
+            self.compact_room = 0.;
+        }
+        self.compact_room = self
+            .compact_room
+            .max(f32::from(self.scroll.bounds().size.height));
+        // The run-out under the grid is content like the cards are, so the plan
+        // is made from what is left after it rather than being corrected for it
+        // a frame later.
+        let room = (self.compact_room - bar_reserve - COMPACT_RUNOUT).max(0.);
+        // The plan is made from a hand-kept model of what each card costs
+        // (`COMPACT_SECTIONS`), and a model is never the page: a card a row
+        // taller than its weight, a switch label that wraps, a subheading — any
+        // of them puts the bottom of the tallest column under the floating bar,
+        // which is the one thing the plan is there to prevent. Reserving the
+        // bar's room is not enough on its own for that reason, so the page
+        // calibrates the model against what it actually drew: a grid that came
+        // out scrollable needed `room + max_offset` where it was given `room`,
+        // so the model is short by that ratio.
+        //
+        // A **ratio**, not the overflow in pixels: how far the model is out is
+        // a property of the cards (a wrapped label, a row taller than its
+        // weight), so it carries across widths, where a pixel count belongs to
+        // the one window it was measured in — it went stale the moment the
+        // window was widened, and resetting it per width put the wrong layout
+        // on screen once per frame of a drag. The scale only ever rises and is
+        // never reset, so each correction costs one frame and there are only
+        // ever a few; it is capped, since past `COMPACT_SCALE_MAX` the model is
+        // wrong rather than imprecise and the answer is to fix the weights.
+        // Dividing the room by it is the same plan as multiplying every card by
+        // it, and keeps the scale out of `compact_grid` itself.
+        //
+        // The measurement is only read when this frame plans from the same
+        // width and room as the frame it came from (`compact_plan`): mid-drag
+        // the two differ, and an overflow measured at one width says nothing
+        // about the plan at another — reading it there would ratchet the scale
+        // up on a window merely being made shorter, whose grid overflows
+        // because it is a smaller window and not because the model is wrong.
+        let plan = (body, room);
+        let settled = plan == self.compact_plan;
+        self.compact_plan = plan;
+        if self.compact && measured > 0. && settled {
+            let over = f32::from(self.scroll.max_offset().height);
+            let raised = if over > 1. && room > 0. {
+                (self.compact_scale * (room + over) / room).min(COMPACT_SCALE_MAX)
+            } else {
+                self.compact_scale
+            };
+            if raised > self.compact_scale {
+                self.compact_scale = raised;
+                // This frame already plans at the raised scale, but nothing has
+                // yet seen that plan fit, and an unverified plan is laid out
+                // rather than painted. A measurement dirties nothing, so the
+                // frame that confirms it has to be asked for.
+                self.compact_checked = false;
+                window.request_animation_frame();
+            } else {
+                // Either it fits, or the scale is capped and the answer is to
+                // fix the weights rather than to keep hiding the page: a grid
+                // that overflows is still better seen than not.
+                self.compact_checked = true;
+            }
+        }
+        let grid = compact_grid(&weights, body, room / self.compact_scale);
         let compact = !grid.is_empty();
         self.compact = compact;
+        // An unverified grid is laid out and not painted, so the frame that
+        // verifies it is the one that puts the page on screen — nothing else
+        // would ask for it.
+        if compact && !self.compact_checked {
+            window.request_animation_frame();
+        }
         self.compact_widths = vec![0.; present];
         for column in &grid {
             for &section in &column.sections {
@@ -2764,7 +2896,19 @@ impl Render for SettingsView {
                     // replace with a grid. Opacity, not `hidden()`: the latter
                     // is `display: none`, which skips the layout this frame
                     // exists for.
-                    .when(measured <= 0., |body| body.opacity(0.))
+                    //
+                    // The same goes for a grid whose scale has not been
+                    // confirmed to fit: that is precisely the frame that draws
+                    // the tallest column's last card under the floating player
+                    // bar, and the correction lands a frame later. Laying it
+                    // out unseen is what produces the `max_offset` the
+                    // calibration above reads, so the wrong layout is never on
+                    // screen at all. Only the *grid* waits — the scrolling
+                    // column scrolls and cannot be wrong.
+                    .when(
+                        measured <= 0. || (compact && !self.compact_checked),
+                        |body| body.opacity(0.),
+                    )
                     // The wheel is the user overruling a jump in flight, and
                     // the highlight has to follow the new position rather than
                     // the target that was abandoned. Notifying here is also
@@ -2777,8 +2921,15 @@ impl Render for SettingsView {
                     .px_4()
                     .gap_4()
                     // The grid is meant to end well short of the bottom, so it
-                    // does not need the scrolling column's run-out.
-                    .pb(px(if compact { 16. } else { 148. }))
+                    // does not need the scrolling column's run-out — only
+                    // whatever the floating card is standing on. The column's
+                    // own run-out already clears the docked bar, and the
+                    // floating card is shorter than it.
+                    .pb(px(if compact {
+                        COMPACT_RUNOUT + bar_reserve
+                    } else {
+                        148_f32.max(bar_reserve + 24.)
+                    }))
                     .map(|scroll_body| match compact {
                         // Columns are top-aligned rather than stretched: a
                         // short column ending level with a tall one would draw

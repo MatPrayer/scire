@@ -128,6 +128,23 @@ pub fn float_panel_bottom(bar_open: f32) -> f32 {
     FLOAT_MARGIN + (FLOAT_BAR_H + FLOAT_MARGIN) * bar_open
 }
 
+/// Height at the bottom of the content area the floating card stands over.
+///
+/// Nothing is *reserved* for the card — a grid scrolling under it is the point
+/// of the style — but a page laid out to **fit** the window rather than scroll
+/// (the settings grid), and the run-out at the end of one that does scroll,
+/// both have to clear it or their last row is unreachable behind the card.
+/// Zero for the docked bar, which has a row of its own, and zero while the bar
+/// is hidden (`hide_idle_player_bar`), where the space would be held for
+/// nothing.
+pub fn float_reserve(floating: bool, shown: bool) -> f32 {
+    if floating && shown {
+        FLOAT_BAR_H + FLOAT_MARGIN * 2.
+    } else {
+        0.
+    }
+}
+
 /// Width the floating card is drawn at, in a window of `window_width`.
 pub fn float_width(window_width: f32) -> f32 {
     (window_width - FLOAT_MARGIN * 2.).min(FLOAT_MAX_W)
@@ -1140,9 +1157,20 @@ impl Render for PlayerBar {
 mod tests {
     use super::{
         FLOAT_BAR_H, FLOAT_FILL_ALPHA, FLOAT_MARGIN, FLOAT_MAX_W, SIDE_MIN, SIDE_WIDTH,
-        float_bottom, float_fill, float_panel_bottom, float_width, side_width,
+        float_bottom, float_fill, float_panel_bottom, float_reserve, float_width, side_width,
     };
     use gpui::hsla;
+
+    #[test]
+    fn only_a_shown_floating_card_reserves_room_under_the_page() {
+        assert_eq!(float_reserve(false, true), 0.);
+        assert_eq!(float_reserve(false, false), 0.);
+        assert_eq!(float_reserve(true, false), 0.);
+        // Its whole height plus the margin above and below it.
+        assert_eq!(float_reserve(true, true), FLOAT_BAR_H + FLOAT_MARGIN * 2.);
+        // A page clearing the reserve clears the card's top edge.
+        assert!(float_reserve(true, true) >= float_bottom(1.) + FLOAT_BAR_H);
+    }
 
     #[test]
     fn the_floating_fill_darkens_without_moving_the_colour() {
