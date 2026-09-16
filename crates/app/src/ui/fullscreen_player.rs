@@ -188,7 +188,7 @@ impl CardDensity {
     /// a tighter one costs only spacing.
     fn for_window(width: f32, height: f32) -> Self {
         let content = (width - 2. * EDGE).max(0.);
-        let card = if height > width {
+        let card = if stacks(width, height) {
             // Stacked: the card is drawn to a share of the cover, which has the
             // content width.
             content.min(CARD_MAX) * CARD_STACKED_SHARE
@@ -249,6 +249,31 @@ impl CardDensity {
         self != Self::Compact
     }
 }
+/// Widest a window can be, relative to its height, and still be laid out as a
+/// column rather than as a row.
+///
+/// The side-by-side row is what a widescreen window wants: there is width to
+/// spare and height is the scarce thing, so cover and card sit next to each
+/// other. A **squarish** window is the other way round — a 4:3 (1.33) has the
+/// height to carry the cover above the card, and spending it on a row instead
+/// leaves a band of empty window under both columns while the cover is capped
+/// by a width it is sharing. So anything up to this ratio is stacked, which
+/// includes every portrait window (a window taller than it is wide is inside
+/// the bound by definition) as well as 5:4, 4:3 and square. 16:10 (1.6) and
+/// wider stay a row. The bound is one number rather than a per-piece fit test
+/// because it is a judgement about the window's *shape*, not about what fits:
+/// both layouts fit a 4:3 window, and the column is the better page there.
+const STACK_MAX_ASPECT: f32 = 1.4;
+
+/// Whether a window of this size is laid out as a column.
+///
+/// Read off the window itself, so folding the sidebar or opening a panel does
+/// not change what shape the window is. A degenerate height cannot be divided
+/// into, and reads as a row.
+fn stacks(width: f32, height: f32) -> bool {
+    height > 0. && width <= height * STACK_MAX_ASPECT
+}
+
 /// Cover cap beside the card once the window has height to spare. Below the
 /// point where the share reaches `ART_MAX` this is exactly the old cap, so a
 /// window that only just fits the overlay is laid out as it always was — and
@@ -343,7 +368,7 @@ impl Layout {
         // cover rather than stacking a column that fits neither.
         let panel_row_fits = side_panel > 0. && width - 2. * EDGE - GAP - side_panel >= CARD_MIN;
 
-        if height > width || (!row_fits && !panel_row_fits) {
+        if stacks(width, height) || (!row_fits && !panel_row_fits) {
             // Stacked: one column, so the vertical volume slider has nowhere
             // sensible to sit.
             let content = (width - 2. * EDGE).max(0.);
@@ -464,13 +489,30 @@ impl Layout {
             // gives up spacing to free that height — but not its album or
             // stream-info lines: this is a tall window, and the track's own
             // details are the point of the page.
-            if density == CardDensity::Full && full.art < full.card + ART_LEAD {
+            let stacked = if density == CardDensity::Full && full.art < full.card + ART_LEAD {
                 let tight = column(CardDensity::Tight);
-                if tight.art > full.art {
-                    return tight;
-                }
+                if tight.art > full.art { tight } else { full }
+            } else {
+                full
+            };
+            // A squarish *landscape* window stacks because that is the better
+            // page for its shape, not because the row does not fit — so it has
+            // to earn it. A 4:3 window only a few hundred pixels tall has no
+            // height to put a cover *above* the card: the column comes back
+            // with a sliver of a cover, or none, where the row would have drawn
+            // one twice the size beside it. The test is the column's own one —
+            // the cover has to lead the card — since a column that does not
+            // read as a cover with its controls beneath is not the page this
+            // shape was chosen for. It is measured against the card's *minimum*
+            // rather than against the card it got, since with a panel beside it
+            // that card is as wide as the panel leaves and a cover is not
+            // competing with it for width — the question is only whether the
+            // cover is big enough to lead the row under it at all. A portrait
+            // window keeps the column regardless (there is no row to turn it on
+            // its side for), as does any window with no row to fall back to.
+            if height >= width || stacked.art >= CARD_MIN + ART_LEAD || !row_fits {
+                return stacked;
             }
-            return full;
         }
 
         // The row, for one card form.
@@ -3794,7 +3836,7 @@ mod tests {
                 "{w}x{h}: {l:?}"
             );
             assert!(l.art <= w - 2. * EDGE + 0.5, "{w}x{h}: {l:?}");
-            assert!(l.art >= l.card + ART_LEAD, "{w}x{h}: {l:?}");
+            assert!(l.art >= CARD_MIN + ART_LEAD, "{w}x{h}: {l:?}");
             assert!(content_height(&l) <= h + 0.5, "{w}x{h} overruns: {l:?}");
             last = l.art;
         }
@@ -4005,6 +4047,29 @@ mod tests {
     }
 
     #[test]
+    fn a_squarish_landscape_window_stacks_like_a_portrait_one() {
+        // 4:3 and 5:4 have the height to carry the cover above the card, and a
+        // panel opened there sits beside the card rather than under it.
+        for (w, h) in [(1440., 1080.), (1280., 1024.), (1200., 900.)] {
+            let l = resolve(w, h, false, true);
+            assert!(l.stacked, "{w}x{h} should stack: {l:?}");
+            assert!(l.art >= CARD_MIN + ART_LEAD, "{w}x{h}: {l:?}");
+            let panel = resolve(w, h, true, true);
+            assert!(panel.stacked && panel.panel_beside, "{w}x{h}: {panel:?}");
+        }
+        // Widescreen is what the row is for.
+        for (w, h) in [(1600., 900.), (1920., 1080.), (1400., 900.)] {
+            let l = resolve(w, h, false, true);
+            assert!(!l.stacked, "{w}x{h} should not stack: {l:?}");
+        }
+        // Squarish but too short to put anything above anything: the column
+        // would come back with a sliver of a cover, so the row keeps it.
+        let short = resolve(760., 600., false, true);
+        assert!(!short.stacked, "{short:?}");
+        assert!(short.art >= ART_MIN);
+    }
+
+    #[test]
     fn a_window_taller_than_it_is_wide_stacks() {
         let l = resolve(800., 1200., false, true);
         assert!(l.stacked);
@@ -4124,7 +4189,7 @@ mod tests {
                 l.density.secondary_lines(),
                 "{w}x{h} dropped the track details: {l:?}"
             );
-            assert!(l.art >= l.card + ART_LEAD, "{w}x{h}: {l:?}");
+            assert!(l.art >= CARD_MIN + ART_LEAD, "{w}x{h}: {l:?}");
         }
     }
 
