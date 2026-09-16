@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    AlbumPageLayout, CoverSize, DefaultPage, FullscreenBackground, FullscreenCoverSize,
-    PlayerBarStyle, QueueEndBehavior, ReplayGainMode, ThemePref,
+    AlbumPageLayout, ArtistAlbumSize, CoverSize, DefaultPage, FullscreenBackground,
+    FullscreenCoverSize, PlayerBarStyle, QueueEndBehavior, ReplayGainMode, ThemePref,
 };
 use crate::services::library_db::LibraryDb;
 use crate::services::{art_precache, artwork, navidrome_sync, runtime};
@@ -122,7 +122,7 @@ const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Fullscreen", 7),
     ("Player bar", 10),
     ("Playback", 10),
-    ("Browsing", 13),
+    ("Browsing", 15),
     ("Streaming", 5),
     ("Library", 14),
     ("Account", 3),
@@ -397,6 +397,7 @@ enum SettingsButton {
     Repeat(RepeatMode),
     DefaultPage(DefaultPage),
     CoverSize(CoverSize),
+    ArtistAlbumSize(ArtistAlbumSize),
     TrackInfo(TrackInfoField),
     Format(Option<&'static str>),
     Bitrate(Option<u32>),
@@ -876,6 +877,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_artist_album_size(&mut self, size: ArtistAlbumSize, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.artist_album_size = size);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_waveform(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.waveform_seekbar = enabled);
@@ -1162,6 +1170,7 @@ impl SettingsView {
             SettingsButton::Repeat(m) => self.set_default_repeat(m, cx),
             SettingsButton::DefaultPage(p) => self.set_default_page(p, cx),
             SettingsButton::CoverSize(s) => self.set_cover_size(s, cx),
+            SettingsButton::ArtistAlbumSize(s) => self.set_artist_album_size(s, cx),
             SettingsButton::TrackInfo(f) => self.toggle_track_info(f.toggle(), cx),
             SettingsButton::Format(f) => self.set_format(f, cx),
             SettingsButton::Bitrate(r) => self.set_bitrate(r, cx),
@@ -1609,11 +1618,20 @@ impl Render for SettingsView {
                     .map(|srv| (srv.url.clone(), srv.username.clone())),
             )
         };
-        let (default_page, cover_size, track_info, waveform, stream_info, detailed_volume) = {
+        let (
+            default_page,
+            cover_size,
+            artist_album_size,
+            track_info,
+            waveform,
+            stream_info,
+            detailed_volume,
+        ) = {
             let s = &self.session.read(cx).settings;
             (
                 s.default_page,
                 s.cover_size,
+                s.artist_album_size,
                 s.track_info.clone(),
                 s.waveform_seekbar,
                 s.stream_info_bar,
@@ -2285,6 +2303,54 @@ impl Render for SettingsView {
                         "Extra large",
                         "Extra large",
                         cover_size == CoverSize::ExtraLarge,
+                        cx,
+                    )),
+            )
+            .child(self.subheading("Artist page covers", cx))
+            .child(self.note(
+                "Size of the album cards on an artist's page. Match follows the \
+                 setting above; the rest size that page on its own.",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    // Ids are prefixed: the cover sizes above carry the same
+                    // labels, and an element id is page-wide.
+                    .child(self.label_btn(
+                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Match),
+                        "artist-album-size-match",
+                        ArtistAlbumSize::Match.label(),
+                        artist_album_size == ArtistAlbumSize::Match,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Small),
+                        "artist-album-size-small",
+                        ArtistAlbumSize::Small.label(),
+                        artist_album_size == ArtistAlbumSize::Small,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Medium),
+                        "artist-album-size-medium",
+                        ArtistAlbumSize::Medium.label(),
+                        artist_album_size == ArtistAlbumSize::Medium,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Large),
+                        "artist-album-size-large",
+                        ArtistAlbumSize::Large.label(),
+                        artist_album_size == ArtistAlbumSize::Large,
+                        cx,
+                    ))
+                    .child(self.label_btn(
+                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::ExtraLarge),
+                        "artist-album-size-xl",
+                        ArtistAlbumSize::ExtraLarge.label(),
+                        artist_album_size == ArtistAlbumSize::ExtraLarge,
                         cx,
                     )),
             )

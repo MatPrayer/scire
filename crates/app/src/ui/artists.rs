@@ -21,7 +21,7 @@ use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
 use crate::ui::albums::album_from_row;
-use crate::ui::{strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor};
+use crate::ui::{CARD_PADDING, strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor};
 
 const ART_SIZE: u32 = 320;
 /// Resolution the hero image is re-fetched at for the lightbox, matching the
@@ -42,6 +42,13 @@ const FALLBACK_COLS: usize = 5;
 
 pub enum ArtistsEvent {
     OpenArtist(String),
+}
+
+/// Cover size for an artist page's album cards: its own setting, or the album
+/// grid's when that setting is `Match`.
+fn album_cover(session: &Entity<Session>, cx: &App) -> crate::config::CoverSize {
+    let settings = &session.read(cx).settings;
+    settings.artist_album_size.resolve(settings.cover_size)
 }
 
 /// One card's pre-formatted contents. Built when the list changes rather than
@@ -700,6 +707,9 @@ pub struct ArtistDetailView {
     vi_scroll_synced: Option<usize>,
     /// Per-album accent colours for `Settings::selection_glow_album_color`.
     glow_accents: RefCell<HashMap<String, gpui::Hsla>>,
+    /// Resolution the discography covers are currently fetched at, so a
+    /// cover-size change is noticed in `render` and refetched once.
+    album_art_px: u32,
 }
 
 pub enum ArtistDetailEvent {
@@ -717,6 +727,7 @@ impl ArtistDetailView {
         cx: &mut Context<Self>,
     ) -> Self {
         let scroll = ScrollHandle::new();
+        let album_art_px = album_cover(&session, cx).wrap_art_px();
         let mut this = Self {
             session,
             player,
@@ -742,6 +753,7 @@ impl ArtistDetailView {
             vi_cursor: None,
             vi_scroll_synced: None,
             glow_accents: RefCell::new(HashMap::new()),
+            album_art_px,
         };
         this.load_appears_on(cx);
         this.load(cx);
@@ -750,6 +762,28 @@ impl ArtistDetailView {
 
     fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
         self.session.read(cx).client.clone()
+    }
+
+    /// Pick up a cover-size change: refetch the discography art at the new
+    /// resolution. Compared at `artwork::bucket`'s rung, like the album grid —
+    /// two sizes sharing a rung name the very same cache entry, so dropping the
+    /// paths would look up the identical files again.
+    ///
+    /// The paths are kept rather than cleared: `fetch_art` puts whatever is
+    /// already on disk up first (`cached_best`), so a page that has to grow its
+    /// covers scales the ones it has instead of blanking.
+    fn refetch_art(&mut self, art_px: u32, cx: &mut Context<Self>) {
+        self.album_art_px = art_px;
+        let albums: Vec<_> = self
+            .artist
+            .iter()
+            .flat_map(|a| a.album.iter())
+            .chain(self.appears_on.iter().map(|(album, _)| album))
+            .map(|album| (album.id.clone(), album.cover_art.clone()))
+            .collect();
+        for (id, cover) in albums {
+            self.fetch_art(id, cover, cx);
+        }
     }
 
     /// Re-apply the library selection to the page in place.
@@ -887,24 +921,25 @@ impl ArtistDetailView {
 
     fn fetch_art(&mut self, album_id: String, cover_art: Option<String>, cx: &mut Context<Self>) {
         let Some(cover_id) = cover_art else { return };
+        let art_px = self.album_art_px;
         // Draw whatever is already on disk right now, at whatever size it was
         // cached — the albums grid usually holds this very cover, at a rung
         // that depends on the cover-size setting rather than matching this
         // view's. Rendering it instantly is the difference between a page of
         // covers and a page of empty squares.
-        if let Some(path) = artwork::cached_best(&cover_id, ART_SIZE) {
+        if let Some(path) = artwork::cached_best(&cover_id, art_px) {
             self.art_paths.insert(album_id.clone(), path);
         }
         // Only the exact size ends the job; anything else is a stand-in that
         // still needs the real one fetched behind it.
-        if artwork::cached(&cover_id, ART_SIZE).is_some() {
+        if artwork::cached(&cover_id, art_px).is_some() {
             return;
         }
         let Some(client) = self.client(cx) else {
             return;
         };
         let task = cx.spawn(async move |this, cx| {
-            if let Ok(path) = artwork::fetch(client, cover_id, ART_SIZE).await {
+            if let Ok(path) = artwork::fetch(client, cover_id, art_px).await {
                 let _ = this.update(cx, |view, cx| {
                     view.art_paths.insert(album_id, path);
                     view.schedule_art_repaint(cx);
@@ -1075,6 +1110,9 @@ impl ArtistDetailView {
         flat: usize,
         focused: bool,
         subtitle: Option<String>,
+        // Cover edge, from `Settings::artist_album_size`. The card is that plus
+        // its own padding, so the text column stays as wide as the art.
+        tile: f32,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let id = album.id.clone();
@@ -1098,7 +1136,7 @@ impl ArtistDetailView {
         let card = v_flex()
             .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
             .group("aacard")
-            .w(px(172.))
+            .w(px(tile + CARD_PADDING))
             .p_1p5()
             .gap_1p5()
             .rounded_lg()
@@ -1120,14 +1158,14 @@ impl ArtistDetailView {
             }))
             .child(
                 div()
-                    .size(px(160.))
+                    .size(px(tile))
                     .rounded_lg()
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
                     .relative()
                     .when_some(art, |this, path| {
-                        this.child(img(path).size(px(160.)).rounded_lg())
+                        this.child(img(path).size(px(tile)).rounded_lg())
                     })
                     // Hover play button over the artwork, same as the
                     // album grid's cards.
@@ -1253,6 +1291,15 @@ impl Render for ArtistDetailView {
             .map(|g| format!("Genres: {g}"));
         let hero_art = self.artist_image_path.clone();
 
+        // Cover size for this page's cards, and a refetch when it moved. The
+        // rung is what matters: two settings landing on the same one name the
+        // same cache entry.
+        let cover = album_cover(&self.session, cx);
+        let tile = cover.wrap_tile();
+        if artwork::bucket(cover.wrap_art_px()) != artwork::bucket(self.album_art_px) {
+            self.refetch_art(cover.wrap_art_px(), cx);
+        }
+
         // Build the discography in render order (album cards first, then
         // singles/EPs) and record each card's album id at its flat vi index.
         self.discography_ids.clear();
@@ -1266,7 +1313,7 @@ impl Render for ArtistDetailView {
                 let flat = self.discography_ids.len();
                 self.discography_ids.push(album.id.clone());
                 let focused = self.vi_cursor == Some(flat);
-                album_cards.push(self.render_album_card(album, flat, focused, None, cx));
+                album_cards.push(self.render_album_card(album, flat, focused, None, tile, cx));
             }
             for album in artist.album.iter() {
                 if !is_single_or_ep(album) {
@@ -1275,7 +1322,7 @@ impl Render for ArtistDetailView {
                 let flat = self.discography_ids.len();
                 self.discography_ids.push(album.id.clone());
                 let focused = self.vi_cursor == Some(flat);
-                single_cards.push(self.render_album_card(album, flat, focused, None, cx));
+                single_cards.push(self.render_album_card(album, flat, focused, None, tile, cx));
             }
         }
         // Guest appearances last: they are someone else's records, and the
@@ -1296,6 +1343,7 @@ impl Render for ArtistDetailView {
                 flat,
                 focused,
                 Some(appearance_line(album, *tracks)),
+                tile,
                 cx,
             ));
         }

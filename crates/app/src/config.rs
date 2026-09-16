@@ -99,6 +99,10 @@ pub struct Settings {
     pub album_sort: AlbumSort,
     /// Cover-art tile size in the album grid.
     pub cover_size: CoverSize,
+    /// Cover size of the album cards on an artist's page. `Match` follows
+    /// `cover_size`; the rest pick a size for that page alone.
+    #[serde(default)]
+    pub artist_album_size: ArtistAlbumSize,
     /// Extra columns shown next to song titles in track lists.
     pub track_info: TrackInfo,
     /// Render the seek bar as the track's waveform (downloads each track a
@@ -285,6 +289,72 @@ impl CoverSize {
     /// range, never invalidates already-cached covers.
     pub fn art_px(self) -> u32 {
         (self.max_px() * 1.5) as u32
+    }
+
+    /// Tile edge for a *wrapped* grid of cards rather than the album grid's
+    /// column-fitting one — the artist page's discography rows, which wrap at
+    /// whatever width they have and so have no leftover to spend.
+    ///
+    /// A single number per size, not a range: with nothing to absorb there is
+    /// nothing to grow into. `Medium` is the 160px the artist page drew before
+    /// the size was settable, so the default look is unchanged.
+    pub fn wrap_tile(self) -> f32 {
+        match self {
+            Self::Small => 112.,
+            Self::Medium => 160.,
+            Self::Large => 212.,
+            Self::ExtraLarge => 280.,
+        }
+    }
+
+    /// Resolution to request for [`wrap_tile`](Self::wrap_tile) cards. 2× the
+    /// tile, which keeps `Medium` on the 512 rung the artist page already used
+    /// and so costs the default no refetch.
+    pub fn wrap_art_px(self) -> u32 {
+        (self.wrap_tile() * 2.) as u32
+    }
+}
+
+/// Cover size for the album cards on an artist's page.
+///
+/// Separate from [`CoverSize`] because the two grids are not the same shape —
+/// the album grid fills its width by growing the tile, the artist page's
+/// discography wraps at a fixed one — and a user who wants a dense browsing
+/// grid may still want a readable discography. `Match` is the default and is
+/// what the page did before the setting existed: whatever the album grid is set
+/// to, so one knob still moves both for anyone who only wants one knob.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtistAlbumSize {
+    /// Follow `Settings::cover_size`.
+    #[default]
+    Match,
+    Small,
+    Medium,
+    Large,
+    ExtraLarge,
+}
+
+impl ArtistAlbumSize {
+    /// The size actually drawn, `grid` being the album grid's own setting.
+    pub fn resolve(self, grid: CoverSize) -> CoverSize {
+        match self {
+            Self::Match => grid,
+            Self::Small => CoverSize::Small,
+            Self::Medium => CoverSize::Medium,
+            Self::Large => CoverSize::Large,
+            Self::ExtraLarge => CoverSize::ExtraLarge,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Match => "Match album grid",
+            Self::Small => "Small",
+            Self::Medium => "Medium",
+            Self::Large => "Large",
+            Self::ExtraLarge => "Extra large",
+        }
     }
 }
 
@@ -613,6 +683,7 @@ impl Default for Settings {
             default_page: DefaultPage::default(),
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),
+            artist_album_size: ArtistAlbumSize::default(),
             track_info: TrackInfo {
                 artist: true,
                 ..Default::default()
@@ -814,7 +885,42 @@ pub fn delete_password(server_url: &str, username: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImportedThemesFile, Settings};
+    use super::{ArtistAlbumSize, CoverSize, ImportedThemesFile, Settings};
+
+    #[test]
+    fn the_artist_page_cover_size_follows_the_grid_only_when_it_is_match() {
+        for grid in [
+            CoverSize::Small,
+            CoverSize::Medium,
+            CoverSize::Large,
+            CoverSize::ExtraLarge,
+        ] {
+            assert_eq!(ArtistAlbumSize::Match.resolve(grid), grid);
+            assert_eq!(ArtistAlbumSize::Small.resolve(grid), CoverSize::Small);
+            assert_eq!(
+                ArtistAlbumSize::ExtraLarge.resolve(grid),
+                CoverSize::ExtraLarge
+            );
+        }
+        // The default is the old behaviour: one knob still moves both.
+        assert_eq!(ArtistAlbumSize::default(), ArtistAlbumSize::Match);
+    }
+
+    #[test]
+    fn wrapped_tiles_are_ordered_and_medium_is_the_size_the_page_always_drew() {
+        let sizes = [
+            CoverSize::Small,
+            CoverSize::Medium,
+            CoverSize::Large,
+            CoverSize::ExtraLarge,
+        ];
+        for pair in sizes.windows(2) {
+            assert!(pair[0].wrap_tile() < pair[1].wrap_tile());
+            assert!(pair[0].wrap_art_px() < pair[1].wrap_art_px());
+        }
+        assert_eq!(CoverSize::Medium.wrap_tile(), 160.);
+        assert_eq!(CoverSize::Medium.wrap_art_px(), 320);
+    }
 
     #[test]
     fn imported_theme_json_deserializes_named_theme() {
