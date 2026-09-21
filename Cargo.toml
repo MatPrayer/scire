@@ -9,7 +9,7 @@ members = ["crates/subsonic", "crates/playback", "crates/app", "crates/dmg"]
 default-members = ["crates/app"]
 
 [workspace.package]
-version = "0.17.3"
+version = "0.17.4"
 edition = "2024"
 license = "MIT"
 
@@ -26,7 +26,7 @@ gpui-component-assets = "0.5.1"
 # m4a holding ALAC (or aiff/mkv/caf/adpcm) fails to decode. A Navidrome library
 # can hold anything symphonia can read — enable the lot.
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
-stream-download = { version = "0.24.1", features = ["reqwest", "temp-storage"] }
+stream-download = { version = "0.24.4", features = ["reqwest", "temp-storage"] }
 
 # HTTP / async
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -119,5 +119,14 @@ codegen-units = 16
 # Local fork of gpui-component 0.5.1 — single-line change: popover_style shadow
 # removed (was shadow_lg) so context menus don't cast a heavy halo over the
 # bright album grid. See vendor/gpui-component/src/styled.rs.
+#
+# Local fork of stream-download 0.24.4 — a seek restarts the downloader's
+# prefetch at the seek target, and the prefetch write path never woke a reader
+# waiting on a position, so the reader stayed parked until a later ordinary
+# write crossed it: for a seek to the end of a file, after the whole file had
+# downloaded. Measured at 12s on a 4.5MB m4a, which is also how long the
+# decoder took to be built. See vendor/stream-download/src/source/mod.rs
+# (`notify_if_position_reached`).
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
+stream-download = { path = "vendor/stream-download" }

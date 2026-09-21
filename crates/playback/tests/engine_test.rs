@@ -364,7 +364,12 @@ async fn seek_at_playing_moves_the_track() {
 /// against a real server — the bytes are not downloaded yet, so the decoder has
 /// to re-request them — and it is the only way to catch an engine that waits for
 /// the seek with the control loop in its hand.
-fn slow_range_server(body: Vec<u8>, fast_bytes: usize, range_delay: Duration) -> String {
+fn slow_range_server(
+    body: Vec<u8>,
+    fast_bytes: usize,
+    range_delay: Duration,
+    content_type: &'static str,
+) -> String {
     use std::io::{BufRead, BufReader};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -400,7 +405,7 @@ fn slow_range_server(body: Vec<u8>, fast_bytes: usize, range_delay: Duration) ->
                 let head = if range_start.is_some() {
                     std::thread::sleep(range_delay);
                     format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\n\
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: {content_type}\r\n\
                          Accept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\n\
                          Content-Length: {}\r\n\r\n",
                         start,
@@ -410,7 +415,7 @@ fn slow_range_server(body: Vec<u8>, fast_bytes: usize, range_delay: Duration) ->
                     )
                 } else {
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n\
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
                          Accept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
                         body.len()
                     )
@@ -445,7 +450,12 @@ fn slow_range_server(body: Vec<u8>, fast_bytes: usize, range_delay: Duration) ->
 /// playback is going rather than where it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_seek_does_not_stop_the_engine_answering() {
-    let url = slow_range_server(wav_bytes_secs(300), 512 * 1024, Duration::from_secs(2));
+    let url = slow_range_server(
+        wav_bytes_secs(300),
+        512 * 1024,
+        Duration::from_secs(2),
+        "audio/wav",
+    );
 
     let (player, mut events) = Player::new();
     player.set_volume(0.0);
@@ -516,6 +526,91 @@ async fn a_slow_seek_does_not_stop_the_engine_answering() {
     assert!(
         answered < Duration::from_secs(2),
         "the engine took {answered:?} to answer, so it was waiting out the seek",
+    );
+}
+
+/// The ALAC fixture with `pad` bytes of `free` atom pushed in between its
+/// audio and its index, so the index sits further into the file than the
+/// downloader's prefetch reaches. A `free` atom is ignorable padding and sits
+/// *after* the audio, so every offset the index carries still points where it
+/// did — which is why it can be added to a real file without rewriting it.
+fn m4a_with_trailing_index(pad: usize) -> Vec<u8> {
+    let body = include_bytes!("fixtures/alac.m4a").to_vec();
+    // Walk the top-level atoms to the one after the audio: that is where the
+    // padding goes.
+    let mut split = 0usize;
+    while split + 8 <= body.len() {
+        let size = u32::from_be_bytes(body[split..split + 4].try_into().expect("size")) as usize;
+        let kind = &body[split + 4..split + 8];
+        assert!(size >= 8, "unexpected atom size {size} at {split}");
+        split += size;
+        if kind == b"mdat" {
+            break;
+        }
+    }
+    let mut out = body[..split].to_vec();
+    let mut free = vec![0u8; pad];
+    free[..4].copy_from_slice(&(pad as u32).to_be_bytes());
+    free[4..8].copy_from_slice(b"free");
+    out.extend_from_slice(&free);
+    out.extend_from_slice(&body[split..]);
+    out
+}
+
+/// An m4a's index is at the end of the file, so the decoder's first move is to
+/// seek there — and the downloader restarts its prefetch at a seek target.
+/// That prefetch path used not to wake the reader waiting on the position, so
+/// nothing came back until a later ordinary write crossed it, i.e. after the
+/// gap between prefetch and index had downloaded in full: the whole file, at
+/// whatever the link gives. Measured at 12s on a 4.5MB track against a real
+/// server — over the engine's 12s identify timeout, so a slow link did not
+/// merely stall the album, it failed tracks outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trailing_index_is_read_without_the_whole_download() {
+    // 4MB of padding at 32KB per 100ms is ~12s of trickle between the prefetch
+    // and the index; playback must not wait for it.
+    let url = slow_range_server(
+        m4a_with_trailing_index(4 * 1024 * 1024),
+        288 * 1024,
+        Duration::ZERO,
+        "audio/mp4",
+    );
+
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    let asked_at = std::time::Instant::now();
+    player.play(TrackSource {
+        url,
+        duration_hint: Some(Duration::from_millis(300)),
+        path: None,
+        id: None,
+        live: false,
+    });
+
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Playing => break,
+                    Event::Failed(msg) => {
+                        if msg.contains("audio output unavailable") {
+                            eprintln!("skipping: no audio device ({msg})");
+                            return;
+                        }
+                        panic!("playback failed: {msg}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("timed out waiting for playback to start"),
+        }
+    }
+    let started = asked_at.elapsed();
+    assert!(
+        started < Duration::from_secs(3),
+        "took {started:?} to start, so the decoder waited out the download",
     );
 }
 
