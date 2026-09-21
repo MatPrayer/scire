@@ -53,6 +53,55 @@ fn smoothed(
     duration.map_or(pos, |d| pos.min(d))
 }
 
+/// Format asked of the server for a file the decoder cannot read as stored.
+/// mp3 is the one transcoding profile every Subsonic server ships configured,
+/// so it is the format most likely to actually come back transcoded; a server
+/// that has no profile for it answers with the original file, which is no
+/// worse than the request that just failed.
+const FALLBACK_FORMAT: &str = "mp3";
+/// Bitrate cap for that fallback, when the user has set none of their own.
+const FALLBACK_BITRATE: u32 = 320;
+
+/// Whether the decoder cannot read this file as the server stores it.
+///
+/// symphonia (0.5.5) decodes FLAC up to 24 bits per sample. A **32-bit** FLAC
+/// — what `flac -b 32` and some CD rippers write — passes the metadata parse
+/// and then dies inside the first frame with "end of stream", so nothing about
+/// the failure names the bit depth. The depth *is* in the OpenSubsonic song
+/// row, so the case is caught before playing rather than explained after.
+///
+/// Pure so the rule is testable: a server that reports no depth (vanilla
+/// Subsonic) yields `false` here and is covered by the retry on failure.
+fn unplayable_as_stored(song: &Song) -> bool {
+    let flac = song
+        .suffix
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("flac"))
+        || song
+            .content_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("audio/flac"));
+    flac && song.bit_depth.is_some_and(|depth| depth > 24)
+}
+
+/// Stream options for one song: the user's preferences, with a transcode
+/// forced when the file cannot be decoded as stored (or when a previous
+/// attempt at this song already failed). The user's own format wins if they
+/// set one — they have asked for a transcode already.
+fn stream_opts_for(base: &StreamOptions, song: &Song, forced: bool) -> StreamOptions {
+    if !forced && !unplayable_as_stored(song) {
+        return base.clone();
+    }
+    StreamOptions {
+        format: base
+            .format
+            .clone()
+            .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("raw"))
+            .or_else(|| Some(FALLBACK_FORMAT.to_string())),
+        max_bit_rate: base.max_bit_rate.or(Some(FALLBACK_BITRATE)),
+    }
+}
+
 pub struct PlayerState {
     player: Player,
     pub queue: Queue,
@@ -118,6 +167,11 @@ pub struct PlayerState {
     /// Whole seconds last written to the resume file, so the position events
     /// (several a second) only touch the disk when the value moved.
     resume_written_secs: u64,
+    /// Song id whose stream is being re-requested transcoded after the decoder
+    /// rejected the original. One id, not a flag: it is what stops the retry
+    /// from repeating, and what keeps a *different* song's failure from being
+    /// treated as the second attempt at this one.
+    transcode_retry: Option<String>,
 }
 
 impl PlayerState {
@@ -208,6 +262,7 @@ impl PlayerState {
             resume_enabled: false,
             pending_resume: None,
             resume_written_secs: 0,
+            transcode_retry: None,
         }
     }
 
@@ -913,10 +968,33 @@ impl PlayerState {
 
     fn stream_url(&self, song: &Song) -> Result<String, String> {
         let client = self.client.as_ref().ok_or("not connected")?;
+        let forced = self.transcode_retry.as_deref() == Some(song.id.as_str());
+        let opts = stream_opts_for(&self.stream_opts, song, forced);
         client
-            .stream_url(&song.id, &self.stream_opts)
+            .stream_url(&song.id, &opts)
             .map(|u| u.to_string())
             .map_err(|e| e.to_string())
+    }
+
+    /// The current track's id when it is worth asking the server for it again
+    /// transcoded: a remote library track, not already retried, whose forced
+    /// options actually differ from the ones that just failed (a user who has
+    /// set their own format is already transcoding — asking twice for the same
+    /// URL only delays the skip).
+    fn retryable_transcode(&self) -> Option<String> {
+        if self.is_radio() {
+            return None;
+        }
+        let song = self.queue.current_song()?;
+        if song.local_path.is_some() || self.transcode_retry.as_deref() == Some(song.id.as_str()) {
+            return None;
+        }
+        let forced = stream_opts_for(&self.stream_opts, song, true);
+        let plain = stream_opts_for(&self.stream_opts, song, false);
+        if forced.format == plain.format && forced.max_bit_rate == plain.max_bit_rate {
+            return None;
+        }
+        Some(song.id.clone())
     }
 
     fn start_current(&mut self, cx: &mut Context<Self>) {
@@ -1130,6 +1208,24 @@ impl PlayerState {
                 self.engine_has_track = false;
                 let streak = self.failed_streak + 1;
                 tracing::warn!("playback failed: {msg}");
+                // The decoder cannot say *why* it could not read a container
+                // (symphonia reports a 32-bit FLAC as "end of stream"), and a
+                // server that publishes no bit depth gives `stream_opts_for`
+                // nothing to go on — so a remote track that failed is asked
+                // for once more, transcoded, before the queue moves past it.
+                if streak < MAX_FAILED_STREAK
+                    && let Some(id) = self.retryable_transcode()
+                {
+                    self.transcode_retry = Some(id);
+                    self.start_current(cx);
+                    // `start_current` clears the streak as a user-intent entry
+                    // point; a retry is not new intent, and letting it reset
+                    // would keep the queue walking into a dead server forever.
+                    self.failed_streak = streak;
+                    self.last_error = Some(msg);
+                    cx.notify();
+                    return;
+                }
                 // One unplayable file must not end the session: move on to the
                 // next track. `start_current` is also the user-intent entry
                 // point, so it clears both the streak and `last_error` — they
@@ -1351,7 +1447,12 @@ fn persist_recent(list: &[Song]) {
 mod tests {
     use std::time::Duration;
 
-    use super::{ResumeState, SMOOTH_MAX, read_resume_at, resume_for, smoothed, write_resume_at};
+    use subsonic::{Song, StreamOptions};
+
+    use super::{
+        FALLBACK_BITRATE, FALLBACK_FORMAT, ResumeState, SMOOTH_MAX, read_resume_at, resume_for,
+        smoothed, stream_opts_for, write_resume_at,
+    };
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
 
@@ -1427,5 +1528,80 @@ mod tests {
         );
         assert_eq!(resume_for(Some(&pending), "song-2"), None);
         assert_eq!(resume_for(None, "song-1"), None);
+    }
+
+    /// `Song` has no `Default` and two dozen fields; the deserializer is the
+    /// shortest way to one carrying only what the rule reads.
+    fn song(suffix: &str, content_type: &str, bit_depth: Option<u32>) -> Song {
+        serde_json::from_value(serde_json::json!({
+            "id": "s-1",
+            "title": "t",
+            "suffix": suffix,
+            "contentType": content_type,
+            "bitDepth": bit_depth,
+        }))
+        .unwrap()
+    }
+
+    fn flac(bit_depth: Option<u32>) -> Song {
+        song("flac", "audio/flac", bit_depth)
+    }
+
+    /// 32-bit FLAC is the case: symphonia parses its header and then dies in
+    /// the first frame, so it has to be caught from the metadata.
+    #[test]
+    fn a_32_bit_flac_is_streamed_transcoded() {
+        let opts = stream_opts_for(&StreamOptions::default(), &flac(Some(32)), false);
+        assert_eq!(opts.format.as_deref(), Some(FALLBACK_FORMAT));
+        assert_eq!(opts.max_bit_rate, Some(FALLBACK_BITRATE));
+    }
+
+    /// Everything the decoder can read is streamed as stored — the point of a
+    /// lossless library is not to transcode it.
+    #[test]
+    fn ordinary_files_are_left_alone() {
+        for song in [flac(Some(16)), flac(Some(24)), flac(None)] {
+            let opts = stream_opts_for(&StreamOptions::default(), &song, false);
+            assert!(opts.format.is_none(), "{:?}", song.bit_depth);
+        }
+        let mp3 = song("mp3", "audio/mpeg", Some(32));
+        assert!(
+            stream_opts_for(&StreamOptions::default(), &mp3, false)
+                .format
+                .is_none()
+        );
+    }
+
+    /// The retry after a decode failure knows nothing about the file, so the
+    /// same options are forced on anything.
+    #[test]
+    fn a_forced_retry_transcodes_whatever_it_is_given() {
+        let opts = stream_opts_for(&StreamOptions::default(), &flac(Some(16)), true);
+        assert_eq!(opts.format.as_deref(), Some(FALLBACK_FORMAT));
+    }
+
+    /// A user who set a format has asked for a transcode already; overriding
+    /// it with our own would quietly undo the setting.
+    #[test]
+    fn a_configured_format_wins_over_the_fallback() {
+        let base = StreamOptions {
+            format: Some("opus".into()),
+            max_bit_rate: Some(128),
+        };
+        let opts = stream_opts_for(&base, &flac(Some(32)), true);
+        assert_eq!(opts.format.as_deref(), Some("opus"));
+        assert_eq!(opts.max_bit_rate, Some(128));
+    }
+
+    /// `raw` is the *absence* of a transcode spelled out, so it must not be
+    /// treated as one — a raw request is exactly what failed.
+    #[test]
+    fn an_explicit_raw_format_is_replaced() {
+        let base = StreamOptions {
+            format: Some("raw".into()),
+            max_bit_rate: None,
+        };
+        let opts = stream_opts_for(&base, &flac(Some(32)), true);
+        assert_eq!(opts.format.as_deref(), Some(FALLBACK_FORMAT));
     }
 }
