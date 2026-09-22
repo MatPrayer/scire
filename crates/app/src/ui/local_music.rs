@@ -87,7 +87,9 @@ pub struct LocalMusicView {
     player: Entity<PlayerState>,
     albums: Vec<AlbumRow>,
     art_paths: HashMap<String, PathBuf>,
-    art_tasks: Vec<gpui::Task<()>>,
+    /// In-flight cover jobs by album id, so a card that scrolls away can have
+    /// its job cancelled and a card that comes back can ask again.
+    art_tasks: HashMap<String, gpui::Task<()>>,
     art_repaint_pending: bool,
     art_px: u32,
     art_range: Option<(usize, usize)>,
@@ -122,7 +124,7 @@ impl LocalMusicView {
             player,
             albums: Vec::new(),
             art_paths: HashMap::new(),
-            art_tasks: Vec::new(),
+            art_tasks: HashMap::new(),
             art_repaint_pending: false,
             art_px,
             art_range: None,
@@ -181,11 +183,13 @@ impl LocalMusicView {
         let Some(source) = local_art_path(&hash).filter(|path| path.exists()) else {
             return;
         };
+        // A range that grows by a row re-asks for every card it already
+        // covers; without this the same cover is decoded once per pass.
+        if self.art_tasks.contains_key(&album.id) {
+            return;
+        }
         let album_id = album.id.clone();
         let art_px = self.art_px;
-        if self.art_tasks.len() > 256 {
-            self.art_tasks.drain(0..128);
-        }
         let task = cx.spawn(async move |this, cx| {
             // Formats outside the thumbnail decoder's JPEG/PNG feature set
             // keep the original path rather than losing a cover GPUI may
@@ -207,7 +211,7 @@ impl LocalMusicView {
                 }
             });
         });
-        self.art_tasks.push(task);
+        self.art_tasks.insert(album.id.clone(), task);
     }
 
     fn schedule_art_repaint(&mut self, cx: &mut Context<Self>) {
@@ -253,6 +257,15 @@ impl LocalMusicView {
         }
         self.art_range = Some(range);
         let albums = self.albums[range.0..range.1].to_vec();
+        // Keep only the window's own jobs. Dropping a `Task` cancels it, so
+        // what is thrown away here is work for cards that have scrolled out of
+        // reach — and dropping the entry is also what lets the card ask again
+        // if it comes back. Capping a flat list instead cancelled by *age*,
+        // which during a fast scroll is whatever was queued first: the cards
+        // now on screen, left blank with nothing to re-request them.
+        let keep: std::collections::HashSet<&str> =
+            albums.iter().map(|album| album.id.as_str()).collect();
+        self.art_tasks.retain(|id, _| keep.contains(id.as_str()));
         for album in &albums {
             self.fetch_art(album, cx);
         }

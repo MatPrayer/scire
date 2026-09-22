@@ -1105,12 +1105,22 @@ pub fn apply_theme(pref: ThemePref, font_size: UiFontSize, window: &mut Window, 
 }
 
 /// Apply persisted interface type scale and keep it across later theme changes.
+///
+/// Writing it into both mode themes as well as the live one is what survives a
+/// later `Theme::change`, which rebuilds the whole theme from the mode's config
+/// and would otherwise put the size back to 16px on the next theme pick.
 pub fn apply_font_size(size: UiFontSize, cx: &mut App) {
     let value = size.px();
     let theme = Theme::global_mut(cx);
     theme.font_size = px(value);
     Rc::make_mut(&mut theme.light_theme).font_size = Some(value);
     Rc::make_mut(&mut theme.dark_theme).font_size = Some(value);
+    // The theme is a global and mutating it dirties nothing, so notifying the
+    // view that made the change repaints that view alone: the sidebar, player
+    // bar and whatever page is open keep the old scale until some unrelated
+    // event happens to redraw them. `Theme::change` takes a window for this
+    // reason; the size can be set from a menu item holding only an `App`.
+    cx.refresh_windows();
 }
 
 /// The colour the bottom player bar is tinted with: a darkened, slightly

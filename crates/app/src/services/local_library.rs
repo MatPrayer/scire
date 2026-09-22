@@ -551,18 +551,25 @@ fn prune_local_art_dir(dir: &Path, referenced: &std::collections::HashSet<String
     for entry in entries {
         let entry = entry?;
         let file_type = entry.file_type()?;
-        let keep = entry
-            .path()
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|hash| referenced.contains(hash));
+        let path = entry.path();
+        // The squaring marker and a download's temp file are the directory's
+        // own bookkeeping, not covers: nothing in the DB references either, so
+        // an unfiltered sweep reads both as orphans. Losing the marker re-runs
+        // the whole squaring pass on the next launch for nothing.
+        let bookkeeping = entry.file_name() == std::ffi::OsStr::new(artwork::SQUARED_MARKER)
+            || path.extension().is_some_and(|ext| ext == "part");
+        let keep = bookkeeping
+            || path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|hash| referenced.contains(hash));
         if keep {
             continue;
         }
         if file_type.is_dir() && !file_type.is_symlink() {
-            std::fs::remove_dir_all(entry.path())?;
+            std::fs::remove_dir_all(&path)?;
         } else {
-            std::fs::remove_file(entry.path())?;
+            std::fs::remove_file(&path)?;
         }
     }
     Ok(())
@@ -696,6 +703,8 @@ mod tests {
         std::fs::write(cache.join("keep.jpg"), b"cover").unwrap();
         std::fs::write(cache.join("remove.jpg"), b"old").unwrap();
         std::fs::write(cache.join("nested/cover.jpg"), b"cover").unwrap();
+        std::fs::write(cache.join(artwork::SQUARED_MARKER), b"").unwrap();
+        std::fs::write(cache.join("half-written.part"), b"partial").unwrap();
         let sentinel = root.join("keep.txt");
         std::fs::write(&sentinel, b"keep").unwrap();
         let referenced = std::collections::HashSet::from(["keep".to_string()]);
@@ -706,6 +715,9 @@ mod tests {
         assert_eq!(std::fs::read(cache.join("keep.jpg")).unwrap(), b"cover");
         assert!(!cache.join("remove.jpg").exists());
         assert!(!cache.join("nested").exists());
+        // The directory's own bookkeeping is not a cover to be collected.
+        assert!(cache.join(artwork::SQUARED_MARKER).exists());
+        assert!(cache.join("half-written.part").exists());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
         cleanup(&root);
     }

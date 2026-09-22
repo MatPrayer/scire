@@ -250,9 +250,7 @@ pub async fn fetch_as(
         .await?;
         std::fs::create_dir_all(&dir)?;
         // Write via temp file so partial downloads never poison the cache.
-        let tmp = path2.with_extension("part");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path2)?;
+        write_atomic(&path2, &bytes)?;
         evict_if_over_cap(&dir);
         // Replaces the remembered miss `cached` left behind for this key.
         mem_cache()
@@ -262,6 +260,38 @@ pub async fn fetch_as(
         Ok(path2)
     })
     .await
+}
+
+/// Write `bytes` to `out` through a temp file nobody else can be writing.
+///
+/// The temp name carries a per-call counter as well as the process id, because
+/// two jobs for the *same* cover are not merely possible but ordinary: a grid
+/// draws the same album twice, or a prefetch and a view ask at once. Sharing
+/// one `key-256.part` between them lets the second truncate the file the first
+/// is about to rename, which publishes a half-written image into a cache keyed
+/// by content — it is never re-fetched, so the cover stays broken.
+///
+/// The rename itself is allowed to lose: a duplicate worker writing identical
+/// bytes to the same destination is the race resolving correctly, so an error
+/// with the destination in place is success.
+fn write_atomic(out: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let unique = format!(
+        "{}.{}.part",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp = out.with_extension(unique);
+    std::fs::write(&tmp, bytes)?;
+    if let Err(error) = std::fs::rename(&tmp, out) {
+        let _ = std::fs::remove_file(&tmp);
+        if !out.exists() {
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 /// Cache key for a cover extracted from a local file.
@@ -303,15 +333,9 @@ pub async fn thumbnail_file(source: &Path, key: &str, size: u32) -> Result<PathB
         }
         let bytes = thumbnail_bytes(&source, size)?;
         std::fs::create_dir_all(&dir)?;
-        let tmp = path2.with_extension("part");
-        std::fs::write(&tmp, bytes)?;
-        // A duplicate worker may have won the race and renamed the same temp
-        // file. Its finished path is equally valid.
-        if let Err(error) = std::fs::rename(&tmp, &path2)
-            && !path2.exists()
-        {
-            return Err(error.into());
-        }
+        // A duplicate worker may have won the race; its finished path is
+        // equally valid, which `write_atomic` is what decides.
+        write_atomic(&path2, &bytes)?;
         evict_if_over_cap(&dir);
         mem_cache()
             .lock()
@@ -471,14 +495,18 @@ fn blur_into(source: &Path, out: &Path) -> Result<PathBuf> {
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = out.with_extension("part");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, out)?;
+    write_atomic(out, &bytes)?;
     Ok(out.to_path_buf())
 }
 
 /// Marker written into a cache directory once its art has been squared.
-const SQUARED_MARKER: &str = ".squared-v1";
+///
+/// Public because a cache directory's *own* housekeeping has to know not to
+/// delete it: the local art cache is pruned against the covers the DB still
+/// references, and a marker nothing references reads as an orphan — deleting
+/// it sends the whole directory back through `squarify_dir` on the next
+/// launch, cropping files that are already square.
+pub const SQUARED_MARKER: &str = ".squared-v1";
 
 /// One-off pass over the art already on disk, cropping what was cached before
 /// covers were squared on the way in.
@@ -525,10 +553,7 @@ fn squarify_dir(dir: &Path) {
             let Some(square) = square_crop(&bytes) else {
                 continue;
             };
-            let tmp = path.with_extension("part");
-            if std::fs::write(&tmp, &square).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+            let _ = write_atomic(&path, &square);
         }
     }
     let _ = std::fs::create_dir_all(dir);
@@ -579,7 +604,10 @@ fn evict_if_over_cap(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SIZE_LADDER, bucket, search_order, square_crop, stable_key, thumbnail_from_bytes};
+    use super::{
+        SIZE_LADDER, bucket, search_order, square_crop, stable_key, thumbnail_from_bytes,
+        write_atomic,
+    };
 
     fn encode(width: u32, height: u32) -> Vec<u8> {
         let img =
@@ -612,6 +640,44 @@ mod tests {
         assert!(square_crop(&encode(300, 300)).is_none());
         // Undecodable input is left alone rather than dropped.
         assert!(square_crop(b"not an image").is_none());
+    }
+
+    /// Two jobs writing the same cover must not share a temp file: one can
+    /// truncate what the other is about to rename, publishing a half-written
+    /// image into a cache keyed by content, which is never re-fetched.
+    #[test]
+    fn concurrent_writes_of_one_cover_never_share_a_temp_file() {
+        let dir = std::env::temp_dir().join(format!("scire-art-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("cover-256.img");
+
+        let first = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let out = out.clone();
+                    scope.spawn(move || write_atomic(&out, &vec![7_u8; 64 * 1024]))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(first.iter().all(|result| result.is_ok()));
+        assert_eq!(std::fs::read(&out).unwrap(), vec![7_u8; 64 * 1024]);
+        // Every temp file is claimed by its own writer and cleaned up.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "left temp files behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

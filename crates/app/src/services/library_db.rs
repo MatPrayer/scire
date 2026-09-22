@@ -213,6 +213,33 @@ ALTER TABLE tracks ADD COLUMN replay_peak_album REAL;
 UPDATE tracks SET file_modified = NULL WHERE source = 'local';
 ";
 
+/// One migration step, applied atomically with the version it records.
+///
+/// SQLite makes DDL transactional, and the two halves of a step have to travel
+/// together. Autocommitted, a batch that fails partway — V8 is twelve
+/// `ALTER`s — leaves the columns it managed to add behind *without* the
+/// version that says so, and every later launch re-runs the whole batch and
+/// dies on `duplicate column name`: a database that cannot be opened again,
+/// and the cache is not the only thing in it. Rolled back, the step simply
+/// runs again next time.
+fn migration_step(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    version: Option<i32>,
+) -> Result<(), rusqlite::Error> {
+    // `unchecked_transaction` because the connection is reached through the
+    // mutex guard rather than held mutably.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(sql)?;
+    if let Some(version) = version {
+        tx.execute(
+            "INSERT INTO _schema_version (version) VALUES (?1)",
+            rusqlite::params![version],
+        )?;
+    }
+    tx.commit()
+}
+
 // ---------------------------------------------------------------------------
 // Query matching
 // ---------------------------------------------------------------------------
@@ -355,35 +382,22 @@ impl LibraryDb {
             .unwrap_or(0);
 
         if version < 1 {
-            conn.execute_batch(SCHEMA_V1)?;
+            // V1 records no version of its own: `IF NOT EXISTS` throughout
+            // makes it idempotent, and V2 is what first writes a number.
+            migration_step(&conn, SCHEMA_V1, None)?;
         }
-        if version < 2 {
-            conn.execute_batch(SCHEMA_V2)?;
-            conn.execute("INSERT INTO _schema_version (version) VALUES (2)", [])?;
-        }
-        if version < 3 {
-            conn.execute_batch(SCHEMA_V3)?;
-            conn.execute("INSERT INTO _schema_version (version) VALUES (3)", [])?;
-        }
-        if version < 4 {
-            conn.execute_batch(SCHEMA_V4)?;
-            conn.execute("INSERT INTO _schema_version (version) VALUES (4)", [])?;
-        }
-        if version < 5 {
-            conn.execute_batch(SCHEMA_V5)?;
-            conn.execute("INSERT INTO _schema_version (version) VALUES (5)", [])?;
-        }
-        if version < 6 {
-            conn.execute_batch(SCHEMA_V6)?;
-            conn.execute("INSERT INTO _schema_version (version) VALUES (6)", [])?;
-        }
-        if version < 7 {
-            conn.execute_batch(SCHEMA_V7)?;
-            conn.execute("INSERT INTO _schema_version (version) VALUES (7)", [])?;
-        }
-        if version < 8 {
-            conn.execute_batch(SCHEMA_V8)?;
-            conn.execute("INSERT INTO _schema_version (version) VALUES (8)", [])?;
+        for (target, sql) in [
+            (2, SCHEMA_V2),
+            (3, SCHEMA_V3),
+            (4, SCHEMA_V4),
+            (5, SCHEMA_V5),
+            (6, SCHEMA_V6),
+            (7, SCHEMA_V7),
+            (8, SCHEMA_V8),
+        ] {
+            if version < target {
+                migration_step(&conn, sql, Some(target))?;
+            }
         }
         Ok(())
     }
@@ -1551,6 +1565,50 @@ mod tests {
 
     fn test_db() -> LibraryDb {
         LibraryDb::open_in_memory().unwrap()
+    }
+
+    /// A step that dies partway takes its own half-applied columns with it.
+    ///
+    /// Left behind, they are what makes the *next* launch fail too: the step
+    /// re-runs from the top, hits `duplicate column name` on the column that
+    /// did land, and the database never opens again.
+    #[test]
+    fn a_failed_migration_step_leaves_no_half_applied_schema() {
+        let db = test_db();
+        let conn = db.conn.lock().unwrap();
+        let batch = "
+            ALTER TABLE tracks ADD COLUMN applied TEXT;
+            ALTER TABLE tracks ADD COLUMN applied TEXT;
+        ";
+
+        assert!(migration_step(&conn, batch, Some(99)).is_err());
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('tracks')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "applied"));
+        let version: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM _schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(version, 99);
+        // And the retry a later launch makes now succeeds.
+        drop(columns);
+        assert!(
+            migration_step(
+                &conn,
+                "ALTER TABLE tracks ADD COLUMN applied TEXT",
+                Some(99)
+            )
+            .is_ok()
+        );
     }
 
     /// A file-backed database comes up in WAL, so a sync writing album rows

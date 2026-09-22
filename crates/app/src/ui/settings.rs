@@ -133,7 +133,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 /// makes "the sections that are present" a prefix of this list.
 const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Window", 4),
-    ("Appearance", 10),
+    ("Appearance", 11),
     ("Album pages", 7),
     ("Fullscreen", 7),
     ("Player bar", 11),
