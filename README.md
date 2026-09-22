@@ -6,7 +6,7 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/), and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.17.4-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.18.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#installation)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
@@ -36,10 +36,11 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 ## Features
 
 - [x] **Gapless playback**: one audio sink across tracks, prefetched hand-over, no gap and no click.
-- [x] **Two libraries, one app**: stream from Navidrome over Subsonic, or index local files into a SQLite library and play them straight off disk.
+- [x] **Two libraries, one app**: stream from Navidrome over Subsonic, or index local files into a SQLite library and play them straight off disk. Local album pages include file format, bitrate, sample rate, bit depth, channels, size, added date and ReplayGain metadata.
 - [x] **Real-time 3D visualizer**: eight software-rendered scenes that switch on the beat, plus a music-timed Auto mode.
 - [x] **Waveform seek bar**: per-track amplitude envelope (480 buckets, cached to disk); the next track's peaks are computed while the current one plays.
 - [x] **Fully themable**: Light / Dark / system / custom JSON, with a pywal16 template and cover-reactive accent colour.
+- [x] **Adjustable interface text**: choose any base font size from the fixed 9px–32px dropdown under Settings → Appearance.
 - [x] **Format support**: everything Symphonia decodes: FLAC, MP3, AAC/M4A, ALAC, Vorbis, WAV, AIFF and more.
 - [x] **Album page layouts**: the cover and details above the track list, or — on a landscape widescreen window — in a tall panel down either side with a much bigger cover (Settings → Appearance).
 - [x] **Album & artist browsing**: album grid with infinite scroll and sort (name / new / recent / frequent / random / starred), artist index with bios and images.
@@ -57,6 +58,7 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 - [x] **Output device picker**: pick where audio goes — PulseAudio/PipeWire sinks on Linux, Bluetooth included — and playback follows the route when a device is connected or pulled out.
 - [x] **OS media keys**: media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS).
 - [x] **Artwork cache**: LRU-evicted disk cache (configurable cap) with HiDPI-aware resolution bump. Optionally preloads every album and artist cover in the background (Settings → Library), so the grids never download while you scroll.
+- [x] **One-shot cache repair**: Rebuild local cache re-reads local metadata and covers first, then rebuilds the connected server catalog; local-only libraries work without a server.
 - [x] **Self-laying settings page**: the panels wrap into a centred multi-column grid whenever the window can hold the whole page at once, and fall back to the scrolling column — captions and all — when it cannot. No setting to find.
 - [x] **Navigation**: mouse back/forward buttons, bracket keys, configurable default page, and optional vi-mode navigation with a **Reduce motion** toggle.
 
@@ -73,6 +75,9 @@ cargo run                     # build + launch
 ```
 
 Log in with your Navidrome URL, username and password, or point **Settings → Local Music** at a folder and skip the server entirely.
+
+> [!WARNING]
+> The first visit to Local Music may take a moment while Scirè makes smaller cover thumbnails. They are cached, so later visits are fast and use less memory.
 
 ### Linux dependencies
 

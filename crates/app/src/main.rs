@@ -104,7 +104,7 @@ fn main() {
             cx.open_window(
                 ui::window_options(settings.client_titlebar, WindowBounds::Windowed(bounds)),
                 |window, cx| {
-                    ui::apply_theme(settings.theme, window, cx);
+                    ui::apply_theme(settings.theme, settings.font_size, window, cx);
                     ui::apply_window_chrome(settings.client_titlebar, window, cx);
                     let root_view = cx.new(|cx| {
                         ui::root::RootView::new(session, player, playlists, library_db, window, cx)

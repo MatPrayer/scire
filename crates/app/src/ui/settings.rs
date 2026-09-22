@@ -6,6 +6,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::switch::Switch;
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
@@ -18,14 +19,17 @@ use std::time::{Duration, Instant};
 use crate::config::{
     AlbumPageLayout, ArtistAlbumSize, CoverSize, DefaultPage, FullscreenBackground,
     FullscreenCoverSize, PlayerBarStyle, QueueEndBehavior, ReplayGainMode, ThemePref,
+    UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize,
 };
 use crate::services::library_db::LibraryDb;
+use crate::services::local_library::LocalScanner;
 use crate::services::{art_precache, artwork, navidrome_sync, runtime};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
 use crate::ui::{
-    apply_theme, apply_window_chrome, sync_focus_scroll, transition, with_focus_cursor,
+    apply_font_size, apply_theme, apply_window_chrome, sync_focus_scroll, transition,
+    with_focus_cursor,
 };
 
 /// How often the two library maintenance jobs republish their progress.
@@ -136,6 +140,10 @@ const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Library", 14),
     ("Account", 3),
 ];
+
+fn font_size_options() -> Vec<u8> {
+    (UI_FONT_SIZE_MIN..=UI_FONT_SIZE_MAX).collect()
+}
 
 /// One column of the compact grid: the sections that landed in it, in document
 /// order, and the width to lay their cards out at.
@@ -448,6 +456,7 @@ impl TrackInfoField {
 enum SettingsAction {
     Switch(SettingsSwitch),
     Button(SettingsButton),
+    FontSize,
     DirInput,
 }
 
@@ -615,7 +624,7 @@ impl SettingsView {
         .detach();
     }
 
-    /// Throw away the cached catalog and re-import every album from scratch.
+    /// Re-read local files and covers, then re-import every server album.
     ///
     /// The escape hatch behind the incremental refresh: that one re-fetches an
     /// album's tracks when the listing's track count or duration moves, so an
@@ -624,19 +633,53 @@ impl SettingsView {
         if self.rebuild.is_running() {
             return;
         }
-        let Some(client) = self.session.read(cx).client.clone() else {
-            self.rebuild = TaskState::Failed("Not connected to a server".into());
-            cx.notify();
-            return;
-        };
-        self.rebuild = TaskState::Running("Reading catalog…".into());
+        let client = self.session.read(cx).client.clone();
+        let dirs = self.session.read(cx).settings.local_music_dirs.clone();
+        self.rebuild = TaskState::Running("Preparing local cache…".into());
         cx.notify();
 
         let db = self.library_db.clone();
+        let scanner = Arc::new(LocalScanner::new(db.clone()));
+        let watched_scanner = scanner.clone();
         let progress = Arc::new(navidrome_sync::SyncProgress::default());
         let watched = progress.clone();
         cx.spawn(async move |this, cx| {
-            let work = runtime::spawn_io(async move {
+            let local_scanner = scanner.clone();
+            let local_work = runtime::spawn_blocking_io(move || local_scanner.rebuild_cache(&dirs));
+            let local_result =
+                crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, local_work, |cx| {
+                    let files = watched_scanner.progress();
+                    let _ = this.update(cx, |this, cx| {
+                        this.rebuild = TaskState::Running(if files == 0 {
+                            "Scanning local files…".into()
+                        } else {
+                            format!("Scanning local files… {files} files")
+                        });
+                        cx.notify();
+                    });
+                })
+                .await;
+            if let Err(error) = local_result {
+                let _ = this.update(cx, |this, cx| {
+                    this.rebuild =
+                        TaskState::Failed(format!("Local cache rebuild failed: {error}"));
+                    cx.notify();
+                });
+                return;
+            }
+
+            let Some(client) = client else {
+                let _ = this.update(cx, |this, cx| {
+                    this.rebuild = TaskState::Done("Local cache rebuilt.".into());
+                    cx.notify();
+                });
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.rebuild = TaskState::Running("Reading server catalog…".into());
+                cx.notify();
+            });
+            let server_work = runtime::spawn_io(async move {
                 navidrome_sync::sync_navidrome(
                     db,
                     &client,
@@ -646,13 +689,13 @@ impl SettingsView {
                 )
                 .await
             });
-            let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, work, |cx| {
+            let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, server_work, |cx| {
                 let (done, total) = watched.snapshot();
                 let _ = this.update(cx, |this, cx| {
                     this.rebuild = TaskState::Running(if total == 0 {
-                        "Reading catalog…".into()
+                        "Reading server catalog…".into()
                     } else {
-                        format!("Importing {done}/{total} albums")
+                        format!("Importing server albums… {done}/{total}")
                     });
                     cx.notify();
                 });
@@ -660,7 +703,7 @@ impl SettingsView {
             .await;
             let _ = this.update(cx, |this, cx| {
                 this.rebuild = match result {
-                    Ok(()) => TaskState::Done("Library cache rebuilt.".into()),
+                    Ok(()) => TaskState::Done("Local and server caches rebuilt.".into()),
                     Err(e) => TaskState::Failed(format!("Rebuild failed: {e}")),
                 };
                 cx.notify();
@@ -758,7 +801,17 @@ impl SettingsView {
             cx.notify();
         });
         self.persist(cx);
-        apply_theme(pref, window, cx);
+        let font_size = self.session.read(cx).settings.font_size;
+        apply_theme(pref, font_size, window, cx);
+        cx.notify();
+    }
+
+    fn set_font_size(&mut self, font_size: UiFontSize, cx: &mut Context<Self>) {
+        self.session.update(cx, |session, _| {
+            session.settings.font_size = font_size;
+            session.persist_settings();
+        });
+        apply_font_size(font_size, cx);
         cx.notify();
     }
 
@@ -1495,6 +1548,15 @@ impl SettingsView {
                 self.dispatch_switch(which, !current, window, cx);
             }
             SettingsAction::Button(button) => self.dispatch_button(button, window, cx),
+            SettingsAction::FontSize => {
+                let current = self.session.read(cx).settings.font_size.value();
+                let next = if current == UI_FONT_SIZE_MAX {
+                    UI_FONT_SIZE_MIN
+                } else {
+                    current + 1
+                };
+                self.set_font_size(UiFontSize::new(next), cx);
+            }
             SettingsAction::DirInput => {
                 self.dir_input.update(cx, |s, cx| s.focus(window, cx));
                 cx.notify();
@@ -1677,6 +1739,7 @@ impl Render for SettingsView {
         let player_bar_translucent = self.session.read(cx).settings.player_bar_translucent;
         let translucent_disabled = self.switch_disabled(SettingsSwitch::PlayerBarTranslucent, cx);
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
+        let font_size = self.session.read(cx).settings.font_size;
         let adaptive_from_page = self.session.read(cx).settings.adaptive_from_page;
         let adaptive_page_gradient = self.session.read(cx).settings.adaptive_page_gradient;
         let album_layout = self.session.read(cx).settings.album_layout;
@@ -1879,6 +1942,7 @@ impl Render for SettingsView {
             ));
 
         // Appearance
+        let font_menu_view = cx.entity();
         let appearance_section = self
             .section("Appearance", cx)
             .child(self.subheading("Theme", cx))
@@ -1921,6 +1985,45 @@ impl Render for SettingsView {
                         theme == ThemePref::Custom,
                         cx,
                     )),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(self.subheading("Font size", cx))
+                    .child(
+                        self.vi_control(
+                            SettingsAction::FontSize,
+                            Button::new("font-size")
+                                .label(format!("{} px", font_size.value()))
+                                .dropdown_caret(true)
+                                .outline()
+                                .small()
+                                .w(px(112.))
+                                .h(px(32.))
+                                .text_size(px(14.))
+                                .dropdown_menu(move |menu, _window, _cx| {
+                                    font_size_options().into_iter().fold(menu, |menu, value| {
+                                        let view = font_menu_view.clone();
+                                        let selected = value == font_size.value();
+                                        menu.item(
+                                            PopupMenuItem::new(format!("{value} px"))
+                                                .checked(selected)
+                                                .on_click(move |_, _, cx: &mut gpui::App| {
+                                                    view.update(cx, |settings, cx| {
+                                                        settings.set_font_size(
+                                                            UiFontSize::new(value),
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                        )
+                                    })
+                                }),
+                            cx,
+                        ),
+                    ),
             )
             .child(self.vi_switch(
                 SettingsSwitch::ReducedMotion,
@@ -2652,7 +2755,7 @@ impl Render for SettingsView {
             .child(self.subheading("Maintenance", cx))
             .child(self.note(
                 "Refresh in the sidebar picks up albums the server already knows \
-                 about. These two are slower and rarely needed.",
+                 about. These maintenance jobs are slower and rarely needed.",
                 cx,
             ))
             .child(self.vi_library_task(
@@ -2671,8 +2774,8 @@ impl Render for SettingsView {
                 SettingsButton::RebuildCache,
                 "rebuild-cache",
                 "Rebuild local cache",
-                "Re-import every album from the server. Fixes a cache that has \
-                 drifted, e.g. after re-tagging music in place.",
+                "Re-read local metadata and covers, then re-import every album \
+                 from the server when connected. Never changes music files.",
                 &rebuild_state,
                 cx,
             ))
@@ -2984,6 +3087,14 @@ mod tests {
     const VIEWPORT_TOP: f32 = 100.;
     fn tops() -> Vec<f32> {
         (0..7).map(|i| VIEWPORT_TOP + 300. * i as f32).collect()
+    }
+
+    #[test]
+    fn font_menu_contains_every_supported_pixel_size() {
+        let options = font_size_options();
+        assert_eq!(options.len(), 24);
+        assert_eq!(options.first(), Some(&9));
+        assert_eq!(options.last(), Some(&32));
     }
 
     #[test]

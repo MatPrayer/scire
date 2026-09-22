@@ -31,7 +31,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::TitleBar;
 use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeRegistry};
 
-use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref};
+use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref, UiFontSize};
 use crate::services::library_db::LibraryStats;
 
 fn settings_theme_path() -> Option<PathBuf> {
@@ -477,6 +477,142 @@ pub fn track_extras(
     parts.join(" · ")
 }
 
+/// Technical summary of an album's files: formats, bitrate range, sample rate
+/// and bit depth, channels, and total size.
+pub fn album_quality_chips(songs: &[subsonic::Song]) -> Vec<String> {
+    let mut chips = Vec::new();
+    let mut formats = Vec::new();
+    for song in songs {
+        let raw = song.suffix.as_deref().or_else(|| {
+            song.content_type
+                .as_deref()
+                .and_then(|content_type| content_type.rsplit('/').next())
+        });
+        if let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) {
+            let format = raw.to_uppercase();
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+    }
+    if !formats.is_empty() {
+        chips.push(formats.join(" / "));
+    }
+
+    let bitrates: Vec<u32> = songs
+        .iter()
+        .filter_map(|song| song.bit_rate)
+        .filter(|bitrate| *bitrate > 0)
+        .collect();
+    if let (Some(&low), Some(&high)) = (bitrates.iter().min(), bitrates.iter().max()) {
+        chips.push(if low == high {
+            format!("{low} kbps")
+        } else {
+            format!("{low}–{high} kbps")
+        });
+    }
+
+    let rate = songs
+        .iter()
+        .filter_map(|song| song.sampling_rate)
+        .filter(|rate| *rate > 0)
+        .max();
+    let depth = songs
+        .iter()
+        .filter_map(|song| song.bit_depth)
+        .filter(|depth| *depth > 0)
+        .max();
+    match (rate, depth) {
+        (Some(rate), Some(depth)) => chips.push(format!("{} · {depth} bit", format_khz(rate))),
+        (Some(rate), None) => chips.push(format_khz(rate)),
+        (None, Some(depth)) => chips.push(format!("{depth} bit")),
+        (None, None) => {}
+    }
+
+    if let Some(channels) = songs
+        .iter()
+        .filter_map(|song| song.channel_count)
+        .filter(|channels| *channels > 0)
+        .max()
+    {
+        chips.push(match channels {
+            1 => "Mono".to_string(),
+            2 => "Stereo".to_string(),
+            count => format!("{count} ch"),
+        });
+    }
+
+    let total: u64 = songs.iter().filter_map(|song| song.size).sum();
+    if total > 0 {
+        chips.push(format_bytes(total));
+    }
+    chips
+}
+
+/// ReplayGain album value and track range, absent when no track has tags.
+pub fn album_replaygain_line(songs: &[subsonic::Song]) -> Option<String> {
+    let gains: Vec<&subsonic::ReplayGain> = songs
+        .iter()
+        .filter_map(|song| song.replay_gain.as_ref())
+        .collect();
+    if gains.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(album_gain) = gains.iter().find_map(|gain| gain.album_gain) {
+        parts.push(format!("album {album_gain:+.2} dB"));
+    }
+    if let Some(peak) = gains
+        .iter()
+        .filter_map(|gain| gain.album_peak)
+        .reduce(f32::max)
+    {
+        parts.push(format!("peak {peak:.2}"));
+    }
+    let track_gains: Vec<f32> = gains.iter().filter_map(|gain| gain.track_gain).collect();
+    if let (Some(low), Some(high)) = (
+        track_gains.iter().copied().reduce(f32::min),
+        track_gains.iter().copied().reduce(f32::max),
+    ) {
+        parts.push(if (high - low).abs() < 0.005 {
+            format!("tracks {low:+.2} dB")
+        } else {
+            format!("tracks {low:+.2} … {high:+.2} dB")
+        });
+    }
+    (!parts.is_empty()).then(|| format!("ReplayGain: {}", parts.join(" · ")))
+}
+
+/// ISO date-time to date. Unexpected values pass through unchanged.
+pub fn format_added_date(created: &str) -> String {
+    created
+        .split(['T', ' '])
+        .next()
+        .unwrap_or(created)
+        .to_string()
+}
+
+fn format_khz(hz: u32) -> String {
+    let khz = hz as f32 / 1000.0;
+    if (khz - khz.round()).abs() < 0.05 {
+        format!("{} kHz", khz.round() as u32)
+    } else {
+        format!("{khz:.1} kHz")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1024.0 {
+        format!("{:.2} GB", mb / 1024.0)
+    } else if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{mb:.1} MB")
+    }
+}
+
 /// Scrolling speed and end pauses for [`scrolling_line`].
 const MARQUEE_SPEED: f32 = 34.;
 const MARQUEE_HOLD: f32 = 2.2;
@@ -884,7 +1020,7 @@ pub fn waveform_seek_bar(
 }
 
 /// Apply the theme preference. `System` follows the OS appearance.
-pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
+pub fn apply_theme(pref: ThemePref, font_size: UiFontSize, window: &mut Window, cx: &mut App) {
     // When switching away from Custom, reset stored theme configs to defaults.
     // apply_custom_theme_from_settings overwrites dark_theme/light_theme via
     // Theme::apply_config, causing Dark/Light/System to re-apply custom colors.
@@ -921,6 +1057,16 @@ pub fn apply_theme(pref: ThemePref, window: &mut Window, cx: &mut App) {
     if matches!(pref, ThemePref::Custom) {
         apply_custom_theme_from_settings(cx);
     }
+    apply_font_size(font_size, cx);
+}
+
+/// Apply persisted interface type scale and keep it across later theme changes.
+pub fn apply_font_size(size: UiFontSize, cx: &mut App) {
+    let value = size.px();
+    let theme = Theme::global_mut(cx);
+    theme.font_size = px(value);
+    Rc::make_mut(&mut theme.light_theme).font_size = Some(value);
+    Rc::make_mut(&mut theme.dark_theme).font_size = Some(value);
 }
 
 /// The colour the bottom player bar is tinted with: a darkened, slightly

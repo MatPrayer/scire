@@ -1287,6 +1287,7 @@ mod tests {
                     track_no: None,
                     file_modified: None,
                     album_id: Some("local:album:x".into()),
+                    ..TrackRow::default()
                 },
                 TrackRow {
                     id: "navidrome:track:t2".into(),
@@ -1300,6 +1301,7 @@ mod tests {
                     track_no: None,
                     file_modified: None,
                     album_id: Some("navidrome:album:al-remote".into()),
+                    ..TrackRow::default()
                 },
             ],
         }

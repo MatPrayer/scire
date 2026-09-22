@@ -29,8 +29,8 @@ use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
 use crate::ui::albums::album_from_row;
 use crate::ui::{
-    format_duration, strip_html, sync_focus_scroll, track_extras, truncate_at_word,
-    with_focus_cursor,
+    album_quality_chips, album_replaygain_line, format_added_date, format_duration, strip_html,
+    sync_focus_scroll, track_extras, truncate_at_word, with_focus_cursor,
 };
 
 /// Resolution to request for the header cover.
@@ -881,156 +881,6 @@ fn album_credits(album: &subsonic::Album) -> Vec<(String, Option<String>)> {
     }
 }
 
-/// Technical summary of the album's files, as short chip strings: formats,
-/// bitrate, sample rate / bit depth, channels, total size. Everything here is
-/// OpenSubsonic-only except the bitrate, so vanilla servers yield fewer chips
-/// and no empty placeholders.
-fn quality_chips(songs: &[Song]) -> Vec<String> {
-    let mut chips = Vec::new();
-
-    let mut formats: Vec<String> = Vec::new();
-    for song in songs {
-        // `suffix` is the file extension; fall back to the MIME subtype, which
-        // is what servers that omit it still give us ("audio/flac" → FLAC).
-        let raw = song.suffix.as_deref().or_else(|| {
-            song.content_type
-                .as_deref()
-                .and_then(|c| c.rsplit('/').next())
-        });
-        if let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) {
-            let fmt = raw.to_uppercase();
-            if !formats.contains(&fmt) {
-                formats.push(fmt);
-            }
-        }
-    }
-    if !formats.is_empty() {
-        chips.push(formats.join(" / "));
-    }
-
-    // Ranges, not averages: a mixed-source album should say so.
-    let bitrates: Vec<u32> = songs
-        .iter()
-        .filter_map(|s| s.bit_rate)
-        .filter(|&b| b > 0)
-        .collect();
-    if let (Some(&lo), Some(&hi)) = (bitrates.iter().min(), bitrates.iter().max()) {
-        chips.push(if lo == hi {
-            format!("{lo} kbps")
-        } else {
-            format!("{lo}–{hi} kbps")
-        });
-    }
-
-    let rate = songs
-        .iter()
-        .filter_map(|s| s.sampling_rate)
-        .filter(|&r| r > 0)
-        .max();
-    let depth = songs
-        .iter()
-        .filter_map(|s| s.bit_depth)
-        .filter(|&d| d > 0)
-        .max();
-    match (rate, depth) {
-        (Some(r), Some(d)) => chips.push(format!("{} · {d} bit", fmt_khz(r))),
-        (Some(r), None) => chips.push(fmt_khz(r)),
-        (None, Some(d)) => chips.push(format!("{d} bit")),
-        (None, None) => {}
-    }
-
-    if let Some(ch) = songs
-        .iter()
-        .filter_map(|s| s.channel_count)
-        .filter(|&c| c > 0)
-        .max()
-    {
-        chips.push(match ch {
-            1 => "Mono".to_string(),
-            2 => "Stereo".to_string(),
-            n => format!("{n} ch"),
-        });
-    }
-
-    let total: u64 = songs.iter().filter_map(|s| s.size).sum();
-    if total > 0 {
-        chips.push(fmt_bytes(total));
-    }
-    chips
-}
-
-/// ReplayGain summary line, or `None` when no track carries the tags. Album
-/// gain is one value for the whole album, so the first track that has it wins;
-/// track gains are shown as the range they span.
-fn replaygain_line(songs: &[Song]) -> Option<String> {
-    let gains: Vec<&subsonic::ReplayGain> = songs
-        .iter()
-        .filter_map(|s| s.replay_gain.as_ref())
-        .collect();
-    if gains.is_empty() {
-        return None;
-    }
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(album_gain) = gains.iter().find_map(|g| g.album_gain) {
-        parts.push(format!("album {album_gain:+.2} dB"));
-    }
-    if let Some(peak) = gains
-        .iter()
-        .filter_map(|g| g.album_peak)
-        .fold(None, |acc: Option<f32>, p| {
-            Some(acc.map_or(p, |a| a.max(p)))
-        })
-    {
-        parts.push(format!("peak {peak:.2}"));
-    }
-    let track_gains: Vec<f32> = gains.iter().filter_map(|g| g.track_gain).collect();
-    if let (Some(lo), Some(hi)) = (
-        track_gains
-            .iter()
-            .copied()
-            .fold(None, |a: Option<f32>, g| Some(a.map_or(g, |a| a.min(g)))),
-        track_gains
-            .iter()
-            .copied()
-            .fold(None, |a: Option<f32>, g| Some(a.map_or(g, |a| a.max(g)))),
-    ) {
-        parts.push(if (hi - lo).abs() < 0.005 {
-            format!("tracks {lo:+.2} dB")
-        } else {
-            format!("tracks {lo:+.2} … {hi:+.2} dB")
-        });
-    }
-    (!parts.is_empty()).then(|| format!("ReplayGain: {}", parts.join(" · ")))
-}
-
-/// `44100` → `44.1 kHz`, dropping a trailing `.0`.
-fn fmt_khz(hz: u32) -> String {
-    let khz = hz as f32 / 1000.0;
-    if (khz - khz.round()).abs() < 0.05 {
-        format!("{} kHz", khz.round() as u32)
-    } else {
-        format!("{khz:.1} kHz")
-    }
-}
-
-fn fmt_bytes(bytes: u64) -> String {
-    const MB: f64 = 1024.0 * 1024.0;
-    let mb = bytes as f64 / MB;
-    if mb >= 1024.0 {
-        format!("{:.2} GB", mb / 1024.0)
-    } else if mb >= 10.0 {
-        format!("{mb:.0} MB")
-    } else {
-        format!("{mb:.1} MB")
-    }
-}
-
-/// Server timestamps are ISO-8601 (`2019-03-08T21:12:44Z`); only the date is
-/// worth showing, and anything unexpected is passed through untouched.
-fn fmt_added(created: &str) -> String {
-    created.split('T').next().unwrap_or(created).to_string()
-}
-
 /// Horizontal padding the scrolling column lays its cards out within (`p_4`
 /// either side).
 const PAGE_PADDING_X: f32 = 32.;
@@ -1203,11 +1053,11 @@ impl Render for AlbumDetailView {
                 if discs > 1 {
                     chips.push(format!("{discs} discs"));
                 }
-                let quality = quality_chips(&a.song);
+                let quality = album_quality_chips(&a.song);
                 has_quality = !quality.is_empty();
                 chips.extend(quality);
                 if let Some(created) = a.album.created.as_deref().filter(|c| !c.is_empty()) {
-                    chips.push(format!("Added {}", fmt_added(created)));
+                    chips.push(format!("Added {}", format_added_date(created)));
                 }
             }
             // The quality chips are the clearest case of the whole problem: the
@@ -1242,7 +1092,10 @@ impl Render for AlbumDetailView {
                         })
                         .collect::<Vec<_>>(),
                 );
-            let replaygain = self.album.as_ref().and_then(|a| replaygain_line(&a.song));
+            let replaygain = self
+                .album
+                .as_ref()
+                .and_then(|a| album_replaygain_line(&a.song));
 
             let rating_stars = h_flex().gap_0p5().children((1..=5u8).map(|r| {
                 div()
@@ -2043,11 +1896,9 @@ impl AlbumDetailView {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        album_credits, album_from_row, cached_album, fmt_bytes, fmt_khz, quality_chips,
-        replaygain_line,
-    };
+    use super::{album_credits, album_from_row, cached_album};
     use crate::services::library_db::{AlbumRow, LibraryDb};
+    use crate::ui::{album_quality_chips, album_replaygain_line, format_bytes, format_khz};
     use subsonic::{ArtistRef, Song};
 
     fn album(artist: Option<&str>, artists: Vec<(&str, &str)>) -> subsonic::Album {
@@ -2168,7 +2019,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            quality_chips(&songs),
+            album_quality_chips(&songs),
             vec![
                 "FLAC".to_string(),
                 "1004 kbps".into(),
@@ -2185,7 +2036,7 @@ mod tests {
             song(r#"{"id":"1","title":"a","suffix":"flac","bitRate":1004,"samplingRate":96000}"#),
             song(r#"{"id":"2","title":"b","contentType":"audio/mpeg","bitRate":320}"#),
         ];
-        let chips = quality_chips(&songs);
+        let chips = album_quality_chips(&songs);
         assert_eq!(chips[0], "FLAC / MPEG");
         assert_eq!(chips[1], "320–1004 kbps");
         assert_eq!(chips[2], "96 kHz");
@@ -2194,7 +2045,7 @@ mod tests {
     #[test]
     fn quality_chips_empty_without_opensubsonic_fields() {
         let songs = vec![song(r#"{"id":"1","title":"a"}"#)];
-        assert!(quality_chips(&songs).is_empty());
+        assert!(album_quality_chips(&songs).is_empty());
     }
 
     #[test]
@@ -2210,21 +2061,21 @@ mod tests {
             ),
         ];
         assert_eq!(
-            replaygain_line(&songs).unwrap(),
+            album_replaygain_line(&songs).unwrap(),
             "ReplayGain: album -8.30 dB · peak 0.99 · tracks -9.10 … -7.20 dB"
         );
     }
 
     #[test]
     fn replaygain_line_absent_without_tags() {
-        assert!(replaygain_line(&[song(r#"{"id":"1","title":"a"}"#)]).is_none());
+        assert!(album_replaygain_line(&[song(r#"{"id":"1","title":"a"}"#)]).is_none());
     }
 
     #[test]
     fn khz_and_bytes_formatting() {
-        assert_eq!(fmt_khz(44100), "44.1 kHz");
-        assert_eq!(fmt_khz(48000), "48 kHz");
-        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MB");
-        assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.00 GB");
+        assert_eq!(format_khz(44100), "44.1 kHz");
+        assert_eq!(format_khz(48000), "48 kHz");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.00 GB");
     }
 }

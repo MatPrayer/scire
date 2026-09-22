@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use anyhow::Result;
-use lofty::Accessor;
 use lofty::AudioFile;
 use lofty::TaggedFileExt;
+use lofty::{Accessor, ItemKey};
 
 use crate::services::artwork;
-use crate::services::library_db::{AlbumRow, LibraryDb};
+use crate::services::library_db::{AlbumRow, LibraryDb, TrackMetadata};
 
 pub const IDLE: u8 = 0;
 pub const SCANNING: u8 = 1;
@@ -66,25 +66,70 @@ impl LocalScanner {
             return Ok(());
         }
         let _guard = ScanGuard;
+        self.scan_locked(dirs, true)
+    }
+
+    /// Clear generated covers, invalidate fingerprints, and scan while holding
+    /// the process-wide guard for the entire maintenance job.
+    pub fn rebuild_cache(&self, dirs: &[PathBuf]) -> Result<()> {
+        let started = std::time::Instant::now();
+        while SCAN_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            if started.elapsed() >= std::time::Duration::from_secs(30 * 60) {
+                anyhow::bail!("timed out waiting for the current local scan");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _guard = ScanGuard;
+        self.db.invalidate_local_scan_fingerprints()?;
+        self.scan_locked(dirs, false)?;
+        prune_local_art_cache(&self.db)
+    }
+
+    fn scan_locked(&self, dirs: &[PathBuf], preserve_existing_covers: bool) -> Result<()> {
         self.status.store(SCANNING, Ordering::Relaxed);
         self.progress.store(0, Ordering::Relaxed);
         let exts = [
             "flac", "mp3", "ogg", "opus", "wav", "aiff", "aac", "m4a", "m4b",
         ];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut album_covers: std::collections::HashMap<String, String> =
+            if preserve_existing_covers {
+                self.db
+                    .albums_by_source("local")?
+                    .into_iter()
+                    .filter_map(|album| album.cover_art.map(|cover| (album.id, cover)))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
         for dir in dirs {
             if !dir.is_dir() {
                 tracing::warn!("local music dir not found: {dir:?}");
                 continue;
             }
-            scan_dir(self.db.clone(), dir, &exts, &self.progress, &mut seen)?;
+            scan_dir(
+                self.db.clone(),
+                dir,
+                &exts,
+                &self.progress,
+                &mut seen,
+                &mut album_covers,
+            )?;
         }
         cleanup_stale_entries(&self.db, &seen);
         // Update album stats from tracks (avoids per-file accounting).
         let _ = self.db.conn.lock().unwrap().execute_batch(
             "UPDATE albums SET
                song_count = (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id),
-               duration   = (SELECT COALESCE(SUM(duration), 0) FROM tracks WHERE tracks.album_id = albums.id)
+               duration   = (SELECT COALESCE(SUM(duration), 0) FROM tracks WHERE tracks.album_id = albums.id),
+               created    = (
+                   SELECT datetime(MIN(file_created), 'unixepoch')
+                   FROM tracks
+                   WHERE tracks.album_id = albums.id
+               )
              WHERE source = 'local'",
         );
         self.db.bump_scan_version();
@@ -110,6 +155,7 @@ fn scan_dir(
     exts: &[&str],
     progress: &AtomicUsize,
     seen: &mut std::collections::HashSet<String>,
+    album_covers: &mut std::collections::HashMap<String, String>,
 ) -> Result<()> {
     // ponytail: scan m3u files found directly in each root dir (not recursed).
     // Full m3u-tree scanning is O(extra IO); current approach checks root only.
@@ -140,12 +186,12 @@ fn scan_dir(
             continue;
         }
         if path.is_dir() {
-            scan_dir(db.clone(), &path, exts, progress, seen)?;
+            scan_dir(db.clone(), &path, exts, progress, seen, album_covers)?;
         } else if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if exts.contains(&ext.to_lowercase().as_str()) {
                 let path_str = path.to_string_lossy().to_string();
-                if let Err(e) = scan_file(&db, &path) {
+                if let Err(e) = scan_file(&db, &path, album_covers) {
                     tracing::warn!("error scanning {path:?}: {e}");
                 }
                 seen.insert(path_str);
@@ -156,10 +202,15 @@ fn scan_dir(
     Ok(())
 }
 
-fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
+fn scan_file(
+    db: &LibraryDb,
+    path: &Path,
+    album_covers: &mut std::collections::HashMap<String, String>,
+) -> Result<()> {
     let path_str = path.to_string_lossy();
-    let modified = std::fs::metadata(path)
-        .ok()
+    let file_metadata = std::fs::metadata(path).ok();
+    let modified = file_metadata
+        .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64);
@@ -206,11 +257,43 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
         (name, None, None, None, None, None, None)
     };
 
-    let duration = tagged.properties().duration().as_secs_f64();
+    let properties = tagged.properties();
+    let duration = properties.duration().as_secs_f64();
     let duration = if duration > 0.0 { Some(duration) } else { None };
+    let suffix = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let content_type = suffix.as_deref().and_then(mime_for_suffix);
+    let album_artist = tag_value(&tagged, &ItemKey::AlbumArtist);
+    let metadata = TrackMetadata {
+        suffix,
+        content_type: content_type.map(str::to_string),
+        bit_rate: properties.audio_bitrate().map(i64::from),
+        sampling_rate: properties.sample_rate().map(i64::from),
+        bit_depth: properties.bit_depth().map(i64::from),
+        channel_count: properties.channels().map(i64::from),
+        file_size: file_metadata
+            .as_ref()
+            .and_then(|metadata| i64::try_from(metadata.len()).ok()),
+        file_created: file_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.created().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+        replay_gain_track: replaygain_value(&tagged, &ItemKey::ReplayGainTrackGain),
+        replay_gain_album: replaygain_value(&tagged, &ItemKey::ReplayGainAlbumGain),
+        replay_peak_track: replaygain_value(&tagged, &ItemKey::ReplayGainTrackPeak),
+        replay_peak_album: replaygain_value(&tagged, &ItemKey::ReplayGainAlbumPeak),
+        play_count: None,
+    };
 
-    let cover = extract_cover(path, &album_name, &artist);
     let album_key = format!("local:album:{}", album_name.as_deref().unwrap_or("Unknown"));
+    let cover = select_album_cover(
+        &album_key,
+        extract_cover(path, &album_name, &artist),
+        album_covers,
+    );
     let artist_key = format!("local:artist:{}", artist.as_deref().unwrap_or("Unknown"));
 
     if let Some(ref name) = artist {
@@ -226,7 +309,7 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
     album_row.year = year.map(|y| y as i32);
     album_row.cover_art = cover.clone();
     let _ = db.upsert_album(&album_row);
-    let _ = db.upsert_track(
+    let _ = db.upsert_track_with_metadata(
         &id,
         "local",
         &title,
@@ -234,7 +317,7 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
         Some(&artist_key),
         album_name.as_deref(),
         Some(&album_key),
-        None, // album_artist — lofty 0.18 Accessor lacks this
+        album_artist.as_deref(),
         track_no.map(|t| t as i32),
         disc_number.map(|d| d as i32),
         year.map(|y| y as i32),
@@ -243,8 +326,51 @@ fn scan_file(db: &LibraryDb, path: &Path) -> Result<()> {
         Some(&path_str),
         cover.as_deref(),
         modified,
+        &metadata,
     );
     Ok(())
+}
+
+fn tag_value(tagged: &lofty::TaggedFile, key: &ItemKey) -> Option<String> {
+    tagged
+        .tags()
+        .iter()
+        .find_map(|tag| tag.get_string(key))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn replaygain_value(tagged: &lofty::TaggedFile, key: &ItemKey) -> Option<f64> {
+    tag_value(tagged, key).and_then(|value| parse_replaygain(&value))
+}
+
+fn parse_replaygain(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    let numeric = trimmed
+        .strip_suffix("dB")
+        .or_else(|| trimmed.strip_suffix("DB"))
+        .or_else(|| trimmed.strip_suffix("db"))
+        .unwrap_or(trimmed)
+        .trim();
+    numeric
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn mime_for_suffix(suffix: &str) -> Option<&'static str> {
+    match suffix {
+        "flac" => Some("audio/flac"),
+        "mp3" => Some("audio/mpeg"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "opus" => Some("audio/opus"),
+        "wav" => Some("audio/wav"),
+        "aiff" | "aif" => Some("audio/aiff"),
+        "aac" => Some("audio/aac"),
+        "m4a" | "m4b" => Some("audio/mp4"),
+        _ => None,
+    }
 }
 
 /// Remove DB entries for files no longer on disk.
@@ -341,39 +467,44 @@ fn extract_cover(path: &Path, _album: &Option<String>, _artist: &Option<String>)
 }
 
 fn cache_cover_file(src: &Path) -> Option<String> {
-    let hash = simple_hash(src)?;
-    let dest = local_art_path(&hash)?;
-    if !dest.exists() {
-        let _ = std::fs::create_dir_all(dest.parent()?);
-        // Square it on the way in like every other cover, rather than copying
-        // a `folder.jpg` of whatever shape the user's library happens to hold.
-        match std::fs::read(src)
-            .ok()
-            .and_then(|bytes| artwork::square_crop(&bytes))
-        {
-            Some(square) => {
-                let _ = std::fs::write(&dest, square);
-            }
-            None => {
-                let _ = std::fs::copy(src, &dest);
-            }
-        }
-    }
-    Some(hash)
+    let data = std::fs::read(src).ok()?;
+    cache_cover_bytes(&data)
 }
 
 fn cache_cover_bytes(data: &[u8]) -> Option<String> {
+    let dir = local_art_dir()?;
+    cache_cover_bytes_in(data, &dir)
+}
+
+fn cache_cover_bytes_in(data: &[u8], dir: &Path) -> Option<String> {
+    let hash = cover_hash(data);
+    let dest = dir.join(format!("{hash}.jpg"));
+    if !dest.exists() {
+        std::fs::create_dir_all(dir).ok()?;
+        let squared = artwork::square_crop(data);
+        std::fs::write(&dest, squared.as_deref().unwrap_or(data)).ok()?;
+    }
+    dest.is_file().then_some(hash)
+}
+
+fn cover_hash(data: &[u8]) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
-    let hash = format!("{:x}", h.finish());
-    let dest = local_art_path(&hash)?;
-    if !dest.exists() {
-        let _ = std::fs::create_dir_all(dest.parent()?);
-        let squared = artwork::square_crop(data);
-        let _ = std::fs::write(&dest, squared.as_deref().unwrap_or(data));
+    format!("{:x}", h.finish())
+}
+
+fn select_album_cover(
+    album_id: &str,
+    found: Option<String>,
+    album_covers: &mut std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(cover) = found {
+        album_covers.insert(album_id.to_string(), cover.clone());
+        Some(cover)
+    } else {
+        album_covers.get(album_id).cloned()
     }
-    Some(hash)
 }
 
 fn path_to_id(path: &Path, prefix: &str) -> String {
@@ -381,13 +512,6 @@ fn path_to_id(path: &Path, prefix: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
     format!("{}:{:x}", prefix, h.finish())
-}
-
-fn simple_hash(path: &Path) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
-    Some(format!("{:x}", h.finish()))
 }
 
 pub fn local_art_path(hash: &str) -> Option<PathBuf> {
@@ -398,6 +522,50 @@ pub fn local_art_path(hash: &str) -> Option<PathBuf> {
 pub fn local_art_dir() -> Option<PathBuf> {
     let dir = crate::config::project_dirs().ok()?;
     Some(dir.cache_dir().join("local_art"))
+}
+
+fn prune_local_art_cache(db: &LibraryDb) -> Result<()> {
+    let Some(dir) = local_art_dir() else {
+        return Ok(());
+    };
+    let mut referenced = std::collections::HashSet::new();
+    for album in db.albums_by_source("local")? {
+        if let Some(hash) = album.cover_art {
+            referenced.insert(hash);
+        }
+    }
+    for track in db.tracks_by_source("local")? {
+        if let Some(hash) = track.cover_art {
+            referenced.insert(hash);
+        }
+    }
+    prune_local_art_dir(&dir, &referenced)
+}
+
+fn prune_local_art_dir(dir: &Path, referenced: &std::collections::HashSet<String>) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let keep = entry
+            .path()
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|hash| referenced.contains(hash));
+        if keep {
+            continue;
+        }
+        if file_type.is_dir() && !file_type.is_symlink() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -425,6 +593,28 @@ mod tests {
 
     fn cleanup(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn wav_bytes() -> Vec<u8> {
+        let samples = [0_i16; 8];
+        let data_len = (samples.len() * std::mem::size_of::<i16>()) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&44_100_u32.to_le_bytes());
+        bytes.extend_from_slice(&(44_100_u32 * 2).to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
     }
 
     #[test]
@@ -495,5 +685,124 @@ mod tests {
         let a = path_to_id(Path::new("/music/test.flac"), "local");
         let b = path_to_id(Path::new("/music/test.flac"), "navidrome");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pruning_local_art_keeps_references_and_stays_inside_target() {
+        let root =
+            std::env::temp_dir().join(format!("scire-local-art-test-{}", std::process::id()));
+        let cache = root.join("local_art");
+        std::fs::create_dir_all(cache.join("nested")).unwrap();
+        std::fs::write(cache.join("keep.jpg"), b"cover").unwrap();
+        std::fs::write(cache.join("remove.jpg"), b"old").unwrap();
+        std::fs::write(cache.join("nested/cover.jpg"), b"cover").unwrap();
+        let sentinel = root.join("keep.txt");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let referenced = std::collections::HashSet::from(["keep".to_string()]);
+
+        prune_local_art_dir(&cache, &referenced).unwrap();
+
+        assert!(cache.exists());
+        assert_eq!(std::fs::read(cache.join("keep.jpg")).unwrap(), b"cover");
+        assert!(!cache.join("remove.jpg").exists());
+        assert!(!cache.join("nested").exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn folder_cover_key_changes_with_content() {
+        assert_eq!(cover_hash(b"same"), cover_hash(b"same"));
+        assert_ne!(cover_hash(b"old"), cover_hash(b"new"));
+    }
+
+    #[test]
+    fn cover_reference_is_returned_only_after_file_exists() {
+        let root =
+            std::env::temp_dir().join(format!("scire-cover-write-test-{}", std::process::id()));
+        cleanup(&root);
+        let hash = cache_cover_bytes_in(b"cover bytes", &root).unwrap();
+        assert_eq!(
+            std::fs::read(root.join(format!("{hash}.jpg"))).unwrap(),
+            b"cover bytes"
+        );
+
+        let blocked = root.join("not-a-directory");
+        std::fs::write(&blocked, b"file").unwrap();
+        assert!(cache_cover_bytes_in(b"other", &blocked).is_none());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn later_track_without_art_keeps_album_cover_found_this_scan() {
+        let mut covers = std::collections::HashMap::new();
+        assert_eq!(
+            select_album_cover("album", Some("cover".into()), &mut covers),
+            Some("cover".into())
+        );
+        assert_eq!(
+            select_album_cover("album", None, &mut covers),
+            Some("cover".into())
+        );
+    }
+
+    #[test]
+    fn invalidating_fingerprints_forces_unchanged_file_rescan() {
+        let _guard = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("scire-rescan-test-{}", std::process::id()));
+        cleanup(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Original.wav");
+        std::fs::write(&path, wav_bytes()).unwrap();
+        let db = Arc::new(LibraryDb::open_in_memory().unwrap());
+        let scanner = LocalScanner::new(db.clone());
+        scanner.scan(std::slice::from_ref(&dir)).unwrap();
+        let id = path_to_id(&std::fs::canonicalize(&path).unwrap(), "local");
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tracks SET title = 'Stale' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+
+        db.invalidate_local_scan_fingerprints().unwrap();
+        scanner.scan(std::slice::from_ref(&dir)).unwrap();
+
+        assert_eq!(db.get_track(&id).unwrap().unwrap().title, "Original");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn scanner_records_file_properties() {
+        let _guard = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("scire-metadata-test-{}", std::process::id()));
+        cleanup(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Properties.wav");
+        std::fs::write(&path, wav_bytes()).unwrap();
+        let db = Arc::new(LibraryDb::open_in_memory().unwrap());
+        LocalScanner::new(db.clone())
+            .scan(std::slice::from_ref(&dir))
+            .unwrap();
+        let id = path_to_id(&std::fs::canonicalize(&path).unwrap(), "local");
+        let track = db.get_track(&id).unwrap().unwrap();
+
+        assert_eq!(track.suffix.as_deref(), Some("wav"));
+        assert_eq!(track.content_type.as_deref(), Some("audio/wav"));
+        assert_eq!(track.sampling_rate, Some(44_100));
+        assert_eq!(track.bit_depth, Some(16));
+        assert_eq!(track.channel_count, Some(1));
+        assert_eq!(track.file_size, Some(wav_bytes().len() as i64));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn replaygain_parser_accepts_units_and_rejects_bad_values() {
+        assert_eq!(parse_replaygain(" -7.20 dB "), Some(-7.2));
+        assert_eq!(parse_replaygain("0.9876"), Some(0.9876));
+        assert_eq!(parse_replaygain("not gain"), None);
+        assert_eq!(parse_replaygain("NaN"), None);
     }
 }

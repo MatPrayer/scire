@@ -264,6 +264,86 @@ pub async fn fetch_as(
     .await
 }
 
+/// Cache key for a cover extracted from a local file.
+///
+/// The scanner's hash is over the original bytes, so replacing a cover gives
+/// every derived size a new identity without an explicit invalidation pass.
+pub fn local_cover_key(hash: &str) -> String {
+    format!("local-{hash}")
+}
+
+/// Build or reuse a size-bucketed texture source for local cover art.
+///
+/// Server covers arrive at the requested width. Local covers do not: embedded
+/// pictures and folder images can be several thousand pixels square, and
+/// handing those files to GPUI uploads full-size textures even when the card
+/// draws them at 150px. Store the local derivative in the same capped artwork
+/// cache and on the same size ladder as server thumbnails.
+pub async fn thumbnail_file(source: &Path, key: &str, size: u32) -> Result<PathBuf> {
+    if let Some(path) = cached(key, size) {
+        return Ok(path);
+    }
+    let key = stable_key(key).to_string();
+    let size = bucket(size);
+    let cache_key = format!("{key}-{size}");
+    let dir = config::artwork_cache_dir()?;
+    let path = dir.join(format!("{}-{size}.img", config::sanitize(&key)));
+    let source = source.to_path_buf();
+    let path2 = path.clone();
+    let cache_key2 = cache_key.clone();
+    runtime::spawn_blocking_io(move || {
+        // Another card using the same cover may have completed while this job
+        // waited for a blocking thread.
+        if path2.exists() {
+            mem_cache()
+                .lock()
+                .unwrap()
+                .insert(cache_key2, Some(path2.clone()));
+            return Ok(path2);
+        }
+        let bytes = thumbnail_bytes(&source, size)?;
+        std::fs::create_dir_all(&dir)?;
+        let tmp = path2.with_extension("part");
+        std::fs::write(&tmp, bytes)?;
+        // A duplicate worker may have won the race and renamed the same temp
+        // file. Its finished path is equally valid.
+        if let Err(error) = std::fs::rename(&tmp, &path2)
+            && !path2.exists()
+        {
+            return Err(error.into());
+        }
+        evict_if_over_cap(&dir);
+        mem_cache()
+            .lock()
+            .unwrap()
+            .insert(cache_key2, Some(path2.clone()));
+        Ok(path2)
+    })
+    .await
+}
+
+fn thumbnail_bytes(source: &Path, edge: u32) -> Result<Vec<u8>> {
+    thumbnail_from_bytes(&std::fs::read(source)?, edge)
+}
+
+fn thumbnail_from_bytes(bytes: &[u8], edge: u32) -> Result<Vec<u8>> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let format = reader.format();
+    let image = reader.decode()?;
+    // Avoid enlarging a small embedded cover. It is still re-encoded into the
+    // derivative cache so future lookups do not reopen the scanner's source.
+    let edge = edge.min(image.width().min(image.height())).max(1);
+    let image = image.resize_to_fill(edge, edge, image::imageops::FilterType::Lanczos3);
+    let mut out = Vec::new();
+    if format == Some(image::ImageFormat::Png) {
+        image.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+            .encode_image(&image.to_rgb8())?;
+    }
+    Ok(out)
+}
+
 /// Center-crop art that is not square, so a cover fills the square tile it is
 /// drawn in instead of being letterboxed.
 ///
@@ -499,7 +579,7 @@ fn evict_if_over_cap(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SIZE_LADDER, bucket, search_order, square_crop, stable_key};
+    use super::{SIZE_LADDER, bucket, search_order, square_crop, stable_key, thumbnail_from_bytes};
 
     fn encode(width: u32, height: u32) -> Vec<u8> {
         let img =
@@ -532,6 +612,14 @@ mod tests {
         assert!(square_crop(&encode(300, 300)).is_none());
         // Undecodable input is left alone rather than dropped.
         assert!(square_crop(b"not an image").is_none());
+    }
+
+    #[test]
+    fn local_thumbnail_is_square_and_never_enlarged() {
+        let large = thumbnail_from_bytes(&encode(1200, 800), 256).unwrap();
+        assert_eq!(dimensions(&large), (256, 256));
+        let small = thumbnail_from_bytes(&encode(40, 20), 256).unwrap();
+        assert_eq!(dimensions(&small), (20, 20));
     }
 
     #[test]

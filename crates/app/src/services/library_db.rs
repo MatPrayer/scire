@@ -192,6 +192,27 @@ CREATE TABLE IF NOT EXISTS album_artists (
 CREATE INDEX IF NOT EXISTS idx_album_artists_artist ON album_artists(artist_id);
 ";
 
+/// Per-file metadata used by local album pages and track columns.
+///
+/// Existing local rows are marked stale rather than deleted: the next scan
+/// reads their files again and backfills these columns while playlists keep
+/// pointing at the same track ids.
+const SCHEMA_V8: &str = "
+ALTER TABLE tracks ADD COLUMN suffix TEXT;
+ALTER TABLE tracks ADD COLUMN content_type TEXT;
+ALTER TABLE tracks ADD COLUMN bit_rate INTEGER;
+ALTER TABLE tracks ADD COLUMN sampling_rate INTEGER;
+ALTER TABLE tracks ADD COLUMN bit_depth INTEGER;
+ALTER TABLE tracks ADD COLUMN channel_count INTEGER;
+ALTER TABLE tracks ADD COLUMN file_size INTEGER;
+ALTER TABLE tracks ADD COLUMN file_created INTEGER;
+ALTER TABLE tracks ADD COLUMN replay_gain_track REAL;
+ALTER TABLE tracks ADD COLUMN replay_gain_album REAL;
+ALTER TABLE tracks ADD COLUMN replay_peak_track REAL;
+ALTER TABLE tracks ADD COLUMN replay_peak_album REAL;
+UPDATE tracks SET file_modified = NULL WHERE source = 'local';
+";
+
 // ---------------------------------------------------------------------------
 // Query matching
 // ---------------------------------------------------------------------------
@@ -360,6 +381,10 @@ impl LibraryDb {
             conn.execute_batch(SCHEMA_V7)?;
             conn.execute("INSERT INTO _schema_version (version) VALUES (7)", [])?;
         }
+        if version < 8 {
+            conn.execute_batch(SCHEMA_V8)?;
+            conn.execute("INSERT INTO _schema_version (version) VALUES (8)", [])?;
+        }
         Ok(())
     }
 
@@ -388,12 +413,59 @@ impl LibraryDb {
         cover_art: Option<&str>,
         file_modified: Option<i64>,
     ) -> Result<(), rusqlite::Error> {
+        self.upsert_track_with_metadata(
+            id,
+            source,
+            title,
+            artist,
+            artist_id,
+            album,
+            album_id,
+            album_artist,
+            track_no,
+            disc_number,
+            year,
+            genre,
+            duration,
+            local_path,
+            cover_art,
+            file_modified,
+            &TrackMetadata::default(),
+        )
+    }
+
+    /// Insert or replace a track row including technical file metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_track_with_metadata(
+        &self,
+        id: &str,
+        source: &str,
+        title: &str,
+        artist: Option<&str>,
+        artist_id: Option<&str>,
+        album: Option<&str>,
+        album_id: Option<&str>,
+        album_artist: Option<&str>,
+        track_no: Option<i32>,
+        disc_number: Option<i32>,
+        year: Option<i32>,
+        genre: Option<&str>,
+        duration: Option<f64>,
+        local_path: Option<&str>,
+        cover_art: Option<&str>,
+        file_modified: Option<i64>,
+        metadata: &TrackMetadata,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO tracks
              (id, source, title, artist, artist_id, album, album_id, album_artist,
-              track_no, disc_number, year, genre, duration, local_path, cover_art, file_modified)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+              track_no, disc_number, year, genre, duration, local_path, cover_art, file_modified,
+              suffix, content_type, bit_rate, sampling_rate, bit_depth, channel_count,
+              file_size, file_created, replay_gain_track, replay_gain_album,
+              replay_peak_track, replay_peak_album, play_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                    ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             rusqlite::params![
                 id,
                 source,
@@ -410,34 +482,46 @@ impl LibraryDb {
                 duration,
                 local_path,
                 cover_art,
-                file_modified
+                file_modified,
+                metadata.suffix,
+                metadata.content_type,
+                metadata.bit_rate,
+                metadata.sampling_rate,
+                metadata.bit_depth,
+                metadata.channel_count,
+                metadata.file_size,
+                metadata.file_created,
+                metadata.replay_gain_track,
+                metadata.replay_gain_album,
+                metadata.replay_peak_track,
+                metadata.replay_peak_album,
+                metadata.play_count,
             ],
         )?;
         Ok(())
+    }
+
+    /// Force unchanged local files through the scanner on its next pass.
+    pub fn invalidate_local_scan_fingerprints(&self) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tracks SET file_modified = NULL WHERE source = 'local'",
+            [],
+        )
     }
 
     /// Fetch a single track by id.
     pub fn get_track(&self, id: &str) -> Result<Option<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art,
+                    track_no, file_modified, album_id, disc_number, year, genre,
+                    suffix, content_type, bit_rate, sampling_rate, bit_depth, channel_count,
+                    file_size, file_created, replay_gain_track, replay_gain_album,
+                    replay_peak_track, replay_peak_album, play_count
              FROM tracks WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(rusqlite::params![id], |row| {
-            Ok(TrackRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                title: row.get(2)?,
-                artist: row.get(3)?,
-                album: row.get(4)?,
-                duration: row.get(5)?,
-                local_path: row.get(6)?,
-                cover_art: row.get(7)?,
-                track_no: row.get(8)?,
-                file_modified: row.get(9)?,
-                album_id: row.get(10)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(rusqlite::params![id], track_from_row)?;
         match rows.next() {
             Some(Ok(track)) => Ok(Some(track)),
             _ => Ok(None),
@@ -507,27 +591,17 @@ impl LibraryDb {
         // `limit` is a usize, so interpolating it cannot inject anything; the
         // query's own words are all bound.
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art,
+                    track_no, file_modified, album_id, disc_number, year, genre,
+                    suffix, content_type, bit_rate, sampling_rate, bit_depth, channel_count,
+                    file_size, file_created, replay_gain_track, replay_gain_album,
+                    replay_peak_track, replay_peak_album, play_count
              FROM tracks
              WHERE {where_clause}
              ORDER BY title COLLATE NOCASE
              LIMIT {limit}",
         ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), |row| {
-            Ok(TrackRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                title: row.get(2)?,
-                artist: row.get(3)?,
-                album: row.get(4)?,
-                duration: row.get(5)?,
-                local_path: row.get(6)?,
-                cover_art: row.get(7)?,
-                track_no: row.get(8)?,
-                file_modified: row.get(9)?,
-                album_id: row.get(10)?,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), track_from_row)?;
         rows.collect()
     }
 
@@ -602,25 +676,15 @@ impl LibraryDb {
     pub fn tracks_by_album(&self, album_id: &str) -> Result<Vec<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art,
+                    track_no, file_modified, album_id, disc_number, year, genre,
+                    suffix, content_type, bit_rate, sampling_rate, bit_depth, channel_count,
+                    file_size, file_created, replay_gain_track, replay_gain_album,
+                    replay_peak_track, replay_peak_album, play_count
              FROM tracks WHERE album_id = ?1
              ORDER BY disc_number, track_no",
         )?;
-        let rows = stmt.query_map(rusqlite::params![album_id], |row| {
-            Ok(TrackRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                title: row.get(2)?,
-                artist: row.get(3)?,
-                album: row.get(4)?,
-                duration: row.get(5)?,
-                local_path: row.get(6)?,
-                cover_art: row.get(7)?,
-                track_no: row.get(8)?,
-                file_modified: row.get(9)?,
-                album_id: row.get(10)?,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params![album_id], track_from_row)?;
         rows.collect()
     }
 
@@ -638,25 +702,15 @@ impl LibraryDb {
     pub fn tracks_by_source(&self, source: &str) -> Result<Vec<TrackRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, source, title, artist, album, duration, local_path, cover_art, track_no, file_modified, album_id
+            "SELECT id, source, title, artist, album, duration, local_path, cover_art,
+                    track_no, file_modified, album_id, disc_number, year, genre,
+                    suffix, content_type, bit_rate, sampling_rate, bit_depth, channel_count,
+                    file_size, file_created, replay_gain_track, replay_gain_album,
+                    replay_peak_track, replay_peak_album, play_count
              FROM tracks WHERE source = ?1
              ORDER BY album, track_no",
         )?;
-        let rows = stmt.query_map(rusqlite::params![source], |row| {
-            Ok(TrackRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                title: row.get(2)?,
-                artist: row.get(3)?,
-                album: row.get(4)?,
-                duration: row.get(5)?,
-                local_path: row.get(6)?,
-                cover_art: row.get(7)?,
-                track_no: row.get(8)?,
-                file_modified: row.get(9)?,
-                album_id: row.get(10)?,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params![source], track_from_row)?;
         rows.collect()
     }
 
@@ -1246,7 +1300,24 @@ impl LibraryDb {
 // Row types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+pub struct TrackMetadata {
+    pub suffix: Option<String>,
+    pub content_type: Option<String>,
+    pub bit_rate: Option<i64>,
+    pub sampling_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+    pub channel_count: Option<i64>,
+    pub file_size: Option<i64>,
+    pub file_created: Option<i64>,
+    pub replay_gain_track: Option<f64>,
+    pub replay_gain_album: Option<f64>,
+    pub replay_peak_track: Option<f64>,
+    pub replay_peak_album: Option<f64>,
+    pub play_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TrackRow {
     pub id: String,
     pub source: String,
@@ -1262,6 +1333,22 @@ pub struct TrackRow {
     /// which is what lets a track's cover be addressed per *album* rather than
     /// per song — see `artwork::song_cover`.
     pub album_id: Option<String>,
+    pub disc_number: Option<i32>,
+    pub year: Option<i32>,
+    pub genre: Option<String>,
+    pub suffix: Option<String>,
+    pub content_type: Option<String>,
+    pub bit_rate: Option<i64>,
+    pub sampling_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+    pub channel_count: Option<i64>,
+    pub file_size: Option<i64>,
+    pub file_created: Option<i64>,
+    pub replay_gain_track: Option<f64>,
+    pub replay_gain_album: Option<f64>,
+    pub replay_peak_track: Option<f64>,
+    pub replay_peak_album: Option<f64>,
+    pub play_count: Option<i64>,
 }
 
 impl TrackRow {
@@ -1274,27 +1361,93 @@ impl TrackRow {
             album_id: self.album_id,
             artist: self.artist,
             artist_id: None,
-            track: self.track_no.map(|t| t as u32),
-            disc_number: None,
-            year: None,
-            genre: None,
+            track: self.track_no.and_then(|v| v.try_into().ok()),
+            disc_number: self.disc_number.and_then(|v| v.try_into().ok()),
+            year: self.year,
+            genre: self.genre,
             cover_art: self.cover_art,
-            duration: self.duration.map(|d| d as u32),
-            bit_rate: None,
-            sampling_rate: None,
-            bit_depth: None,
-            channel_count: None,
-            content_type: None,
-            suffix: None,
-            size: None,
+            duration: self
+                .duration
+                .filter(|d| d.is_finite() && *d >= 0.0 && *d <= u32::MAX as f64)
+                .map(|d| d as u32),
+            bit_rate: self.bit_rate.and_then(|v| v.try_into().ok()),
+            sampling_rate: self.sampling_rate.and_then(|v| v.try_into().ok()),
+            bit_depth: self.bit_depth.and_then(|v| v.try_into().ok()),
+            channel_count: self.channel_count.and_then(|v| v.try_into().ok()),
+            content_type: self.content_type,
+            suffix: self.suffix,
+            size: self.file_size.and_then(|v| v.try_into().ok()),
             starred: None,
             user_rating: None,
-            play_count: None,
-            replay_gain: None,
+            play_count: self.play_count.and_then(|v| v.try_into().ok()),
+            replay_gain: replay_gain_from_row(
+                self.replay_gain_track,
+                self.replay_gain_album,
+                self.replay_peak_track,
+                self.replay_peak_album,
+            ),
             artists: Vec::new(),
             local_path: self.local_path,
         }
     }
+}
+
+fn replay_gain_from_row(
+    track_gain: Option<f64>,
+    album_gain: Option<f64>,
+    track_peak: Option<f64>,
+    album_peak: Option<f64>,
+) -> Option<subsonic::ReplayGain> {
+    let finite = |value: Option<f64>| {
+        value
+            .filter(|value| value.is_finite())
+            .map(|value| value as f32)
+    };
+    let replay_gain = subsonic::ReplayGain {
+        track_gain: finite(track_gain),
+        album_gain: finite(album_gain),
+        track_peak: finite(track_peak),
+        album_peak: finite(album_peak),
+        base_gain: None,
+        fallback_gain: None,
+    };
+    (replay_gain.track_gain.is_some()
+        || replay_gain.album_gain.is_some()
+        || replay_gain.track_peak.is_some()
+        || replay_gain.album_peak.is_some())
+    .then_some(replay_gain)
+}
+
+fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
+    Ok(TrackRow {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        title: row.get(2)?,
+        artist: row.get(3)?,
+        album: row.get(4)?,
+        duration: row.get(5)?,
+        local_path: row.get(6)?,
+        cover_art: row.get(7)?,
+        track_no: row.get(8)?,
+        file_modified: row.get(9)?,
+        album_id: row.get(10)?,
+        disc_number: row.get(11)?,
+        year: row.get(12)?,
+        genre: row.get(13)?,
+        suffix: row.get(14)?,
+        content_type: row.get(15)?,
+        bit_rate: row.get(16)?,
+        sampling_rate: row.get(17)?,
+        bit_depth: row.get(18)?,
+        channel_count: row.get(19)?,
+        file_size: row.get(20)?,
+        file_created: row.get(21)?,
+        replay_gain_track: row.get(22)?,
+        replay_gain_album: row.get(23)?,
+        replay_peak_track: row.get(24)?,
+        replay_peak_album: row.get(25)?,
+        play_count: row.get(26)?,
+    })
 }
 
 /// What a sync compares a listed album against to decide whether its tracks
@@ -1438,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_7() {
+    fn schema_version_is_8() {
         let db = test_db();
         let conn = db.conn.lock().unwrap();
         let version: i32 = conn
@@ -1446,7 +1599,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -1515,6 +1668,127 @@ mod tests {
         assert_eq!(t.title, "Test Song");
         assert_eq!(t.artist.as_deref(), Some("Test Artist"));
         assert_eq!(t.local_path.as_deref(), Some("/music/test.flac"));
+    }
+
+    #[test]
+    fn track_metadata_round_trips_into_song() {
+        let db = test_db();
+        let metadata = TrackMetadata {
+            suffix: Some("flac".into()),
+            content_type: Some("audio/flac".into()),
+            bit_rate: Some(1_004),
+            sampling_rate: Some(96_000),
+            bit_depth: Some(24),
+            channel_count: Some(2),
+            file_size: Some(12_345_678),
+            file_created: Some(1_700_000_000),
+            replay_gain_track: Some(-7.2),
+            replay_gain_album: Some(-6.4),
+            replay_peak_track: Some(0.97),
+            replay_peak_album: Some(0.99),
+            play_count: Some(42),
+        };
+        db.upsert_track_with_metadata(
+            "local:metadata",
+            "local",
+            "Metadata",
+            Some("Artist"),
+            None,
+            Some("Album"),
+            Some("local:album:metadata"),
+            None,
+            Some(3),
+            Some(2),
+            Some(2024),
+            Some("Jazz"),
+            Some(123.0),
+            Some("/music/metadata.flac"),
+            None,
+            Some(999),
+            &metadata,
+        )
+        .unwrap();
+
+        let row = db.get_track("local:metadata").unwrap().unwrap();
+        assert_eq!(row.file_created, Some(1_700_000_000));
+        let song = row.into_song();
+        assert_eq!(song.track, Some(3));
+        assert_eq!(song.disc_number, Some(2));
+        assert_eq!(song.year, Some(2024));
+        assert_eq!(song.genre.as_deref(), Some("Jazz"));
+        assert_eq!(song.suffix.as_deref(), Some("flac"));
+        assert_eq!(song.content_type.as_deref(), Some("audio/flac"));
+        assert_eq!(song.bit_rate, Some(1_004));
+        assert_eq!(song.sampling_rate, Some(96_000));
+        assert_eq!(song.bit_depth, Some(24));
+        assert_eq!(song.channel_count, Some(2));
+        assert_eq!(song.size, Some(12_345_678));
+        assert_eq!(song.play_count, Some(42));
+        let gain = song.replay_gain.unwrap();
+        assert_eq!(gain.track_gain, Some(-7.2));
+        assert_eq!(gain.album_gain, Some(-6.4));
+        assert_eq!(gain.track_peak, Some(0.97));
+        assert_eq!(gain.album_peak, Some(0.99));
+    }
+
+    #[test]
+    fn legacy_track_row_keeps_unsupported_metadata_absent() {
+        let song = TrackRow {
+            id: "legacy".into(),
+            source: "local".into(),
+            title: "Legacy".into(),
+            ..TrackRow::default()
+        }
+        .into_song();
+        assert!(song.suffix.is_none());
+        assert!(song.replay_gain.is_none());
+        assert!(song.play_count.is_none());
+    }
+
+    #[test]
+    fn schema_v8_marks_local_rows_stale_without_removing_playlists() {
+        let dir = std::env::temp_dir().join(format!("scire-schema-v8-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("music.db");
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        for (version, schema) in [
+            (2, SCHEMA_V2),
+            (3, SCHEMA_V3),
+            (4, SCHEMA_V4),
+            (5, SCHEMA_V5),
+            (6, SCHEMA_V6),
+            (7, SCHEMA_V7),
+        ] {
+            conn.execute_batch(schema).unwrap();
+            conn.execute(
+                "INSERT INTO _schema_version (version) VALUES (?1)",
+                rusqlite::params![version],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tracks (id, source, title, file_modified)
+             VALUES ('local:old', 'local', 'Old', 123)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlists (id, name) VALUES ('playlist:keep', 'Keep')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = LibraryDb::open(&path).unwrap();
+        assert_eq!(
+            db.get_track("local:old").unwrap().unwrap().file_modified,
+            None
+        );
+        assert_eq!(db.all_playlists().unwrap().len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

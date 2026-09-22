@@ -20,13 +20,44 @@ use crate::services::library_db::{AlbumRow, LibraryDb};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
-use crate::ui::{format_duration, sync_focus_scroll, with_focus_cursor};
+use crate::ui::{
+    album_quality_chips, album_replaygain_line, format_added_date, format_duration,
+    sync_focus_scroll, track_extras, with_focus_cursor,
+};
 
 /// Cover edge in the stacked header; the side panel sizes its own.
 const HEADER_ART: f32 = 220.;
 
 /// Horizontal padding the columns lay their cards out within (`p_4` a side).
 const PAGE_PADDING_X: f32 = 32.;
+
+fn local_album_chips(album: Option<&AlbumRow>, songs: &[subsonic::Song]) -> Vec<String> {
+    let mut chips = Vec::new();
+    if let Some(genre) = songs
+        .iter()
+        .filter_map(|song| song.genre.as_deref())
+        .map(str::trim)
+        .find(|genre| !genre.is_empty())
+    {
+        chips.push(genre.to_string());
+    }
+    let discs = songs
+        .iter()
+        .filter_map(|song| song.disc_number)
+        .max()
+        .unwrap_or(0);
+    if discs > 1 {
+        chips.push(format!("{discs} discs"));
+    }
+    chips.extend(album_quality_chips(songs));
+    if let Some(created) = album
+        .and_then(|album| album.created.as_deref())
+        .filter(|created| !created.is_empty())
+    {
+        chips.push(format!("Added {}", format_added_date(created)));
+    }
+    chips
+}
 
 pub struct LocalAlbumDetailView {
     db: Arc<LibraryDb>,
@@ -36,6 +67,8 @@ pub struct LocalAlbumDetailView {
     album: Option<AlbumRow>,
     tracks: Vec<crate::services::library_db::TrackRow>,
     art_path: Option<PathBuf>,
+    /// Last completed local scan loaded into this open page.
+    scan_version: u64,
     scroll: ScrollHandle,
     /// The side panel's own scroll; see `AlbumDetailView`.
     panel_scroll: ScrollHandle,
@@ -68,6 +101,7 @@ impl LocalAlbumDetailView {
         cx: &mut Context<Self>,
     ) -> Self {
         let scroll = ScrollHandle::new();
+        let scan_version = db.scan_version();
         let mut view = Self {
             db,
             player,
@@ -76,6 +110,7 @@ impl LocalAlbumDetailView {
             album: None,
             tracks: Vec::new(),
             art_path: None,
+            scan_version,
             scroll: scroll.clone(),
             panel_scroll: ScrollHandle::new(),
             panel_w: 0.,
@@ -101,12 +136,18 @@ impl LocalAlbumDetailView {
             .find(|a| a.id == id);
         let tracks = self.db.tracks_by_album(&id).unwrap_or_default();
 
+        self.art_path = None;
         if let Some(ref a) = album
             && let Some(ref hash) = a.cover_art
             && let Some(path) = local_art_path(hash)
             && path.exists()
         {
             self.art_path = Some(path);
+        }
+        self.scan_version = self.db.scan_version();
+        if self.art_path.as_ref() != self.accent_for.as_ref() {
+            self.accent = None;
+            self.accent_for = None;
         }
         self.album = album;
         self.tracks = tracks;
@@ -190,6 +231,9 @@ impl LocalAlbumDetailView {
 
 impl Render for LocalAlbumDetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.db.scan_version() != self.scan_version {
+            self.load(cx);
+        }
         // Scroll-into-view runs here, not in `vi_move`: the anchor's origin
         // is only as fresh as the last paint, and from a key handler that is
         // the row the cursor just LEFT — going up, the focused row landed one
@@ -238,6 +282,14 @@ impl Render for LocalAlbumDetailView {
         self.refresh_accent(cx);
         let page_accent = self.page_accent(cx);
         let header_tint = self.header_tint(cx);
+        let songs: Vec<_> = self
+            .tracks
+            .iter()
+            .cloned()
+            .map(|track| track.into_song())
+            .collect();
+        let chips = local_album_chips(self.album.as_ref(), &songs);
+        let replaygain = album_replaygain_line(&songs);
 
         let header = {
             let (name, artist, meta) = match &self.album {
@@ -274,40 +326,63 @@ impl Render for LocalAlbumDetailView {
                     this.child(img(path).size(px(art_px)).rounded_2xl())
                 });
 
-            let info = v_flex()
-                .gap_2()
-                .child(div().text_2xl().font_medium().child(name))
-                .child(div().child(artist))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(meta),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .mt_1()
-                        .child({
-                            let play = Button::new("local-album-play")
-                                .icon(app_icon(icons::PLAY))
-                                .label("Play")
-                                .disabled(!has_songs)
-                                .on_click(cx.listener(|this, _, _, cx| this.play_from(0, cx)));
-                            match page_accent {
-                                Some(a) => play.custom(crate::ui::accent_button(a, cx)),
-                                None => play.primary(),
-                            }
-                        })
-                        .child(
-                            Button::new("local-album-shuffle")
-                                .ghost()
-                                .icon(app_icon(icons::SHUFFLE))
-                                .label("Shuffle")
-                                .disabled(!has_songs)
-                                .on_click(cx.listener(|this, _, _, cx| this.play_shuffled(cx))),
-                        ),
-                );
+            let info =
+                v_flex()
+                    .gap_2()
+                    .child(div().text_2xl().font_medium().child(name))
+                    .child(div().child(artist))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(meta),
+                    )
+                    .when(!chips.is_empty(), |this| {
+                        this.child(h_flex().gap_1p5().flex_wrap().children(
+                            chips.iter().cloned().map(|chip| {
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(cx.theme().muted)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(chip)
+                            }),
+                        ))
+                    })
+                    .when_some(replaygain.clone(), |this, line| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(line),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .mt_1()
+                            .child({
+                                let play = Button::new("local-album-play")
+                                    .icon(app_icon(icons::PLAY))
+                                    .label("Play")
+                                    .disabled(!has_songs)
+                                    .on_click(cx.listener(|this, _, _, cx| this.play_from(0, cx)));
+                                match page_accent {
+                                    Some(a) => play.custom(crate::ui::accent_button(a, cx)),
+                                    None => play.primary(),
+                                }
+                            })
+                            .child(
+                                Button::new("local-album-shuffle")
+                                    .ghost()
+                                    .icon(app_icon(icons::SHUFFLE))
+                                    .label("Shuffle")
+                                    .disabled(!has_songs)
+                                    .on_click(cx.listener(|this, _, _, cx| this.play_shuffled(cx))),
+                            ),
+                    );
 
             match panel.is_some() {
                 // In the panel the cover leads and the details read down under
@@ -325,6 +400,7 @@ impl Render for LocalAlbumDetailView {
 
         let glow = self.session.read(cx).settings.selection_glow_vi;
         let hover_glow = self.session.read(cx).settings.selection_glow_hover;
+        let info_prefs = self.session.read(cx).settings.track_info.clone();
         let accent = self
             .session
             .read(cx)
@@ -340,6 +416,8 @@ impl Render for LocalAlbumDetailView {
                 let is_playing = playing_id.as_deref() == Some(track.id.as_str());
                 let focused = self.vi_cursor == Some(i);
                 let track_no = track.track_no.map(|t| t.to_string()).unwrap_or_default();
+                let song = track.clone().into_song();
+                let extras = track_extras(&song, &info_prefs, false);
                 let dur = track
                     .duration
                     .map(|s| format_duration(std::time::Duration::from_secs_f64(s)))
@@ -387,6 +465,16 @@ impl Render for LocalAlbumDetailView {
                             .truncate()
                             .child(track.title.clone()),
                     )
+                    .when(!extras.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .max_w(px(320.))
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .truncate()
+                                .child(extras),
+                        )
+                    })
                     // Hover actions: play-next, enqueue
                     .child(
                         h_flex()
@@ -576,5 +664,54 @@ impl LocalAlbumDetailView {
         if let Some(i) = self.vi_cursor {
             self.play_from(i, cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_album_chips;
+    use crate::services::library_db::AlbumRow;
+
+    fn song(json: &str) -> subsonic::Song {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn local_album_chips_include_tags_quality_and_added_date() {
+        let mut album = AlbumRow::new("local:album:test", "local", "Test");
+        album.created = Some("2024-03-04 12:13:14".into());
+        let songs = vec![
+            song(
+                r#"{"id":"1","title":"one","genre":"Jazz","discNumber":1,"suffix":"flac",
+                    "bitRate":900,"samplingRate":44100,"bitDepth":16,"channelCount":2,
+                    "size":1048576}"#,
+            ),
+            song(
+                r#"{"id":"2","title":"two","genre":"Jazz","discNumber":2,"suffix":"flac",
+                    "bitRate":1000,"samplingRate":44100,"bitDepth":16,"channelCount":2,
+                    "size":1048576}"#,
+            ),
+        ];
+
+        assert_eq!(
+            local_album_chips(Some(&album), &songs),
+            vec![
+                "Jazz",
+                "2 discs",
+                "FLAC",
+                "900–1000 kbps",
+                "44.1 kHz · 16 bit",
+                "Stereo",
+                "2.0 MB",
+                "Added 2024-03-04",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_album_omits_added_when_creation_time_is_unknown() {
+        let album = AlbumRow::new("local:album:test", "local", "Test");
+        let songs = vec![song(r#"{"id":"1","title":"one"}"#)];
+        assert!(local_album_chips(Some(&album), &songs).is_empty());
     }
 }

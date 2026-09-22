@@ -67,6 +67,8 @@ pub struct Settings {
     pub transcoding: Transcoding,
     /// Colour theme.
     pub theme: ThemePref,
+    /// Base size for rem-based interface text, clamped to 9–32px.
+    pub font_size: UiFontSize,
     /// Draw the in-app title bar (gpui-component `TitleBar`). When false, use native WM chrome.
     pub client_titlebar: bool,
     /// Strip the in-app title bar down to the window controls: no app name, no
@@ -672,6 +674,7 @@ impl Default for Settings {
             library_ids: Vec::new(),
             transcoding: Transcoding::default(),
             theme: ThemePref::default(),
+            font_size: UiFontSize::default(),
             client_titlebar: true,
             minimal_titlebar: false,
             scrobble_enabled: true,
@@ -755,6 +758,61 @@ pub enum ThemePref {
     #[serde(rename = "adaptive")]
     Adaptive,
     Custom,
+}
+
+pub const UI_FONT_SIZE_MIN: u8 = 9;
+pub const UI_FONT_SIZE_MAX: u8 = 32;
+pub const UI_FONT_SIZE_DEFAULT: u8 = 16;
+
+/// Base size for rem-based interface text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct UiFontSize(u8);
+
+impl UiFontSize {
+    pub fn new(px: u8) -> Self {
+        Self(px.clamp(UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX))
+    }
+
+    pub fn value(self) -> u8 {
+        self.0
+    }
+
+    pub fn px(self) -> f32 {
+        f32::from(self.0)
+    }
+}
+
+impl Default for UiFontSize {
+    fn default() -> Self {
+        Self(UI_FONT_SIZE_DEFAULT)
+    }
+}
+
+impl<'de> Deserialize<'de> for UiFontSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Pixels(u64),
+            Legacy(String),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Pixels(px) => Ok(Self::new(px.min(u64::from(u8::MAX)) as u8)),
+            Repr::Legacy(value) => match value.as_str() {
+                "small" => Ok(Self::new(14)),
+                "default" => Ok(Self::default()),
+                "large" => Ok(Self::new(18)),
+                _ => Err(serde::de::Error::custom(format!(
+                    "unknown font size {value:?}"
+                ))),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -885,7 +943,15 @@ pub fn delete_password(server_url: &str, username: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtistAlbumSize, CoverSize, ImportedThemesFile, Settings};
+    use super::{
+        ArtistAlbumSize, CoverSize, ImportedThemesFile, Settings, UI_FONT_SIZE_DEFAULT,
+        UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize,
+    };
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct FontSizeFixture {
+        value: UiFontSize,
+    }
 
     #[test]
     fn the_artist_page_cover_size_follows_the_grid_only_when_it_is_match() {
@@ -962,7 +1028,29 @@ volume = 0.8
 "#;
         let s: Settings = toml::from_str(toml_input).unwrap();
         assert!(s.local_music_dirs.is_empty());
+        assert_eq!(s.font_size, UiFontSize::default());
         assert!((s.volume - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn ui_font_size_clamps_to_supported_range() {
+        assert_eq!(UiFontSize::new(0).value(), UI_FONT_SIZE_MIN);
+        assert_eq!(UiFontSize::default().value(), UI_FONT_SIZE_DEFAULT);
+        assert_eq!(UiFontSize::new(u8::MAX).value(), UI_FONT_SIZE_MAX);
+    }
+
+    #[test]
+    fn ui_font_size_reads_legacy_presets_and_writes_pixels() {
+        let small: UiFontSize = toml::from_str("value = \"small\"")
+            .map(|value: FontSizeFixture| value.value)
+            .unwrap();
+        assert_eq!(small.value(), 14);
+
+        let output = toml::to_string(&FontSizeFixture {
+            value: UiFontSize::new(23),
+        })
+        .unwrap();
+        assert_eq!(output, "value = 23\n");
     }
 
     #[test]

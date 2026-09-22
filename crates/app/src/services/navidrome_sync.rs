@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 use subsonic::SubsonicClient;
 
-use crate::services::library_db::{AlbumFingerprint, AlbumRow, LibraryDb};
+use crate::services::library_db::{AlbumFingerprint, AlbumRow, LibraryDb, TrackMetadata};
 
 const PAGE_SIZE: u32 = 500;
 
@@ -335,7 +335,38 @@ async fn fetch_album_tracks(
             .as_ref()
             .map(|id| format!("navidrome:artist:{id}"))
             .or_else(|| album_artist_id.clone());
-        let _ = db.upsert_track(
+        let metadata = TrackMetadata {
+            suffix: song.suffix.clone(),
+            content_type: song.content_type.clone(),
+            bit_rate: song.bit_rate.map(i64::from),
+            sampling_rate: song.sampling_rate.map(i64::from),
+            bit_depth: song.bit_depth.map(i64::from),
+            channel_count: song.channel_count.map(i64::from),
+            file_size: song.size.and_then(|value| i64::try_from(value).ok()),
+            replay_gain_track: song
+                .replay_gain
+                .as_ref()
+                .and_then(|gain| gain.track_gain)
+                .map(f64::from),
+            replay_gain_album: song
+                .replay_gain
+                .as_ref()
+                .and_then(|gain| gain.album_gain)
+                .map(f64::from),
+            replay_peak_track: song
+                .replay_gain
+                .as_ref()
+                .and_then(|gain| gain.track_peak)
+                .map(f64::from),
+            replay_peak_album: song
+                .replay_gain
+                .as_ref()
+                .and_then(|gain| gain.album_peak)
+                .map(f64::from),
+            play_count: song.play_count.and_then(|value| i64::try_from(value).ok()),
+            ..TrackMetadata::default()
+        };
+        let _ = db.upsert_track_with_metadata(
             &track_id,
             "navidrome",
             &song.title,
@@ -352,6 +383,7 @@ async fn fetch_album_tracks(
             None, // local_path
             song.cover_art.as_deref(),
             Some(now),
+            &metadata,
         );
         let _ = db.set_track_artists(&track_id, &song_credits(song, artist_id.as_deref()));
     }
