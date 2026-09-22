@@ -465,16 +465,11 @@ impl Render for PlayerBar {
             if p.is_radio() {
                 (None, Vec::new())
             } else if let Some(s) = p.current_song() {
-                let artists: Vec<(String, Option<String>)> = if !s.artists.is_empty() {
-                    s.artists
-                        .iter()
-                        .map(|a| (a.name.clone(), Some(a.id.clone())))
-                        .collect()
-                } else if let Some(name) = s.artist.clone() {
-                    vec![(name, s.artist_id.clone())]
-                } else {
-                    Vec::new()
-                };
+                let artists = crate::ui::artist_credits(
+                    &s.artists,
+                    s.artist.as_deref(),
+                    s.artist_id.as_deref(),
+                );
                 (s.album_id.clone(), artists)
             } else {
                 (None, Vec::new())

@@ -918,6 +918,43 @@ pub fn live_badge(
         .into_any_element()
 }
 
+/// Every artist a song or album is credited to, as `(name, id)` pairs.
+///
+/// OpenSubsonic's `artists` array is the only place a collaboration is spelled
+/// out — `artist`/`artistId` collapse it to the one artist the server picked as
+/// primary. Vanilla servers send no array and fall back to the single pair,
+/// which yields exactly the one credit they always did.
+pub fn artist_credits(
+    artists: &[subsonic::ArtistRef],
+    name: Option<&str>,
+    id: Option<&str>,
+) -> Vec<(String, Option<String>)> {
+    if !artists.is_empty() {
+        return artists
+            .iter()
+            .map(|a| (a.name.clone(), Some(a.id.clone())))
+            .collect();
+    }
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => vec![(name.to_string(), id.map(str::to_string))],
+        None => Vec::new(),
+    }
+}
+
+/// The subset of [`artist_credits`] that can actually be navigated to — a
+/// credit with no id has no artist page, and offering it in a menu is offering
+/// a row that does nothing.
+pub fn artist_links(
+    artists: &[subsonic::ArtistRef],
+    name: Option<&str>,
+    id: Option<&str>,
+) -> Vec<(String, String)> {
+    artist_credits(artists, name, id)
+        .into_iter()
+        .filter_map(|(n, id)| id.map(|id| (n, id)))
+        .collect()
+}
+
 /// "MP3 · 128 kbps · Jazz" for the station now playing, or None when it did
 /// not say (and when radio is not playing at all).
 pub fn radio_info_line(
@@ -1976,6 +2013,43 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credits_spell_a_collaboration_out_and_fall_back_to_the_single_pair() {
+        use super::{artist_credits, artist_links};
+        let refs = |pairs: &[(&str, &str)]| -> Vec<subsonic::ArtistRef> {
+            pairs
+                .iter()
+                .map(|(id, name)| subsonic::ArtistRef {
+                    id: (*id).into(),
+                    name: (*name).into(),
+                })
+                .collect()
+        };
+        // The array wins: it is the only place both names are written down.
+        let both = refs(&[("a1", "irossa"), ("a2", "Amore Audio")]);
+        assert_eq!(
+            artist_links(&both, Some("irossa • Amore Audio"), Some("a1")),
+            vec![
+                ("irossa".to_string(), "a1".to_string()),
+                ("Amore Audio".to_string(), "a2".to_string())
+            ]
+        );
+        // A vanilla server sends no array: exactly the one credit as before.
+        assert_eq!(
+            artist_links(&[], Some("The Beatles"), Some("a9")),
+            vec![("The Beatles".to_string(), "a9".to_string())]
+        );
+        // A credit with no id has no page to open, so it is not offered —
+        // but it is still a credit, and the text side keeps it.
+        assert!(artist_links(&[], Some("Unknown"), None).is_empty());
+        assert_eq!(
+            artist_credits(&[], Some("Unknown"), None),
+            vec![("Unknown".to_string(), None)]
+        );
+        assert!(artist_credits(&[], Some("  "), Some("a1")).is_empty());
+        assert!(artist_credits(&[], None, Some("a1")).is_empty());
+    }
+
     #[test]
     fn a_reveal_travels_between_its_two_ends_and_stops_there() {
         use super::reveal_openness;

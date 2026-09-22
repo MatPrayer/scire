@@ -863,22 +863,11 @@ impl AlbumDetailView {
 /// to that first artist's page. Vanilla servers send no array and fall back to
 /// the single pair, which renders exactly as it did before.
 fn album_credits(album: &subsonic::Album) -> Vec<(String, Option<String>)> {
-    if !album.artists.is_empty() {
-        return album
-            .artists
-            .iter()
-            .map(|a| (a.name.clone(), Some(a.id.clone())))
-            .collect();
-    }
-    match album
-        .artist
-        .as_deref()
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-    {
-        Some(name) => vec![(name.to_string(), album.artist_id.clone())],
-        None => Vec::new(),
-    }
+    crate::ui::artist_credits(
+        &album.artists,
+        album.artist.as_deref(),
+        album.artist_id.as_deref(),
+    )
 }
 
 /// Horizontal padding the scrolling column lays its cards out within (`p_4`
@@ -1333,7 +1322,11 @@ impl Render for AlbumDetailView {
                 let song_enq = song.clone();
                 // Right-click context menu data.
                 let menu_song = song.clone();
-                let menu_artist_id = song.artist_id.clone();
+                let menu_artists = crate::ui::artist_links(
+                    &song.artists,
+                    song.artist.as_deref(),
+                    song.artist_id.as_deref(),
+                );
                 let menu_view = cx.entity();
                 let menu_song_id = song.id.clone();
                 let menu_playlists = self.playlists.clone();
@@ -1525,17 +1518,52 @@ impl Render for AlbumDetailView {
                                         star_view.update(cx, |v, cx| v.toggle_song_star(i, cx));
                                     }),
                             );
-                        if let Some(aid) = menu_artist_id.clone() {
-                            let artist_view = menu_view.clone();
-                            menu = menu.item(PopupMenuItem::separator()).item(
-                                PopupMenuItem::new("Go to artist").on_click(
-                                    move |_, _, cx: &mut gpui::App| {
-                                        artist_view.update(cx, |_, cx| {
-                                            cx.emit(AlbumDetailEvent::OpenArtist(aid.clone()))
-                                        });
+                        // A track credited to several artists asks which one:
+                        // `artistId` is the primary credit alone, so a single
+                        // row sent the guest's name to somebody else's page.
+                        match menu_artists.as_slice() {
+                            [] => {}
+                            [(_, aid)] => {
+                                let artist_view = menu_view.clone();
+                                let aid = aid.clone();
+                                menu = menu.item(PopupMenuItem::separator()).item(
+                                    PopupMenuItem::new("Go to artist").on_click(
+                                        move |_, _, cx: &mut gpui::App| {
+                                            artist_view.update(cx, |_, cx| {
+                                                cx.emit(AlbumDetailEvent::OpenArtist(aid.clone()))
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            _ => {
+                                let artists = menu_artists.clone();
+                                let artist_view = menu_view.clone();
+                                menu = menu.item(PopupMenuItem::separator()).submenu(
+                                    "Go to artist",
+                                    window,
+                                    cx,
+                                    move |sub, _w, _c| {
+                                        let mut sub = sub;
+                                        for (name, aid) in artists.iter() {
+                                            let view = artist_view.clone();
+                                            let aid = aid.clone();
+                                            sub = sub.item(
+                                                PopupMenuItem::new(name.clone()).on_click(
+                                                    move |_, _, cx: &mut gpui::App| {
+                                                        view.update(cx, |_, cx| {
+                                                            cx.emit(AlbumDetailEvent::OpenArtist(
+                                                                aid.clone(),
+                                                            ))
+                                                        });
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        sub
                                     },
-                                ),
-                            );
+                                );
+                            }
                         }
                         menu
                     });

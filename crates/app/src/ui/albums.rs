@@ -813,7 +813,11 @@ impl AlbumsView {
         let year = album.year.map(|y| y.to_string()).unwrap_or_default();
         // Right-click context menu data.
         let menu_id = album.id.clone();
-        let menu_artist_id = album.artist_id.clone();
+        let menu_artists = crate::ui::artist_links(
+            &album.artists,
+            album.artist.as_deref(),
+            album.artist_id.as_deref(),
+        );
         let view = entity.clone();
         let open_view = entity.clone();
         let play_view = entity.clone();
@@ -979,17 +983,48 @@ impl AlbumsView {
                         }
                         sub
                     });
-                if let Some(aid) = menu_artist_id.clone() {
-                    let view = view.clone();
-                    menu = menu.item(PopupMenuItem::separator()).item(
-                        PopupMenuItem::new("Go to artist").on_click(
-                            move |_, _, cx: &mut gpui::App| {
-                                view.update(cx, |_, cx| {
-                                    cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
-                                });
+                // One credit goes straight to that artist; a collaboration asks
+                // which one, since `artistId` names only the primary credit and
+                // silently sending every name there is the bug this replaces.
+                match menu_artists.as_slice() {
+                    [] => {}
+                    [(_, aid)] => {
+                        let view = view.clone();
+                        let aid = aid.clone();
+                        menu = menu.item(PopupMenuItem::separator()).item(
+                            PopupMenuItem::new("Go to artist").on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    view.update(cx, |_, cx| {
+                                        cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
+                                    });
+                                },
+                            ),
+                        );
+                    }
+                    _ => {
+                        let artists = menu_artists.clone();
+                        let art_view = view.clone();
+                        menu = menu.item(PopupMenuItem::separator()).submenu(
+                            "Go to artist",
+                            window,
+                            cx,
+                            move |sub, _w, _c| {
+                                let mut sub = sub;
+                                for (name, aid) in artists.iter() {
+                                    let view = art_view.clone();
+                                    let aid = aid.clone();
+                                    sub = sub.item(PopupMenuItem::new(name.clone()).on_click(
+                                        move |_, _, cx: &mut gpui::App| {
+                                            view.update(cx, |_, cx| {
+                                                cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
+                                            });
+                                        },
+                                    ));
+                                }
+                                sub
                             },
-                        ),
-                    );
+                        );
+                    }
                 }
                 menu
             });
