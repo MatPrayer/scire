@@ -107,8 +107,8 @@ pub struct Settings {
     pub artist_album_size: ArtistAlbumSize,
     /// Extra columns shown next to song titles in track lists.
     pub track_info: TrackInfo,
-    /// Render the seek bar as the track's waveform (downloads each track a
-    /// second time to decode it).
+    /// Render the seek bar as the track's waveform (downloads remote tracks a
+    /// second time or reads local tracks to decode them).
     pub waveform_seekbar: bool,
     /// Show format/bitrate/sample-rate of the current track in the player bar.
     pub stream_info_bar: bool,

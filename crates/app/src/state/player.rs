@@ -844,11 +844,11 @@ impl PlayerState {
         if !self.waveform_enabled {
             return;
         }
-        let Some(song_id) = self
+        let Some((song_id, local_path)) = self
             .queue
             .next_pos()
             .and_then(|pos| self.queue.iter_ordered().nth(pos))
-            .map(|(_, s)| s.id.clone())
+            .map(|(_, s)| (s.id.clone(), s.local_path.clone()))
         else {
             return;
         };
@@ -858,18 +858,22 @@ impl PlayerState {
         {
             return;
         }
-        let Some(client) = self.client.as_ref() else {
-            return;
-        };
-        let Ok(url) = client.stream_url(&song_id, &crate::services::waveform::stream_options())
-        else {
-            return;
+        let source = if let Some(path) = local_path {
+            crate::services::waveform::Source::Local(path.into())
+        } else {
+            let Some(client) = self.client.as_ref() else {
+                return;
+            };
+            let Ok(url) = client.stream_url(&song_id, &crate::services::waveform::stream_options())
+            else {
+                return;
+            };
+            crate::services::waveform::Source::Remote(url.to_string())
         };
         self.waveform_prewarmed_for = Some(song_id.clone());
-        let url = url.to_string();
         cx.spawn(async move |_, _| {
             if let Err(e) =
-                runtime::spawn_io(crate::services::waveform::fetch_peaks(url, song_id)).await
+                runtime::spawn_io(crate::services::waveform::fetch_peaks(source, song_id)).await
             {
                 tracing::debug!("waveform prewarm failed: {e:#}");
             }

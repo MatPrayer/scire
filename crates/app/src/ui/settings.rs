@@ -2316,8 +2316,9 @@ impl Render for SettingsView {
                 cx,
             ))
             .child(self.note(
-                "The waveform seek bar downloads each track a second time to \
-                 decode it, so it uses extra bandwidth.",
+                "The waveform seek bar reads each local track or downloads each \
+                 remote track a second time to decode it, so remote music uses \
+                 extra bandwidth.",
                 cx,
             ))
             .child(self.vi_switch(
