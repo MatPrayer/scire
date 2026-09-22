@@ -338,13 +338,27 @@ pub fn album_side_panel(content_w: f32, window_w: f32, window_h: f32) -> Option<
     if window_w < SIDE_PANEL_MIN_WINDOW_W || window_w / window_h < SIDE_PANEL_MIN_ASPECT {
         return None;
     }
+    // Floored to a whole pixel, and that is load-bearing rather than tidy. The
+    // page measures its own width as the track column's bounds *plus* this
+    // panel, and gpui rounds an element's bounds to whole pixels — so a
+    // fractional panel made the sum `round(content - width) + width`, which is
+    // not the content width. `LiveWidth` then relearned its chrome from a
+    // measurement that moved every frame, the panel resized by a fraction of a
+    // pixel, the rounding flipped the other way, and the two states alternated
+    // for as long as the page was open: at 1180x700 the panel sat at 383.40 and
+    // 383.66 on alternate frames, which is the cover and every line under it
+    // visibly bobbing. An integral width makes the track column's bounds exact
+    // and the sum a fixed point.
     let width = (content_w * SIDE_PANEL_SHARE)
         .clamp(SIDE_PANEL_MIN_W, SIDE_PANEL_MAX_W)
-        .min(content_w - SIDE_PANEL_TRACKS_MIN);
+        .min(content_w - SIDE_PANEL_TRACKS_MIN)
+        .floor();
     if width < SIDE_PANEL_MIN_W {
         return None;
     }
-    let art = (width - SIDE_PANEL_PADDING).min(window_h * SIDE_PANEL_ART_SHARE);
+    let art = (width - SIDE_PANEL_PADDING)
+        .min(window_h * SIDE_PANEL_ART_SHARE)
+        .floor();
     (art >= SIDE_PANEL_ART_MIN).then_some(AlbumSidePanel { width, art })
 }
 
@@ -1996,6 +2010,29 @@ mod tests {
         assert!(album_side_panel(1000., 1080., 1920.).is_none());
         // Landscape but small.
         assert!(album_side_panel(800., 1000., 700.).is_none());
+    }
+
+    /// The panel's width is a whole number of pixels, and the page's own
+    /// measurement — the track column's rounded bounds plus the panel — is
+    /// therefore a fixed point rather than a value that alternates every frame.
+    /// A fractional panel had the cover and every line under it bobbing for as
+    /// long as the page was open.
+    #[test]
+    fn the_panel_width_is_whole_pixels() {
+        for content in [1128., 1216., 1301.5, 900.25, 2300.] {
+            let Some(panel) = album_side_panel(content, content + 52., 700.) else {
+                continue;
+            };
+            assert_eq!(panel.width, panel.width.floor(), "content {content}");
+            // What the page feeds back into its own width next frame.
+            let measured = (content - panel.width).round() + panel.width;
+            assert_eq!(measured, content.round(), "content {content}");
+            assert_eq!(
+                album_side_panel(measured, measured + 52., 700.).map(|p| p.width),
+                Some(panel.width),
+                "content {content} must settle"
+            );
+        }
     }
 
     /// The track list's floor outranks the panel: a content column that can't

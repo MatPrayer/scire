@@ -145,8 +145,13 @@ const QUEUE_ROW_H: f32 = 44.;
 /// it) rather than measured, so `QUEUE_CHROME_H` is true by construction.
 const QUEUE_HEADER_H: f32 = 20.;
 /// The queue panel's own chrome around that list: `p_4` above and below, the
-/// "Queue" header, and the `gap_2` under it.
-const QUEUE_CHROME_H: f32 = 16. * 2. + QUEUE_HEADER_H + 8.;
+/// "Queue" header, the `gap_2` under it, and the card's own `border_1` — taffy
+/// lays out border-box, so the height handed to the panel has to carry the
+/// border as well as the padding. Leaving those two pixels out gave the list
+/// two less than a whole number of rows: the queue then *looked* like it fit
+/// and still scrolled a hair, clipping the bottom of the last row, which is
+/// the one thing the row snapping exists to prevent.
+const QUEUE_CHROME_H: f32 = 16. * 2. + QUEUE_HEADER_H + 8. + 2.;
 /// Window padding (`px_10`) and the gap between content columns (`gap_8`).
 const EDGE: f32 = 40.;
 /// Vertical window padding once compact.
