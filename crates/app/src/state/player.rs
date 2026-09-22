@@ -449,6 +449,9 @@ impl PlayerState {
             self.start_current(cx);
         } else {
             persist_queue(&self.queue);
+            // Auto resolves Album/Track from what the queue holds, so a track
+            // appended to an album queue changes which gain applies.
+            self.recompute_gain();
             self.refresh_prefetch(cx);
         }
     }
@@ -462,6 +465,7 @@ impl PlayerState {
             self.start_current(cx);
         } else {
             persist_queue(&self.queue);
+            self.recompute_gain();
             self.refresh_prefetch(cx);
         }
     }
@@ -484,6 +488,7 @@ impl PlayerState {
                 self.start_current(cx);
             }
         } else {
+            self.recompute_gain();
             self.refresh_prefetch(cx);
         }
         cx.notify();
@@ -624,7 +629,7 @@ impl PlayerState {
 
     /// Effective engine volume = user volume × ReplayGain factor.
     fn effective_volume(&self) -> f32 {
-        (self.volume * self.current_gain).clamp(0.0, 4.0)
+        (self.volume * self.current_gain).clamp(0.0, playback::MAX_VOLUME)
     }
 
     /// Push the effective volume to the engine.
@@ -1208,6 +1213,10 @@ impl PlayerState {
                 self.engine_has_track = false;
                 let streak = self.failed_streak + 1;
                 tracing::warn!("playback failed: {msg}");
+                // Named while the queue still points at the track that failed:
+                // both branches below advance past it first.
+                let failed_title = self.current_song().map(|s| s.title.clone());
+                let msg = crate::errors::playback_error(&msg, failed_title.as_deref());
                 // The decoder cannot say *why* it could not read a container
                 // (symphonia reports a 32-bit FLAC as "end of stream"), and a
                 // server that publishes no bit depth gives `stream_opts_for`
@@ -1238,14 +1247,36 @@ impl PlayerState {
                     self.start_current(cx);
                 }
                 self.failed_streak = streak;
-                self.last_error = Some(msg);
+                // A run this long is not a bad file, it is the server or the
+                // network being gone — and the queue has stopped rather than
+                // walked on, which the message has to account for or the app
+                // looks like it simply quit playing.
+                self.last_error = Some(match streak >= MAX_FAILED_STREAK {
+                    true => format!(
+                        "{msg}. Stopped after {MAX_FAILED_STREAK} tracks failed in a row — \
+                         check the server and the network."
+                    ),
+                    false => msg,
+                });
             }
             Event::PrefetchFailed { id, error } => {
                 tracing::warn!(?id, "next track could not be prepared: {error}");
                 // The gapless hand-over will not happen and starting that track
                 // will fail the same way, so say so now rather than letting the
                 // queue walk into it silently.
-                self.last_error = Some(format!("Next track unavailable: {error}"));
+                // The event names the song it was preparing, which is the one
+                // to name back — `next_pos` would be re-derived and can have
+                // moved if the queue was edited inside the prefetch window.
+                let title = id.as_ref().and_then(|id| {
+                    self.queue
+                        .iter_ordered()
+                        .find(|(_, song)| &song.id == id)
+                        .map(|(_, song)| song.title.clone())
+                });
+                self.last_error = Some(format!(
+                    "Next track unavailable — {}",
+                    crate::errors::playback_error(&error, title.as_deref())
+                ));
             }
             Event::OutputOpened { device } => {
                 self.output_device = device;
@@ -1337,7 +1368,7 @@ fn replaygain_linear(rg: &subsonic::ReplayGain, mode: ReplayGainMode) -> f32 {
     if let Some(pk) = peak.filter(|&p| p > 0.0) {
         g = g.min(1.0 / pk); // clipping prevention
     }
-    g.clamp(0.0, 4.0)
+    g.clamp(0.0, playback::MAX_VOLUME)
 }
 
 // ---- queue persistence ----
@@ -1450,11 +1481,111 @@ mod tests {
     use subsonic::{Song, StreamOptions};
 
     use super::{
-        FALLBACK_BITRATE, FALLBACK_FORMAT, ResumeState, SMOOTH_MAX, read_resume_at, resume_for,
-        smoothed, stream_opts_for, write_resume_at,
+        FALLBACK_BITRATE, FALLBACK_FORMAT, ReplayGainMode, ResumeState, SMOOTH_MAX, read_resume_at,
+        replaygain_linear, resume_for, smoothed, stream_opts_for, write_resume_at,
     };
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    // ---- ReplayGain ----
+
+    fn rg(
+        track_gain: Option<f32>,
+        album_gain: Option<f32>,
+        track_peak: Option<f32>,
+        album_peak: Option<f32>,
+    ) -> subsonic::ReplayGain {
+        subsonic::ReplayGain {
+            track_gain,
+            album_gain,
+            track_peak,
+            album_peak,
+            ..Default::default()
+        }
+    }
+
+    /// dB → linear is `10^(dB/20)`: -6 dB halves the amplitude, +6 doubles it.
+    #[test]
+    fn a_gain_in_db_becomes_a_linear_multiplier() {
+        let g = replaygain_linear(&rg(Some(-6.02), None, None, None), ReplayGainMode::Track);
+        assert!((g - 0.5).abs() < 0.001, "{g}");
+        let g = replaygain_linear(&rg(Some(6.02), None, None, None), ReplayGainMode::Track);
+        assert!((g - 2.0).abs() < 0.005, "{g}");
+    }
+
+    /// The whole point of Album mode: every track of the album is scaled by the
+    /// same number, so the quiet ones stay quiet relative to the loud ones.
+    #[test]
+    fn album_mode_takes_the_album_gain_and_peak() {
+        let block = rg(Some(-3.0), Some(-9.0), Some(0.9), Some(0.99));
+        let album = replaygain_linear(&block, ReplayGainMode::Album);
+        let track = replaygain_linear(&block, ReplayGainMode::Track);
+        assert!((album - 10f32.powf(-9.0 / 20.0)).abs() < 0.001, "{album}");
+        assert!((track - 10f32.powf(-3.0 / 20.0)).abs() < 0.001, "{track}");
+    }
+
+    /// An album with no album tags still normalizes off the track ones rather
+    /// than falling back to unity, which would leave it unnormalized.
+    #[test]
+    fn album_mode_falls_back_to_the_track_tags() {
+        let g = replaygain_linear(
+            &rg(Some(-4.0), None, Some(0.8), None),
+            ReplayGainMode::Album,
+        );
+        assert!((g - 10f32.powf(-4.0 / 20.0)).abs() < 0.001, "{g}");
+    }
+
+    /// A boost past the headroom the peak leaves would clip; it is cut back to
+    /// exactly 1/peak rather than applied and distorted.
+    #[test]
+    fn a_boost_is_held_under_the_peak() {
+        // +12 dB is ~3.98x, but a 0.5 peak only has 2x of headroom.
+        let g = replaygain_linear(
+            &rg(Some(12.0), None, Some(0.5), None),
+            ReplayGainMode::Track,
+        );
+        assert!((g - 2.0).abs() < 0.001, "{g}");
+    }
+
+    /// `baseGain` (Opus R128) is an offset on top of the tagged gain.
+    #[test]
+    fn the_base_gain_is_added() {
+        let block = subsonic::ReplayGain {
+            track_gain: Some(-4.0),
+            base_gain: Some(-1.0),
+            ..Default::default()
+        };
+        let g = replaygain_linear(&block, ReplayGainMode::Track);
+        assert!((g - 10f32.powf(-5.0 / 20.0)).abs() < 0.001, "{g}");
+    }
+
+    /// The server's configured fallback covers a track with no tags at all; a
+    /// block with nothing in it leaves the volume alone.
+    #[test]
+    fn an_untagged_track_uses_the_fallback_or_unity() {
+        let block = subsonic::ReplayGain {
+            fallback_gain: Some(-8.0),
+            ..Default::default()
+        };
+        let g = replaygain_linear(&block, ReplayGainMode::Track);
+        assert!((g - 10f32.powf(-8.0 / 20.0)).abs() < 0.001, "{g}");
+        assert_eq!(
+            replaygain_linear(&subsonic::ReplayGain::default(), ReplayGainMode::Track),
+            1.0
+        );
+        assert_eq!(
+            replaygain_linear(&rg(Some(-8.0), None, None, None), ReplayGainMode::Off),
+            1.0
+        );
+    }
+
+    /// A bogus tag cannot ask for unbounded amplification, and the ceiling is
+    /// the engine's own — a gain the engine would clamp away is not applied.
+    #[test]
+    fn the_gain_is_capped_at_the_engines_ceiling() {
+        let g = replaygain_linear(&rg(Some(60.0), None, None, None), ReplayGainMode::Track);
+        assert_eq!(g, playback::MAX_VOLUME);
+    }
 
     #[test]
     fn a_position_is_filled_in_between_ticks() {

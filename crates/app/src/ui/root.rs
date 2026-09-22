@@ -243,6 +243,8 @@ pub struct RootView {
     setup_local_dirs: Vec<PathBuf>,
     setup_dir_input: Entity<InputState>,
     setup_error: Option<String>,
+    /// Why the last library refresh stopped short, shown on the refresh row.
+    refresh_error: Option<String>,
 }
 
 /// Ask for one more frame after the chrome around the content changes width.
@@ -577,6 +579,7 @@ impl RootView {
             setup_local_dirs: Vec::new(),
             setup_dir_input: setup_dir,
             setup_error: None,
+            refresh_error: None,
         }
     }
 
@@ -679,16 +682,18 @@ impl RootView {
         }
         self.refreshing = true;
         self.refresh_stage = RefreshStage::Idle;
+        self.refresh_error = None;
         cx.notify();
         let dirs: Vec<PathBuf> = self.session.read(cx).settings.local_music_dirs.clone();
         let client = self.session.read(cx).client.clone();
         let db = self.library_db.clone();
         cx.spawn_in(window, async move |this, cx| {
+            let mut failure: Option<String> = None;
             if !dirs.is_empty() {
                 let scanner = Arc::new(LocalScanner::new(db.clone()));
                 let watched = scanner.clone();
                 let scan = runtime::spawn_blocking_io(move || scanner.scan(&dirs));
-                Self::drive_progress(&this, cx, scan, move || {
+                failure = Self::drive_progress(&this, cx, scan, move || {
                     RefreshStage::LocalScan(watched.progress())
                 })
                 .await;
@@ -710,7 +715,7 @@ impl RootView {
                     )
                     .await
                 });
-                Self::drive_progress(&this, cx, sync, move || {
+                let sync_failure = Self::drive_progress(&this, cx, sync, move || {
                     let (done, total) = watched.snapshot();
                     // `total` is 0 until the listing pass finishes; showing
                     // "0/0 albums" for that stretch reads as broken.
@@ -721,10 +726,14 @@ impl RootView {
                     }
                 })
                 .await;
+                // The server step is the one a user is usually waiting on, so
+                // its failure wins over the local scan's.
+                failure = sync_failure.or(failure);
             }
             let _ = this.update_in(cx, |this, window, cx| {
                 this.refreshing = false;
                 this.refresh_stage = RefreshStage::Idle;
+                this.refresh_error = failure;
                 // The catalog views hold the rows they were built from and
                 // never reload on their own; drop them so the next visit
                 // re-seeds from what the refresh just wrote.
@@ -745,13 +754,15 @@ impl RootView {
     }
 
     /// Await `work` while republishing `stage()` into the sidebar a few times a
-    /// second.
+    /// second. Returns the failure, if the step had one, for the caller to put
+    /// on the refresh row — a step that fails silently is a refresh that looks
+    /// like it simply found nothing.
     async fn drive_progress<T: Send + 'static>(
         this: &WeakEntity<Self>,
         cx: &mut AsyncWindowContext,
         work: impl Future<Output = anyhow::Result<T>> + Send + 'static,
         stage: impl Fn() -> RefreshStage,
-    ) {
+    ) -> Option<String> {
         let result = crate::ui::poll_until_done(cx, REFRESH_POLL, work, |cx| {
             let stage = stage();
             let _ = this.update(cx, |this, cx| {
@@ -762,8 +773,12 @@ impl RootView {
             });
         })
         .await;
-        if let Err(e) = result {
-            tracing::warn!("library refresh step failed: {e}");
+        match result {
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("library refresh step failed: {e:#}");
+                Some(crate::errors::error_text(&e))
+            }
         }
     }
 
@@ -2378,6 +2393,7 @@ impl Render for RootView {
         };
         let sidebar_model = SidebarModel {
             active: self.section,
+            refresh_error: self.refresh_error.clone(),
             active_playlist: self.active_playlist.clone(),
             playlists: self
                 .playlists

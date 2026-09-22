@@ -145,6 +145,50 @@ pub fn format_playtime(secs: f64) -> String {
     }
 }
 
+/// The standard error line for a content view: the sentence, and a Retry
+/// button when trying again could plausibly work.
+///
+/// Every page used to draw a bare line of red text, which for the two failures
+/// a user actually hits — the server asleep, the network gone — is a dead end:
+/// the only way back was to navigate away and return, and on a retained view
+/// (the album and artist grids are kept across navigation) even that did not
+/// re-request. The button is deliberately absent for permanent failures; one
+/// that cannot work is worse than none, which is why `ErrorNote` carries the
+/// distinction rather than the call site guessing at it.
+pub fn error_banner(
+    note: &crate::errors::ErrorNote,
+    on_retry: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    use gpui_component::button::{Button, ButtonVariants as _};
+    use gpui_component::{Sizable as _, h_flex};
+
+    h_flex()
+        .px_4()
+        .py_1()
+        .gap_2()
+        .items_center()
+        .flex_wrap()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(cx.theme().danger)
+                .text_sm()
+                .child(note.text.clone()),
+        )
+        .when(note.retryable, |this| {
+            this.child(
+                Button::new("error-retry")
+                    .ghost()
+                    .xsmall()
+                    .icon(crate::assets::app_icon(crate::assets::icons::REFRESH))
+                    .label("Retry")
+                    .on_click(on_retry),
+            )
+        })
+}
+
 /// One-line library summary for a catalog page header: the count of whatever
 /// that page lists, then the totals behind it.
 ///

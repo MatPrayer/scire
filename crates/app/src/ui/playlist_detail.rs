@@ -31,7 +31,7 @@ pub struct PlaylistDetailView {
     playlist: Option<PlaylistWithSongs>,
     rename_input: Entity<InputState>,
     renaming: bool,
-    error: Option<String>,
+    error: Option<crate::errors::ErrorNote>,
     /// Id of the playing song — the only thing this view draws out of the
     /// player, so the only change worth repainting for.
     playing_id: Option<String>,
@@ -119,7 +119,7 @@ impl PlaylistDetailView {
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(pl) => view.playlist = Some(pl),
-                    Err(e) => view.error = Some(format!("{e:#}")),
+                    Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
                 cx.notify();
             });
@@ -355,8 +355,15 @@ impl Render for PlaylistDetailView {
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("{count} tracks")),
             )
-            .when_some(self.error.clone(), |this, e| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
+            .when_some(self.error.clone(), |this, note| {
+                this.child(crate::ui::error_banner(
+                    &note,
+                    cx.listener(|view, _, _, cx| {
+                        view.error = None;
+                        view.load(cx);
+                    }),
+                    cx,
+                ))
             })
             .child(v_flex().gap_0p5().children(rows))
     }

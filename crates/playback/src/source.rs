@@ -63,6 +63,16 @@ const PREFETCH_FILE: u64 = 256 * 1024;
 const PREFETCH_LIVE: u64 = 32 * 1024;
 /// Cap on fetching a playlist before giving up and trying the URL as a stream.
 const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on establishing the connection for a stream. reqwest has no default, so
+/// a server that drops packets left the engine waiting on the OS — two minutes
+/// of SYN retries during which the track neither starts nor fails, and the
+/// control loop (which awaits the open inline) answers no command.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on the gap between two bytes of a response body. A library file arrives
+/// as fast as the link allows and a station sends continuously, so a half-minute
+/// of silence is a stream that has died rather than a slow one — and a dead
+/// stream must surface as a failed track, not as buffering forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An opened source, ready to be handed to the decoder.
 pub(crate) struct Opened {
@@ -116,7 +126,7 @@ pub(crate) async fn open(
             .map_err(|e| PlaybackError(format!("bad url: {e}")))?,
     )
     .await
-    .map_err(|e| PlaybackError(e.to_string()))?;
+    .map_err(PlaybackError::from_http)?;
 
     // Reject what the decoder cannot play *before* handing it over. HE-AAC
     // ("aacp") is the one that matters: symphonia implements AAC-LC only, and
@@ -155,7 +165,7 @@ pub(crate) async fn open(
 
     let reader = StreamDownload::from_stream(stream, TempStorageProvider::new(), settings)
         .await
-        .map_err(|e| PlaybackError(e.to_string()))?;
+        .map_err(PlaybackError::from_http)?;
 
     let reader = match metaint {
         Some(metaint) => SourceReader::Icy(IcyStrip::new(reader, metaint, event_tx.clone())),
@@ -176,7 +186,13 @@ pub(crate) async fn open(
 /// every m4a whose `moov` index sits after the audio.
 fn plain_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(Client::new)
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 /// Shared client that asks for ICY metadata, used for live streams only. A
@@ -191,6 +207,8 @@ fn icy_client() -> &'static Client {
         );
         Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .unwrap_or_default()
     })

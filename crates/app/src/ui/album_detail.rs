@@ -272,7 +272,7 @@ pub struct AlbumDetailView {
     /// Album description expanded past its preview length.
     notes_expanded: bool,
     art_path: Option<PathBuf>,
-    error: Option<String>,
+    error: Option<crate::errors::ErrorNote>,
     /// Last observed playing-song id; used to refresh play counts when a track
     /// from this album finishes (its scrobble updates the server count).
     last_playing_id: Option<String>,
@@ -507,7 +507,7 @@ impl AlbumDetailView {
                         }
                         view.album = Some(album);
                     }
-                    Err(e) => view.error = Some(format!("{e:#}")),
+                    Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
                 cx.notify();
             });
@@ -727,7 +727,7 @@ impl AlbumDetailView {
             .await;
             if let Err(e) = result {
                 let _ = this.update(cx, |view, cx| {
-                    view.error = Some(format!("{e:#}"));
+                    view.error = Some(crate::errors::ErrorNote::new(&e));
                     cx.notify();
                 });
             }
@@ -760,7 +760,7 @@ impl AlbumDetailView {
             .await;
             if let Err(e) = result {
                 let _ = this.update(cx, |view, cx| {
-                    view.error = Some(format!("{e:#}"));
+                    view.error = Some(crate::errors::ErrorNote::new(&e));
                     cx.notify();
                 });
             }
@@ -792,7 +792,7 @@ impl AlbumDetailView {
             .await;
             if let Err(e) = result {
                 let _ = this.update(cx, |view, cx| {
-                    view.error = Some(format!("{e:#}"));
+                    view.error = Some(crate::errors::ErrorNote::new(&e));
                     cx.notify();
                 });
             }
@@ -1708,10 +1708,17 @@ impl Render for AlbumDetailView {
             })
             .child(header);
 
-        let error_line = self
-            .error
-            .clone()
-            .map(|e| div().text_color(cx.theme().danger).text_sm().child(e));
+        let error_line = self.error.clone().map(|note| {
+            crate::ui::error_banner(
+                &note,
+                cx.listener(|view, _, _, cx| {
+                    view.error = None;
+                    view.load(cx);
+                }),
+                cx,
+            )
+            .into_any_element()
+        });
         // Rows of the same height and columns as the real ones, for the album
         // the cache could not seed: an empty page that sprouts a track list
         // reads as a failure until it does.

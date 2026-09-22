@@ -10,6 +10,19 @@ use crate::error::{ApiErrorCode, Error};
 pub(crate) const API_VERSION: &str = "1.16.1";
 pub(crate) const CLIENT_NAME: &str = "Scirè";
 
+/// Cap on establishing a connection. reqwest has no default at all, so a host
+/// that drops packets (a server that moved, a laptop off the network) is left
+/// to the OS: Linux retries the SYN for over two minutes. With only two IO
+/// workers every request behind it waits, which is what "the whole app froze"
+/// was — a listing that will never arrive has to fail quickly enough to be
+/// reported.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on the gap between two bytes of a response, not on the whole response:
+/// `getArtists` returns an entire library in one body and a total timeout
+/// would abort a large one on a slow link. A server that has stopped sending
+/// mid-body still fails here.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Async Subsonic API client.
 ///
 /// Cheap to clone; holds a shared reqwest client. Every request carries fresh
@@ -42,6 +55,17 @@ struct ApiError {
     message: Option<String>,
 }
 
+/// Wrap a reqwest failure **with its URL removed**.
+///
+/// Every request URL this crate builds carries `u`, `t` (the auth token) and
+/// `s` (the salt) as query params, and `reqwest::Error`'s `Display` prints the
+/// URL it failed on — so the app rendering an error into a view, or writing
+/// one to a log, published the credentials with it. `without_url` is reqwest's
+/// own way to drop it; the endpoint is named by the caller's context anyway.
+fn http_error(e: reqwest::Error) -> Error {
+    Error::Http(e.without_url())
+}
+
 impl SubsonicClient {
     /// Create a client for `base_url` (e.g. `https://music.example.com`).
     pub fn new(base_url: &str, credentials: Credentials) -> Result<Self, Error> {
@@ -59,7 +83,10 @@ impl SubsonicClient {
             http: reqwest::Client::builder()
                 .pool_idle_timeout(Duration::from_secs(300))
                 .tcp_keepalive(Duration::from_secs(60))
-                .build()?,
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
+                .build()
+                .map_err(http_error)?,
             base_url: url,
             credentials,
         })
@@ -96,8 +123,15 @@ impl SubsonicClient {
         params: &[(&str, &str)],
     ) -> Result<T, Error> {
         let url = self.build_url(endpoint, params)?;
-        let resp = self.http.get(url).send().await?.error_for_status()?;
-        let envelope: Envelope<T> = resp.json().await?;
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(http_error)?
+            .error_for_status()
+            .map_err(http_error)?;
+        let envelope: Envelope<T> = resp.json().await.map_err(http_error)?;
         let body = envelope.inner;
         if body.status != "ok" {
             let (code, message) = body

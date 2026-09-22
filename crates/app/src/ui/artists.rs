@@ -123,7 +123,7 @@ pub struct ArtistsView {
     art_range: Option<(usize, usize)>,
     scroll: UniformListScrollHandle,
     loading: bool,
-    error: Option<String>,
+    error: Option<crate::errors::ErrorNote>,
     /// Card index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
     /// Catalog totals shown in the header, for the selected libraries.
@@ -297,7 +297,7 @@ impl ArtistsView {
                         // main thread.
                         view.art_range = None;
                     }
-                    Err(e) => view.error = Some(format!("{e:#}")),
+                    Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
                 cx.notify();
             });
@@ -603,14 +603,15 @@ impl Render for ArtistsView {
                         )
                     }),
             )
-            .when_some(self.error.clone(), |this, e| {
-                this.child(
-                    div()
-                        .px_4()
-                        .text_color(cx.theme().danger)
-                        .text_sm()
-                        .child(e),
-                )
+            .when_some(self.error.clone(), |this, note| {
+                this.child(crate::ui::error_banner(
+                    &note,
+                    cx.listener(|view, _, _, cx| {
+                        view.error = None;
+                        view.load(cx);
+                    }),
+                    cx,
+                ))
             })
             .child(grid)
     }
@@ -685,7 +686,7 @@ pub struct ArtistDetailView {
     /// The hero image is open full-window.
     show_full_art: bool,
     full_art_path: Option<PathBuf>,
-    error: Option<String>,
+    error: Option<crate::errors::ErrorNote>,
     /// Biography + image URLs from getArtistInfo2 (Navidrome's agents).
     info: Option<ArtistInfo2>,
     /// An artist-image fetch has started; stops info2's fallback from
@@ -858,7 +859,7 @@ impl ArtistDetailView {
                         view.fetch_artist_image(cover, cx);
                         view.fetch_artist_info(&artist_id, cx);
                     }
-                    Err(e) => view.error = Some(format!("{e:#}")),
+                    Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
                 cx.notify();
             });
@@ -910,7 +911,7 @@ impl ArtistDetailView {
                 }
                 Err(e) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.error = Some(format!("{e:#}"));
+                        view.error = Some(crate::errors::ErrorNote::new(&e));
                         cx.notify();
                     });
                 }
@@ -1480,8 +1481,15 @@ impl Render for ArtistDetailView {
                             ),
                     ),
             )
-            .when_some(self.error.clone(), |this, e| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
+            .when_some(self.error.clone(), |this, note| {
+                this.child(crate::ui::error_banner(
+                    &note,
+                    cx.listener(|view, _, _, cx| {
+                        view.error = None;
+                        view.load(cx);
+                    }),
+                    cx,
+                ))
             })
             .child(make_section("Albums".to_string(), album_cards))
             .child(make_section("Singles / EPs".to_string(), single_cards))

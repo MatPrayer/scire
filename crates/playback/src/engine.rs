@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use crate::pulse;
 use crate::source::{self, EndSignal, Hint, Opened, SourceReader};
 use crate::spectrum::{SpectrumTap, Tap};
-use crate::{Command, Event, PlaybackError, TrackSource};
+use crate::{Command, Event, MAX_VOLUME, PlaybackError, TrackSource};
 
 const TICK: Duration = Duration::from_millis(500);
 
@@ -81,6 +81,11 @@ async fn control_loop(
     // `spawn_seek`).
     let mut sink: Option<Arc<rodio::Player>> = None;
     let mut volume: f32 = 1.0;
+    // Above 1.0 deliberately: rodio's volume is a linear sample multiplier and
+    // the caller folds ReplayGain into it, so a track tagged with a *positive*
+    // gain (quiet masters — classical, early CDs) asks for more than unity.
+    // Clamping at 1.0 here silently dropped every boost while attenuation kept
+    // working, i.e. normalization only ever made things quieter.
     // Chosen output device name (None = OS default) and the currently-loaded
     // track, retained so a device switch can reopen and resume in place.
     let mut selected_device: Option<String> = None;
@@ -317,7 +322,7 @@ async fn control_loop(
                         }
                     }
                     Command::SetVolume(v) => {
-                        volume = v.clamp(0.0, 1.0);
+                        volume = v.clamp(0.0, MAX_VOLUME);
                         if let Some(s) = &sink {
                             s.set_volume(volume);
                         }

@@ -45,7 +45,7 @@ impl PlaylistsState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(playlists) => state.playlists = playlists,
-                    Err(e) => state.error = Some(format!("{e:#}")),
+                    Err(e) => state.error = Some(crate::errors::error_text(&e)),
                 }
                 cx.notify();
             });
@@ -87,7 +87,7 @@ impl PlaylistsState {
             .await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(e) = result {
-                    state.error = Some(format!("{e:#}"));
+                    state.error = Some(crate::errors::error_text(&e));
                     cx.notify();
                 } else {
                     state.reload(cx);
@@ -126,7 +126,7 @@ impl PlaylistsState {
             .await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(e) = result {
-                    state.error = Some(format!("{e:#}"));
+                    state.error = Some(crate::errors::error_text(&e));
                     cx.notify();
                 } else {
                     state.reload(cx);
@@ -150,7 +150,7 @@ impl PlaylistsState {
             .await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(e) = result {
-                    state.error = Some(format!("{e:#}"));
+                    state.error = Some(crate::errors::error_text(&e));
                     cx.notify();
                 } else {
                     state.reload(cx);
@@ -174,7 +174,7 @@ impl PlaylistsState {
             .await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(e) = result {
-                    state.error = Some(format!("{e:#}"));
+                    state.error = Some(crate::errors::error_text(&e));
                     cx.notify();
                 } else {
                     state.reload(cx);
@@ -199,7 +199,7 @@ impl PlaylistsState {
             .await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(e) = result {
-                    state.error = Some(format!("{e:#}"));
+                    state.error = Some(crate::errors::error_text(&e));
                     cx.notify();
                 } else {
                     state.reload(cx);
