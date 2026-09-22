@@ -116,6 +116,26 @@ fn score(query: &str, primary: &str, secondary: Option<&str>) -> u8 {
         .unwrap_or(MISS)
 }
 
+/// The whole sort key for a row: its tier, then the shorter text, then the
+/// text itself.
+///
+/// The tier on its own leaves a collaboration credited as its own artist tied
+/// with the plain one — "skrill" is a prefix of both "Skrillex" and "Skrillex
+/// & Damian Marley", and only the exact and word-boundary tiers tell those
+/// apart, which a half-typed query never reaches. A tie then fell to whatever
+/// order the source handed the rows over in, which for the cache is
+/// alphabetical and for the server is its own relevance, and the featured
+/// credit landed above the artist often enough to be the complaint.
+///
+/// Length is what separates them: of two texts answering the query equally
+/// well, the one carrying less *around* the match is the one that is the
+/// answer, and everything longer is that answer plus somebody else. The final
+/// field only makes the order total, so it does not depend on the source's.
+fn sort_key(query: &str, primary: &str, secondary: Option<&str>) -> (u8, usize, String) {
+    let text = primary.trim().to_lowercase();
+    (score(query, primary, secondary), text.chars().count(), text)
+}
+
 // ---------------------------------------------------------------------------
 // Results
 // ---------------------------------------------------------------------------
@@ -178,50 +198,89 @@ impl Hits {
 
     /// Append what `other` holds and this does not. What is already shown keeps
     /// its place: the cache paints first, and a server response arriving 200ms
-    /// later must not reshuffle the row the user is reaching for.
+    /// later must not reshuffle the row the user is reaching for — a row that
+    /// moves between the press and the release of a click is a click that
+    /// lands on a different track than the one that was aimed at, which is the
+    /// whole of "clicking a search result sometimes does nothing".
+    ///
+    /// A duplicate is not discarded outright, though: the two sources do not
+    /// carry the same fields. A cache row has whatever the last sync wrote and
+    /// the server's has whatever the server knows, so a cover the row is
+    /// missing is taken from its twin rather than the row being left with a
+    /// placeholder for a cover that did arrive.
     fn merge(&mut self, other: Hits) {
-        let artists: HashSet<String> = self.artists.iter().map(|a| a.id.clone()).collect();
-        self.artists.extend(
-            other
-                .artists
-                .into_iter()
-                .filter(|a| !artists.contains(&a.id)),
-        );
+        let mut artists: HashMap<String, usize> = self
+            .artists
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.id.clone(), i))
+            .collect();
+        for artist in other.artists {
+            match artists.get(&artist.id) {
+                Some(&i) => adopt(&mut self.artists[i].cover, artist.cover),
+                None => {
+                    artists.insert(artist.id.clone(), self.artists.len());
+                    self.artists.push(artist);
+                }
+            }
+        }
 
-        let albums: HashSet<(bool, String)> = self
+        let mut albums: HashMap<(bool, String), usize> = self
             .albums
             .iter()
-            .map(|a| (a.local, a.id.clone()))
+            .enumerate()
+            .map(|(i, a)| ((a.local, a.id.clone()), i))
             .collect();
-        self.albums.extend(
-            other
-                .albums
-                .into_iter()
-                .filter(|a| !albums.contains(&(a.local, a.id.clone()))),
-        );
+        for album in other.albums {
+            let key = (album.local, album.id.clone());
+            match albums.get(&key) {
+                Some(&i) => adopt(&mut self.albums[i].cover, album.cover),
+                None => {
+                    albums.insert(key, self.albums.len());
+                    self.albums.push(album);
+                }
+            }
+        }
 
-        let songs: HashSet<(bool, String)> = self
+        let mut songs: HashMap<(bool, String), usize> = self
             .songs
             .iter()
-            .map(|s| (s.local, s.song.id.clone()))
+            .enumerate()
+            .map(|(i, s)| ((s.local, s.song.id.clone()), i))
             .collect();
-        self.songs.extend(
-            other
-                .songs
-                .into_iter()
-                .filter(|s| !songs.contains(&(s.local, s.song.id.clone()))),
-        );
+        for song in other.songs {
+            let key = (song.local, song.song.id.clone());
+            match songs.get(&key) {
+                Some(&i) => adopt(&mut self.songs[i].cover, song.cover),
+                None => {
+                    songs.insert(key, self.songs.len());
+                    self.songs.push(song);
+                }
+            }
+        }
     }
 
-    /// Put the rows that answer the query at the top of each section. Sorting
-    /// is stable, so within a tier the cache's alphabetical order and the
-    /// server's relevance order both survive.
+    /// Put the rows that answer the query at the top of each section, closest
+    /// match first. See [`sort_key`] for what "closest" means.
+    ///
+    /// Only ever run on a freshly built set, never on one already on screen:
+    /// re-sorting rows the user can see is exactly what [`merge`] refuses to
+    /// do, and doing it a step later is the same reshuffle.
+    ///
+    /// [`merge`]: Self::merge
     fn rank(&mut self, query: &str) {
-        self.artists.sort_by_key(|a| score(query, &a.name, None));
+        self.artists.sort_by_key(|a| sort_key(query, &a.name, None));
         self.albums
-            .sort_by_key(|a| score(query, &a.title, a.artist.as_deref()));
+            .sort_by_key(|a| sort_key(query, &a.title, a.artist.as_deref()));
         self.songs
-            .sort_by_key(|s| score(query, &s.song.title, s.song.artist.as_deref()));
+            .sort_by_key(|s| sort_key(query, &s.song.title, s.song.artist.as_deref()));
+    }
+}
+
+/// Fill a row's cover from its twin in the other source, if it has none.
+fn adopt(cover: &mut Option<Cover>, other: Option<Cover>) {
+    if cover.is_none() {
+        *cover = other;
     }
 }
 
@@ -724,11 +783,14 @@ impl SearchBar {
                 bar.pending = false;
                 match result {
                     Ok(r) => {
-                        let hits = hits_from_server(r);
+                        let query = bar.input.read(cx).value().trim().to_string();
+                        let mut hits = hits_from_server(r);
+                        // Ranked before the merge, never after: `merge` appends
+                        // so the rows already on screen hold still, and a rank
+                        // over the joined list would move them anyway.
+                        hits.rank(&query);
                         bar.fetch_result_art(&hits, cx);
                         bar.results.merge(hits);
-                        let query = bar.input.read(cx).value().trim().to_string();
-                        bar.results.rank(&query);
                         bar.error = None;
                     }
                     // A dead server is not a dead search — the cache's rows
@@ -896,6 +958,21 @@ impl SearchBar {
             )
     }
 
+    /// A row's element id, keyed by what the row *is* rather than by where it
+    /// sits.
+    ///
+    /// gpui matches a press to its release through the element id, so a row
+    /// identified by its index is a different row the moment the list changes
+    /// under the cursor — and it does, 300ms after the last keystroke, when
+    /// the server's answer merges into the cache's. Clicks that landed on
+    /// nothing and clicks that played the neighbouring track were both this.
+    /// The source is in the id too, since a local file and a server track can
+    /// carry the same id.
+    fn row_id(prefix: &str, local: bool, id: &str) -> ElementId {
+        let source = if local { 'l' } else { 'r' };
+        ElementId::from(gpui::SharedString::from(format!("{prefix}-{source}-{id}")))
+    }
+
     /// Build the result rows shared by the inline dropdown and the palette.
     /// The flat selectable index is threaded so the highlighted row matches
     /// `selected`; section titles do not advance it.
@@ -905,11 +982,11 @@ impl SearchBar {
 
         if !self.results.artists.is_empty() {
             rows.push(Self::section_title("Artists", cx));
-            for (i, artist) in self.results.artists.iter().take(MAX_ARTISTS).enumerate() {
+            for artist in self.results.artists.iter().take(MAX_ARTISTS) {
                 let id = artist.id.clone();
                 rows.push(
                     self.row_shell(
-                        ("sb-artist", i),
+                        Self::row_id("sb-artist", false, &artist.id),
                         idx,
                         artist.cover.as_ref(),
                         IconName::CircleUser,
@@ -928,12 +1005,12 @@ impl SearchBar {
 
         if !self.results.albums.is_empty() {
             rows.push(Self::section_title("Albums", cx));
-            for (i, album) in self.results.albums.iter().take(MAX_ALBUMS).enumerate() {
+            for album in self.results.albums.iter().take(MAX_ALBUMS) {
                 let id = album.id.clone();
                 let local = album.local;
                 rows.push(
                     self.row_shell(
-                        ("sb-album", i),
+                        Self::row_id("sb-album", album.local, &album.id),
                         idx,
                         album.cover.as_ref(),
                         IconName::LayoutDashboard,
@@ -961,12 +1038,12 @@ impl SearchBar {
         // Songs: click plays, `+` enqueues.
         if !self.results.songs.is_empty() {
             rows.push(Self::section_title("Songs", cx));
-            for (i, hit) in self.results.songs.iter().take(MAX_SONGS).enumerate() {
+            for hit in self.results.songs.iter().take(MAX_SONGS) {
                 let play = hit.song.clone();
                 let enqueue = hit.song.clone();
                 rows.push(
                     self.row_shell(
-                        ("sb-song", i),
+                        Self::row_id("sb-song", hit.local, &hit.song.id),
                         idx,
                         hit.cover.as_ref(),
                         IconName::Star,
@@ -984,7 +1061,7 @@ impl SearchBar {
                         this.dismiss(window, cx);
                     }))
                     .child(
-                        Button::new(("sb-enq", i))
+                        Button::new(Self::row_id("sb-enq", hit.local, &hit.song.id))
                             .ghost()
                             .xsmall()
                             .icon(Icon::new(IconName::Plus))
@@ -1229,6 +1306,74 @@ mod tests {
         });
         let titles: Vec<_> = hits.albums.iter().map(|a| a.title.as_str()).collect();
         assert_eq!(titles, ["Kid A", "Amnesiac"]);
+    }
+
+    #[test]
+    fn the_shorter_of_two_equal_matches_comes_first() {
+        // Half-typed query: every one of these is a plain prefix match, so the
+        // tier cannot separate them and only length can.
+        let mut hits = Hits {
+            artists: vec![
+                artist_hit("Skrillex, Diplo & Justin Bieber"),
+                artist_hit("Skrillexia"),
+                artist_hit("Skrillex"),
+            ],
+            ..Default::default()
+        };
+        hits.rank("skrill");
+        let names: Vec<_> = hits.artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Skrillex", "Skrillexia", "Skrillex, Diplo & Justin Bieber",]
+        );
+    }
+
+    #[test]
+    fn equal_rows_order_the_same_whichever_way_round_they_arrive() {
+        // The tail of the key is the text itself, so the result does not
+        // depend on the order the cache or the server handed the rows over in.
+        let names = |mut hits: Hits| {
+            hits.rank("hits");
+            hits.artists
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let forward = names(Hits {
+            artists: vec![artist_hit("Hits B"), artist_hit("Hits A")],
+            ..Default::default()
+        });
+        let backward = names(Hits {
+            artists: vec![artist_hit("Hits A"), artist_hit("Hits B")],
+            ..Default::default()
+        });
+        assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn a_shown_row_takes_the_cover_its_twin_brought() {
+        // The cache has no cover for an artist until a sync has recorded one;
+        // the server's answer does. Dropping the duplicate outright left the
+        // row with a placeholder for art that had arrived.
+        let mut hits = Hits {
+            artists: vec![artist_hit("Radiohead")],
+            ..Default::default()
+        };
+        let mut with_cover = artist_hit("Radiohead");
+        with_cover.cover = Some(Cover {
+            id: "ar-1".into(),
+            key: "ar-1".into(),
+            local: false,
+        });
+        hits.merge(Hits {
+            artists: vec![with_cover],
+            ..Default::default()
+        });
+        assert_eq!(hits.artists.len(), 1);
+        assert_eq!(
+            hits.artists[0].cover.as_ref().map(|c| c.id.as_str()),
+            Some("ar-1")
+        );
     }
 
     #[test]

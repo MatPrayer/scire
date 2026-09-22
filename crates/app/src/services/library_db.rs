@@ -798,25 +798,28 @@ impl LibraryDb {
     ///
     /// SQLite autocommits every statement, so a thousand single upserts is a
     /// thousand commits — that alone was ~3s of an otherwise ~1s incremental
-    /// sync. `artists` is `(id, name, library_id)`, deduplicated by the caller;
-    /// `album_credits` is `(album id, every artist credited on it)`, replacing
-    /// whatever those albums had.
+    /// sync. `artists` is `(id, name, library_id, cover_art)`, deduplicated by
+    /// the caller; `album_credits` is `(album id, every artist credited on it)`,
+    /// replacing whatever those albums had.
     pub fn upsert_catalog(
         &self,
         source: &str,
         albums: &[AlbumRow],
-        artists: &[(String, String, Option<String>)],
+        artists: &[(String, String, Option<String>, Option<String>)],
         album_credits: &[(String, Vec<String>)],
     ) -> Result<(), rusqlite::Error> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         {
+            // This is INSERT OR REPLACE, so a missing cover would *blank* the
+            // stored one: an artist row derived from an album credit carries no
+            // cover at all, and must not wipe the one `getArtists` supplied.
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO artists (id, source, name, cover_art, library_id)
-                 VALUES (?1,?2,?3,NULL,?4)",
+                 VALUES (?1,?2,?3,COALESCE(?5, (SELECT cover_art FROM artists WHERE id = ?1)),?4)",
             )?;
-            for (id, name, library_id) in artists {
-                stmt.execute(rusqlite::params![id, source, name, library_id])?;
+            for (id, name, library_id, cover_art) in artists {
+                stmt.execute(rusqlite::params![id, source, name, library_id, cover_art])?;
             }
         }
         {

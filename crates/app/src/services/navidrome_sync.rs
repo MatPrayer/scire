@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -134,6 +134,28 @@ pub async fn sync_navidrome(
     let mut seen: HashSet<String> = HashSet::new();
     let mut listed: Vec<(subsonic::Album, Option<String>)> = Vec::new();
 
+    // Artist covers, once per music folder. The album listing never carries an
+    // artist's own cover id, so without this every cached artist row is written
+    // with a NULL cover and the seeded grids draw a placeholder icon. Cosmetic:
+    // a failure here is logged and the sync carries on with what it has.
+    let mut artist_covers: HashMap<String, String> = HashMap::new();
+    for folder_id in &folders {
+        match client.get_artists(folder_id.as_ref()).await {
+            Ok(indexes) => {
+                for index in indexes {
+                    for artist in index.artist {
+                        if let Some(cover) = artist.cover_art {
+                            artist_covers.insert(format!("navidrome:artist:{}", artist.id), cover);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("navidrome sync: artist covers unavailable: {e}");
+            }
+        }
+    }
+
     for folder_id in &folders {
         let mut offset = 0u32;
         let mut previous_page_head: Option<String> = None;
@@ -191,7 +213,7 @@ pub async fn sync_navidrome(
 
     let mut stale: Vec<(subsonic::Album, Option<String>)> = Vec::new();
     let mut album_rows: Vec<AlbumRow> = Vec::with_capacity(listed.len());
-    let mut artist_rows: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut artist_rows: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
     let mut album_credit_rows: Vec<(String, Vec<String>)> = Vec::with_capacity(listed.len());
     let mut artists_seen: HashSet<String> = HashSet::new();
 
@@ -209,7 +231,12 @@ pub async fn sync_navidrome(
         let credits = album_credits(&album);
         for (aid, name) in &credits {
             if artists_seen.insert(aid.clone()) {
-                artist_rows.push((aid.clone(), name.clone(), folder_id.clone()));
+                artist_rows.push((
+                    aid.clone(),
+                    name.clone(),
+                    folder_id.clone(),
+                    artist_covers.get(aid).cloned(),
+                ));
             }
         }
         album_credit_rows.push((
