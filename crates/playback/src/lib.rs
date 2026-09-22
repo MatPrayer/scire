@@ -21,6 +21,11 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+/// Ceiling on the volume the engine accepts. Above 1.0 because the caller
+/// folds ReplayGain into it and a positive track gain asks for amplification;
+/// capped so a bogus tag cannot ask for 40 dB of it.
+pub const MAX_VOLUME: f32 = 4.0;
+
 /// What to play: a fully-authenticated stream URL, or a local file path.
 /// When `path` is `Some`, the engine reads from the local file instead of
 /// fetching the URL (the URL is still set for display/metadata purposes).
@@ -235,7 +240,9 @@ impl Player {
         let _ = self.tx.send(Command::Seek(position));
     }
 
-    /// Volume in [0.0, 1.0] (clamped by the engine).
+    /// Linear volume multiplier in [0.0, `MAX_VOLUME`] (clamped by the engine).
+    /// Not capped at 1.0: ReplayGain is applied by scaling this, and a quiet
+    /// master's positive gain needs more than unity.
     pub fn set_volume(&self, volume: f32) {
         let _ = self.tx.send(Command::SetVolume(volume));
     }
