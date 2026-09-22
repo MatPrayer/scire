@@ -21,7 +21,7 @@ use crate::services::library_db::{AlbumRow, LibraryDb, LibraryStats};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
-use crate::ui::{CARD_PADDING, with_focus_cursor};
+use crate::ui::{card_inset, card_padding, with_focus_cursor};
 
 /// Column guess before the grid has measured itself.
 const FALLBACK_COLS: usize = 5;
@@ -353,15 +353,24 @@ impl LocalMusicView {
             None
         };
 
+        // Same trade as the album grid's cards: the cover takes the card's
+        // chrome for itself, the card's width is unchanged.
+        let flush = self.session.read(cx).settings.flush_album_covers;
+        let cover = crate::ui::card_cover_edge(tile, flush);
+
         let card = v_flex()
             .id(SharedString::from(format!("local-album-{}", album.id)))
             .group("lcard")
-            .w(px(tile + CARD_PADDING))
-            .p_1p5()
+            .w(px(tile + card_padding()))
+            .map(|c| match flush {
+                true => c,
+                false => c
+                    .p(px(card_inset()))
+                    .border_1()
+                    .border_color(gpui::hsla(0., 0., 0.5, 0.15)),
+            })
             .gap_1p5()
             .rounded_lg()
-            .border_1()
-            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
             .hover(|s| {
                 let s = s.bg(cx.theme().muted);
@@ -379,14 +388,14 @@ impl LocalMusicView {
             })
             .child(
                 div()
-                    .size(px(tile))
+                    .size(px(cover))
                     .rounded_lg()
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
                     .relative()
                     .when_some(art, |this, path| {
-                        this.child(img(path).size(px(tile)).rounded_lg())
+                        this.child(img(path).size(px(cover)).rounded_lg())
                     })
                     .child(
                         div()
@@ -411,6 +420,11 @@ impl LocalMusicView {
             .child(
                 v_flex()
                     .h(px(TEXT_BLOCK_H))
+                    // Flush, the card kept no padding for the text to sit in.
+                    .map(|t| match flush {
+                        true => t.px(px(card_inset())).pb(px(card_inset())),
+                        false => t,
+                    })
                     .gap_0()
                     .overflow_hidden()
                     .child(

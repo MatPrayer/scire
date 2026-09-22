@@ -21,7 +21,9 @@ use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
 use crate::ui::albums::album_from_row;
-use crate::ui::{CARD_PADDING, strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor};
+use crate::ui::{
+    card_inset, card_padding, strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor,
+};
 
 const ART_SIZE: u32 = 320;
 /// Resolution the hero image is re-fetched at for the lightbox, matching the
@@ -427,7 +429,7 @@ impl ArtistsView {
         };
         let card_el = v_flex()
             .id(card.id.clone())
-            .w(px(tile + crate::ui::CARD_PADDING))
+            .w(px(tile + crate::ui::card_padding()))
             .p_1p5()
             .gap_1p5()
             .items_center()
@@ -1134,15 +1136,23 @@ impl ArtistDetailView {
         } else {
             None
         };
+        // The album grid's setting, applied to the album cards here too —
+        // these are the same card at a different size.
+        let flush = self.session.read(cx).settings.flush_album_covers;
+        let cover = crate::ui::card_cover_edge(tile, flush);
         let card = v_flex()
             .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
             .group("aacard")
-            .w(px(tile + CARD_PADDING))
-            .p_1p5()
+            .w(px(tile + card_padding()))
+            .map(|c| match flush {
+                true => c,
+                false => c
+                    .p(px(card_inset()))
+                    .border_1()
+                    .border_color(gpui::hsla(0., 0., 0.5, 0.15)),
+            })
             .gap_1p5()
             .rounded_lg()
-            .border_1()
-            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
             .hover(|s| {
                 let s = s.bg(cx.theme().muted);
@@ -1159,14 +1169,14 @@ impl ArtistDetailView {
             }))
             .child(
                 div()
-                    .size(px(tile))
+                    .size(px(cover))
                     .rounded_lg()
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
                     .relative()
                     .when_some(art, |this, path| {
-                        this.child(img(path).size(px(tile)).rounded_lg())
+                        this.child(img(path).size(px(cover)).rounded_lg())
                     })
                     // Hover play button over the artwork, same as the
                     // album grid's cards.
@@ -1191,6 +1201,11 @@ impl ArtistDetailView {
             .child(
                 v_flex()
                     .gap_0()
+                    // Flush, the card kept no padding for the text to sit in.
+                    .map(|t| match flush {
+                        true => t.px(px(card_inset())).pb(px(card_inset())),
+                        false => t,
+                    })
                     // Explicit line heights: the default line box clips
                     // descenders (y, g, j) inside truncated text.
                     .child(

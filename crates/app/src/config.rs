@@ -53,6 +53,13 @@ pub fn library_db_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("music.db"))
 }
 
+/// `true`, for the `#[serde(default = …)]` of a field whose own default is on
+/// while the struct's is not reachable (a field skipped by the container's
+/// `#[serde(default)]` only when it is itself absent).
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -69,6 +76,11 @@ pub struct Settings {
     pub theme: ThemePref,
     /// Base size for rem-based interface text, clamped to 9–32px.
     pub font_size: UiFontSize,
+    /// Coarse multiplier on the interface's pixel chrome — gutters, card
+    /// padding, row and bar heights. See [`UiScale`] for why this is separate
+    /// from `font_size`.
+    #[serde(default)]
+    pub ui_scale: UiScale,
     /// Draw the in-app title bar (gpui-component `TitleBar`). When false, use native WM chrome.
     pub client_titlebar: bool,
     /// Strip the in-app title bar down to the window controls: no app name, no
@@ -89,18 +101,46 @@ pub struct Settings {
     /// background, instead of downloading them as the grids scroll past.
     #[serde(default)]
     pub precache_art: bool,
-    /// Look missing lyrics up on LRCLIB when the server has none for a song.
-    /// Sends the track's artist, title, album and length to lrclib.net, and
-    /// only ever while the lyrics panel is open. The container's
-    /// `#[serde(default)]` fills it from `Settings::default()`, so an older
-    /// settings file comes back with it on.
-    pub online_lyrics: bool,
+    /// Legacy "look missing lyrics up on LRCLIB" switch, superseded by
+    /// [`lyrics_provider`](Self::lyrics_provider) and migrated into it on load.
+    ///
+    /// An `Option` rather than a `bool` so the migration can tell a settings
+    /// file that *said* something from one that never carried the key: the
+    /// container's `#[serde(default)]` fills a missing field from
+    /// `Settings::default()`, which for a plain `bool` is indistinguishable
+    /// from the user having chosen that value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_lyrics: Option<bool>,
+    /// Which sources the lyrics panel reads, and in what order.
+    #[serde(default)]
+    pub lyrics_provider: LyricsProvider,
+    /// Let a *timed* document from the lower-priority source beat an untimed
+    /// one from the higher.
+    ///
+    /// Off, the first source with any words at all wins, which is what the
+    /// panel did before the setting existed. On, a library copy scraped out of
+    /// a tag with no timings is passed over for an LRCLIB document that has
+    /// them — the words are usually the same and only one of the two can be
+    /// followed line by line. It costs one extra lookup on exactly the tracks
+    /// whose library copy is untimed, and nothing at all under
+    /// `LibraryOnly`/`OnlineOnly`, which have no second source to consult.
+    #[serde(default = "default_true")]
+    pub prefer_synced_lyrics: bool,
     /// Page shown right after connecting.
     pub default_page: DefaultPage,
     /// Last selected album list filter, restored across sessions.
     pub album_sort: AlbumSort,
     /// Cover-art tile size in the album grid.
     pub cover_size: CoverSize,
+    /// Let the cover fill its card in the album grids, edge to edge, instead of
+    /// sitting inside the card's padding and border.
+    ///
+    /// The card keeps the width it always had — the cover grows into the
+    /// chrome rather than the card shrinking — so the column count and the
+    /// grid's rhythm are identical either way, and turning it on cannot
+    /// reflow the page.
+    #[serde(default)]
+    pub flush_album_covers: bool,
     /// Cover size of the album cards on an artist's page. `Match` follows
     /// `cover_size`; the rest pick a size for that page alone.
     #[serde(default)]
@@ -467,6 +507,125 @@ impl AlbumPageLayout {
     }
 }
 
+/// Coarse multiplier on the interface's own pixel chrome.
+///
+/// Deliberately *not* the same knob as `font_size`. gpui-component sets the
+/// window's rem size from `Theme::font_size` (`root.rs`), so the font setting
+/// already scales every `rems()`-based length — all the `text_*` sizes and the
+/// widget metrics derived from them. What it cannot touch is the pixel chrome
+/// this app lays out itself: grid gutters, card padding, player-bar and row
+/// heights, the sidebar's width. Those are what this scales, and it is why the
+/// two settings are both worth having — type can be made bigger without the
+/// layout loosening, and the layout can be loosened without the type growing.
+///
+/// Coarse on purpose: these are structural numbers that other numbers are
+/// derived from (column counts, panel minimums, what fits in a window), and a
+/// continuous slider over them invites widths that only *nearly* work. Four
+/// rungs are enough to matter and few enough to reason about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiScale {
+    /// 90% — tighter gutters and shorter rows, more content per screen.
+    Snug,
+    #[default]
+    Normal,
+    /// 110%.
+    Roomy,
+    /// 125%.
+    Large,
+}
+
+impl UiScale {
+    pub fn factor(self) -> f32 {
+        match self {
+            Self::Snug => 0.9,
+            Self::Normal => 1.0,
+            Self::Roomy => 1.1,
+            Self::Large => 1.25,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Snug => "90%",
+            Self::Normal => "100%",
+            Self::Roomy => "110%",
+            Self::Large => "125%",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [Self::Snug, Self::Normal, Self::Roomy, Self::Large];
+}
+
+/// Which sources the lyrics panel reads, and in what order.
+///
+/// "Library" is the file's own words — the server's copy for a streamed track,
+/// the sidecar `.lrc` or `LYRICS` tag read off disk for a local one. "Online"
+/// is a lookup on [LRCLIB](https://lrclib.net), which sends the track's artist,
+/// title, album and length to lrclib.net and so is the one with a privacy cost;
+/// it is also the one that routinely comes back *timed* where a tag-scraped
+/// copy is not.
+///
+/// The order matters beyond which answer wins: a source that is never reached
+/// is never asked, so `LibraryOnly` makes no network request at all and
+/// `OnlineOnly` skips reading the file. `Settings::prefer_synced_lyrics` is
+/// what lets the second source overrule the first, and only on timings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LyricsProvider {
+    /// Only the file's own words. Never contacts LRCLIB.
+    LibraryOnly,
+    /// Only LRCLIB. Ignores whatever the file or the server carries.
+    OnlineOnly,
+    /// The file's own words, falling back to LRCLIB when there are none.
+    #[default]
+    LibraryFirst,
+    /// LRCLIB, falling back to the file's own words when it has none.
+    OnlineFirst,
+}
+
+impl LyricsProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LibraryOnly => "Library only",
+            Self::OnlineOnly => "LRCLIB only",
+            Self::LibraryFirst => "Library, then LRCLIB",
+            Self::OnlineFirst => "LRCLIB, then library",
+        }
+    }
+
+    /// Every provider, in the order the settings page offers them.
+    pub const ALL: [Self; 4] = [
+        Self::LibraryFirst,
+        Self::OnlineFirst,
+        Self::LibraryOnly,
+        Self::OnlineOnly,
+    ];
+
+    /// Whether the file's / server's own lyrics are consulted at all.
+    pub fn uses_library(self) -> bool {
+        !matches!(self, Self::OnlineOnly)
+    }
+
+    /// Whether LRCLIB is consulted at all. This is the switch that decides
+    /// whether the app ever talks to lrclib.net.
+    pub fn uses_online(self) -> bool {
+        !matches!(self, Self::LibraryOnly)
+    }
+
+    /// Whether the library is asked first. Meaningless for the two single-
+    /// source providers, which never reach a second one.
+    pub fn library_first(self) -> bool {
+        matches!(self, Self::LibraryOnly | Self::LibraryFirst)
+    }
+
+    /// Whether both sources are on offer, i.e. whether "prefer synced" has a
+    /// second source to promote.
+    pub fn has_fallback(self) -> bool {
+        self.uses_library() && self.uses_online()
+    }
+}
+
 /// How the bottom player bar sits against the rest of the UI.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -675,6 +834,7 @@ impl Default for Settings {
             transcoding: Transcoding::default(),
             theme: ThemePref::default(),
             font_size: UiFontSize::default(),
+            ui_scale: UiScale::default(),
             client_titlebar: true,
             minimal_titlebar: false,
             scrobble_enabled: true,
@@ -682,10 +842,13 @@ impl Default for Settings {
             default_repeat: RepeatMode::Off,
             artwork_cache_mb: 256,
             precache_art: false,
-            online_lyrics: true,
+            online_lyrics: None,
+            lyrics_provider: LyricsProvider::default(),
+            prefer_synced_lyrics: true,
             default_page: DefaultPage::default(),
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),
+            flush_album_covers: false,
             artist_album_size: ArtistAlbumSize::default(),
             track_info: TrackInfo {
                 artist: true,
@@ -881,6 +1044,17 @@ impl Settings {
                     settings.library_ids = vec![id];
                 }
                 settings.library_id = None;
+                // Migrate the pre-provider "fetch missing lyrics online"
+                // switch. Only `false` carries information: it is the one
+                // choice the four providers cannot all express, and it maps
+                // onto exactly one of them. `true` was the default and means
+                // the user never touched it, so it is left to whatever
+                // `lyrics_provider` says — which for a file written before the
+                // key existed is `LibraryFirst`, the same behaviour.
+                if settings.online_lyrics == Some(false) {
+                    settings.lyrics_provider = LyricsProvider::LibraryOnly;
+                }
+                settings.online_lyrics = None;
                 Ok(settings)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {

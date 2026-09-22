@@ -18,7 +18,15 @@ use crate::ui::player_bar::float_fill;
 
 /// Fixed row height — `uniform_list` requires every row to be the same size.
 /// Two lines of text (title over artist) plus the row's vertical padding.
-const ROW_H: f32 = 44.;
+const ROW_H_BASE: f32 = 44.;
+
+/// [`ROW_H_BASE`] at the current UI scale. A function because the panel's own
+/// height is a whole number of these — a row and a panel sized from different
+/// numbers is a panel that ends mid-row, which is the fault the row-snapping
+/// exists to avoid.
+fn row_h() -> f32 {
+    crate::ui::scaled(ROW_H_BASE)
+}
 
 /// One row's pre-formatted contents.
 ///
@@ -117,7 +125,7 @@ impl QueuePanel {
 
     fn render_row(&self, entity: &Entity<Self>, ix: usize, cx: &gpui::App) -> gpui::AnyElement {
         let Some(row) = self.rows.get(ix) else {
-            return div().h(px(ROW_H)).into_any_element();
+            return div().h(px(row_h())).into_any_element();
         };
         let pos = row.pos;
         let is_current = self.current == Some(pos);
@@ -135,7 +143,7 @@ impl QueuePanel {
             // `uniform_list` sizes its items to their content, so without this
             // the duration and the controls land at a different x per line.
             .w_full()
-            .h(px(ROW_H))
+            .h(px(row_h()))
             .px_2()
             .border_b_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))

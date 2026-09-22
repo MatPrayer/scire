@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::{
     AlbumPageLayout, ArtistAlbumSize, CoverSize, DefaultPage, FullscreenBackground,
-    FullscreenCoverSize, PlayerBarStyle, QueueEndBehavior, ReplayGainMode, ThemePref,
-    UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize,
+    FullscreenCoverSize, LyricsProvider, PlayerBarStyle, QueueEndBehavior, ReplayGainMode,
+    ThemePref, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize, UiScale,
 };
 use crate::services::library_db::LibraryDb;
 use crate::services::local_library::LocalScanner;
@@ -133,14 +133,14 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 /// makes "the sections that are present" a prefix of this list.
 const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Window", 4),
-    ("Appearance", 11),
+    ("Appearance", 14),
     ("Album pages", 7),
     ("Fullscreen", 7),
     ("Player bar", 11),
     ("Playback", 10),
-    ("Browsing", 15),
+    ("Browsing", 17),
     ("Streaming", 5),
-    ("Library", 14),
+    ("Library", 16),
     ("Account", 3),
 ];
 
@@ -401,7 +401,8 @@ enum SettingsSwitch {
     ViMode,
     ReducedMotion,
     PrecacheArt,
-    OnlineLyrics,
+    PreferSyncedLyrics,
+    FlushAlbumCovers,
 }
 
 /// A button-group entry or a standalone settings button.
@@ -460,6 +461,8 @@ enum SettingsAction {
     Switch(SettingsSwitch),
     Button(SettingsButton),
     FontSize,
+    UiScale,
+    LyricsProvider,
     DirInput,
 }
 
@@ -783,9 +786,32 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn set_online_lyrics(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    fn set_prefer_synced_lyrics(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
-            .update(cx, |s, _| s.settings.online_lyrics = enabled);
+            .update(cx, |s, _| s.settings.prefer_synced_lyrics = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_ui_scale(&mut self, scale: UiScale, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, _| s.settings.ui_scale = scale);
+        self.persist(cx);
+        // Like `apply_font_size`: the store on its own dirties nothing, so
+        // every other view keeps the old metrics until something repaints it.
+        crate::ui::set_ui_scale(scale, cx);
+        cx.notify();
+    }
+
+    fn set_flush_album_covers(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.flush_album_covers = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_lyrics_provider(&mut self, provider: LyricsProvider, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.lyrics_provider = provider);
         self.persist(cx);
         cx.notify();
     }
@@ -1176,7 +1202,8 @@ impl SettingsView {
             SettingsSwitch::ViMode => s.vi_mode,
             SettingsSwitch::ReducedMotion => s.reduced_motion,
             SettingsSwitch::PrecacheArt => s.precache_art,
-            SettingsSwitch::OnlineLyrics => s.online_lyrics,
+            SettingsSwitch::PreferSyncedLyrics => s.prefer_synced_lyrics,
+            SettingsSwitch::FlushAlbumCovers => s.flush_album_covers,
         }
     }
 
@@ -1236,7 +1263,8 @@ impl SettingsView {
             SettingsSwitch::ViMode => self.set_vi_mode(value, cx),
             SettingsSwitch::ReducedMotion => self.set_reduced_motion(value, cx),
             SettingsSwitch::PrecacheArt => self.set_precache_art(value, cx),
-            SettingsSwitch::OnlineLyrics => self.set_online_lyrics(value, cx),
+            SettingsSwitch::PreferSyncedLyrics => self.set_prefer_synced_lyrics(value, cx),
+            SettingsSwitch::FlushAlbumCovers => self.set_flush_album_covers(value, cx),
         }
     }
 
@@ -1560,6 +1588,21 @@ impl SettingsView {
                 };
                 self.set_font_size(UiFontSize::new(next), cx);
             }
+            SettingsAction::UiScale => {
+                let current = self.session.read(cx).settings.ui_scale;
+                let at = UiScale::ALL.iter().position(|s| *s == current).unwrap_or(0);
+                let next = UiScale::ALL[(at + 1) % UiScale::ALL.len()];
+                self.set_ui_scale(next, cx);
+            }
+            SettingsAction::LyricsProvider => {
+                let current = self.session.read(cx).settings.lyrics_provider;
+                let at = LyricsProvider::ALL
+                    .iter()
+                    .position(|p| *p == current)
+                    .unwrap_or(0);
+                let next = LyricsProvider::ALL[(at + 1) % LyricsProvider::ALL.len()];
+                self.set_lyrics_provider(next, cx);
+            }
             SettingsAction::DirInput => {
                 self.dir_input.update(cx, |s, cx| s.focus(window, cx));
                 cx.notify();
@@ -1734,6 +1777,7 @@ impl Render for SettingsView {
                 s.detailed_volume,
             )
         };
+        let flush_album_covers = self.session.read(cx).settings.flush_album_covers;
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
         let hide_idle_player_bar = self.session.read(cx).settings.hide_idle_player_bar;
         let player_bar_style = self.session.read(cx).settings.player_bar_style;
@@ -1743,6 +1787,7 @@ impl Render for SettingsView {
         let translucent_disabled = self.switch_disabled(SettingsSwitch::PlayerBarTranslucent, cx);
         let show_nav_buttons = self.session.read(cx).settings.show_nav_buttons;
         let font_size = self.session.read(cx).settings.font_size;
+        let ui_scale = self.session.read(cx).settings.ui_scale;
         let adaptive_from_page = self.session.read(cx).settings.adaptive_from_page;
         let adaptive_page_gradient = self.session.read(cx).settings.adaptive_page_gradient;
         let album_layout = self.session.read(cx).settings.album_layout;
@@ -1764,7 +1809,9 @@ impl Render for SettingsView {
         let rebuild_state = self.rebuild.clone();
         let precache_art = self.session.read(cx).settings.precache_art;
         let precache_state = self.precache.clone();
-        let online_lyrics = self.session.read(cx).settings.online_lyrics;
+        let lyrics_provider = self.session.read(cx).settings.lyrics_provider;
+        let prefer_synced_lyrics = self.session.read(cx).settings.prefer_synced_lyrics;
+        let lyrics_menu_view = cx.entity();
 
         // Rebuilt from scratch each render: `section` re-registers every card
         // it opens, in the order they are laid out.
@@ -1946,6 +1993,7 @@ impl Render for SettingsView {
 
         // Appearance
         let font_menu_view = cx.entity();
+        let scale_menu_view = cx.entity();
         let appearance_section = self
             .section("Appearance", cx)
             .child(self.subheading("Theme", cx))
@@ -2031,6 +2079,48 @@ impl Render for SettingsView {
                         ),
                     ),
             )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(self.subheading("UI scale", cx))
+                    .child(
+                        self.vi_control(
+                            SettingsAction::UiScale,
+                            Button::new("ui-scale")
+                                .label(ui_scale.label())
+                                .dropdown_caret(true)
+                                .outline()
+                                .small()
+                                .w(px(112.))
+                                .h(px(32.))
+                                .text_size(px(14.))
+                                .dropdown_menu(move |menu, _window, _cx| {
+                                    UiScale::ALL.into_iter().fold(menu, |menu, scale| {
+                                        let view = scale_menu_view.clone();
+                                        menu.item(
+                                            PopupMenuItem::new(scale.label())
+                                                .checked(scale == ui_scale)
+                                                .on_click(move |_, _, cx: &mut gpui::App| {
+                                                    view.update(cx, |settings, cx| {
+                                                        settings.set_ui_scale(scale, cx);
+                                                    });
+                                                }),
+                                        )
+                                    })
+                                }),
+                            cx,
+                        ),
+                    ),
+            )
+            .child(self.note(
+                "Font size sets the interface's text; UI scale sets the space \
+                 around it — gutters, card padding, row and bar heights. They \
+                 are separate knobs, so text can grow without the layout \
+                 loosening and the layout can loosen without the text growing.",
+                cx,
+            ))
             .child(self.vi_switch(
                 SettingsSwitch::ReducedMotion,
                 "reduced-motion",
@@ -2547,6 +2637,20 @@ impl Render for SettingsView {
                         cx,
                     )),
             )
+            .child(self.vi_switch(
+                SettingsSwitch::FlushAlbumCovers,
+                "flush-album-covers",
+                flush_album_covers,
+                false,
+                "Cover fills the card",
+                cx,
+            ))
+            .child(self.note(
+                "Drops the padding and border around the cover and gives that \
+                 space to the art instead. The cards keep the width they had, \
+                 so the grid's columns do not move.",
+                cx,
+            ))
             .child(self.subheading("Artist page covers", cx))
             .child(self.note(
                 "Size of the album cards on an artist's page. Match follows the \
@@ -2883,21 +2987,67 @@ impl Render for SettingsView {
             })
             .child(crate::ui::divider())
             .child(self.subheading("Lyrics", cx))
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_sm().child("Source"))
+                    .child(
+                        self.vi_control(
+                            SettingsAction::LyricsProvider,
+                            Button::new("lyrics-provider")
+                                .label(lyrics_provider.label())
+                                .dropdown_caret(true)
+                                .outline()
+                                .small()
+                                .h(px(32.))
+                                .text_size(px(14.))
+                                .dropdown_menu(move |menu, _window, _cx| {
+                                    LyricsProvider::ALL
+                                        .into_iter()
+                                        .fold(menu, |menu, provider| {
+                                            let view = lyrics_menu_view.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(provider.label())
+                                                    .checked(provider == lyrics_provider)
+                                                    .on_click(move |_, _, cx: &mut gpui::App| {
+                                                        view.update(cx, |settings, cx| {
+                                                            settings
+                                                                .set_lyrics_provider(provider, cx);
+                                                        });
+                                                    }),
+                                            )
+                                        })
+                                }),
+                            cx,
+                        ),
+                    ),
+            )
             .child(self.vi_switch(
-                SettingsSwitch::OnlineLyrics,
-                "online-lyrics",
-                online_lyrics,
-                false,
-                "Fetch missing lyrics online",
+                SettingsSwitch::PreferSyncedLyrics,
+                "prefer-synced-lyrics",
+                prefer_synced_lyrics,
+                !lyrics_provider.has_fallback(),
+                "Prefer synced lyrics",
                 cx,
             ))
             .child(self.note(
-                "Lyrics come from a file's own tags or a sidecar .lrc — the \
-                 server's copy for streamed tracks, read off disk for local \
-                 ones. When there are none, look the song up on LRCLIB — often \
-                 with timings, which tagged lyrics rarely carry. Sends the track's \
-                 artist, title, album and length to lrclib.net, and only while \
-                 the lyrics panel is open. Answers are cached on disk.",
+                "\"Library\" is a file's own words — its tags or a sidecar .lrc, \
+                 the server's copy for streamed tracks and read off disk for \
+                 local ones. \"LRCLIB\" looks the song up on lrclib.net, which \
+                 means sending it the track's artist, title, album and length; \
+                 it is only ever asked while the lyrics panel is open, and its \
+                 answers are cached on disk. Library only never contacts it at \
+                 all.",
+                cx,
+            ))
+            .child(self.note(
+                "Prefer synced lyrics lets the second source win when the first \
+                 has only untimed words: the words are usually the same and only \
+                 timed ones can be followed line by line. It costs one extra \
+                 lookup on those tracks, and needs a second source to be on.",
                 cx,
             ));
 

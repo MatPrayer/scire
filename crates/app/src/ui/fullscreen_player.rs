@@ -1,6 +1,8 @@
 //! Full-window now-playing overlay with dynamic blurred-art background.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -135,14 +137,19 @@ const LYRIC_REM_ACTIVE: f32 = 1.5;
 const LYRIC_GROW_MS: u64 = 420;
 /// Queue row height. `uniform_list` needs every row the same size, and a whole
 /// number of them is what keeps the panel from ending mid-row.
-const QUEUE_ROW_H: f32 = 44.;
+const QUEUE_ROW_H_BASE: f32 = 44.;
+
+/// [`QUEUE_ROW_H_BASE`] at the current UI scale.
+fn queue_row_h() -> f32 {
+    crate::ui::scaled(QUEUE_ROW_H_BASE)
+}
 /// Height the queue panel's header row is *pinned* to. gpui's default line
 /// height is `phi()` (1.618) of the font size, so a `text_sm` header draws at
 /// 23px rather than the 20 this arithmetic used to assume — the list then got
 /// three pixels less than a whole number of rows and the last one was clipped,
 /// which is exactly what the row snapping exists to prevent. The header is
 /// given the height (and the matching line height, so the text still centres in
-/// it) rather than measured, so `QUEUE_CHROME_H` is true by construction.
+/// it) rather than measured, so `queue_chrome_h()` is true by construction.
 const QUEUE_HEADER_H: f32 = 20.;
 /// The queue panel's own chrome around that list: `p_4` above and below, the
 /// "Queue" header, the `gap_2` under it, and the card's own `border_1` — taffy
@@ -151,7 +158,11 @@ const QUEUE_HEADER_H: f32 = 20.;
 /// two less than a whole number of rows: the queue then *looked* like it fit
 /// and still scrolled a hair, clipping the bottom of the last row, which is
 /// the one thing the row snapping exists to prevent.
-const QUEUE_CHROME_H: f32 = 16. * 2. + QUEUE_HEADER_H + 8. + 2.;
+const QUEUE_CHROME_H_BASE: f32 = 16. * 2. + QUEUE_HEADER_H + 8. + 2.;
+
+fn queue_chrome_h() -> f32 {
+    crate::ui::scaled(QUEUE_CHROME_H_BASE)
+}
 /// Window padding (`px_10`) and the gap between content columns (`gap_8`).
 const EDGE: f32 = 40.;
 /// Vertical window padding once compact.
@@ -302,7 +313,7 @@ fn stacked_art_cap(content: f32, size: FullscreenCoverSize) -> f32 {
 /// row sliced through the middle, which reads as a rendering fault rather than
 /// as a list that carries on below the fold.
 fn queue_visible_rows(max_h: f32, len: usize) -> usize {
-    let fits = ((max_h - QUEUE_CHROME_H) / QUEUE_ROW_H).floor().max(1.) as usize;
+    let fits = ((max_h - queue_chrome_h()) / queue_row_h()).floor().max(1.) as usize;
     fits.min(len.max(1))
 }
 
@@ -735,6 +746,41 @@ fn best_lyrics(docs: Vec<StructuredLyrics>) -> Option<StructuredLyrics> {
         .collect();
     let pick = docs.iter().position(|d| d.synced).unwrap_or(0);
     (pick < docs.len()).then(|| docs.swap_remove(pick))
+}
+
+/// Whether a hit from the *next* source displaces what is already held.
+///
+/// `held` is whether the document in hand is synced, or `None` for nothing in
+/// hand at all. Holding nothing, anything is an improvement. Holding a timed
+/// document, nothing is — a lower-priority source cannot overrule the one the
+/// user put first when both answer equally well. Holding an *untimed* one is
+/// the only interesting case, and it is exactly what `Settings::
+/// prefer_synced_lyrics` decides: off, the first source to answer wins and the
+/// second is never consulted; on, a timed document from the second source takes
+/// over, because the words are usually the same and only one of the two can be
+/// followed line by line.
+fn takes_over(held: Option<bool>, candidate_synced: bool, prefer_synced: bool) -> bool {
+    match held {
+        None => true,
+        Some(true) => false,
+        Some(false) => prefer_synced && candidate_synced,
+    }
+}
+
+/// Whether what is held is as good as the settings allow, i.e. whether the
+/// remaining sources are worth asking.
+///
+/// The complement of [`takes_over`]'s "keep looking": a timed document can
+/// never be improved on, and with `prefer_synced` off neither can an untimed
+/// one. Stopping matters beyond the wasted wait — carrying on is what sends the
+/// track's metadata to lrclib.net, so a user who did not ask for the second
+/// source must not be made to pay for it.
+fn settled(held: Option<bool>, prefer_synced: bool) -> bool {
+    match held {
+        None => false,
+        Some(true) => true,
+        Some(false) => !prefer_synced,
+    }
 }
 
 /// Wrap classic getLyrics' one text blob as an unsynced document, so the panel
@@ -1514,7 +1560,10 @@ impl FullscreenPlayer {
         if self.panel != Some(SidePanel::Lyrics) {
             return;
         }
-        let online = self.session.read(cx).settings.online_lyrics;
+        let (provider, prefer_synced) = {
+            let s = &self.session.read(cx).settings;
+            (s.lyrics_provider, s.prefer_synced_lyrics)
+        };
         let (id, query, local_path) = {
             let p = self.player.read(cx);
             let Some(song) = p.current_song() else {
@@ -1549,7 +1598,11 @@ impl FullscreenPlayer {
         // server about it can only ever be a miss, so those read their own file
         // instead.
         let server = local_path.is_none().then(|| self.client(cx)).flatten();
-        if server.is_none() && local_path.is_none() && !online {
+        let local_path = provider.uses_library().then_some(local_path).flatten();
+        let server = provider.uses_library().then_some(server).flatten();
+        // Nothing to ask: the library side has neither a file nor a server
+        // behind it, and the online side is switched off by the provider.
+        if server.is_none() && local_path.is_none() && !provider.uses_online() {
             self.lyrics_loading = false;
             cx.notify();
             return;
@@ -1557,23 +1610,26 @@ impl FullscreenPlayer {
         self.lyrics_loading = true;
         cx.spawn(async move |this, cx| {
             let by_id = id.clone();
+            let online_query = query.clone();
             let found = runtime::spawn_io(async move {
-                // A local file's own words: a sidecar .lrc beside it, or its
-                // LYRICS tag. This is the library lookup for a file no server
-                // has ever seen, so it is what the Library badge means here.
-                // On the blocking pool — it opens and parses a file, and the
-                // two IO workers must stay free for the requests below.
-                if let Some(path) = local_path {
-                    let docs = runtime::spawn_blocking_io(move || {
-                        anyhow::Ok(lyrics::from_file(std::path::Path::new(&path)))
-                    })
-                    .await
-                    .unwrap_or_default();
-                    if let Some(doc) = best_lyrics(docs) {
-                        return anyhow::Ok(Some((doc, LyricsSource::Library)));
+                // The file's own words, wherever they live: read off disk for a
+                // local file, asked of the server for a streamed one. Both are
+                // the Library badge — the difference is only who indexed them.
+                let library = async move {
+                    if let Some(path) = local_path {
+                        // On the blocking pool — it opens and parses a file,
+                        // and the two IO workers must stay free for the
+                        // requests below.
+                        let docs = runtime::spawn_blocking_io(move || {
+                            anyhow::Ok(lyrics::from_file(std::path::Path::new(&path)))
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if let Some(doc) = best_lyrics(docs) {
+                            return Some((doc, LyricsSource::Library));
+                        }
                     }
-                }
-                if let Some(client) = server {
+                    let client = server?;
                     // getLyricsBySongId is what actually answers: Navidrome
                     // collects lyrics at scan time out of the file's tags and
                     // out of a sidecar .lrc, and only publishes them under the
@@ -1587,29 +1643,64 @@ impl FullscreenPlayer {
                         .await
                         .unwrap_or_default();
                     if let Some(doc) = best_lyrics(structured) {
-                        return anyhow::Ok(Some((doc, LyricsSource::Library)));
+                        return Some((doc, LyricsSource::Library));
                     }
-                    let classic = client
+                    client
                         .get_lyrics(query.artist.as_deref(), Some(query.title.as_str()))
                         .await
                         .ok()
                         .and_then(|l| l.value)
                         .map(|text| vec![plain_lyrics(text)])
-                        .and_then(best_lyrics);
-                    if let Some(doc) = classic {
-                        return anyhow::Ok(Some((doc, LyricsSource::Library)));
-                    }
-                }
-                // Nothing in the library. LRCLIB has what was never tagged,
-                // and answers with an LRC document when it has one, so this
-                // fallback can come back better than the server's own copy.
-                if online {
+                        .and_then(best_lyrics)
+                        .map(|doc| (doc, LyricsSource::Library))
+                };
+                // LRCLIB has what was never tagged, and answers with an LRC
+                // document when it has one, so this can come back better than
+                // the server's own copy — which is what `prefer_synced` is for.
+                let online = async move {
                     // A lookup that fails is not an answer — leave it uncached
                     // and let the next open try again.
-                    let found = lyrics::fetch(query).await.ok().flatten();
-                    return anyhow::Ok(found.map(|doc| (doc, LyricsSource::Online)));
+                    let found = lyrics::fetch(online_query).await.ok().flatten();
+                    found.map(|doc| (doc, LyricsSource::Online))
+                };
+                // Only the enabled sources, in the provider's order. Boxed
+                // because the two blocks are different types and the order is
+                // a runtime choice; a source left out of the list is never
+                // polled, which is what makes `LibraryOnly` cost no request.
+                type Lookup<'a> = Pin<
+                    Box<dyn Future<Output = Option<(StructuredLyrics, LyricsSource)>> + Send + 'a>,
+                >;
+                let library: Lookup = Box::pin(library);
+                let online: Lookup = Box::pin(online);
+                let mut sources: Vec<Lookup> = Vec::with_capacity(2);
+                let (first, second) = match provider.library_first() {
+                    true => (library, online),
+                    false => (online, library),
+                };
+                let (wants_first, wants_second) = match provider.library_first() {
+                    true => (provider.uses_library(), provider.uses_online()),
+                    false => (provider.uses_online(), provider.uses_library()),
+                };
+                if wants_first {
+                    sources.push(first);
                 }
-                anyhow::Ok(None)
+                if wants_second {
+                    sources.push(second);
+                }
+
+                let mut found: Option<(StructuredLyrics, LyricsSource)> = None;
+                for source in sources {
+                    let held = found.as_ref().map(|(doc, _)| doc.synced);
+                    if let Some(hit) = source.await
+                        && takes_over(held, hit.0.synced, prefer_synced)
+                    {
+                        found = Some(hit);
+                    }
+                    if settled(found.as_ref().map(|(doc, _)| doc.synced), prefer_synced) {
+                        break;
+                    }
+                }
+                anyhow::Ok(found)
             })
             .await
             .ok()
@@ -1652,7 +1743,8 @@ impl FullscreenPlayer {
         // Drawn at a whole number of rows, so the panel never ends halfway
         // through one; `uniform_list` also virtualizes a long queue and is what
         // `sync_queue_scroll` steers to follow the playing track.
-        let height = QUEUE_CHROME_H + queue_visible_rows(max_h, rows.len()) as f32 * QUEUE_ROW_H;
+        let height =
+            queue_chrome_h() + queue_visible_rows(max_h, rows.len()) as f32 * queue_row_h();
         let list = gpui::uniform_list(
             "fs-queue-list",
             rows.len(),
@@ -1668,7 +1760,7 @@ impl FullscreenPlayer {
                             // that does not claim the width lands at whatever
                             // its own text needs.
                             .w_full()
-                            .h(px(QUEUE_ROW_H))
+                            .h(px(queue_row_h()))
                             .px_2()
                             .gap_2()
                             .rounded_md()
@@ -3475,9 +3567,9 @@ mod tests {
     use super::{
         ART_LEAD, ART_MAX, ART_MAX_STACKED, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity,
         EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, PANEL_LYRICS_MAX, PANEL_MAX,
-        PANEL_MIN, QUEUE_CHROME_H, QUEUE_ROW_H, SidePanel, VOLUME_W, active_line, best_lyrics,
-        blob_base, blob_field, hash01, line_emphasis, lyric_color, lyric_seek_target, lyric_wrap,
-        plain_lyrics, queue_visible_rows,
+        PANEL_MIN, SidePanel, VOLUME_W, active_line, best_lyrics, blob_base, blob_field, hash01,
+        line_emphasis, lyric_color, lyric_seek_target, lyric_wrap, plain_lyrics, queue_chrome_h,
+        queue_row_h, queue_visible_rows, settled, takes_over,
     };
     use crate::config::FullscreenCoverSize;
     use std::time::Duration;
@@ -3537,6 +3629,54 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(picked.lines[0].value, "timed");
+    }
+
+    /// Nothing in hand: whatever the first source answered is the answer,
+    /// timings or not.
+    #[test]
+    fn the_first_hit_is_always_taken() {
+        for prefer in [false, true] {
+            assert!(takes_over(None, false, prefer));
+            assert!(takes_over(None, true, prefer));
+        }
+    }
+
+    /// A timed document from the source the user put first cannot be overruled
+    /// by the fallback, however good the fallback's answer is.
+    #[test]
+    fn a_timed_hit_is_never_displaced() {
+        for prefer in [false, true] {
+            assert!(!takes_over(Some(true), true, prefer));
+            assert!(!takes_over(Some(true), false, prefer));
+        }
+        assert!(settled(Some(true), false));
+        assert!(settled(Some(true), true));
+    }
+
+    /// The whole of what the setting buys: an untimed first hit is passed over
+    /// for a timed second one, and only for a timed one.
+    #[test]
+    fn prefer_synced_promotes_only_timings() {
+        assert!(takes_over(Some(false), true, true));
+        assert!(!takes_over(Some(false), false, true));
+        assert!(!settled(Some(false), true));
+    }
+
+    /// With the setting off the first source to answer wins outright — and the
+    /// second is not consulted at all, which is what keeps a track's metadata
+    /// off lrclib.net for a user who did not ask for it.
+    #[test]
+    fn without_prefer_synced_the_first_answer_settles_it() {
+        assert!(!takes_over(Some(false), true, false));
+        assert!(settled(Some(false), false));
+    }
+
+    /// An empty hand is never settled, or a first source that missed would
+    /// stop the fallback being asked.
+    #[test]
+    fn nothing_in_hand_keeps_looking() {
+        assert!(!settled(None, false));
+        assert!(!settled(None, true));
     }
 
     #[test]
@@ -3916,11 +4056,11 @@ mod tests {
         // a row cut through the middle reads as a bug, not as a longer list.
         for max_h in [140., 260., 333., 620., 900.] {
             let rows = queue_visible_rows(max_h, 200);
-            let drawn = QUEUE_CHROME_H + rows as f32 * QUEUE_ROW_H;
+            let drawn = queue_chrome_h() + rows as f32 * queue_row_h();
             assert!(drawn <= max_h + 0.5, "{max_h}: {rows} rows is {drawn}");
             // …and it uses the room it has: one more row would not fit.
             assert!(
-                drawn + QUEUE_ROW_H > max_h,
+                drawn + queue_row_h() > max_h,
                 "{max_h}: {rows} rows wastes a row"
             );
         }

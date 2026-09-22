@@ -101,6 +101,10 @@ fn main() {
                     .unwrap_or_else(|| LibraryDb::open_in_memory().unwrap()),
             );
 
+            // Before the window exists, so the very first frame is laid out at
+            // the persisted scale rather than at 100% and then corrected.
+            ui::init_ui_scale(settings.ui_scale);
+
             let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
             cx.open_window(
                 ui::window_options(settings.client_titlebar, WindowBounds::Windowed(bounds)),

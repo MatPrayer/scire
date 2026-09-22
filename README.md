@@ -6,7 +6,7 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/), and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.18.4-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.19.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#installation)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
@@ -42,8 +42,9 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 - [x] **Fully themable**: Light / Dark / system / custom JSON, with a pywal16 template and cover-reactive accent colour.
 - [x] **Adjustable interface text**: choose any base font size from the fixed 9px–32px dropdown under Settings → Appearance.
 - [x] **Format support**: everything Symphonia decodes: FLAC, MP3, AAC/M4A, ALAC, Vorbis, WAV, AIFF and more.
+- [x] **Interface sizing**: two separate knobs — **Font size** sets the interface's text, **UI scale** (90/100/110/125%) sets the space around it: gutters, card padding, row and bar heights (Settings → Appearance).
 - [x] **Album page layouts**: the cover and details above the track list, or — on a landscape widescreen window — in a tall panel down either side with a much bigger cover (Settings → Appearance).
-- [x] **Album & artist browsing**: album grid with infinite scroll and sort (name / new / recent / frequent / random / starred), artist index with bios and images.
+- [x] **Album & artist browsing**: album grid with infinite scroll and sort (name / new / recent / frequent / random / starred), artist index with bios and images. Covers can fill their card edge to edge, with no padding or border around the art (Settings → Browsing → Cover fills the card).
 - [x] **Artist page**: discography, singles/EPs and an "Appears on" section of the records they only guest on; every artist an album is credited to links to their own page, and the photo enlarges like a cover. Its album cards follow the grid's cover size or take one of their own (Settings → Browsing → Artist page covers).
 - [x] **Search**: a centered command palette (`Ctrl`/`Cmd`+`K`) with arrow-key navigation, answered from the local cache as you type — so it covers local files, works offline, and matches words in any order ("dark side moon") — then merged with the server's own results.
 - [x] **Queue**: shuffle, repeat (off / all / one), reorder, play-next, clear, persisted across restarts, optional resume of the current track's position.
@@ -54,7 +55,7 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 - [x] **Internet radio**: list, play, add and delete stations, with a live ICY now-playing title.
 - [x] **Transcoding**: per-session format (mp3 / ogg / raw) and max bitrate.
 - [x] **Fullscreen player**: album art, track info, waveform seek bar, lyrics and queue panels, five background styles, four cover sizes.
-- [x] **Lyrics**: from a file's own tags or a sidecar `.lrc` — what your server scraped for streamed tracks, read straight off disk for local ones — with [LRCLIB](https://lrclib.net) as the fallback for everything neither has. Timed lyrics are followed line by line, lit and scrolled as they are sung, click any line to jump to it, and a badge says which of the two they came from. Cached on disk, and switched off in one click (Settings → Library).
+- [x] **Lyrics**: from a file's own tags or a sidecar `.lrc` — what your server scraped for streamed tracks, read straight off disk for local ones — with [LRCLIB](https://lrclib.net) as the fallback for everything neither has. Timed lyrics are followed line by line, lit and scrolled as they are sung, click any line to jump to it, and a badge says which of the two they came from. Cached on disk. **Settings → Library → Source** picks which of the two is consulted and in what order — library only (never contacts LRCLIB), LRCLIB only, or either one first — and *Prefer synced lyrics* lets the second source win when the first has only untimed words, since only timed ones can be followed line by line.
 - [x] **Output device picker**: pick where audio goes — PulseAudio/PipeWire sinks on Linux, Bluetooth included — and playback follows the route when a device is connected or pulled out.
 - [x] **OS media keys**: media keys + Now Playing via `souvlaki` (macOS media center, Linux MPRIS).
 - [x] **Artwork cache**: LRU-evicted disk cache (configurable cap) with HiDPI-aware resolution bump. Optionally preloads every album and artist cover in the background (Settings → Library), so the grids never download while you scroll.

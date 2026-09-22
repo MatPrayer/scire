@@ -35,7 +35,7 @@ use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
 use crate::ui::local_album_detail::LocalAlbumDetailView;
 use crate::ui::local_music::{LocalMusicEvent, LocalMusicView};
 use crate::ui::player_bar::{
-    BAR_H, FLOAT_MARGIN, FLOAT_MAX_W, PlayerBar, PlayerBarEvent, float_bottom, float_panel_bottom,
+    PlayerBar, PlayerBarEvent, bar_h, float_bottom, float_margin, float_max_w, float_panel_bottom,
 };
 use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
 use crate::ui::queue_panel::{QueuePanel, QueuePanelEvent};
@@ -2699,11 +2699,11 @@ impl Render for RootView {
                                 this.child(
                                     div()
                                         .absolute()
-                                        .top(px(FLOAT_MARGIN))
+                                        .top(px(float_margin()))
                                         // The travel is in `right`, not a
                                         // margin: `left` is auto here, so a
                                         // margin moves nothing.
-                                        .right(px(FLOAT_MARGIN - 20. * (1. - queue_open)))
+                                        .right(px(float_margin() - 20. * (1. - queue_open)))
                                         .bottom(px(float_panel_bottom(bar_open)))
                                         .flex()
                                         .opacity(queue_open)
@@ -2736,15 +2736,15 @@ impl Render for RootView {
                     div()
                         .flex_none()
                         .w_full()
-                        .h(px(BAR_H * bar_open))
+                        .h(px(bar_h() * bar_open))
                         .relative()
                         .overflow_hidden()
                         .child(
                             div()
                                 .absolute()
-                                .top(px(BAR_H * (1. - bar_open)))
+                                .top(px(bar_h() * (1. - bar_open)))
                                 .w_full()
-                                .h(px(BAR_H))
+                                .h(px(bar_h()))
                                 .child(self.player_bar.clone()),
                         ),
                 )
@@ -2752,15 +2752,15 @@ impl Render for RootView {
             // Floating style: no row of its own and no room reserved for it —
             // the page runs the full height of the window and the bar hovers
             // over it as a translucent card, centred and inset by
-            // `FLOAT_MARGIN`, the same card treatment as the fullscreen
+            // `float_margin()`, the same card treatment as the fullscreen
             // overlay's panels. It leaves through the bottom edge on the same
             // `bar_open`/`bar_visible` the docked bar uses.
             .when(bar_visible && floating_bar, |this| {
                 this.child(
                     div()
                         .absolute()
-                        .left(px(FLOAT_MARGIN))
-                        .right(px(FLOAT_MARGIN))
+                        .left(px(float_margin()))
+                        .right(px(float_margin()))
                         .bottom(px(float_bottom(bar_open)))
                         .flex()
                         .justify_center()
@@ -2768,7 +2768,7 @@ impl Render for RootView {
                         .child(
                             div()
                                 .w_full()
-                                .max_w(px(FLOAT_MAX_W))
+                                .max_w(px(float_max_w()))
                                 .child(self.player_bar.clone()),
                         ),
                 )

@@ -26,21 +26,38 @@ use crate::ui::format_duration;
 /// The bar's own height. Public because the root animates the bar in and out
 /// (`Settings::hide_idle_player_bar`) by shrinking a clip around it, and a box
 /// sized off anything but the bar's real height clips it in the wrong place.
-pub const BAR_H: f32 = 124.;
+const BAR_H_BASE: f32 = 124.;
+
+/// [`BAR_H_BASE`] at the current UI scale.
+pub fn bar_h() -> f32 {
+    crate::ui::scaled(BAR_H_BASE)
+}
 
 /// Gap the floating style leaves between the card and every window edge.
 /// Public because the root places the card by it.
-pub const FLOAT_MARGIN: f32 = 12.;
+const FLOAT_MARGIN_BASE: f32 = 12.;
+
+pub fn float_margin() -> f32 {
+    crate::ui::scaled(FLOAT_MARGIN_BASE)
+}
 
 /// The floating card's own height. Deliberately well under `BAR_H`: it is drawn
 /// *over* the page rather than beside it, so every pixel it takes is a pixel of
 /// the album grid it is standing on.
-pub const FLOAT_BAR_H: f32 = 84.;
+const FLOAT_BAR_H_BASE: f32 = 84.;
+
+pub fn float_bar_h() -> f32 {
+    crate::ui::scaled(FLOAT_BAR_H_BASE)
+}
 
 /// Widest the floating card is drawn. Stretched edge to edge it reads as a
 /// docked bar that has merely been rounded off; a card the window is visibly
 /// wider than is what makes it read as floating over the page.
-pub const FLOAT_MAX_W: f32 = 1040.;
+const FLOAT_MAX_W_BASE: f32 = 1040.;
+
+pub fn float_max_w() -> f32 {
+    crate::ui::scaled(FLOAT_MAX_W_BASE)
+}
 
 /// Fill alpha of the floating card with `Settings::player_bar_translucent` on.
 ///
@@ -84,15 +101,41 @@ pub fn float_fill(base: Hsla, translucent: bool) -> Hsla {
 }
 
 /// Widest the now-playing and volume columns flanking the transport are drawn.
-const SIDE_WIDTH: f32 = 348.;
+const SIDE_WIDTH_BASE: f32 = 348.;
 /// Narrowest they shrink to: the cover, its gap, and enough room for a title
 /// to scroll through.
-const SIDE_MIN: f32 = 170.;
+const SIDE_MIN_BASE: f32 = 170.;
 /// Room the transport needs between them (buttons plus a usable seek bar).
-const TRANSPORT_MIN: f32 = 300.;
+const TRANSPORT_MIN_BASE: f32 = 300.;
 /// The bar's own horizontal padding (`px_4`) and the gaps either side of the
 /// transport (`gap_4`).
-const BAR_CHROME: f32 = 32. + 32.;
+const BAR_CHROME_BASE: f32 = 32. + 32.;
+
+/// The bar's own metrics at the current UI scale. `bar_inset` is half of the
+/// `px_4`/`gap_4` pair `BAR_CHROME_BASE` counts, and the render uses it for
+/// both — the column maths and the element have to agree, or the transport
+/// stops being centred at any scale but 100%.
+fn side_width_max() -> f32 {
+    crate::ui::scaled(SIDE_WIDTH_BASE)
+}
+
+fn side_min() -> f32 {
+    crate::ui::scaled(SIDE_MIN_BASE)
+}
+
+fn transport_min() -> f32 {
+    crate::ui::scaled(TRANSPORT_MIN_BASE)
+}
+
+fn bar_chrome() -> f32 {
+    crate::ui::scaled(BAR_CHROME_BASE)
+}
+
+/// The bar's horizontal padding, which is also the gap either side of the
+/// transport — a quarter of `bar_chrome()`, which counts both of both.
+pub fn bar_inset() -> f32 {
+    bar_chrome() / 4.
+}
 
 /// Width of the columns flanking the transport, at a given window width.
 ///
@@ -101,8 +144,8 @@ const BAR_CHROME: f32 = 32. + 32.;
 /// is the reason the volume column is width-matched to the now-playing block in
 /// the first place.
 fn side_width(window_width: f32) -> f32 {
-    let free = window_width - TRANSPORT_MIN - BAR_CHROME;
-    (free / 2.).clamp(SIDE_MIN, SIDE_WIDTH)
+    let free = window_width - transport_min() - bar_chrome();
+    (free / 2.).clamp(side_min(), side_width_max())
 }
 
 /// Where the floating card's bottom edge sits at a given reveal openness.
@@ -111,7 +154,7 @@ fn side_width(window_width: f32) -> f32 {
 /// off the window rather than a low, faint ghost of one still catching the eye
 /// through the last of the fade.
 pub fn float_bottom(open: f32) -> f32 {
-    FLOAT_MARGIN - (FLOAT_BAR_H + FLOAT_MARGIN) * (1. - open)
+    float_margin() - (float_bar_h() + float_margin()) * (1. - open)
 }
 
 /// Where a panel floating *above* the player card sits, at a given bar
@@ -125,7 +168,7 @@ pub fn float_bottom(open: f32) -> f32 {
 /// the panel sitting on the window's own margin rather than on a gap held for
 /// something that is not there.
 pub fn float_panel_bottom(bar_open: f32) -> f32 {
-    FLOAT_MARGIN + (FLOAT_BAR_H + FLOAT_MARGIN) * bar_open
+    float_margin() + (float_bar_h() + float_margin()) * bar_open
 }
 
 /// Height at the bottom of the content area the floating card stands over.
@@ -139,7 +182,7 @@ pub fn float_panel_bottom(bar_open: f32) -> f32 {
 /// nothing.
 pub fn float_reserve(floating: bool, shown: bool) -> f32 {
     if floating && shown {
-        FLOAT_BAR_H + FLOAT_MARGIN * 2.
+        float_bar_h() + float_margin() * 2.
     } else {
         0.
     }
@@ -147,7 +190,7 @@ pub fn float_reserve(floating: bool, shown: bool) -> f32 {
 
 /// Width the floating card is drawn at, in a window of `window_width`.
 pub fn float_width(window_width: f32) -> f32 {
-    (window_width - FLOAT_MARGIN * 2.).min(FLOAT_MAX_W)
+    (window_width - float_margin() * 2.).min(float_max_w())
 }
 
 /// Bubbled to RootView.
@@ -504,9 +547,9 @@ impl Render for PlayerBar {
         let side_width = side_width(bar_width);
         // The floating card is over the page, not beside it: it is shorter,
         // and everything sized off its height comes down with it.
-        let bar_h = if floating { FLOAT_BAR_H } else { BAR_H };
-        let cover_px = if floating { 56. } else { 76. };
-        let wave_h = if floating { 20. } else { 26. };
+        let bar_h = if floating { float_bar_h() } else { bar_h() };
+        let cover_px = crate::ui::scaled(if floating { 56. } else { 76. });
+        let wave_h = crate::ui::scaled(if floating { 20. } else { 26. });
 
         // Small, quiet transport icon buttons; primary circular play.
         let icon_btn = |id: &'static str, icon_path: &'static str, active: bool| {
@@ -535,8 +578,8 @@ impl Render for PlayerBar {
             .w_full()
             .h(px(bar_h))
             .flex_none()
-            .px_4()
-            .gap_4()
+            .px(px(bar_inset()))
+            .gap(px(bar_inset()))
             .items_center()
             .map(|this| {
                 if floating {
@@ -1156,8 +1199,8 @@ impl Render for PlayerBar {
 #[cfg(test)]
 mod tests {
     use super::{
-        FLOAT_BAR_H, FLOAT_FILL_ALPHA, FLOAT_MARGIN, FLOAT_MAX_W, SIDE_MIN, SIDE_WIDTH,
-        float_bottom, float_fill, float_panel_bottom, float_reserve, float_width, side_width,
+        FLOAT_FILL_ALPHA, float_bar_h, float_bottom, float_fill, float_margin, float_max_w,
+        float_panel_bottom, float_reserve, float_width, side_min, side_width, side_width_max,
     };
     use gpui::hsla;
 
@@ -1167,9 +1210,12 @@ mod tests {
         assert_eq!(float_reserve(false, false), 0.);
         assert_eq!(float_reserve(true, false), 0.);
         // Its whole height plus the margin above and below it.
-        assert_eq!(float_reserve(true, true), FLOAT_BAR_H + FLOAT_MARGIN * 2.);
+        assert_eq!(
+            float_reserve(true, true),
+            float_bar_h() + float_margin() * 2.
+        );
         // A page clearing the reserve clears the card's top edge.
-        assert!(float_reserve(true, true) >= float_bottom(1.) + FLOAT_BAR_H);
+        assert!(float_reserve(true, true) >= float_bottom(1.) + float_bar_h());
     }
 
     #[test]
@@ -1202,14 +1248,14 @@ mod tests {
 
     #[test]
     fn the_floating_card_rests_a_margin_off_the_bottom_edge() {
-        assert_eq!(float_bottom(1.), FLOAT_MARGIN);
+        assert_eq!(float_bottom(1.), float_margin());
     }
 
     #[test]
     fn a_closed_floating_card_is_off_the_window() {
         let bottom = float_bottom(0.);
         assert!(
-            bottom + FLOAT_BAR_H <= 0.,
+            bottom + float_bar_h() <= 0.,
             "top edge still on screen: {bottom}"
         );
     }
@@ -1219,32 +1265,32 @@ mod tests {
         // Open bar: the panel clears the whole card and the gap either side.
         assert_eq!(
             float_panel_bottom(1.),
-            FLOAT_MARGIN + FLOAT_BAR_H + FLOAT_MARGIN
+            float_margin() + float_bar_h() + float_margin()
         );
         // No bar on screen: the panel sits on the window's own margin rather
         // than on a gap held for something that is not there.
-        assert_eq!(float_panel_bottom(0.), FLOAT_MARGIN);
+        assert_eq!(float_panel_bottom(0.), float_margin());
         // The gap between the two holds for the whole of the bar's travel.
         for open in [0.25, 0.5, 0.75] {
-            let gap = float_panel_bottom(open) - (float_bottom(open) + FLOAT_BAR_H);
-            assert!((gap - FLOAT_MARGIN).abs() < 0.01, "{open}: {gap}");
+            let gap = float_panel_bottom(open) - (float_bottom(open) + float_bar_h());
+            assert!((gap - float_margin()).abs() < 0.01, "{open}: {gap}");
         }
     }
 
     #[test]
     fn the_floating_card_insets_a_narrow_window_and_caps_a_wide_one() {
-        assert_eq!(float_width(900.), 900. - FLOAT_MARGIN * 2.);
-        assert_eq!(float_width(2560.), FLOAT_MAX_W);
+        assert_eq!(float_width(900.), 900. - float_margin() * 2.);
+        assert_eq!(float_width(2560.), float_max_w());
         // Never wider than the window it is inset in.
         for w in [400., 700., 1040., 1064., 1600.] {
-            assert!(float_width(w) <= w - FLOAT_MARGIN * 2. + 0.01, "{w}");
+            assert!(float_width(w) <= w - float_margin() * 2. + 0.01, "{w}");
         }
     }
 
     #[test]
     fn wide_windows_keep_the_full_side_columns() {
-        assert_eq!(side_width(1400.), SIDE_WIDTH);
-        assert_eq!(side_width(1060.), SIDE_WIDTH);
+        assert_eq!(side_width(1400.), side_width_max());
+        assert_eq!(side_width(1060.), side_width_max());
     }
 
     #[test]
@@ -1252,13 +1298,16 @@ mod tests {
         // Both sides shrink, so the transport keeps its room and stays centred.
         for w in [1000., 900., 800., 700., 600.] {
             let side = side_width(w);
-            assert!((SIDE_MIN..=SIDE_WIDTH).contains(&side));
-            assert!(2. * side + 300. + 64. <= w + 0.5 || side == SIDE_MIN, "{w}");
+            assert!((side_min()..=side_width_max()).contains(&side));
+            assert!(
+                2. * side + 300. + 64. <= w + 0.5 || side == side_min(),
+                "{w}"
+            );
         }
     }
 
     #[test]
     fn the_columns_never_shrink_past_the_cover_and_its_title() {
-        assert_eq!(side_width(200.), SIDE_MIN);
+        assert_eq!(side_width(200.), side_min());
     }
 }

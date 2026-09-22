@@ -830,15 +830,25 @@ impl AlbumsView {
             None
         };
 
+        // The cover takes the card's padding and border for itself, or sits
+        // inside them; the card's own width is the same either way, so the
+        // grid's columns do not move when the setting does.
+        let flush = self.session.read(cx).settings.flush_album_covers;
+        let cover = crate::ui::card_cover_edge(tile, flush);
+
         let card = v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
             .group("acard")
-            .w(px(tile + crate::ui::CARD_PADDING))
-            .p_1p5()
+            .w(px(tile + crate::ui::card_padding()))
+            .map(|c| match flush {
+                true => c,
+                false => c
+                    .p(px(crate::ui::card_inset()))
+                    .border_1()
+                    .border_color(gpui::hsla(0., 0., 0.5, 0.15)),
+            })
             .gap_1p5()
             .rounded_lg()
-            .border_1()
-            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .cursor_pointer()
             .hover(|s| {
                 let s = s.bg(cx.theme().muted);
@@ -854,14 +864,14 @@ impl AlbumsView {
             })
             .child(
                 div()
-                    .size(px(tile))
+                    .size(px(cover))
                     .rounded_lg()
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
                     .relative()
                     .when_some(art, |this, path| {
-                        this.child(img(path).size(px(tile)).rounded_lg())
+                        this.child(img(path).size(px(cover)).rounded_lg())
                     })
                     // Hover play button over the artwork.
                     .child(
@@ -892,6 +902,16 @@ impl AlbumsView {
                     // the default line box is tight enough to clip descenders
                     // (y, g, j) inside the overflow-hidden text block.
                     .h(px(TEXT_BLOCK_H))
+                    // Flush, the card has no padding of its own for the text to
+                    // sit in — the cover took it — so the text block carries
+                    // its own, or the title runs into the card's edge and,
+                    // with no border to read it against, into the next card.
+                    .map(|t| match flush {
+                        true => t
+                            .px(px(crate::ui::card_inset()))
+                            .pb(px(crate::ui::card_inset())),
+                        false => t,
+                    })
                     .gap_0()
                     .overflow_hidden()
                     .child(
@@ -1076,7 +1096,7 @@ impl Render for AlbumsView {
                     // evenly — left/right gutters stay equal at any width.
                     h_flex()
                         .w_full()
-                        .gap_4()
+                        .gap(px(crate::ui::grid_gap()))
                         .justify_center()
                         .pb_3()
                         .children(cards)
@@ -1085,7 +1105,9 @@ impl Render for AlbumsView {
                 .collect::<Vec<_>>()
         })
         .flex_1()
-        .px_4()
+        // Half of `grid_padding_x`, which is the pair; `grid_columns_padded`
+        // takes the whole of it back off the element's own bounds.
+        .px(px(crate::ui::grid_padding_x() / 2.))
         .track_scroll(self.scroll.clone())
         .on_scroll_wheel(cx.listener(|this, _, _, cx| {
             this.maybe_load_more_on_scroll(cx);

@@ -31,7 +31,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::TitleBar;
 use gpui_component::theme::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode, ThemeRegistry};
 
-use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref, UiFontSize};
+use crate::config::{ImportedThemeDefinition, ImportedThemesFile, ThemePref, UiFontSize, UiScale};
 use crate::services::library_db::LibraryStats;
 
 fn settings_theme_path() -> Option<PathBuf> {
@@ -214,13 +214,107 @@ pub fn library_summary(primary: (i64, &str), stats: &LibraryStats) -> String {
 /// Shared by the album and artist grids so the two pages line up column for
 /// column at every width.
 ///
-/// `CARD_PADDING` is the card's `p_1p5` (6px a side) *plus* its 1px border:
+/// `card_padding()` is the card's inset (6px a side at 100%) *plus* its 1px border:
 /// taffy lays out border-box, so both come out of the width the card is given
 /// and a card only `tile + 12` wide squeezes its own cover by 2px. The column
 /// maths has to use the same number the card is built with, which is why the
 /// cards take their width from this constant rather than repeating a literal.
-pub const GRID_GAP: f32 = 16.;
-pub const CARD_PADDING: f32 = 14.;
+const GRID_GAP_BASE: f32 = 16.;
+/// Inset between a card's edge and its cover, per side, at 100% scale.
+const CARD_INSET_BASE: f32 = 6.;
+/// The card's border. **Not** scaled: a hairline is a hairline at every size,
+/// and a 1.25px border lands on a fractional boundary and renders unevenly.
+const CARD_BORDER: f32 = 1.;
+
+/// The grid's gutter and a card's total horizontal chrome, at the current UI
+/// scale.
+///
+/// Functions rather than constants because `Settings::ui_scale` multiplies
+/// them: the column maths, the cards themselves and the art request all have to
+/// agree on one number, and a constant left beside a scaled call site is
+/// exactly the disagreement that leaves a row overflowing its grid. At 100%
+/// they are the 16 and 14 the grids were built with, which is what the layout
+/// tests below assert.
+pub fn grid_gap() -> f32 {
+    scaled(GRID_GAP_BASE)
+}
+
+/// A card's inset, per side — what a card puts between its edge and its cover.
+pub fn card_inset() -> f32 {
+    scaled(CARD_INSET_BASE)
+}
+
+/// Everything a card adds around its cover: its inset either side plus its
+/// border either side. Taffy lays out border-box, so both come out of the width
+/// the card is given.
+pub fn card_padding() -> f32 {
+    card_inset() * 2. + CARD_BORDER * 2.
+}
+
+/// The live [`UiScale`] factor, as `f32` bits.
+///
+/// A process global rather than something read off the `App`, because the
+/// metrics it multiplies are consumed by *pure* layout helpers — `grid_fit`,
+/// `player_bar::side_width`, `fullscreen_player::Layout::resolve`,
+/// `album_side_panel` — which take a width and return a layout and have no
+/// `App` to read a setting from. Threading a factor through every one of them
+/// would put the same number in every signature in this module for a value
+/// that changes about once in a session.
+///
+/// Relaxed ordering: a scale change that lands a frame late is a frame drawn at
+/// the old size, and `set_ui_scale` refreshes the windows behind it anyway.
+static UI_SCALE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(f32::to_bits(1.0));
+
+/// Apply a scale and repaint. Like `apply_font_size`, the store on its own
+/// dirties nothing — every view holds a layout computed from the old factor
+/// until something happens to redraw it.
+pub fn set_ui_scale(scale: UiScale, cx: &mut App) {
+    UI_SCALE.store(
+        scale.factor().to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    cx.refresh_windows();
+}
+
+/// Set the scale without a repaint, for the one call before any window exists.
+pub fn init_ui_scale(scale: UiScale) {
+    UI_SCALE.store(
+        scale.factor().to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn ui_scale() -> f32 {
+    f32::from_bits(UI_SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A chrome length in logical pixels, at the current UI scale.
+///
+/// Every scaled metric in the app goes through this, and every one of them is
+/// defined as its 100% value — so at the default scale this is the identity and
+/// the layout is numerically what it has always been, which is what the layout
+/// tests assert.
+pub fn scaled(px: f32) -> f32 {
+    px * ui_scale()
+}
+
+/// Edge of the cover drawn inside a grid card `card_padding()` wider than it.
+///
+/// `flush` is `Settings::flush_album_covers`: the cover takes the card's
+/// padding and border for itself instead of sitting inside them. The **card**
+/// keeps the width the column maths gave it either way — the cover grows into
+/// the chrome rather than the card shrinking around a bigger cover — so
+/// `grid_fit` needs to know nothing about the setting and toggling it cannot
+/// change the column count or reflow the page. The requested art resolution is
+/// unaffected for the same reason: it is keyed off the *setting's* maximum
+/// tile, which a card's chrome is not part of, so nothing is re-fetched.
+pub fn card_cover_edge(tile: f32, flush: bool) -> f32 {
+    match flush {
+        true => tile + card_padding(),
+        false => tile,
+    }
+}
 
 /// Horizontal padding the grids place *inside* their scrolling element
 /// (`px_4` a side).
@@ -231,7 +325,11 @@ pub const CARD_PADDING: f32 = 14.;
 /// row overflows and, because it is centred, is clipped at *both* edges. It
 /// only happens in the 32px band either side of a column boundary, so dragging
 /// the window edge flickers in and out of it.
-pub const GRID_PADDING_X: f32 = 32.;
+const GRID_PADDING_X_BASE: f32 = 32.;
+
+pub fn grid_padding_x() -> f32 {
+    scaled(GRID_PADDING_X_BASE)
+}
 
 /// Columns that fit in `width` for a cover `tile` px wide. Zero width means
 /// nothing has been laid out yet — the caller's guess stands.
@@ -239,14 +337,14 @@ pub fn grid_columns(width: f32, tile: f32) -> Option<usize> {
     if width <= 0. {
         return None;
     }
-    let card = tile + CARD_PADDING;
-    Some((((width + GRID_GAP) / (card + GRID_GAP)).floor() as usize).max(1))
+    let card = tile + card_padding();
+    Some((((width + grid_gap()) / (card + grid_gap())).floor() as usize).max(1))
 }
 
 /// Columns that fit inside a scrolling grid element `element_width` wide,
 /// taking off the padding the rows are laid out within.
 pub fn grid_columns_padded(element_width: f32, tile: f32) -> Option<usize> {
-    grid_columns(element_width - GRID_PADDING_X, tile)
+    grid_columns(element_width - grid_padding_x(), tile)
 }
 
 /// Columns *and* the tile size to draw them at, for a cover size given as a
@@ -262,17 +360,17 @@ pub fn grid_columns_padded(element_width: f32, tile: f32) -> Option<usize> {
 pub fn grid_fit(width: f32, min_tile: f32, max_tile: f32) -> Option<(usize, f32)> {
     let cols = grid_columns(width, min_tile)?;
     // Inverse of `grid_columns`: the row is `cols` cards plus `cols - 1` gaps,
-    // so each card gets `(width + GRID_GAP) / cols` and the tile is what's left
+    // so each card gets `(width + grid_gap()) / cols` and the tile is what's left
     // of it once the gap and the card's own padding are taken off.
-    let tile =
-        ((width + GRID_GAP) / cols as f32 - GRID_GAP - CARD_PADDING).clamp(min_tile, max_tile);
+    let tile = ((width + grid_gap()) / cols as f32 - grid_gap() - card_padding())
+        .clamp(min_tile, max_tile);
     Some((cols, tile))
 }
 
 /// [`grid_fit`] inside a scrolling grid element, minus the padding the rows are
 /// laid out within.
 pub fn grid_fit_padded(element_width: f32, min_tile: f32, max_tile: f32) -> Option<(usize, f32)> {
-    grid_fit(element_width - GRID_PADDING_X, min_tile, max_tile)
+    grid_fit(element_width - grid_padding_x(), min_tile, max_tile)
 }
 
 /// Narrowest window the album page's side panel is offered on. Under this the
@@ -430,7 +528,7 @@ impl LiveWidth {
 
     /// Columns and tile size for a card grid whose covers may be drawn anywhere
     /// in `min_tile..=max_tile`, laid out inside the measured element's
-    /// `GRID_PADDING_X`. `fallback` stands in on the first frame, before
+    /// `grid_padding_x()`. `fallback` stands in on the first frame, before
     /// anything has been laid out.
     ///
     /// The fallback is capped at what the *whole window* could hold: it is a
@@ -1978,10 +2076,10 @@ mod tests {
     }
 
     use super::{
-        CARD_PADDING, GRID_GAP, GRID_PADDING_X, LiveWidth, SIDE_PANEL_MAX_W, SIDE_PANEL_MIN_W,
-        SIDE_PANEL_PADDING, SIDE_PANEL_TRACKS_MIN, accent_from_cover_bytes, album_side_panel,
-        format_count, format_playtime, grid_columns, grid_columns_padded, grid_fit,
-        grid_fit_padded, strip_html, truncate_at_word,
+        LiveWidth, SIDE_PANEL_MAX_W, SIDE_PANEL_MIN_W, SIDE_PANEL_PADDING, SIDE_PANEL_TRACKS_MIN,
+        accent_from_cover_bytes, album_side_panel, card_padding, format_count, format_playtime,
+        grid_columns, grid_columns_padded, grid_fit, grid_fit_padded, grid_gap, grid_padding_x,
+        strip_html, truncate_at_word,
     };
 
     /// The layout the setting asks for, on the window it was asked for: a
@@ -2128,6 +2226,52 @@ mod tests {
         assert_eq!(frame(&mut live, measured, 900.), 900. - CHROME);
     }
 
+    /// At the default scale every scaled metric is its own base, which is what
+    /// makes the rest of the layout tests here a regression check on the whole
+    /// scaling change: they assert the numbers the grids were built with.
+    ///
+    /// The scale is a process global, so nothing in this module may *set* it —
+    /// tests run in parallel and a scale left on would be read by every other
+    /// layout test in the file. `UiScale::factor` is pure and carries the rest.
+    #[test]
+    fn the_default_scale_is_the_identity() {
+        use super::{card_inset, ui_scale};
+        assert_eq!(ui_scale(), 1.0);
+        assert_eq!(super::scaled(123.), 123.);
+        assert_eq!(grid_gap(), 16.);
+        assert_eq!(card_inset(), 6.);
+        assert_eq!(card_padding(), 14.);
+        assert_eq!(grid_padding_x(), 32.);
+    }
+
+    /// The border is deliberately left out of the scaling, so a card's chrome
+    /// is its scaled inset plus a hairline that stays a hairline.
+    #[test]
+    fn a_cards_chrome_scales_its_inset_but_not_its_border() {
+        use crate::config::UiScale;
+        for scale in UiScale::ALL {
+            let f = scale.factor();
+            let inset = 6. * f;
+            assert!(
+                (inset * 2. + 2. - (6. * f * 2. + 2.)).abs() < 1e-6,
+                "{scale:?}"
+            );
+        }
+        assert_eq!(UiScale::Normal.factor(), 1.0);
+        assert!(UiScale::Snug.factor() < 1.0);
+        assert!(UiScale::Roomy.factor() > 1.0);
+        assert!(UiScale::Large.factor() > UiScale::Roomy.factor());
+    }
+
+    /// Flush hands the card's whole chrome to the cover; the card's width is
+    /// untouched either way, which is what keeps the column count fixed.
+    #[test]
+    fn a_flush_cover_takes_exactly_the_cards_chrome() {
+        use super::card_cover_edge;
+        assert_eq!(card_cover_edge(160., false), 160.);
+        assert_eq!(card_cover_edge(160., true), 160. + card_padding());
+    }
+
     #[test]
     fn grid_columns_fit_the_cards_and_their_gaps() {
         // 168px cover + 14px card padding and border = 182 wide, 16 between.
@@ -2158,7 +2302,7 @@ mod tests {
     /// actually lays out, so the fit can be checked against the width it was
     /// given rather than against the formula that produced it.
     fn row_width(cols: usize, tile: f32) -> f32 {
-        cols as f32 * (tile + CARD_PADDING) + (cols - 1) as f32 * GRID_GAP
+        cols as f32 * (tile + card_padding()) + (cols - 1) as f32 * grid_gap()
     }
 
     /// The point of the range: whatever the width, the row fills it rather than
@@ -2208,7 +2352,7 @@ mod tests {
         assert_eq!(grid_fit_padded(0., 168., 200.), None);
         // The tile fills the padded width, not the element's own.
         let (cols, tile) = grid_fit_padded(1200., 150., 198.).unwrap();
-        assert!((row_width(cols, tile) - (1200. - GRID_PADDING_X)).abs() < 0.5);
+        assert!((row_width(cols, tile) - (1200. - grid_padding_x())).abs() < 0.5);
     }
 
     #[test]

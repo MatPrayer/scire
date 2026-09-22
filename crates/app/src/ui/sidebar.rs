@@ -497,7 +497,7 @@ pub fn render_sidebar(
                 let mut menu = v_flex()
                     .id("rail-lib-menu")
                     .gap_0p5()
-                    .min_w(px(180.))
+                    .min_w(px(crate::ui::scaled(180.)))
                     .max_h(px(320.))
                     .overflow_y_scroll()
                     .child(library_row(
@@ -561,7 +561,7 @@ pub fn render_sidebar(
                 let mut menu = v_flex()
                     .id("rail-pl-menu")
                     .gap_0p5()
-                    .min_w(px(200.))
+                    .min_w(px(crate::ui::scaled(200.)))
                     .max_h(px(360.))
                     .overflow_y_scroll()
                     .child(
@@ -625,7 +625,7 @@ pub fn render_sidebar(
     v_flex()
         // Collapsed: wide enough for the icon rows' hover/active pill and
         // nothing else.
-        .w(px(if collapsed { 52. } else { 210. }))
+        .w(px(crate::ui::scaled(if collapsed { 52. } else { 210. })))
         .h_full()
         .when(collapsed, |s| s.px_1())
         .when(!collapsed, |s| s.px_2())
