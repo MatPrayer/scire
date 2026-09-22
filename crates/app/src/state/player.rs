@@ -1208,6 +1208,10 @@ impl PlayerState {
                 self.engine_has_track = false;
                 let streak = self.failed_streak + 1;
                 tracing::warn!("playback failed: {msg}");
+                // Named while the queue still points at the track that failed:
+                // both branches below advance past it first.
+                let failed_title = self.current_song().map(|s| s.title.clone());
+                let msg = crate::errors::playback_error(&msg, failed_title.as_deref());
                 // The decoder cannot say *why* it could not read a container
                 // (symphonia reports a 32-bit FLAC as "end of stream"), and a
                 // server that publishes no bit depth gives `stream_opts_for`
@@ -1238,14 +1242,36 @@ impl PlayerState {
                     self.start_current(cx);
                 }
                 self.failed_streak = streak;
-                self.last_error = Some(msg);
+                // A run this long is not a bad file, it is the server or the
+                // network being gone — and the queue has stopped rather than
+                // walked on, which the message has to account for or the app
+                // looks like it simply quit playing.
+                self.last_error = Some(match streak >= MAX_FAILED_STREAK {
+                    true => format!(
+                        "{msg}. Stopped after {MAX_FAILED_STREAK} tracks failed in a row — \
+                         check the server and the network."
+                    ),
+                    false => msg,
+                });
             }
             Event::PrefetchFailed { id, error } => {
                 tracing::warn!(?id, "next track could not be prepared: {error}");
                 // The gapless hand-over will not happen and starting that track
                 // will fail the same way, so say so now rather than letting the
                 // queue walk into it silently.
-                self.last_error = Some(format!("Next track unavailable: {error}"));
+                // The event names the song it was preparing, which is the one
+                // to name back — `next_pos` would be re-derived and can have
+                // moved if the queue was edited inside the prefetch window.
+                let title = id.as_ref().and_then(|id| {
+                    self.queue
+                        .iter_ordered()
+                        .find(|(_, song)| &song.id == id)
+                        .map(|(_, song)| song.title.clone())
+                });
+                self.last_error = Some(format!(
+                    "Next track unavailable — {}",
+                    crate::errors::playback_error(&error, title.as_deref())
+                ));
             }
             Event::OutputOpened { device } => {
                 self.output_device = device;

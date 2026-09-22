@@ -45,7 +45,7 @@ impl RadioState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(stations) => state.stations = stations,
-                    Err(e) => state.error = Some(format!("{e:#}")),
+                    Err(e) => state.error = Some(crate::errors::error_text(&e)),
                 }
                 cx.notify();
             });
@@ -68,7 +68,7 @@ impl RadioState {
             let _ = this.update(cx, |state, cx| match result {
                 Ok(()) => state.reload(cx),
                 Err(e) => {
-                    state.error = Some(format!("{e:#}"));
+                    state.error = Some(crate::errors::error_text(&e));
                     cx.notify();
                 }
             });
@@ -91,7 +91,7 @@ impl RadioState {
             let _ = this.update(cx, |state, cx| match result {
                 Ok(()) => state.reload(cx),
                 Err(e) => {
-                    state.error = Some(format!("{e:#}"));
+                    state.error = Some(crate::errors::error_text(&e));
                     cx.notify();
                 }
             });

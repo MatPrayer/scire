@@ -250,7 +250,7 @@ pub struct AlbumsView {
     art_range: Option<(usize, usize)>,
     /// Virtualized row scroll handle: only visible rows are built/uploaded.
     pub scroll: UniformListScrollHandle,
-    error: Option<String>,
+    error: Option<crate::errors::ErrorNote>,
     /// Card index under the vi-mode cursor (None = cursor hidden).
     vi_cursor: Option<usize>,
     /// Catalog totals shown in the header, for the selected libraries.
@@ -410,6 +410,16 @@ impl AlbumsView {
         cx.notify();
     }
 
+    /// Ask for the page that failed again. The page counter is only advanced
+    /// on success, so this re-requests exactly what was lost rather than
+    /// skipping past it.
+    fn retry_load(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        let tab = self.active_tab;
+        self.load_more(tab, cx);
+        cx.notify();
+    }
+
     fn load_more(&mut self, tab: AlbumSort, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
@@ -481,7 +491,7 @@ impl AlbumsView {
                             && state.buffers.iter().all(|b| b.is_empty());
                         apply_live_page(state, &new_albums);
                     }
-                    Err(e) => view.error = Some(format!("{e:#}")),
+                    Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
                 for album in &new_albums {
                     view.fetch_art(album, cx);
@@ -614,7 +624,7 @@ impl AlbumsView {
                 }
                 Err(e) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.error = Some(format!("{e:#}"));
+                        view.error = Some(crate::errors::ErrorNote::new(&e));
                         cx.notify();
                     });
                 }
@@ -649,7 +659,7 @@ impl AlbumsView {
                 }
                 Err(e) => {
                     let _ = this.update(cx, |view, cx| {
-                        view.error = Some(format!("{e:#}"));
+                        view.error = Some(crate::errors::ErrorNote::new(&e));
                         cx.notify();
                     });
                 }
@@ -1134,14 +1144,12 @@ impl Render for AlbumsView {
                         )
                     }),
             )
-            .when_some(self.error.clone(), |this, e| {
-                this.child(
-                    div()
-                        .px_4()
-                        .text_color(cx.theme().danger)
-                        .text_sm()
-                        .child(e),
-                )
+            .when_some(self.error.clone(), |this, note| {
+                this.child(crate::ui::error_banner(
+                    &note,
+                    cx.listener(|view, _, _, cx| view.retry_load(cx)),
+                    cx,
+                ))
             })
             .child(grid)
             // Pagination indicator, floated over the grid's bottom edge so it

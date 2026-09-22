@@ -145,6 +145,50 @@ pub enum Event {
 #[error("{0}")]
 pub struct PlaybackError(pub String);
 
+impl PlaybackError {
+    /// Build an error out of a message that may quote a stream URL.
+    ///
+    /// A Subsonic stream URL carries `u`, `t` (the auth token) and `s` (the
+    /// salt) as query params, and the HTTP layers below this one print the URL
+    /// they failed on — which the app then puts on the player bar. The host is
+    /// the only part worth showing and the query is the part that must not be.
+    pub(crate) fn from_http(e: impl std::fmt::Display) -> Self {
+        Self(scrub_urls(&e.to_string()))
+    }
+}
+
+/// Cut the query string off every URL in `msg`, leaving scheme, host and path.
+pub fn scrub_urls(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(start) = rest.find("http") {
+        if !rest[start..].starts_with("http://") && !rest[start..].starts_with("https://") {
+            // "http" inside an ordinary word; copy it and carry on past it.
+            out.push_str(&rest[..start + 4]);
+            rest = &rest[start + 4..];
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        let url = &rest[start..];
+        // A URL in prose ends at whitespace or at the bracket/quote it was put
+        // in; the query begins at the first '?' inside that.
+        let end = url
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '"' | '\''))
+            .unwrap_or(url.len());
+        let (url, after) = url.split_at(end);
+        match url.split_once('?') {
+            Some((base, _)) => {
+                out.push_str(base);
+                out.push_str("?…");
+            }
+            None => out.push_str(url),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Handle to the playback engine. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Player {
@@ -209,5 +253,41 @@ impl Player {
     /// Switch output device by name (None = system default).
     pub fn set_output_device(&self, name: Option<String>) {
         let _ = self.tx.send(Command::SetOutputDevice(name));
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::scrub_urls;
+
+    #[test]
+    fn a_stream_urls_auth_params_are_cut_off() {
+        let msg = "error sending request for url (https://music.example.com/rest/stream?id=42&u=me&t=deadbeef&s=abc)";
+        let out = scrub_urls(msg);
+        assert!(!out.contains("t=deadbeef"), "{out}");
+        assert!(!out.contains("s=abc"), "{out}");
+        assert!(
+            out.contains("https://music.example.com/rest/stream?…"),
+            "{out}"
+        );
+        assert!(out.ends_with(')'), "{out}");
+    }
+
+    #[test]
+    fn a_message_without_a_url_is_unchanged() {
+        let msg = "the format of the data has not been recognized";
+        assert_eq!(scrub_urls(msg), msg);
+    }
+
+    #[test]
+    fn the_word_http_in_prose_is_not_mistaken_for_a_url() {
+        let msg = "http chunked transfer ended early";
+        assert_eq!(scrub_urls(msg), msg);
+    }
+
+    #[test]
+    fn a_url_with_no_query_keeps_its_path() {
+        let msg = "failed: https://radio.example.com/stream.mp3 unreachable";
+        assert_eq!(scrub_urls(msg), msg);
     }
 }

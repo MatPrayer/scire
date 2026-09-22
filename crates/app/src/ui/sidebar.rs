@@ -141,6 +141,10 @@ pub struct SidebarModel {
     pub refreshing: bool,
     /// Which step that refresh is on, for the label and the progress bar.
     pub refresh_stage: RefreshStage,
+    /// Why the last refresh did not finish. A refresh that fails against an
+    /// unreachable server used to stop the spinner and say nothing at all,
+    /// which is indistinguishable from one that found no new music.
+    pub refresh_error: Option<String>,
     /// Section highlighted by vi-mode keyboard cursor.
     pub vi_selected: Option<SidebarFocus>,
     /// Folded rail only: whether the playlist dropdown is showing. Controlled
@@ -686,7 +690,14 @@ pub fn render_sidebar(
             } else {
                 SharedString::from("Refresh library")
             };
-            let tip = label.clone();
+            let failure = model.refresh_error.clone();
+            // The failure is what the tooltip has to carry when the rail is
+            // folded: there is no room for a second line there, and the label
+            // has gone back to "Refresh library".
+            let tip = match (&failure, refreshing) {
+                (Some(err), false) => SharedString::from(err.clone()),
+                _ => label.clone(),
+            };
             let refresh_focused = model.vi_selected == Some(SidebarFocus::Refresh);
             v_flex()
                 .id("sidebar-refresh")
@@ -705,7 +716,7 @@ pub fn render_sidebar(
                 })
                 // Collapsed the stage label has nowhere to go, so the tooltip
                 // carries it — that text is the only sign the refresh moved.
-                .when(collapsed, |s| {
+                .when(collapsed || failure.is_some(), |s| {
                     s.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 })
                 .on_click(move |_, window, cx| {
@@ -728,6 +739,13 @@ pub fn render_sidebar(
                 // A refresh is minutes of work on a big library. Without a bar
                 // the row read as hung, which is exactly what it looked like.
                 .when(refreshing, |s| s.child(refresh_bar(stage, cx)))
+                // Only while expanded: the rail has no width for it, and the
+                // tooltip above says the same thing there.
+                .when(!collapsed && !refreshing, |s| {
+                    s.when_some(failure.clone(), |s, err| {
+                        s.child(div().text_xs().text_color(cx.theme().danger).child(err))
+                    })
+                })
         })
         .child(nav_item(
             "Settings",

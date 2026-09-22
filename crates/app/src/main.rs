@@ -1,5 +1,6 @@
 mod assets;
 mod config;
+mod errors;
 mod services;
 mod state;
 mod ui;

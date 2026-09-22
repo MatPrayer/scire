@@ -115,8 +115,11 @@ impl Session {
                 let password = password.clone();
                 async move {
                     runtime::enter(|| {
+                        // Keep the typed error rather than flattening it to a
+                        // string: `errors::error_text` reads the type to pick
+                        // the wording, and a string has none.
                         SubsonicClient::new(&url, Credentials::new(&username, &password))
-                            .map_err(|e| anyhow::anyhow!("{}", e))
+                            .map_err(anyhow::Error::from)
                     })
                 }
             })
@@ -126,7 +129,7 @@ impl Session {
                 Err(e) => {
                     let _ = this.update(cx, |session, cx| {
                         session.client = None;
-                        session.status = ConnectionStatus::Failed(format!("{e}"));
+                        session.status = ConnectionStatus::Failed(friendly_error(&e));
                         cx.notify();
                     });
                     return;
@@ -137,7 +140,7 @@ impl Session {
             let result = runtime::spawn_io(async move {
                 tokio::time::timeout(std::time::Duration::from_secs(10), ping_client.ping())
                     .await
-                    .map_err(|_| anyhow::anyhow!("ping timed out after 10 s"))?
+                    .map_err(|_| anyhow::anyhow!("The server took too long to respond."))?
                     .map_err(anyhow::Error::from)
             })
             .await;
@@ -261,12 +264,7 @@ impl Session {
 }
 
 fn friendly_error(e: &anyhow::Error) -> String {
-    if let Some(api_err) = e.downcast_ref::<subsonic::Error>()
-        && api_err.is_auth_failure()
-    {
-        return "wrong username or password".into();
-    }
-    format!("{e:#}")
+    crate::errors::error_text(e)
 }
 
 pub fn init(cx: &mut gpui::App) -> Entity<Session> {

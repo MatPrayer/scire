@@ -23,7 +23,7 @@ pub struct FavoritesView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
     starred: Option<Starred>,
-    error: Option<String>,
+    error: Option<crate::errors::ErrorNote>,
     /// Id of the playing song — the only thing this view draws out of the
     /// player, so the only change worth repainting for.
     playing_id: Option<String>,
@@ -109,7 +109,7 @@ impl FavoritesView {
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(starred) => view.starred = starred,
-                    Err(e) => view.error = Some(format!("{e:#}")),
+                    Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
                 cx.notify();
             });
@@ -129,7 +129,7 @@ impl FavoritesView {
             let _ = this.update(cx, |view, cx| match result {
                 Ok(()) => view.load(cx),
                 Err(e) => {
-                    view.error = Some(format!("{e:#}"));
+                    view.error = Some(crate::errors::ErrorNote::new(&e));
                     cx.notify();
                 }
             });
@@ -358,8 +358,15 @@ impl Render for FavoritesView {
             .p_4()
             .gap_1()
             .child(div().text_lg().child("Favorites"))
-            .when_some(self.error.clone(), |this, e| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
+            .when_some(self.error.clone(), |this, note| {
+                this.child(crate::ui::error_banner(
+                    &note,
+                    cx.listener(|view, _, _, cx| {
+                        view.error = None;
+                        view.load(cx);
+                    }),
+                    cx,
+                ))
             })
             .children(rows)
     }

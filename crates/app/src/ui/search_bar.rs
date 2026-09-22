@@ -733,7 +733,7 @@ impl SearchBar {
                     }
                     // A dead server is not a dead search — the cache's rows
                     // stay up, and the error explains what is missing.
-                    Err(e) => bar.error = Some(format!("{e:#}")),
+                    Err(e) => bar.error = Some(crate::errors::error_text(&e)),
                 }
                 cx.notify();
             });
