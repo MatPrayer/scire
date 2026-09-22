@@ -66,6 +66,47 @@ pub struct Album {
     /// to several artists then collapses to whichever one the server picked.
     #[serde(default)]
     pub artists: Vec<ArtistRef>,
+    /// OpenSubsonic release dates. `year` is only a year, so two records from
+    /// the same one can only be ordered alphabetically; these carry the month
+    /// and day where the tags have them. `original_release_date` is the first
+    /// release of the work and `release_date` this edition's, which is why the
+    /// former leads when both are present — a remaster reissued this year
+    /// belongs beside the record it is a remaster of.
+    #[serde(default)]
+    pub original_release_date: Option<ItemDate>,
+    #[serde(default)]
+    pub release_date: Option<ItemDate>,
+}
+
+/// An OpenSubsonic `ItemDate`: a partial date, any component of which may be
+/// missing (a server publishing only a year sends `{"year": 2020}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemDate {
+    pub year: Option<i32>,
+    pub month: Option<u32>,
+    pub day: Option<u32>,
+}
+
+impl Album {
+    /// Sort key for release order: year, then month, then day.
+    ///
+    /// Missing components sort *before* a present one within the same year, so
+    /// an album dated only `2020` comes after one dated `2020-06-01` under a
+    /// newest-first sort — the precise date is the one that earns its place.
+    /// An album with no date at all yields `None`, which the caller places
+    /// last.
+    pub fn release_key(&self) -> Option<(i32, u32, u32)> {
+        let date = self
+            .original_release_date
+            .as_ref()
+            .filter(|d| d.year.is_some())
+            .or_else(|| self.release_date.as_ref().filter(|d| d.year.is_some()));
+        match date {
+            Some(d) => Some((d.year?, d.month.unwrap_or(0), d.day.unwrap_or(0))),
+            None => self.year.map(|y| (y, 0, 0)),
+        }
+    }
 }
 
 /// Album detail: header + track list (getAlbum).

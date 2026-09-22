@@ -608,6 +608,8 @@ mod tests {
             user_rating: None,
             play_count: None,
             artists: Vec::new(),
+            original_release_date: None,
+            release_date: None,
         }
     }
 

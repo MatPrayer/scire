@@ -1233,11 +1233,19 @@ impl ArtistDetailView {
         )
     }
 }
+/// Newest first, by the most precise date the server published.
+///
+/// `Album::release_key` prefers OpenSubsonic's `originalReleaseDate` over the
+/// bare `year`, so two records from the same year are ordered by the month and
+/// day the tags carry rather than falling to the alphabetical tie-break — which
+/// on an artist who released four things in a year is an order that means
+/// nothing. Vanilla servers publish only the year and get exactly the old
+/// behaviour, since a yearless key sorts as `(year, 0, 0)`.
 fn sort_discography(albums: &mut [Album]) {
     albums.sort_by(|a, b| {
-        b.year
-            .unwrap_or(i32::MIN)
-            .cmp(&a.year.unwrap_or(i32::MIN))
+        let key = |album: &Album| album.release_key().unwrap_or((i32::MIN, 0, 0));
+        key(b)
+            .cmp(&key(a))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 }
@@ -1647,6 +1655,8 @@ mod tests {
             user_rating: None,
             play_count: None,
             artists: Vec::new(),
+            original_release_date: None,
+            release_date: None,
         };
         let album = Album {
             id: "2".into(),
@@ -1663,6 +1673,8 @@ mod tests {
             user_rating: None,
             play_count: None,
             artists: Vec::new(),
+            original_release_date: None,
+            release_date: None,
         };
         assert!(is_single_or_ep(&single));
         assert!(!is_single_or_ep(&album));
@@ -1744,6 +1756,8 @@ mod grid_tests {
             user_rating: None,
             play_count: None,
             artists: Vec::new(),
+            original_release_date: None,
+            release_date: None,
         }
     }
 
@@ -1758,6 +1772,65 @@ mod grid_tests {
         sort_discography(&mut albums);
         let names: Vec<_> = albums.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Later", "Split B", "Debut", "Unknown"]);
+    }
+
+    fn dated(name: &str, year: i32, month: u32, day: u32) -> Album {
+        let mut album = album(name, Some(year));
+        album.original_release_date = Some(subsonic::ItemDate {
+            year: Some(year),
+            month: Some(month),
+            day: Some(day),
+        });
+        album
+    }
+
+    #[test]
+    fn same_year_releases_are_ordered_by_month_and_day() {
+        let mut albums = vec![
+            dated("March", 2020, 3, 4),
+            dated("November", 2020, 11, 2),
+            dated("March later", 2020, 3, 20),
+        ];
+        sort_discography(&mut albums);
+        let names: Vec<_> = albums.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["November", "March later", "March"]);
+    }
+
+    /// A precise date outranks a bare year within the same year: the album the
+    /// server can place is the one that earns the newer slot.
+    #[test]
+    fn a_dated_release_leads_a_year_only_one_from_the_same_year() {
+        let mut albums = vec![album("Year only", Some(2020)), dated("Dated", 2020, 6, 1)];
+        sort_discography(&mut albums);
+        let names: Vec<_> = albums.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Dated", "Year only"]);
+    }
+
+    /// `releaseDate` (this edition) only answers where `originalReleaseDate`
+    /// (the work) is absent, so a reissue sorts with the record it reissues.
+    #[test]
+    fn the_original_release_date_wins_over_the_edition_date() {
+        let mut album = album("Remaster", Some(2021));
+        album.original_release_date = Some(subsonic::ItemDate {
+            year: Some(1979),
+            month: Some(8),
+            day: None,
+        });
+        album.release_date = Some(subsonic::ItemDate {
+            year: Some(2021),
+            month: Some(5),
+            day: Some(3),
+        });
+        assert_eq!(album.release_key(), Some((1979, 8, 0)));
+    }
+
+    /// A server that sends the element with no year in it is answering
+    /// "unknown", and must not outrank the plain `year` field beside it.
+    #[test]
+    fn an_empty_item_date_falls_back_to_the_year() {
+        let mut album = album("Sparse", Some(2004));
+        album.original_release_date = Some(subsonic::ItemDate::default());
+        assert_eq!(album.release_key(), Some((2004, 0, 0)));
     }
 }
 

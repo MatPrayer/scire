@@ -100,6 +100,33 @@ async fn album_list2_parses_and_paginates() {
     assert_eq!(albums[1].year, None);
 }
 
+/// OpenSubsonic release dates, which are what order two records released in
+/// the same year. A vanilla server sends neither element and falls back to
+/// `year`.
+#[tokio::test]
+async fn album_list2_parses_opensubsonic_release_dates() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getAlbumList2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""albumList2":{"album":[
+                {"id":"al-1","name":"Reissue","year":2021,
+                 "originalReleaseDate":{"year":1979,"month":8},
+                 "releaseDate":{"year":2021,"month":5,"day":3}},
+                {"id":"al-2","name":"Plain","year":1999}
+            ]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let albums = client(&server.uri())
+        .get_album_list2(AlbumListType::AlphabeticalByName, 2, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(albums[0].release_key(), Some((1979, 8, 0)));
+    assert_eq!(albums[1].original_release_date, None);
+    assert_eq!(albums[1].release_key(), Some((1999, 0, 0)));
+}
+
 #[tokio::test]
 async fn get_album_parses_songs() {
     let server = MockServer::start().await;

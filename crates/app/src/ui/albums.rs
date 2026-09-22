@@ -184,6 +184,8 @@ pub(crate) fn album_from_row(row: AlbumRow) -> Album {
         genre: None,
         user_rating: None,
         artists: Vec::new(),
+        original_release_date: None,
+        release_date: None,
     }
 }
 
@@ -1217,6 +1219,8 @@ mod tests {
             user_rating: None,
             play_count: None,
             artists: Vec::new(),
+            original_release_date: None,
+            release_date: None,
         }
     }
 
