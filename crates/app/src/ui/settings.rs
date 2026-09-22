@@ -59,6 +59,9 @@ const SECTION_MIN_W: f32 = 240.;
 /// inside of.
 const SECTION_BODY_PAD: f32 = 16.;
 
+/// Font-size menu stays compact while retaining every supported pixel size.
+const FONT_SIZE_MENU_MAX_H: f32 = 240.;
+
 /// The width to lay a section card out at, inside a scroll body `body` wide.
 ///
 /// **Definite on purpose, and load-bearing.** Built the obvious way — `w_full()`
@@ -2004,22 +2007,25 @@ impl Render for SettingsView {
                                 .h(px(32.))
                                 .text_size(px(14.))
                                 .dropdown_menu(move |menu, _window, _cx| {
-                                    font_size_options().into_iter().fold(menu, |menu, value| {
-                                        let view = font_menu_view.clone();
-                                        let selected = value == font_size.value();
-                                        menu.item(
-                                            PopupMenuItem::new(format!("{value} px"))
-                                                .checked(selected)
-                                                .on_click(move |_, _, cx: &mut gpui::App| {
-                                                    view.update(cx, |settings, cx| {
-                                                        settings.set_font_size(
-                                                            UiFontSize::new(value),
-                                                            cx,
-                                                        );
-                                                    });
-                                                }),
-                                        )
-                                    })
+                                    font_size_options().into_iter().fold(
+                                        menu.max_h(px(FONT_SIZE_MENU_MAX_H)).scrollable(true),
+                                        |menu, value| {
+                                            let view = font_menu_view.clone();
+                                            let selected = value == font_size.value();
+                                            menu.item(
+                                                PopupMenuItem::new(format!("{value} px"))
+                                                    .checked(selected)
+                                                    .on_click(move |_, _, cx: &mut gpui::App| {
+                                                        view.update(cx, |settings, cx| {
+                                                            settings.set_font_size(
+                                                                UiFontSize::new(value),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            )
+                                        },
+                                    )
                                 }),
                             cx,
                         ),
