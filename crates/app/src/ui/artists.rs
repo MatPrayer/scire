@@ -1139,20 +1139,20 @@ impl ArtistDetailView {
         // The album grid's setting, applied to the album cards here too —
         // these are the same card at a different size.
         let flush = self.session.read(cx).settings.flush_album_covers;
+        let square_bottom = self.session.read(cx).settings.square_card_bottom;
         let cover = crate::ui::card_cover_edge(tile, flush);
         let card = v_flex()
             .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
             .group("aacard")
             .w(px(tile + card_padding()))
+            .border_1()
+            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .map(|c| match flush {
                 true => c,
-                false => c
-                    .p(px(card_inset()))
-                    .border_1()
-                    .border_color(gpui::hsla(0., 0., 0.5, 0.15)),
+                false => c.p(px(card_inset())),
             })
             .gap_1p5()
-            .rounded_lg()
+            .map(|c| crate::ui::card_rounding(c, flush, square_bottom))
             .cursor_pointer()
             .hover(|s| {
                 let s = s.bg(cx.theme().muted);

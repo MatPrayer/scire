@@ -304,17 +304,45 @@ pub fn scaled(px: f32) -> f32 {
 /// Edge of the cover drawn inside a grid card `card_padding()` wider than it.
 ///
 /// `flush` is `Settings::flush_album_covers`: the cover takes the card's
-/// padding and border for itself instead of sitting inside them. The **card**
+/// *inset* for itself instead of sitting inside it. The **card**
 /// keeps the width the column maths gave it either way — the cover grows into
 /// the chrome rather than the card shrinking around a bigger cover — so
 /// `grid_fit` needs to know nothing about the setting and toggling it cannot
 /// change the column count or reflow the page. The requested art resolution is
 /// unaffected for the same reason: it is keyed off the *setting's* maximum
 /// tile, which a card's chrome is not part of, so nothing is re-fetched.
+///
+/// The **border stays** — it is what separates one card from the next, and
+/// without it a grid of flush covers has no card left to read, only art running
+/// edge to edge. So the cover takes the inset either side and nothing more:
+/// taffy lays out border-box, so a card `tile + card_padding()` wide has
+/// `tile + card_inset() * 2` of content box inside its border.
 pub fn card_cover_edge(tile: f32, flush: bool) -> f32 {
     match flush {
-        true => tile + card_padding(),
+        true => tile + card_inset() * 2.,
         false => tile,
+    }
+}
+
+/// Whether a grid card squares off its **bottom** two corners.
+///
+/// `Settings::square_card_bottom`, and only under `flush_album_covers`: a card
+/// that is not flush has its cover floating inside its padding, so the card's
+/// corners are chrome around it and squaring half of them reads as a rendering
+/// fault rather than as a style. Flush, the cover *is* the card's top edge, and
+/// squaring the bottom leaves the art rounded above a flat-bottomed tile —
+/// which is the look this setting exists for. Pure so the rule lives in one
+/// place; the switch is disabled outside flush for the same reason.
+pub fn card_square_bottom(flush: bool, square_bottom: bool) -> bool {
+    flush && square_bottom
+}
+
+/// Apply a grid card's corner rounding — all four at `rounded_lg`, or the top
+/// two alone when [`card_square_bottom`].
+pub fn card_rounding<E: Styled>(el: E, flush: bool, square_bottom: bool) -> E {
+    match card_square_bottom(flush, square_bottom) {
+        true => el.rounded_t_lg(),
+        false => el.rounded_lg(),
     }
 }
 
@@ -2385,13 +2413,31 @@ mod tests {
         assert!(UiScale::Large.factor() > UiScale::Roomy.factor());
     }
 
-    /// Flush hands the card's whole chrome to the cover; the card's width is
+    /// Flush hands the card's inset to the cover but keeps the border, so the
+    /// cover fills the card's content box exactly. The card's width is
     /// untouched either way, which is what keeps the column count fixed.
     #[test]
-    fn a_flush_cover_takes_exactly_the_cards_chrome() {
-        use super::card_cover_edge;
+    fn a_flush_cover_takes_the_cards_inset_but_not_its_border() {
+        use super::{card_cover_edge, card_inset};
         assert_eq!(card_cover_edge(160., false), 160.);
-        assert_eq!(card_cover_edge(160., true), 160. + card_padding());
+        assert_eq!(card_cover_edge(160., true), 160. + card_inset() * 2.);
+        // The card is `tile + card_padding()` wide and lays out border-box, so
+        // the flush cover is exactly what is left inside the border.
+        assert_eq!(
+            card_cover_edge(160., true),
+            160. + card_padding() - super::CARD_BORDER * 2.
+        );
+    }
+
+    /// Squaring the bottom is a flush-only style: a card whose cover sits
+    /// inside its padding keeps all four corners however the switch is set.
+    #[test]
+    fn only_a_flush_card_squares_its_bottom() {
+        use super::card_square_bottom;
+        assert!(card_square_bottom(true, true));
+        assert!(!card_square_bottom(true, false));
+        assert!(!card_square_bottom(false, true));
+        assert!(!card_square_bottom(false, false));
     }
 
     #[test]

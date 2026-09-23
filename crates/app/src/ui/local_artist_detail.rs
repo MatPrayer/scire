@@ -205,8 +205,9 @@ impl LocalArtistDetailView {
         let glow = self.session.read(cx).settings.selection_glow_vi;
 
         // Same trade as the album grid's cards: the cover takes the card's
-        // chrome for itself, the card's width is unchanged.
+        // inset for itself, the border and the card's width are unchanged.
         let flush = self.session.read(cx).settings.flush_album_covers;
+        let square_bottom = self.session.read(cx).settings.square_card_bottom;
         let cover = crate::ui::card_cover_edge(tile, flush);
 
         let card = v_flex()
@@ -216,15 +217,14 @@ impl LocalArtistDetailView {
             )))
             .group("local-artist-card")
             .w(px(tile + card_padding()))
+            .border_1()
+            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .map(|c| match flush {
                 true => c,
-                false => c
-                    .p(px(card_inset()))
-                    .border_1()
-                    .border_color(gpui::hsla(0., 0., 0.5, 0.15)),
+                false => c.p(px(card_inset())),
             })
             .gap_1p5()
-            .rounded_lg()
+            .map(|c| crate::ui::card_rounding(c, flush, square_bottom))
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().muted))
             .active(|style| style.opacity(0.8))

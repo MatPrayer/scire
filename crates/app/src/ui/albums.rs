@@ -858,25 +858,26 @@ impl AlbumsView {
             None
         };
 
-        // The cover takes the card's padding and border for itself, or sits
-        // inside them; the card's own width is the same either way, so the
-        // grid's columns do not move when the setting does.
+        // The cover takes the card's inset for itself, or sits inside it; the
+        // border stays either way, since it is what separates one card from the
+        // next. The card's own width is the same either way, so the grid's
+        // columns do not move when the setting does.
         let flush = self.session.read(cx).settings.flush_album_covers;
+        let square_bottom = self.session.read(cx).settings.square_card_bottom;
         let cover = crate::ui::card_cover_edge(tile, flush);
 
         let card = v_flex()
             .id(gpui::SharedString::from(format!("album-{}", album.id)))
             .group("acard")
             .w(px(tile + crate::ui::card_padding()))
+            .border_1()
+            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .map(|c| match flush {
                 true => c,
-                false => c
-                    .p(px(crate::ui::card_inset()))
-                    .border_1()
-                    .border_color(gpui::hsla(0., 0., 0.5, 0.15)),
+                false => c.p(px(crate::ui::card_inset())),
             })
             .gap_1p5()
-            .rounded_lg()
+            .map(|c| crate::ui::card_rounding(c, flush, square_bottom))
             .cursor_pointer()
             .hover(|s| {
                 let s = s.bg(cx.theme().muted);

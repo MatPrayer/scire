@@ -147,6 +147,14 @@ pub struct Settings {
     /// reflow the page.
     #[serde(default)]
     pub flush_album_covers: bool,
+    /// Square off the *bottom* corners of a flush card, leaving the top two
+    /// rounded around the cover.
+    ///
+    /// Only meaningful with `flush_album_covers`: there the cover fills the
+    /// card's whole width and its own rounding is what the top corners read as,
+    /// while the bottom two round around the text block alone.
+    #[serde(default)]
+    pub square_card_bottom: bool,
     /// Cover size of the album cards on an artist's page. `Match` follows
     /// `cover_size`; the rest pick a size for that page alone.
     #[serde(default)]
@@ -864,6 +872,7 @@ impl Default for Settings {
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),
             flush_album_covers: false,
+            square_card_bottom: false,
             artist_album_size: ArtistAlbumSize::default(),
             track_info: TrackInfo {
                 artist: true,
