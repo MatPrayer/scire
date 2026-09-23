@@ -988,6 +988,12 @@ pub struct FullscreenPlayer {
     /// and when it moved. `None` between lines, which is what leaves a user
     /// scrolling by hand alone.
     lyrics_scroll_anim: Option<(gpui::Pixels, Instant)>,
+    /// The panel was closed *by us*, because the track it was showing was
+    /// followed by one nothing has lyrics for. Held so the next track that does
+    /// have them puts the panel back, rather than leaving a reader to reopen it
+    /// on every instrumental. Any manual toggle clears it: a panel the user
+    /// closed themselves stays closed.
+    lyrics_auto_closed: bool,
     /// Waveform peaks for the track in `waveform_for` (when the waveform
     /// seek bar is enabled and the decode finished).
     waveform: Option<Vec<f32>>,
@@ -1107,6 +1113,13 @@ impl FullscreenPlayer {
         })
         .detach();
 
+        // The observer above only fires on a player event, and a paused player
+        // emits none — so the first lookup is made here. It is what decides
+        // whether the Lyrics button opens on anything, and the overlay can be
+        // opened on a track that has been sitting paused for an hour.
+        let handle = cx.entity();
+        cx.defer(move |cx| handle.update(cx, |this: &mut Self, cx| this.maybe_fetch_lyrics(cx)));
+
         // Settings toggle for the waveform seek bar lives on the session.
         cx.observe(&session, |this: &mut Self, _, cx| {
             this.maybe_fetch_waveform(cx);
@@ -1135,6 +1148,7 @@ impl FullscreenPlayer {
             lyrics_prev: None,
             lyrics_followed: None,
             lyrics_scroll_anim: None,
+            lyrics_auto_closed: false,
             waveform: None,
             waveform_for: None,
             seek_hover: None,
@@ -1259,8 +1273,53 @@ impl FullscreenPlayer {
         self.lyrics_followed = None;
         self.lyrics_prev = None;
         self.lyrics_scroll_anim = None;
+        // Whatever the user just did to a panel by hand outranks the automatic
+        // close: a panel closed on purpose must not be reopened by the next
+        // track that happens to have lyrics.
+        self.lyrics_auto_closed = false;
         self.maybe_fetch_lyrics(cx);
         cx.notify();
+    }
+
+    /// Nothing has lyrics for the song on screen — the lookup is done and came
+    /// back empty. `None` while it is still running or has not been made for
+    /// this song yet, which is not the same thing: the button stays live there,
+    /// since a click lands on "Loading…" rather than on an empty panel.
+    fn lyrics_missing(&self, cx: &Context<Self>) -> bool {
+        if self.lyrics_loading || self.lyrics.is_some() {
+            return false;
+        }
+        let Some(song) = self.player.read(cx).current_song() else {
+            return true;
+        };
+        self.lyrics_for.as_deref() == Some(song.id.as_str())
+    }
+
+    /// Open or close the panel on what the finished lookup found. A panel left
+    /// open over a track nothing has words for is an empty box the user has to
+    /// close themselves; one closed for that reason comes back when the words
+    /// do, so a single instrumental in the middle of an album does not cost the
+    /// reader the panel for the rest of it.
+    fn settle_lyrics_panel(&mut self, cx: &mut Context<Self>) {
+        match self.lyrics.is_some() {
+            false if self.panel == Some(SidePanel::Lyrics) => {
+                self.panel = None;
+                self.lyrics_auto_closed = true;
+                cx.notify();
+            }
+            // Only a panel *we* closed reopens, and only into an empty slot —
+            // a queue the user opened meanwhile is not swapped out from under
+            // them.
+            true if self.lyrics_auto_closed && self.panel.is_none() => {
+                self.panel = Some(SidePanel::Lyrics);
+                self.lyrics_auto_closed = false;
+                self.lyrics_followed = None;
+                self.lyrics_prev = None;
+                self.lyrics_scroll_anim = None;
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     /// Keep the playing track visible in the queue panel.
@@ -1561,23 +1620,19 @@ impl FullscreenPlayer {
             })
     }
 
-    /// Fetch lyrics for the current song when the lyrics panel is open.
+    /// Fetch lyrics for the current song.
+    ///
+    /// Run with the panel *closed* as well as open, which is what lets the
+    /// Lyrics button be greyed out for a track nothing has words for rather
+    /// than opening an empty panel. The view only exists while the fullscreen
+    /// overlay is up, so this is still not a background lookup: close the
+    /// overlay and nothing is asked of anyone.
     fn maybe_fetch_lyrics(&mut self, cx: &mut Context<Self>) {
-        if self.panel != Some(SidePanel::Lyrics) {
-            return;
-        }
         let (provider, prefer_synced) = {
             let s = &self.session.read(cx).settings;
             (s.lyrics_provider, s.prefer_synced_lyrics)
         };
-        let (id, query, local_path) = {
-            let p = self.player.read(cx);
-            let Some(song) = p.current_song() else {
-                self.lyrics = None;
-                self.lyrics_source = None;
-                self.lyrics_for = None;
-                return;
-            };
+        let current = self.player.read(cx).current_song().map(|song| {
             (
                 song.id.clone(),
                 lyrics::Query {
@@ -1588,6 +1643,14 @@ impl FullscreenPlayer {
                 },
                 song.local_path.clone(),
             )
+        });
+        let Some((id, query, local_path)) = current else {
+            self.lyrics = None;
+            self.lyrics_source = None;
+            self.lyrics_for = None;
+            self.lyrics_loading = false;
+            self.settle_lyrics_panel(cx);
+            return;
         };
         if self.lyrics_for.as_deref() == Some(id.as_str()) {
             return;
@@ -1610,6 +1673,7 @@ impl FullscreenPlayer {
         // behind it, and the online side is switched off by the provider.
         if server.is_none() && local_path.is_none() && !provider.uses_online() {
             self.lyrics_loading = false;
+            self.settle_lyrics_panel(cx);
             cx.notify();
             return;
         }
@@ -1717,6 +1781,7 @@ impl FullscreenPlayer {
                     let (doc, source) = found.unzip();
                     view.lyrics = doc;
                     view.lyrics_source = source;
+                    view.settle_lyrics_panel(cx);
                     cx.notify();
                 }
             });
@@ -2657,6 +2722,7 @@ impl Render for FullscreenPlayer {
         // Labelled toggles stick out of a narrow card; the icons carry the
         // meaning on their own, and tooltips are not the point here.
         let toggle_labels = layout.card >= TOGGLE_LABEL_MIN;
+        let no_lyrics = self.lyrics_missing(cx);
 
         // --- Open/close transition ---------------------------------------
         // One clock, read straight from state, so the element tree keeps the
@@ -3432,6 +3498,15 @@ impl Render for FullscreenPlayer {
                                         .ghost()
                                         .large()
                                         .icon(Icon::new(IconName::BookOpen))
+                                        // Greyed out rather than opening an
+                                        // empty panel: the lookup has already
+                                        // run for this track, with the panel
+                                        // closed as well as open.
+                                        .disabled(no_lyrics)
+                                        .tooltip(match no_lyrics {
+                                            true => "No lyrics for this track",
+                                            false => "Lyrics",
+                                        })
                                         .when(toggle_labels, |b| b.label("Lyrics"))
                                         .when(self.panel == Some(SidePanel::Lyrics), |b| {
                                             b.primary()
