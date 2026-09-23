@@ -224,6 +224,13 @@ pub struct Settings {
     /// see `ui::album_side_panel`.
     #[serde(default)]
     pub album_layout: AlbumPageLayout,
+    /// Spell the dates on an album page out in full: the time of day beside
+    /// the "Added" date, and the month and day of the release where the
+    /// server publishes them (OpenSubsonic `originalReleaseDate`), instead of
+    /// the bare year. Off by default — the short forms are what the summary
+    /// line is sized for, and a release date is a year to most people.
+    #[serde(default)]
+    pub detailed_album_dates: bool,
     /// How the bottom player bar sits against the rest of the UI. `Docked`
     /// (default) reserves its own row, same as every other panel. `Floating`
     /// draws it as a translucent, rounded card hovering over the content
@@ -885,6 +892,7 @@ impl Default for Settings {
             adaptive_from_page: false,
             adaptive_page_gradient: false,
             album_layout: AlbumPageLayout::default(),
+            detailed_album_dates: false,
             player_bar_style: PlayerBarStyle::default(),
             player_bar_tint: true,
             player_bar_translucent: false,

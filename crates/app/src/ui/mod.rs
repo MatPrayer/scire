@@ -741,13 +741,59 @@ pub fn album_replaygain_line(songs: &[subsonic::Song]) -> Option<String> {
     (!parts.is_empty()).then(|| format!("ReplayGain: {}", parts.join(" · ")))
 }
 
-/// ISO date-time to date. Unexpected values pass through unchanged.
-pub fn format_added_date(created: &str) -> String {
-    created
-        .split(['T', ' '])
+/// ISO date-time to date, or to date and time of day under
+/// `Settings::detailed_album_dates`. Unexpected values pass through unchanged.
+///
+/// The time is printed as the source wrote it, with a `UTC` marker kept where
+/// the source says so (Navidrome stamps `…Z`; the local scanner writes
+/// `datetime(…, 'unixepoch')`, also UTC, without the marker). There is no
+/// timezone library in the tree, so converting to local time is not on offer
+/// and silently relabelling a UTC time as local would be worse than saying
+/// which one it is.
+pub fn format_added_date(created: &str, detailed: bool) -> String {
+    let mut parts = created.split(['T', ' ']);
+    let date = parts.next().unwrap_or(created);
+    if !detailed {
+        return date.to_string();
+    }
+    let Some(time) = parts.next() else {
+        return date.to_string();
+    };
+    // Seconds and any fraction are noise at this scale; a trailing `Z` (or a
+    // `+00:00` offset) is what the marker is read off.
+    let utc = time.ends_with('Z') || time.contains("+00:00");
+    let hhmm: String = time
+        .trim_end_matches('Z')
+        .split(['+', '-'])
         .next()
-        .unwrap_or(created)
-        .to_string()
+        .unwrap_or(time)
+        .splitn(3, ':')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(":");
+    if hhmm.is_empty() {
+        return date.to_string();
+    }
+    if utc {
+        format!("{date} {hhmm} UTC")
+    } else {
+        format!("{date} {hhmm}")
+    }
+}
+
+/// The album's release date for the summary line: the bare year, or the full
+/// date under `Settings::detailed_album_dates` where the server publishes the
+/// month and day.
+///
+/// `release_key` already picks `originalReleaseDate` over this edition's and
+/// over the bare `year`, and reports a missing component as 0 — which is
+/// exactly "the server only knows the year", so it falls back to printing that.
+pub fn format_release_date(album: &subsonic::Album, detailed: bool) -> Option<String> {
+    let (year, month, day) = album.release_key()?;
+    if !detailed || month == 0 || day == 0 {
+        return Some(year.to_string());
+    }
+    Some(format!("{year}-{month:02}-{day:02}"))
 }
 
 fn format_khz(hz: u32) -> String {
@@ -2153,9 +2199,9 @@ mod tests {
 
     use super::{
         LiveWidth, SIDE_PANEL_MAX_W, SIDE_PANEL_MIN_W, SIDE_PANEL_PADDING, SIDE_PANEL_TRACKS_MIN,
-        accent_from_cover_bytes, album_side_panel, card_padding, format_count, format_playtime,
-        grid_columns, grid_columns_padded, grid_fit, grid_fit_padded, grid_gap, grid_padding_x,
-        strip_html, truncate_at_word,
+        accent_from_cover_bytes, album_side_panel, card_padding, format_added_date, format_count,
+        format_playtime, format_release_date, grid_columns, grid_columns_padded, grid_fit,
+        grid_fit_padded, grid_gap, grid_padding_x, strip_html, truncate_at_word,
     };
 
     /// The layout the setting asks for, on the window it was asked for: a
@@ -2501,5 +2547,59 @@ mod tests {
     #[test]
     fn truncate_at_word_backs_up_to_a_boundary() {
         assert_eq!(truncate_at_word("one two three", 9), "one two …");
+    }
+
+    #[test]
+    fn added_date_is_the_day_unless_detail_is_asked_for() {
+        assert_eq!(
+            format_added_date("2024-03-04T18:42:07Z", false),
+            "2024-03-04"
+        );
+        assert_eq!(
+            format_added_date("2024-03-04T18:42:07Z", true),
+            "2024-03-04 18:42 UTC"
+        );
+        // The local scanner's `datetime(…, 'unixepoch')` form: space-separated
+        // and unmarked, so nothing is claimed about the zone.
+        assert_eq!(
+            format_added_date("2024-03-04 18:42:07", true),
+            "2024-03-04 18:42"
+        );
+        // A date with no time, and something that is not a date at all, pass
+        // through rather than growing a half-formatted stamp.
+        assert_eq!(format_added_date("2024-03-04", true), "2024-03-04");
+        assert_eq!(format_added_date("whenever", true), "whenever");
+    }
+
+    #[test]
+    fn release_date_detail_needs_a_month_and_a_day() {
+        let album = |json: &str| -> subsonic::Album { serde_json::from_str(json).expect("album") };
+
+        let year_only = album(r#"{"id":"a1","name":"Album","year":2016}"#);
+        assert_eq!(
+            format_release_date(&year_only, true).as_deref(),
+            Some("2016")
+        );
+
+        let dated = album(
+            r#"{"id":"a1","name":"Album","year":2016,
+                "originalReleaseDate":{"year":2015,"month":5,"day":3}}"#,
+        );
+        assert_eq!(format_release_date(&dated, false).as_deref(), Some("2015"));
+        assert_eq!(
+            format_release_date(&dated, true).as_deref(),
+            Some("2015-05-03")
+        );
+
+        // A year-only `ItemDate` reports 0 components, which is the server
+        // saying it only knows the year.
+        let partial = album(
+            r#"{"id":"a1","name":"Album","year":2016,
+                "originalReleaseDate":{"year":2015}}"#,
+        );
+        assert_eq!(format_release_date(&partial, true).as_deref(), Some("2015"));
+
+        let undated = album(r#"{"id":"a1","name":"Album"}"#);
+        assert!(format_release_date(&undated, true).is_none());
     }
 }

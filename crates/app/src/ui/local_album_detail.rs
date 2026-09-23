@@ -31,7 +31,13 @@ const HEADER_ART: f32 = 220.;
 /// Horizontal padding the columns lay their cards out within (`p_4` a side).
 const PAGE_PADDING_X: f32 = 32.;
 
-fn local_album_chips(album: Option<&AlbumRow>, songs: &[subsonic::Song]) -> Vec<String> {
+/// `detailed` is `Settings::detailed_album_dates`; a local row carries a year
+/// and no month or day, so it only reaches the "Added" stamp here.
+fn local_album_chips(
+    album: Option<&AlbumRow>,
+    songs: &[subsonic::Song],
+    detailed: bool,
+) -> Vec<String> {
     let mut chips = Vec::new();
     if let Some(genre) = songs
         .iter()
@@ -54,7 +60,7 @@ fn local_album_chips(album: Option<&AlbumRow>, songs: &[subsonic::Song]) -> Vec<
         .and_then(|album| album.created.as_deref())
         .filter(|created| !created.is_empty())
     {
-        chips.push(format!("Added {}", format_added_date(created)));
+        chips.push(format!("Added {}", format_added_date(created, detailed)));
     }
     chips
 }
@@ -288,7 +294,8 @@ impl Render for LocalAlbumDetailView {
             .cloned()
             .map(|track| track.into_song())
             .collect();
-        let chips = local_album_chips(self.album.as_ref(), &songs);
+        let detailed_dates = self.session.read(cx).settings.detailed_album_dates;
+        let chips = local_album_chips(self.album.as_ref(), &songs, detailed_dates);
         let replaygain = album_replaygain_line(&songs);
 
         let header = {
@@ -702,7 +709,7 @@ mod tests {
         ];
 
         assert_eq!(
-            local_album_chips(Some(&album), &songs),
+            local_album_chips(Some(&album), &songs, false),
             vec![
                 "Jazz",
                 "2 discs",
@@ -720,6 +727,6 @@ mod tests {
     fn local_album_omits_added_when_creation_time_is_unknown() {
         let album = AlbumRow::new("local:album:test", "local", "Test");
         let songs = vec![song(r#"{"id":"1","title":"one"}"#)];
-        assert!(local_album_chips(Some(&album), &songs).is_empty());
+        assert!(local_album_chips(Some(&album), &songs, false).is_empty());
     }
 }

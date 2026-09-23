@@ -29,8 +29,9 @@ use crate::state::playlists::PlaylistsState;
 use crate::state::session::Session;
 use crate::ui::albums::album_from_row;
 use crate::ui::{
-    album_quality_chips, album_replaygain_line, format_added_date, format_duration, strip_html,
-    sync_focus_scroll, track_extras, truncate_at_word, with_focus_cursor,
+    album_quality_chips, album_replaygain_line, format_added_date, format_duration,
+    format_release_date, strip_html, sync_focus_scroll, track_extras, truncate_at_word,
+    with_focus_cursor,
 };
 
 /// Resolution to request for the header cover.
@@ -988,6 +989,7 @@ impl Render for AlbumDetailView {
         let show_info = loading_info && placeholding(self.info_since);
 
         let hide_stars = self.session.read(cx).settings.hide_album_stars;
+        let detailed_dates = self.session.read(cx).settings.detailed_album_dates;
         let (album_starred, album_rating) = self
             .album
             .as_ref()
@@ -1003,7 +1005,9 @@ impl Render for AlbumDetailView {
                         .duration
                         .map(|s| format_duration(std::time::Duration::from_secs(s as u64)))
                         .unwrap_or_default();
-                    let year = a.album.year.map(|y| format!("{y} · ")).unwrap_or_default();
+                    let year = format_release_date(&a.album, detailed_dates)
+                        .map(|d| format!("{d} · "))
+                        .unwrap_or_default();
                     (
                         a.album.name.clone(),
                         album_credits(&a.album),
@@ -1046,7 +1050,10 @@ impl Render for AlbumDetailView {
                 has_quality = !quality.is_empty();
                 chips.extend(quality);
                 if let Some(created) = a.album.created.as_deref().filter(|c| !c.is_empty()) {
-                    chips.push(format!("Added {}", format_added_date(created)));
+                    chips.push(format!(
+                        "Added {}",
+                        format_added_date(created, detailed_dates)
+                    ));
                 }
             }
             // The quality chips are the clearest case of the whole problem: the

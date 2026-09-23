@@ -135,7 +135,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Window", 4),
     ("Appearance", 14),
-    ("Album pages", 7),
+    ("Album pages", 8),
     ("Fullscreen", 7),
     ("Player bar", 11),
     ("Playback", 14),
@@ -358,6 +358,7 @@ enum SettingsSwitch {
     AdaptivePageGradient,
     AlbumPanelRight,
     HideAlbumStars,
+    DetailedAlbumDates,
     SelectionGlowVi,
     SelectionGlowHover,
     SelectionGlowAlbumColor,
@@ -1178,6 +1179,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_detailed_album_dates(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.detailed_album_dates = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_fullscreen_volume(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.fullscreen_volume = enabled);
@@ -1223,6 +1231,7 @@ impl SettingsView {
             SettingsSwitch::AdaptivePageGradient => s.adaptive_page_gradient,
             SettingsSwitch::AlbumPanelRight => s.album_panel_right,
             SettingsSwitch::HideAlbumStars => s.hide_album_stars,
+            SettingsSwitch::DetailedAlbumDates => s.detailed_album_dates,
             SettingsSwitch::SelectionGlowVi => s.selection_glow_vi,
             SettingsSwitch::SelectionGlowHover => s.selection_glow_hover,
             SettingsSwitch::SelectionGlowAlbumColor => s.selection_glow_album_color,
@@ -1283,6 +1292,7 @@ impl SettingsView {
             SettingsSwitch::AdaptivePageGradient => self.set_adaptive_page_gradient(value, cx),
             SettingsSwitch::AlbumPanelRight => self.set_album_panel_right(value, cx),
             SettingsSwitch::HideAlbumStars => self.set_hide_album_stars(value, cx),
+            SettingsSwitch::DetailedAlbumDates => self.set_detailed_album_dates(value, cx),
             SettingsSwitch::SelectionGlowVi => self.set_selection_glow_vi(value, cx),
             SettingsSwitch::SelectionGlowHover => self.set_selection_glow_hover(value, cx),
             SettingsSwitch::SelectionGlowAlbumColor => {
@@ -1845,6 +1855,7 @@ impl Render for SettingsView {
         let album_layout = self.session.read(cx).settings.album_layout;
         let album_panel_right = self.session.read(cx).settings.album_panel_right;
         let hide_album_stars = self.session.read(cx).settings.hide_album_stars;
+        let detailed_album_dates = self.session.read(cx).settings.detailed_album_dates;
         let resume_playback = self.session.read(cx).settings.resume_playback;
         let listenbrainz_enabled = self.session.read(cx).settings.listenbrainz_enabled;
         let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
@@ -2266,6 +2277,20 @@ impl Render for SettingsView {
             .child(self.note(
                 "Drops the star beside the album title and the one on each \
                  track row. A track's context menu still stars it.",
+                cx,
+            ))
+            .child(self.vi_switch(
+                SettingsSwitch::DetailedAlbumDates,
+                "detailed-album-dates",
+                detailed_album_dates,
+                false,
+                "Detailed dates",
+                cx,
+            ))
+            .child(self.note(
+                "Spells the dates out: the time of day beside the Added date, \
+                 and the full release date where the server publishes the \
+                 month and day instead of the year alone.",
                 cx,
             ))
             .child(self.vi_switch(
