@@ -74,12 +74,24 @@ jobs:
           # forks, and a zipped .app that lost them will not launch.
           ditto -c -k --keepParent "Scirè.app" "scire-$VERSION-macos-arm64.zip"
 
+      # One path per step rather than one step listing both: upload-artifact
+      # roots the artifact at the least common ancestor of its *search paths*,
+      # so naming target/linux and target/macos together roots it at target/
+      # and the archive arrives under linux/. `files: artifacts/*` below then
+      # globs that directory instead of the archive inside it, and what reaches
+      # the release page is a container holding a container holding the tarball.
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
           name: ${{ matrix.name }}
-          path: |
-            target/linux/*.tar.gz
-            target/macos/*.zip
+          path: target/linux/*.tar.gz
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: ${{ matrix.name }}
+          path: target/macos/*.zip
           if-no-files-found: error
 
   release:
