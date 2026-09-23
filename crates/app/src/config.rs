@@ -91,6 +91,12 @@ pub struct Settings {
     pub minimal_titlebar: bool,
     /// Forward now-playing / scrobble submissions to the server.
     pub scrobble_enabled: bool,
+    /// Submit local-file plays directly to ListenBrainz.
+    pub listenbrainz_enabled: bool,
+    /// Plaintext token fallback for systems without a usable keyring.
+    /// Only written when keyring storage fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listenbrainz_token_plaintext: Option<String>,
     /// Default shuffle state for new sessions.
     pub default_shuffle: bool,
     /// Default repeat mode for new sessions.
@@ -147,8 +153,8 @@ pub struct Settings {
     pub artist_album_size: ArtistAlbumSize,
     /// Extra columns shown next to song titles in track lists.
     pub track_info: TrackInfo,
-    /// Render the seek bar as the track's waveform (downloads each track a
-    /// second time to decode it).
+    /// Render the seek bar as the track's waveform (downloads remote tracks a
+    /// second time or reads local tracks to decode them).
     pub waveform_seekbar: bool,
     /// Show format/bitrate/sample-rate of the current track in the player bar.
     pub stream_info_bar: bool,
@@ -838,6 +844,8 @@ impl Default for Settings {
             client_titlebar: true,
             minimal_titlebar: false,
             scrobble_enabled: true,
+            listenbrainz_enabled: false,
+            listenbrainz_token_plaintext: None,
             default_shuffle: false,
             default_repeat: RepeatMode::Off,
             artwork_cache_mb: 256,
@@ -1111,6 +1119,30 @@ pub fn load_password(server_url: &str, username: &str) -> Result<String> {
 pub fn delete_password(server_url: &str, username: &str) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &keyring_account(server_url, username))
     {
+        let _ = entry.delete_credential();
+    }
+}
+
+pub fn store_lb_token(token: &str) -> Result<()> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, "listenbrainz")?;
+    entry.set_password(token)?;
+    Ok(())
+}
+
+pub fn load_lb_token(settings: &Settings) -> Result<String> {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "listenbrainz")
+        && let Ok(token) = entry.get_password()
+    {
+        return Ok(token);
+    }
+    settings
+        .listenbrainz_token_plaintext
+        .clone()
+        .context("ListenBrainz token not found")
+}
+
+pub fn delete_lb_token() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "listenbrainz") {
         let _ = entry.delete_credential();
     }
 }

@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::config::{ReplayGainMode, Settings};
 use crate::services::{artwork, runtime};
 use crate::state::queue::{Queue, RepeatMode};
-use crate::state::scrobble::{ScrobbleAction, ScrobbleTracker};
+use crate::state::scrobble::{ScrobbleAction, ScrobbleTrack, ScrobbleTracker};
 
 /// Cover size fetched for the player bar / OS media controls.
 const ART_SIZE: u32 = 300;
@@ -114,6 +114,8 @@ pub struct PlayerState {
     pub playing: bool,
     pub buffering: bool,
     pub volume: f32,
+    pub muted: bool,
+    last_volume: f32,
     pub last_error: Option<String>,
     /// Tracks that failed to start back to back, without one playing in
     /// between. A single unplayable file is skipped; a run of them is the
@@ -123,6 +125,8 @@ pub struct PlayerState {
     client: Option<SubsonicClient>,
     scrobble: ScrobbleTracker,
     scrobble_enabled: bool,
+    listenbrainz_enabled: bool,
+    listenbrainz_token: Option<String>,
     stream_opts: StreamOptions,
     /// Set while a live radio stream is playing: the station's name as
     /// bookmarked. Doubles as the "this is radio" flag.
@@ -239,11 +243,15 @@ impl PlayerState {
             playing: false,
             buffering: false,
             volume,
+            muted: false,
+            last_volume: if volume > 0.0 { volume } else { 1.0 },
             last_error: None,
             failed_streak: 0,
             client: None,
             scrobble: ScrobbleTracker::default(),
             scrobble_enabled: true,
+            listenbrainz_enabled: false,
+            listenbrainz_token: None,
             stream_opts: StreamOptions::default(),
             radio_title: None,
             radio_stream_title: None,
@@ -268,17 +276,44 @@ impl PlayerState {
 
     /// Fire a scrobble call (now-playing or submission) in the background.
     fn fire_scrobble(&self, action: ScrobbleAction, cx: &mut Context<Self>) {
+        let (track, submission) = match action {
+            ScrobbleAction::None => return,
+            ScrobbleAction::NowPlaying(track) => (track, false),
+            ScrobbleAction::Submit(track) => (track, true),
+        };
+        if track.local {
+            if !self.listenbrainz_enabled {
+                return;
+            }
+            let Some(token) = self.listenbrainz_token.clone() else {
+                return;
+            };
+            let Some(artist) = track.artist else { return };
+            let listen = crate::services::listenbrainz::ListenBrainzListen {
+                artist,
+                title: track.title,
+                album: track.album,
+                duration: track.duration,
+            };
+            cx.spawn(async move |_this, _cx| {
+                if let Err(error) = runtime::spawn_io(async move {
+                    crate::services::listenbrainz::submit_listen(&token, listen, submission).await
+                })
+                .await
+                {
+                    tracing::debug!("ListenBrainz scrobble failed: {error:#}");
+                }
+            })
+            .detach();
+            return;
+        }
         if !self.scrobble_enabled {
             return;
         }
-        let (id, submission) = match action {
-            ScrobbleAction::None => return,
-            ScrobbleAction::NowPlaying(id) => (id, false),
-            ScrobbleAction::Submit(id) => (id, true),
-        };
         let Some(client) = self.client.clone() else {
             return;
         };
+        let id = track.id;
         cx.spawn(async move |_this, _cx| {
             let _ = runtime::spawn_io(async move {
                 client
@@ -623,6 +658,25 @@ impl PlayerState {
 
     pub fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
         self.volume = volume.clamp(0.0, 1.0);
+        self.muted = false;
+        if self.volume > 0.0 {
+            self.last_volume = self.volume;
+        }
+        self.push_volume();
+        cx.notify();
+    }
+
+    pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        if self.muted {
+            self.volume = self.last_volume.clamp(0.0, 1.0);
+            self.muted = false;
+        } else {
+            if self.volume > 0.0 {
+                self.last_volume = self.volume;
+            }
+            self.volume = 0.0;
+            self.muted = true;
+        }
         self.push_volume();
         cx.notify();
     }
@@ -844,11 +898,11 @@ impl PlayerState {
         if !self.waveform_enabled {
             return;
         }
-        let Some(song_id) = self
+        let Some((song_id, local_path)) = self
             .queue
             .next_pos()
             .and_then(|pos| self.queue.iter_ordered().nth(pos))
-            .map(|(_, s)| s.id.clone())
+            .map(|(_, s)| (s.id.clone(), s.local_path.clone()))
         else {
             return;
         };
@@ -858,18 +912,22 @@ impl PlayerState {
         {
             return;
         }
-        let Some(client) = self.client.as_ref() else {
-            return;
-        };
-        let Ok(url) = client.stream_url(&song_id, &crate::services::waveform::stream_options())
-        else {
-            return;
+        let source = if let Some(path) = local_path {
+            crate::services::waveform::Source::Local(path.into())
+        } else {
+            let Some(client) = self.client.as_ref() else {
+                return;
+            };
+            let Ok(url) = client.stream_url(&song_id, &crate::services::waveform::stream_options())
+            else {
+                return;
+            };
+            crate::services::waveform::Source::Remote(url.to_string())
         };
         self.waveform_prewarmed_for = Some(song_id.clone());
-        let url = url.to_string();
         cx.spawn(async move |_, _| {
             if let Err(e) =
-                runtime::spawn_io(crate::services::waveform::fetch_peaks(url, song_id)).await
+                runtime::spawn_io(crate::services::waveform::fetch_peaks(source, song_id)).await
             {
                 tracing::debug!("waveform prewarm failed: {e:#}");
             }
@@ -927,6 +985,17 @@ impl PlayerState {
 
     pub fn set_scrobble_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.scrobble_enabled = enabled;
+        cx.notify();
+    }
+
+    pub fn set_listenbrainz(
+        &mut self,
+        enabled: bool,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.listenbrainz_enabled = enabled;
+        self.listenbrainz_token = token.filter(|token| !token.trim().is_empty());
         cx.notify();
     }
 
@@ -1011,6 +1080,7 @@ impl PlayerState {
         self.buffering = true;
         let song_id = song.id.clone();
         let song_clone = song.clone();
+        let scrobble_track = scrobble_track(&song_clone);
         let duration = song.duration.map(|s| Duration::from_secs(s as u64));
 
         // Local file: use the filesystem path directly; URL is ignored for IO.
@@ -1055,7 +1125,7 @@ impl PlayerState {
         // current one, so the current one has to be settled by then.
         self.refresh_current_art(cx);
         self.refresh_prefetch(cx);
-        let action = self.scrobble.start(song_id);
+        let action = self.scrobble.start(scrobble_track);
         self.fire_scrobble(action, cx);
         self.sync_media_metadata();
         if let Some(c) = &mut self.media_controls {
@@ -1186,7 +1256,7 @@ impl PlayerState {
                     // The gapless track carries its own ReplayGain.
                     self.recompute_gain();
                     if let Some(song) = self.queue.current_song() {
-                        let action = self.scrobble.start(song.id.clone());
+                        let action = self.scrobble.start(scrobble_track(song));
                         self.fire_scrobble(action, cx);
                     }
                     self.sync_media_metadata();
@@ -1326,6 +1396,8 @@ pub fn init(settings: &Settings, cx: &mut gpui::App) -> Entity<PlayerState> {
             }
         }
         state.scrobble_enabled = settings.scrobble_enabled;
+        state.listenbrainz_enabled = settings.listenbrainz_enabled;
+        state.listenbrainz_token = crate::config::load_lb_token(settings).ok();
         state.resume_enabled = settings.resume_playback;
         // Restore the saved position, but only for the track the restored queue
         // is actually sitting on — the queue file and the resume file are
@@ -1346,6 +1418,17 @@ pub fn init(settings: &Settings, cx: &mut gpui::App) -> Entity<PlayerState> {
         }
         state
     })
+}
+
+fn scrobble_track(song: &Song) -> ScrobbleTrack {
+    ScrobbleTrack {
+        id: song.id.clone(),
+        local: song.local_path.is_some(),
+        artist: song.artist.clone(),
+        title: song.title.clone(),
+        album: song.album.clone(),
+        duration: song.duration,
+    }
 }
 
 /// Linear gain factor from a ReplayGain block for the given mode. Applies the

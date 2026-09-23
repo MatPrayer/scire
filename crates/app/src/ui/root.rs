@@ -7,7 +7,7 @@ use gpui::{
     px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{IndentInline, Input, InputEvent, InputState};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
     v_flex,
@@ -26,6 +26,7 @@ use crate::services::{
 use crate::state::maintenance::MaintenanceJobs;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
+use crate::state::queue::RepeatMode;
 use crate::state::radio::RadioState;
 use crate::state::session::{ConnectionStatus, Session};
 use crate::ui::album_detail::{AlbumDetailEvent, AlbumDetailView};
@@ -34,6 +35,7 @@ use crate::ui::artists::{ArtistDetailEvent, ArtistDetailView, ArtistsEvent, Arti
 use crate::ui::favorites::{FavoritesEvent, FavoritesView};
 use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
 use crate::ui::local_album_detail::LocalAlbumDetailView;
+use crate::ui::local_artist_detail::{LocalArtistDetailView, LocalArtistEvent};
 use crate::ui::local_music::{LocalMusicEvent, LocalMusicView};
 use crate::ui::player_bar::{
     PlayerBar, PlayerBarEvent, bar_h, float_bottom, float_margin, float_max_w, float_panel_bottom,
@@ -65,11 +67,111 @@ enum KeyboardMode {
     Command,
 }
 
+const VI_COMMANDS: &[&str] = &[
+    "albums",
+    "artists",
+    "favorites",
+    "fs",
+    "fullscreen",
+    "goto",
+    "help",
+    "local",
+    "newpl",
+    "newplaylist",
+    "next",
+    "noshuffle",
+    "pl",
+    "playlist",
+    "playpause",
+    "prev",
+    "previous",
+    "q",
+    "queue",
+    "quit",
+    "radio",
+    "recent",
+    "refresh",
+    "repeat",
+    "settings",
+    "shuffle",
+    "stop",
+    "toggle",
+    "vol",
+    "volume",
+];
+
+#[derive(Clone)]
+struct CommandCompletion {
+    matches: Vec<&'static str>,
+    index: usize,
+}
+
+/// Complete one command name. Arguments stay untouched: their valid values
+/// depend on live app state, while this list is fixed and deterministic.
+fn command_completion(input: &str, cycle: &mut Option<CommandCompletion>) -> Option<String> {
+    let prefix = input.trim();
+    if prefix.chars().any(char::is_whitespace) {
+        *cycle = None;
+        return None;
+    }
+    if let Some(active) = cycle {
+        if active.matches[active.index].eq_ignore_ascii_case(prefix) {
+            active.index = (active.index + 1) % active.matches.len();
+            return Some(active.matches[active.index].to_string());
+        }
+        *cycle = None;
+    }
+    let prefix = prefix.to_ascii_lowercase();
+    if VI_COMMANDS.contains(&prefix.as_str()) {
+        return Some(format!("{prefix} "));
+    }
+    let matches: Vec<_> = VI_COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| command.starts_with(&prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => None,
+        [command] => Some(format!("{command} ")),
+        _ => {
+            let completed = matches[0].to_string();
+            *cycle = Some(CommandCompletion { matches, index: 0 });
+            Some(completed)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ViHelpLayout {
+    width: f32,
+    height: f32,
+    two_columns: bool,
+    compact_header: bool,
+}
+
+fn vi_help_layout(viewport_width: f32, viewport_height: f32) -> ViHelpLayout {
+    const MARGIN: f32 = 16.;
+    const MAX_WIDTH: f32 = 920.;
+    const MAX_HEIGHT: f32 = 760.;
+    const TWO_COLUMN_MIN: f32 = 848.;
+    const COMPACT_HEADER_MAX: f32 = 640.;
+
+    let width = (viewport_width - MARGIN * 2.).clamp(0., MAX_WIDTH);
+    let height = (viewport_height - MARGIN * 2.).clamp(0., MAX_HEIGHT);
+    ViHelpLayout {
+        width,
+        height,
+        two_columns: width >= TWO_COLUMN_MIN,
+        compact_header: width < COMPACT_HEADER_MAX,
+    }
+}
+
 #[derive(Clone)]
 enum NavEntry {
     Section(NavSection),
     Album(String),
     LocalAlbum(String),
+    LocalArtist(String),
     Artist(String),
     Playlist(String),
 }
@@ -81,11 +183,25 @@ enum Content {
     AlbumDetail(Entity<AlbumDetailView>),
     Favorites(Entity<FavoritesView>),
     LocalAlbumDetail(Entity<LocalAlbumDetailView>),
+    LocalArtistDetail(Entity<LocalArtistDetailView>),
     Playlist(Entity<PlaylistDetailView>),
     Radio(Entity<RadioView>),
     Settings(Entity<SettingsView>),
     Recent(Entity<RecentView>),
     LocalMusic(Entity<LocalMusicView>),
+}
+
+fn command_section(name: &str) -> Option<NavSection> {
+    match name.to_ascii_lowercase().as_str() {
+        "albums" | "album" => Some(NavSection::Albums),
+        "artists" | "artist" => Some(NavSection::Artists),
+        "favorites" | "favourites" | "favorite" | "favourite" => Some(NavSection::Favorites),
+        "recent" => Some(NavSection::Recent),
+        "radio" => Some(NavSection::Radio),
+        "local" | "localmusic" | "local-music" => Some(NavSection::LocalMusic),
+        "settings" | "config" => Some(NavSection::Settings),
+        _ => None,
+    }
 }
 
 /// Where a manual library refresh has got to.
@@ -234,6 +350,9 @@ pub struct RootView {
     mode: KeyboardMode,
     focus_region: FocusRegion,
     cmd_input: Entity<InputState>,
+    cmd_history: Vec<String>,
+    cmd_history_cursor: Option<usize>,
+    cmd_completion: Option<CommandCompletion>,
     vi_selected: usize,
     show_vi_help: bool,
     /// Transient feedback for `:` commands, shown next to the mode indicator.
@@ -298,6 +417,7 @@ impl RootView {
             SearchBarEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
             SearchBarEvent::OpenLocalAlbum(id) => this.open_local_album(id.clone(), cx),
             SearchBarEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+            SearchBarEvent::OpenLocalArtist(id) => this.open_local_artist(id.clone(), cx),
         })
         .detach();
 
@@ -354,11 +474,15 @@ impl RootView {
         let setup_dir = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/music"));
 
         // Enter in command-mode input runs the command.
-        cx.subscribe(&cmd_input, |this: &mut Self, _, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.execute_command(cx);
-            }
-        })
+        cx.subscribe_in(
+            &cmd_input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.execute_command(window, cx);
+                }
+            },
+        )
         .detach();
 
         // Adaptive theme: recolour accents when the playing track changes.
@@ -534,6 +658,9 @@ impl RootView {
             mode: KeyboardMode::Normal,
             focus_region: FocusRegion::Content,
             cmd_input,
+            cmd_history: Vec::new(),
+            cmd_history_cursor: None,
+            cmd_completion: None,
             vi_selected: 0,
             show_vi_help: false,
             vi_status: None,
@@ -1184,6 +1311,7 @@ impl RootView {
             NavEntry::Section(section) => self.navigate(section, Some(window), cx),
             NavEntry::Album(id) => self.open_album(id, cx),
             NavEntry::LocalAlbum(id) => self.open_local_album(id, cx),
+            NavEntry::LocalArtist(id) => self.open_local_artist(id, cx),
             NavEntry::Artist(id) => self.open_artist(id, cx),
             NavEntry::Playlist(id) => self.open_playlist(id, window, cx),
         }
@@ -1225,6 +1353,27 @@ impl RootView {
             )
         });
         self.content = Some(Content::LocalAlbumDetail(view));
+        cx.notify();
+    }
+
+    fn open_local_artist(&mut self, id: String, cx: &mut Context<Self>) {
+        self.push_history();
+        self.current_entry = Some(NavEntry::LocalArtist(id.clone()));
+        let view = cx.new(|cx| {
+            LocalArtistDetailView::new(
+                self.library_db.clone(),
+                self.player.clone(),
+                self.session.clone(),
+                id,
+                cx,
+            )
+        });
+        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+            let LocalArtistEvent::OpenAlbum(id) = event;
+            this.open_local_album(id.clone(), cx);
+        })
+        .detach();
+        self.content = Some(Content::LocalArtistDetail(view));
         cx.notify();
     }
 
@@ -1377,6 +1526,9 @@ impl RootView {
             Some(Content::LocalAlbumDetail(v)) => {
                 v.update(cx, |v, cx| v.vi_move(delta, window, cx))
             }
+            Some(Content::LocalArtistDetail(v)) => {
+                v.update(cx, |v, cx| v.vi_move(delta, window, cx))
+            }
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
@@ -1395,6 +1547,7 @@ impl RootView {
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::LocalArtistDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_activate(window, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_activate(window, cx)),
@@ -1402,6 +1555,42 @@ impl RootView {
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             None => {}
         }
+    }
+
+    fn content_vi_play(&mut self, cx: &mut Context<Self>) {
+        match &self.content {
+            Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            Some(Content::LocalArtistDetail(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            _ => {}
+        }
+    }
+
+    fn content_vi_shuffle(&mut self, cx: &mut Context<Self>) {
+        match &self.content {
+            Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_shuffle(cx)),
+            Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_shuffle(cx)),
+            Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_shuffle(cx)),
+            Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_shuffle(cx)),
+            Some(Content::LocalArtistDetail(v)) => v.update(cx, |v, cx| v.vi_shuffle(cx)),
+            Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_shuffle(cx)),
+            Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_shuffle(cx)),
+            _ => {}
+        }
+    }
+
+    fn toggle_fullscreen(&mut self, cx: &mut Context<Self>) {
+        if self.show_fullscreen {
+            self.fullscreen.update(cx, |f, cx| f.begin_close(cx));
+        } else {
+            self.show_fullscreen = true;
+            self.fullscreen.update(cx, |f, cx| f.reset_for_open(cx));
+        }
+        cx.notify();
     }
 
     /// `i` on a content page with its own text field: focus that field.
@@ -1436,6 +1625,7 @@ impl RootView {
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::LocalArtistDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
@@ -1581,8 +1771,7 @@ impl RootView {
                     cx.stop_propagation();
                 }
                 FocusRegion::PlayerBar => {
-                    let v = (self.player.read(cx).volume - 0.05).max(0.0);
-                    self.player.update(cx, |p, cx| p.set_volume(v, cx));
+                    self.player.update(cx, |p, cx| p.next(cx));
                     cx.stop_propagation();
                 }
             },
@@ -1598,12 +1787,27 @@ impl RootView {
                     cx.stop_propagation();
                 }
                 FocusRegion::PlayerBar => {
-                    let v = (self.player.read(cx).volume + 0.05).min(1.0);
-                    self.player.update(cx, |p, cx| p.set_volume(v, cx));
+                    self.player.update(cx, |p, cx| p.previous(cx));
                     cx.stop_propagation();
                 }
             },
-            // h/l nav back/forward (any region)
+            // h/l seek in the player bar, history elsewhere.
+            (false, "h") if self.focus_region == FocusRegion::PlayerBar => {
+                self.player.update(cx, |p, _| {
+                    p.seek(p.position.saturating_sub(Duration::from_secs(5)));
+                });
+                cx.stop_propagation();
+            }
+            (false, "l") if self.focus_region == FocusRegion::PlayerBar => {
+                self.player.update(cx, |p, _| {
+                    let position = p.position.saturating_add(Duration::from_secs(5));
+                    p.seek(
+                        p.duration
+                            .map_or(position, |duration| position.min(duration)),
+                    );
+                });
+                cx.stop_propagation();
+            }
             (false, "h") => {
                 self.nav_back(window, cx);
                 cx.stop_propagation();
@@ -1622,14 +1826,67 @@ impl RootView {
                     self.content_vi_activate(window, cx);
                     cx.stop_propagation();
                 }
-                FocusRegion::PlayerBar => {
-                    self.player.update(cx, |p, cx| p.toggle_play(cx));
-                    cx.stop_propagation();
-                }
+                FocusRegion::PlayerBar => {}
             },
+            (false, "p") if self.focus_region == FocusRegion::Content => {
+                self.content_vi_play(cx);
+                cx.stop_propagation();
+            }
+            (false, "s") if self.focus_region == FocusRegion::Content => {
+                self.content_vi_shuffle(cx);
+                cx.stop_propagation();
+            }
+            (false, "s") if self.focus_region == FocusRegion::PlayerBar => {
+                self.player.update(cx, |p, cx| p.toggle_shuffle(cx));
+                cx.stop_propagation();
+            }
+            (false, "r") if self.focus_region == FocusRegion::PlayerBar => {
+                self.player.update(cx, |p, cx| p.cycle_repeat(cx));
+                cx.stop_propagation();
+            }
+            (false, "m") if self.focus_region == FocusRegion::PlayerBar => {
+                self.player.update(cx, |p, cx| p.toggle_mute(cx));
+                cx.stop_propagation();
+            }
+            (false, "+") | (false, "=")
+                if self.focus_region == FocusRegion::PlayerBar
+                    && (key == "+" || event.keystroke.modifiers.shift) =>
+            {
+                self.player.update(cx, |p, cx| {
+                    p.set_volume((p.volume + 0.05).min(1.0), cx);
+                });
+                cx.stop_propagation();
+            }
+            (false, "-") if self.focus_region == FocusRegion::PlayerBar => {
+                self.player.update(cx, |p, cx| {
+                    p.set_volume((p.volume - 0.05).max(0.0), cx);
+                });
+                cx.stop_propagation();
+            }
+            (false, "0") if self.focus_region == FocusRegion::PlayerBar => {
+                self.player.update(cx, |p, _| p.seek(Duration::ZERO));
+                cx.stop_propagation();
+            }
+            (false, "$") | (false, "4")
+                if self.focus_region == FocusRegion::PlayerBar
+                    && (key == "$" || event.keystroke.modifiers.shift) =>
+            {
+                self.player.update(cx, |p, _| {
+                    if let Some(duration) = p.duration {
+                        p.seek(duration);
+                    }
+                });
+                cx.stop_propagation();
+            }
+            (false, "f") => {
+                self.toggle_fullscreen(cx);
+                cx.stop_propagation();
+            }
             // Media keys
             (false, "space") => {
-                if matches!(self.content, Some(Content::Settings(_))) {
+                if self.focus_region == FocusRegion::PlayerBar {
+                    self.player.update(cx, |p, cx| p.toggle_play(cx));
+                } else if matches!(self.content, Some(Content::Settings(_))) {
                     self.content_vi_activate(window, cx);
                 } else {
                     self.player.update(cx, |p, cx| p.toggle_play(cx));
@@ -1663,6 +1920,8 @@ impl RootView {
             }
             (false, ":") => {
                 self.mode = KeyboardMode::Command;
+                self.cmd_history_cursor = None;
+                self.cmd_completion = None;
                 self.cmd_input
                     .update(cx, |s, cx| s.set_value("", window, cx));
                 self.cmd_input.update(cx, |s, cx| s.focus(window, cx));
@@ -1730,6 +1989,10 @@ impl RootView {
                 self.player.update(cx, |p, cx| p.next(cx));
                 cx.stop_propagation();
             }
+            "f" if !is_text_input => {
+                self.toggle_fullscreen(cx);
+                cx.stop_propagation();
+            }
             "up" if !is_text_input => {
                 self.player.update(cx, |p, cx| {
                     p.set_volume((p.volume + 0.05).min(1.0), cx);
@@ -1749,24 +2012,83 @@ impl RootView {
     fn handle_vi_command(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.keystroke.key.as_str() == "escape" {
-            self.mode = KeyboardMode::Normal;
-            cx.notify();
-            cx.stop_propagation();
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.mode = KeyboardMode::Normal;
+                self.cmd_history_cursor = None;
+                self.cmd_completion = None;
+                cx.notify();
+                cx.stop_propagation();
+            }
+            "up" => {
+                self.command_history_move(-1, window, cx);
+                cx.stop_propagation();
+            }
+            "down" => {
+                self.command_history_move(1, window, cx);
+                cx.stop_propagation();
+            }
+            "tab" => {
+                window.prevent_default();
+                self.complete_command(window, cx);
+                cx.stop_propagation();
+            }
+            _ => self.cmd_completion = None,
         }
         // InputState handles text entry
     }
 
-    fn execute_command(&mut self, cx: &mut Context<Self>) {
-        let cmd = self.cmd_input.read(cx).value().to_string();
-        let trimmed = cmd.trim();
+    fn complete_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.cmd_input.read(cx).value().to_string();
+        let completed = command_completion(&value, &mut self.cmd_completion);
+        if completed.is_some() {
+            self.cmd_history_cursor = None;
+        }
+        self.cmd_input.update(cx, |input, cx| {
+            if let Some(completed) = completed {
+                input.set_value(completed, window, cx);
+            }
+            input.focus(window, cx);
+        });
+    }
+
+    fn command_history_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cmd_history.is_empty() {
+            return;
+        }
+        self.cmd_completion = None;
+        let next = match (self.cmd_history_cursor, delta.is_negative()) {
+            (None, true) => Some(self.cmd_history.len() - 1),
+            (None, false) => None,
+            (Some(0), true) => Some(0),
+            (Some(index), true) => Some(index - 1),
+            (Some(index), false) if index + 1 < self.cmd_history.len() => Some(index + 1),
+            (Some(_), false) => None,
+        };
+        self.cmd_history_cursor = next;
+        let value = next
+            .and_then(|index| self.cmd_history.get(index))
+            .cloned()
+            .unwrap_or_default();
+        self.cmd_input
+            .update(cx, |input, cx| input.set_value(value, window, cx));
+    }
+
+    fn execute_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let trimmed = self.cmd_input.read(cx).value().trim().to_string();
         self.mode = KeyboardMode::Normal;
+        self.cmd_history_cursor = None;
+        self.cmd_completion = None;
+        window.focus(&self.focus_handle);
         cx.notify();
         if trimmed.is_empty() {
             return;
+        }
+        if self.cmd_history.last() != Some(&trimmed) {
+            self.cmd_history.push(trimmed.clone());
         }
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or_default().to_lowercase();
@@ -1775,6 +2097,79 @@ impl RootView {
             "q" | "quit" => cx.quit(),
             "help" => {
                 self.show_vi_help = true;
+            }
+            "fs" | "fullscreen" => self.toggle_fullscreen(cx),
+            "vol" | "volume" => {
+                let volume = args
+                    .first()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|value| (0.0..=100.0).contains(value));
+                match volume {
+                    Some(volume) => {
+                        self.player
+                            .update(cx, |player, cx| player.set_volume(volume / 100.0, cx));
+                        self.set_vi_status(format!("Volume: {volume:.0}%"), cx);
+                    }
+                    None => self.set_vi_status("Usage: :vol <0-100>".into(), cx),
+                }
+            }
+            "shuffle" | "noshuffle" => {
+                let enabled = cmd == "shuffle";
+                if self.player.read(cx).queue.shuffle != enabled {
+                    self.player
+                        .update(cx, |player, cx| player.toggle_shuffle(cx));
+                }
+                self.set_vi_status(
+                    format!("Shuffle: {}", if enabled { "on" } else { "off" }),
+                    cx,
+                );
+            }
+            "repeat" => {
+                let desired = match args.first().copied() {
+                    None => None,
+                    Some("off") => Some(RepeatMode::Off),
+                    Some("all") => Some(RepeatMode::All),
+                    Some("one") => Some(RepeatMode::One),
+                    Some(_) => {
+                        self.set_vi_status("Usage: :repeat [off|all|one]".into(), cx);
+                        return;
+                    }
+                };
+                self.player.update(cx, |player, cx| match desired {
+                    Some(mode) => {
+                        while player.queue.repeat != mode {
+                            player.cycle_repeat(cx);
+                        }
+                    }
+                    None => player.cycle_repeat(cx),
+                });
+                let mode = match self.player.read(cx).queue.repeat {
+                    RepeatMode::Off => "off",
+                    RepeatMode::All => "all",
+                    RepeatMode::One => "one",
+                };
+                self.set_vi_status(format!("Repeat: {mode}"), cx);
+            }
+            "next" => self.player.update(cx, |player, cx| player.next(cx)),
+            "prev" | "previous" => self.player.update(cx, |player, cx| player.previous(cx)),
+            "toggle" | "playpause" => self.player.update(cx, |player, cx| player.toggle_play(cx)),
+            "stop" => self.player.update(cx, |player, cx| player.stop(cx)),
+            "queue" => {
+                self.show_queue = !self.show_queue;
+                cx.notify();
+            }
+            "refresh" => self.refresh_library(window, cx),
+            "goto" => match args.first().and_then(|name| command_section(name)) {
+                Some(section) => self.navigate_push(section, window, cx),
+                None => self.set_vi_status(
+                    "Usage: :goto <albums|artists|favorites|recent|radio|local|settings>".into(),
+                    cx,
+                ),
+            },
+            "albums" | "artists" | "favorites" | "recent" | "radio" | "local" | "settings" => {
+                if let Some(section) = command_section(&cmd) {
+                    self.navigate_push(section, window, cx);
+                }
             }
             "newpl" | "newplaylist" => {
                 if !args.is_empty() {
@@ -1832,7 +2227,7 @@ impl RootView {
                 _ => self.set_vi_status("Usage: :pl add <name> | :pl list".into(), cx),
             },
             _ => {
-                self.set_vi_status(format!("Unknown command: {cmd}"), cx);
+                self.set_vi_status(format!("Unknown command: {cmd} - try :help"), cx);
             }
         }
     }
@@ -1879,6 +2274,75 @@ impl RootView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let suggestions = self.cmd_completion.as_ref().map(|completion| {
+            const VISIBLE_MATCHES: usize = 7;
+            let count = completion.matches.len();
+            let start = completion
+                .index
+                .saturating_sub(VISIBLE_MATCHES / 2)
+                .min(count.saturating_sub(VISIBLE_MATCHES));
+            let end = (start + VISIBLE_MATCHES).min(count);
+            v_flex()
+                .absolute()
+                .left(px(12.))
+                .bottom(px(48.))
+                .w(px(320.))
+                .occlude()
+                .p_2()
+                .gap_1()
+                .rounded_xl()
+                .border_1()
+                .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+                .bg(cx.theme().background)
+                .shadow_xl()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_bold()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{count} MATCHING COMMANDS")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Tab to cycle"),
+                        ),
+                )
+                .children(completion.matches[start..end].iter().enumerate().map(
+                    |(index, command)| {
+                        let selected = start + index == completion.index;
+                        h_flex()
+                            .px_2()
+                            .py_1p5()
+                            .gap_2()
+                            .rounded_md()
+                            .when(selected, |this| this.bg(cx.theme().muted))
+                            .child(div().text_color(cx.theme().primary).font_bold().child(":"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .when(selected, |this| this.font_semibold())
+                                    .child(*command),
+                            )
+                            .when(selected, |this| {
+                                this.child(div().flex_1()).child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("selected"),
+                                )
+                            })
+                    },
+                ))
+                .into_any_element()
+        });
         div()
             .absolute()
             // Slides up out of the window's bottom edge rather than appearing
@@ -1896,25 +2360,53 @@ impl RootView {
             .px_3()
             .gap_2()
             .when(active, |this| {
-                this.capture_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
-                    match e.keystroke.key.as_str() {
-                        "enter" => {
-                            this.execute_command(cx);
-                            window.focus(&this.focus_handle);
-                            cx.stop_propagation();
-                        }
-                        "escape" => {
-                            this.mode = KeyboardMode::Normal;
-                            this.cmd_input
-                                .update(cx, |s, cx| s.set_value("", window, cx));
-                            window.focus(&this.focus_handle);
-                            cx.notify();
-                            cx.stop_propagation();
-                        }
-                        _ => {}
-                    }
+                this.on_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                    // Input maps Tab to this action before raw key events.
+                    // Handling it here prevents focus traversal and lets the
+                    // command prompt own completion.
+                    window.prevent_default();
+                    this.complete_command(window, cx);
+                    cx.stop_propagation();
                 }))
+                .capture_key_down(cx.listener(
+                    move |this, e: &KeyDownEvent, window, cx| {
+                        match e.keystroke.key.as_str() {
+                            "enter" => {
+                                this.execute_command(window, cx);
+                                window.focus(&this.focus_handle);
+                                cx.stop_propagation();
+                            }
+                            "escape" => {
+                                this.mode = KeyboardMode::Normal;
+                                this.cmd_history_cursor = None;
+                                this.cmd_completion = None;
+                                this.cmd_input
+                                    .update(cx, |s, cx| s.set_value("", window, cx));
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                            "up" => {
+                                this.command_history_move(-1, window, cx);
+                                cx.stop_propagation();
+                            }
+                            "down" => {
+                                this.command_history_move(1, window, cx);
+                                cx.stop_propagation();
+                            }
+                            "tab" => {
+                                // Fallback for platforms that deliver Tab as a
+                                // raw key instead of the input action above.
+                                window.prevent_default();
+                                this.complete_command(window, cx);
+                                cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    },
+                ))
             })
+            .when_some(suggestions, |this, suggestions| this.child(suggestions))
             .child(
                 div()
                     .text_sm()
@@ -1928,19 +2420,66 @@ impl RootView {
 
     /// `t` is the open/close travel. The overlay takes no input of its own, so
     /// unlike the other two it needs no `active` flag.
-    fn render_vi_help(&self, t: f32, cx: &Context<Self>) -> gpui::AnyElement {
-        let key = |k: SharedString, desc: SharedString| {
+    fn render_vi_help(&self, t: f32, window: &Window, cx: &Context<Self>) -> gpui::AnyElement {
+        let viewport = window.viewport_size();
+        let layout = vi_help_layout(f32::from(viewport.width), f32::from(viewport.height));
+        let key = |label: &'static str, desc: &'static str| {
             h_flex()
-                .gap_4()
+                .items_center()
+                .gap_2()
+                .min_h(px(30.))
                 .child(
                     div()
-                        .w(px(120.))
-                        .text_sm()
+                        .flex_none()
+                        .min_w(px(126.))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(cx.theme().muted)
+                        .text_xs()
                         .font_bold()
                         .text_color(cx.theme().primary)
-                        .child(k.clone()),
+                        .child(label),
                 )
-                .child(div().text_sm().child(desc.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(desc),
+                )
+                .into_any_element()
+        };
+        let section = |title: &'static str, rows: &[(&'static str, &'static str)]| {
+            v_flex()
+                .gap_2p5()
+                .p_4()
+                .rounded_xl()
+                .border_1()
+                .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+                .bg(cx.theme().sidebar)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .pb_1()
+                        .child(
+                            div()
+                                .w(px(3.))
+                                .h(px(14.))
+                                .rounded_full()
+                                .bg(cx.theme().primary),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_bold()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(title),
+                        ),
+                )
+                .children(rows.iter().map(|(label, desc)| key(label, desc)))
                 .into_any_element()
         };
         div()
@@ -1958,53 +2497,195 @@ impl RootView {
             .bg(gpui::hsla(0., 0., 0., 0.6 * t))
             .child(
                 v_flex()
-                    // Clamped so the dialog cannot overrun a narrow window.
-                    .w(px(460.))
-                    .max_w_full()
+                    .id("vi-help-scroll")
+                    .w(px(layout.width))
+                    .h(px(layout.height))
+                    .overflow_y_scroll()
+                    .occlude()
                     .opacity(t)
-                    .gap_3()
-                    .p_5()
-                    .rounded_xl()
+                    .gap_4()
+                    .p_4()
+                    .rounded_2xl()
                     .border_1()
-                    .border_color(cx.theme().border)
+                    .border_color(gpui::hsla(0., 0., 0.5, 0.15))
                     .bg(cx.theme().background)
-                    .child(div().text_lg().font_semibold().child("Vi-mode help"))
-                    .child(key(
-                        "j / k".into(),
-                        "Navigate sidebar (incl. playlists), grids, settings".into(),
-                    ))
-                    .child(key(
-                        "Ctrl+h/j/k/l".into(),
-                        "Focus sidebar / player / content".into(),
-                    ))
-                    .child(key(
-                        "Enter".into(),
-                        "Open/play focused item; toggle Settings control".into(),
-                    ))
-                    .child(key("h / l".into(), "Back / forward in history".into()))
-                    .child(key(
-                        "Space".into(),
-                        "Toggle play/pause; toggle Settings control".into(),
-                    ))
-                    .child(key("← / →".into(), "Previous / next track".into()))
-                    .child(key("[ / ]".into(), "Album tabs / Settings sections".into()))
-                    .child(key("i".into(), "Insert mode (pass keys to input)".into()))
-                    .child(key(":".into(), "Command mode (:q / :help)".into()))
-                    .child(key(":newpl <name>".into(), "Create playlist".into()))
-                    .child(key(
-                        ":pl add <name>".into(),
-                        "Add current song to playlist".into(),
-                    ))
-                    .child(key(":pl list".into(), "List playlists".into()))
-                    .child(key("/".into(), "Search (Ctrl+K)".into()))
-                    .child(key("Ctrl+B".into(), "Collapse / expand sidebar".into()))
-                    .child(key("? / Esc".into(), "Toggle help / Dismiss".into()))
+                    .shadow_xl()
                     .child(
                         div()
-                            .mt_2()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Press Esc or ? to close"),
+                            .flex()
+                            .when(layout.compact_header, |this| {
+                                this.flex_col().items_start().gap_3()
+                            })
+                            .when(!layout.compact_header, |this| {
+                                this.flex_row().items_center().justify_between()
+                            })
+                            .px_2()
+                            .pb_4()
+                            .border_b_1()
+                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+                            .child(
+                                div()
+                                    .flex()
+                                    .when(layout.compact_header, |this| {
+                                        this.flex_col().items_start().gap_2()
+                                    })
+                                    .when(!layout.compact_header, |this| {
+                                        this.flex_row().items_center().gap_3()
+                                    })
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(cx.theme().muted)
+                                            .text_xs()
+                                            .font_bold()
+                                            .text_color(cx.theme().primary)
+                                            .child("VI MODE"),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                div()
+                                                    .text_xl()
+                                                    .font_semibold()
+                                                    .child("Keyboard reference"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(
+                                                        "Navigate Scirè without leaving keyboard",
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+                                            .bg(cx.theme().muted)
+                                            .text_xs()
+                                            .font_bold()
+                                            .child("? / Esc"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("Close"),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_4()
+                            .when(layout.two_columns, |this| this.flex_row())
+                            .when(!layout.two_columns, |this| this.flex_col())
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .when(layout.two_columns, |this| this.flex_1())
+                                    .when(!layout.two_columns, |this| this.w_full())
+                                    .gap_4()
+                                    .child(section(
+                                        "NAVIGATION",
+                                        &[
+                                            ("j / k", "Move focused item"),
+                                            ("Enter", "Open or activate focused item"),
+                                            ("h / l", "Back / forward outside player bar"),
+                                            ("p / s", "Play / shuffle focused album or list"),
+                                            ("[ / ]", "Cycle album tabs or Settings sections"),
+                                            ("Ctrl+B", "Collapse / expand sidebar"),
+                                        ],
+                                    ))
+                                    .child(section(
+                                        "PLAYBACK",
+                                        &[
+                                            ("Space", "Play / pause"),
+                                            ("← / →", "Previous / next track"),
+                                            ("f", "Toggle fullscreen player"),
+                                        ],
+                                    ))
+                                    .child(section(
+                                        "PLAYER BAR",
+                                        &[
+                                            ("j / k", "Next / previous track"),
+                                            ("h / l", "Seek backward / forward 5 seconds"),
+                                            ("0 / $", "Seek to track start / end"),
+                                            ("Space", "Play / pause"),
+                                            ("s", "Toggle shuffle"),
+                                            ("r", "Cycle repeat: off → all → one"),
+                                            ("m", "Mute / unmute"),
+                                            ("+ / -", "Volume up / down 5%"),
+                                        ],
+                                    )),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .when(layout.two_columns, |this| this.flex_1())
+                                    .when(!layout.two_columns, |this| this.w_full())
+                                    .gap_4()
+                                    .child(section(
+                                        "COMMANDS",
+                                        &[
+                                            ("↑ / ↓", "Previous / next command in history"),
+                                            (
+                                                "Tab",
+                                                "Show matches, complete, then cycle suggestions",
+                                            ),
+                                            (":q / :help", "Quit / open this help"),
+                                            (":fs / :queue", "Toggle fullscreen / queue"),
+                                            (":refresh", "Refresh local and server libraries"),
+                                            (":vol <0-100>", "Set volume percent"),
+                                            (":shuffle", "Enable shuffle"),
+                                            (":noshuffle", "Disable shuffle"),
+                                            (":repeat [mode]", "Cycle or set off / all / one"),
+                                            (":next / :prev", "Next / previous track"),
+                                            (":toggle / :stop", "Play-pause / stop"),
+                                            (":goto <section>", "Go to named sidebar section"),
+                                            (
+                                                ":albums … :settings",
+                                                "Section aliases; includes :local",
+                                            ),
+                                            (":newpl <name>", "Create playlist"),
+                                            (":pl add <name>", "Add current song to playlist"),
+                                            (":pl list", "List playlists"),
+                                        ],
+                                    ))
+                                    .child(section(
+                                        "REGIONS & SEARCH",
+                                        &[
+                                            ("Ctrl+h", "Focus sidebar"),
+                                            ("Ctrl+j", "Focus player bar"),
+                                            ("Ctrl+k / Ctrl+l", "Focus content"),
+                                            ("/", "Open search"),
+                                            ("i", "Enter INSERT mode"),
+                                            (":", "Enter COMMAND mode"),
+                                            ("Esc", "Return to NORMAL or dismiss overlay"),
+                                        ],
+                                    ))
+                                    .child(section(
+                                        "MODE INDICATORS",
+                                        &[
+                                            ("NORMAL", "Navigation shortcuts active"),
+                                            ("INSERT", "Text input and global media keys"),
+                                            ("COMMAND", "Colon command prompt active"),
+                                        ],
+                                    )),
+                            ),
                     ),
             )
             .into_any_element()
@@ -2369,6 +3050,7 @@ impl Render for RootView {
             Some(Content::ArtistDetail(v)) => v.clone().into_any_element(),
             Some(Content::AlbumDetail(v)) => v.clone().into_any_element(),
             Some(Content::LocalAlbumDetail(v)) => v.clone().into_any_element(),
+            Some(Content::LocalArtistDetail(v)) => v.clone().into_any_element(),
             Some(Content::Favorites(v)) => v.clone().into_any_element(),
             Some(Content::Playlist(v)) => v.clone().into_any_element(),
             Some(Content::Radio(v)) => v.clone().into_any_element(),
@@ -2801,7 +3483,7 @@ impl Render for RootView {
             })
             // Vi-mode help overlay.
             .when(vi_help_visible, |this| {
-                this.child(self.render_vi_help(vi_help_t, cx))
+                this.child(self.render_vi_help(vi_help_t, window, cx))
             })
             // Centered command palette (Ctrl/Cmd+K): dimmed full-window backdrop
             // with the search box near the top. Backdrop click dismisses; the
@@ -2851,7 +3533,7 @@ pub fn player_bar_idle(playing: bool, has_now_playing: bool, queue_empty: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{RefreshStage, player_bar_idle};
+    use super::{RefreshStage, VI_COMMANDS, command_completion, player_bar_idle, vi_help_layout};
     use crate::ui::sidebar::{NavSection, SidebarFocus, sidebar_targets};
 
     #[test]
@@ -2861,6 +3543,88 @@ mod tests {
         assert!(!player_bar_idle(false, true, true));
         assert!(!player_bar_idle(true, false, true));
         assert!(!player_bar_idle(false, false, false));
+    }
+
+    #[test]
+    fn tab_completes_unique_and_exact_commands() {
+        let mut cycle = None;
+        assert_eq!(
+            command_completion("ref", &mut cycle).as_deref(),
+            Some("refresh ")
+        );
+        assert!(cycle.is_none());
+        assert_eq!(command_completion("Q", &mut cycle).as_deref(), Some("q "));
+    }
+
+    #[test]
+    fn repeated_tab_cycles_ambiguous_commands() {
+        let mut cycle = None;
+        assert_eq!(
+            command_completion("f", &mut cycle).as_deref(),
+            Some("favorites")
+        );
+        assert!(cycle.is_some());
+        assert_eq!(
+            command_completion("favorites", &mut cycle).as_deref(),
+            Some("fs")
+        );
+        assert_eq!(
+            command_completion("fs", &mut cycle).as_deref(),
+            Some("fullscreen")
+        );
+        assert_eq!(
+            command_completion("fullscreen", &mut cycle).as_deref(),
+            Some("favorites")
+        );
+    }
+
+    #[test]
+    fn tab_from_empty_prompt_opens_command_catalog() {
+        let mut cycle = None;
+        assert_eq!(
+            command_completion("", &mut cycle).as_deref(),
+            Some("albums")
+        );
+        assert_eq!(
+            cycle.as_ref().map(|cycle| cycle.matches.len()),
+            Some(VI_COMMANDS.len())
+        );
+    }
+
+    #[test]
+    fn editing_text_resets_an_old_completion_cycle() {
+        let mut cycle = None;
+        assert_eq!(
+            command_completion("f", &mut cycle).as_deref(),
+            Some("favorites")
+        );
+        assert_eq!(
+            command_completion("ref", &mut cycle).as_deref(),
+            Some("refresh ")
+        );
+        assert!(cycle.is_none());
+    }
+
+    #[test]
+    fn tab_leaves_arguments_and_unknown_commands_alone() {
+        let mut cycle = None;
+        assert_eq!(command_completion("goto art", &mut cycle), None);
+        assert_eq!(command_completion("wat", &mut cycle), None);
+    }
+
+    #[test]
+    fn vi_help_layout_is_bounded_and_reflows() {
+        let large = vi_help_layout(1_200., 900.);
+        assert_eq!((large.width, large.height), (920., 760.));
+        assert!(large.two_columns);
+        assert!(!large.compact_header);
+
+        let small = vi_help_layout(600., 480.);
+        assert_eq!((small.width, small.height), (568., 448.));
+        assert!(!small.two_columns);
+        assert!(small.compact_header);
+        assert!(small.width <= 600. - 32.);
+        assert!(small.height <= 480. - 32.);
     }
 
     #[test]

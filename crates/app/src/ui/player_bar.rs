@@ -327,15 +327,16 @@ impl PlayerBar {
     /// setting was turned off.
     fn maybe_fetch_waveform(&mut self, cx: &mut Context<Self>) {
         let enabled = self.session.read(cx).settings.waveform_seekbar;
-        let song_id = {
+        let song = {
             let p = self.player.read(cx);
             if !enabled || p.is_radio() {
                 None
             } else {
-                p.current_song().map(|s| s.id.clone())
+                p.current_song()
+                    .map(|s| (s.id.clone(), s.local_path.clone()))
             }
         };
-        let Some(id) = song_id else {
+        let Some((id, local_path)) = song else {
             self.waveform = None;
             self.waveform_for = None;
             return;
@@ -343,18 +344,23 @@ impl PlayerBar {
         if self.waveform_for.as_deref() == Some(id.as_str()) {
             return;
         }
-        let opts = waveform::stream_options();
-        let url = self
-            .session
-            .read(cx)
-            .client
-            .as_ref()
-            .and_then(|c| c.stream_url(&id, &opts).ok().map(|u| u.to_string()));
-        let Some(url) = url else { return };
+        let source = if let Some(path) = local_path {
+            waveform::Source::Local(path.into())
+        } else {
+            let opts = waveform::stream_options();
+            let url = self
+                .session
+                .read(cx)
+                .client
+                .as_ref()
+                .and_then(|c| c.stream_url(&id, &opts).ok().map(|u| u.to_string()));
+            let Some(url) = url else { return };
+            waveform::Source::Remote(url)
+        };
         self.waveform = None;
         self.waveform_for = Some(id.clone());
         cx.spawn(async move |this, cx| {
-            let result = runtime::spawn_io(waveform::fetch_peaks(url, id.clone())).await;
+            let result = runtime::spawn_io(waveform::fetch_peaks(source, id.clone())).await;
             let _ = this.update(cx, |bar, cx| {
                 // Ignore results for a track that is no longer current.
                 if bar.waveform_for.as_deref() == Some(id.as_str()) {

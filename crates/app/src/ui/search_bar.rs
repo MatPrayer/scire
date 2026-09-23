@@ -146,6 +146,7 @@ pub enum SearchBarEvent {
     OpenAlbum(String),
     OpenLocalAlbum(String),
     OpenArtist(String),
+    OpenLocalArtist(String),
 }
 
 /// Where a row's thumbnail comes from.
@@ -183,17 +184,25 @@ struct SongHit {
     local: bool,
 }
 
-/// Everything one query found, from either source, already deduped.
+/// Everything one query found, split by source and already deduped.
 #[derive(Default)]
 struct Hits {
     artists: Vec<ArtistHit>,
     albums: Vec<AlbumHit>,
     songs: Vec<SongHit>,
+    local_artists: Vec<ArtistHit>,
+    local_albums: Vec<AlbumHit>,
+    local_songs: Vec<SongHit>,
 }
 
 impl Hits {
     fn is_empty(&self) -> bool {
-        self.artists.is_empty() && self.albums.is_empty() && self.songs.is_empty()
+        self.artists.is_empty()
+            && self.albums.is_empty()
+            && self.songs.is_empty()
+            && self.local_artists.is_empty()
+            && self.local_albums.is_empty()
+            && self.local_songs.is_empty()
     }
 
     /// Append what `other` holds and this does not. What is already shown keeps
@@ -209,55 +218,12 @@ impl Hits {
     /// missing is taken from its twin rather than the row being left with a
     /// placeholder for a cover that did arrive.
     fn merge(&mut self, other: Hits) {
-        let mut artists: HashMap<String, usize> = self
-            .artists
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (a.id.clone(), i))
-            .collect();
-        for artist in other.artists {
-            match artists.get(&artist.id) {
-                Some(&i) => adopt(&mut self.artists[i].cover, artist.cover),
-                None => {
-                    artists.insert(artist.id.clone(), self.artists.len());
-                    self.artists.push(artist);
-                }
-            }
-        }
-
-        let mut albums: HashMap<(bool, String), usize> = self
-            .albums
-            .iter()
-            .enumerate()
-            .map(|(i, a)| ((a.local, a.id.clone()), i))
-            .collect();
-        for album in other.albums {
-            let key = (album.local, album.id.clone());
-            match albums.get(&key) {
-                Some(&i) => adopt(&mut self.albums[i].cover, album.cover),
-                None => {
-                    albums.insert(key, self.albums.len());
-                    self.albums.push(album);
-                }
-            }
-        }
-
-        let mut songs: HashMap<(bool, String), usize> = self
-            .songs
-            .iter()
-            .enumerate()
-            .map(|(i, s)| ((s.local, s.song.id.clone()), i))
-            .collect();
-        for song in other.songs {
-            let key = (song.local, song.song.id.clone());
-            match songs.get(&key) {
-                Some(&i) => adopt(&mut self.songs[i].cover, song.cover),
-                None => {
-                    songs.insert(key, self.songs.len());
-                    self.songs.push(song);
-                }
-            }
-        }
+        merge_artists(&mut self.artists, other.artists);
+        merge_albums(&mut self.albums, other.albums);
+        merge_songs(&mut self.songs, other.songs);
+        merge_artists(&mut self.local_artists, other.local_artists);
+        merge_albums(&mut self.local_albums, other.local_albums);
+        merge_songs(&mut self.local_songs, other.local_songs);
     }
 
     /// Put the rows that answer the query at the top of each section, closest
@@ -274,6 +240,65 @@ impl Hits {
             .sort_by_key(|a| sort_key(query, &a.title, a.artist.as_deref()));
         self.songs
             .sort_by_key(|s| sort_key(query, &s.song.title, s.song.artist.as_deref()));
+        self.local_artists
+            .sort_by_key(|a| sort_key(query, &a.name, None));
+        self.local_albums
+            .sort_by_key(|a| sort_key(query, &a.title, a.artist.as_deref()));
+        self.local_songs
+            .sort_by_key(|s| sort_key(query, &s.song.title, s.song.artist.as_deref()));
+    }
+}
+
+fn merge_artists(current: &mut Vec<ArtistHit>, other: Vec<ArtistHit>) {
+    let mut seen: HashMap<String, usize> = current
+        .iter()
+        .enumerate()
+        .map(|(i, artist)| (artist.id.clone(), i))
+        .collect();
+    for artist in other {
+        match seen.get(&artist.id) {
+            Some(&i) => adopt(&mut current[i].cover, artist.cover),
+            None => {
+                seen.insert(artist.id.clone(), current.len());
+                current.push(artist);
+            }
+        }
+    }
+}
+
+fn merge_albums(current: &mut Vec<AlbumHit>, other: Vec<AlbumHit>) {
+    let mut seen: HashMap<(bool, String), usize> = current
+        .iter()
+        .enumerate()
+        .map(|(i, album)| ((album.local, album.id.clone()), i))
+        .collect();
+    for album in other {
+        let key = (album.local, album.id.clone());
+        match seen.get(&key) {
+            Some(&i) => adopt(&mut current[i].cover, album.cover),
+            None => {
+                seen.insert(key, current.len());
+                current.push(album);
+            }
+        }
+    }
+}
+
+fn merge_songs(current: &mut Vec<SongHit>, other: Vec<SongHit>) {
+    let mut seen: HashMap<(bool, String), usize> = current
+        .iter()
+        .enumerate()
+        .map(|(i, song)| ((song.local, song.song.id.clone()), i))
+        .collect();
+    for song in other {
+        let key = (song.local, song.song.id.clone());
+        match seen.get(&key) {
+            Some(&i) => adopt(&mut current[i].cover, song.cover),
+            None => {
+                seen.insert(key, current.len());
+                current.push(song);
+            }
+        }
     }
 }
 
@@ -297,9 +322,6 @@ fn strip_ns(id: String, prefix: &str) -> String {
 
 /// Turn the cache's rows into hits, honouring the selected libraries.
 ///
-/// Local artists are dropped: there is no local artist page to open, so a row
-/// that cannot be activated would only be in the way. Their albums and songs
-/// are both reachable and playable, and stay.
 fn hits_from_cache(found: CatalogSearch, libraries: &[String]) -> Hits {
     let in_selection = |source: &str, library_id: &Option<String>| {
         // A subset is only meaningful for server rows, and a row synced before
@@ -310,71 +332,91 @@ fn hits_from_cache(found: CatalogSearch, libraries: &[String]) -> Hits {
             || library_id.as_ref().is_none_or(|id| libraries.contains(id))
     };
 
-    let artists = found
-        .artists
-        .into_iter()
-        .filter(|a| a.source != "local" && in_selection(&a.source, &a.library_id))
-        .map(|a| ArtistHit {
-            cover: a.cover_art.map(|id| Cover {
-                key: id.clone(),
+    let mut hits = Hits::default();
+    for artist in found.artists {
+        if !in_selection(&artist.source, &artist.library_id) {
+            continue;
+        }
+        let local = artist.source == "local";
+        let hit = ArtistHit {
+            cover: artist.cover_art.map(|id| Cover {
+                key: if local {
+                    format!("local:{id}")
+                } else {
+                    id.clone()
+                },
                 id,
-                local: false,
+                local,
             }),
-            id: strip_ns(a.id, "navidrome:artist:"),
-            name: a.name,
-        })
-        .collect();
-
-    let albums = found
-        .albums
-        .into_iter()
-        .filter(|a| in_selection(&a.source, &a.library_id))
-        .map(|a| {
-            let local = a.source == "local";
-            AlbumHit {
-                cover: a.cover_art.map(|id| Cover {
-                    key: if local {
-                        format!("local:{id}")
-                    } else {
-                        id.clone()
-                    },
-                    id,
-                    local,
-                }),
-                id: strip_ns(a.id, "navidrome:album:"),
-                title: a.title,
-                artist: a.artist,
-                local,
-            }
-        })
-        .collect();
-
-    let songs = found
-        .tracks
-        .into_iter()
-        .filter(|t| in_selection(&t.source, &None))
-        .map(|t| {
-            let local = t.source == "local";
-            let mut song = t.into_song();
-            if !local {
-                song.id = strip_ns(song.id, "navidrome:track:");
-                // Stripped too, so the art lands on the key the album pages
-                // already cache the very same cover under.
-                song.album_id = song.album_id.map(|id| strip_ns(id, "navidrome:album:"));
-            }
-            SongHit {
-                cover: song_cover(&song, local),
-                song,
-                local,
-            }
-        })
-        .collect();
-
-    Hits {
-        artists,
-        albums,
-        songs,
+            id: if local {
+                artist.id
+            } else {
+                strip_ns(artist.id, "navidrome:artist:")
+            },
+            name: artist.name,
+        };
+        if local {
+            hits.local_artists.push(hit);
+        } else {
+            hits.artists.push(hit);
+        }
     }
+
+    for album in found.albums {
+        if !in_selection(&album.source, &album.library_id) {
+            continue;
+        }
+        let local = album.source == "local";
+        let hit = AlbumHit {
+            cover: album.cover_art.map(|id| Cover {
+                key: if local {
+                    format!("local:{id}")
+                } else {
+                    id.clone()
+                },
+                id,
+                local,
+            }),
+            id: if local {
+                album.id
+            } else {
+                strip_ns(album.id, "navidrome:album:")
+            },
+            title: album.title,
+            artist: album.artist,
+            local,
+        };
+        if local {
+            hits.local_albums.push(hit);
+        } else {
+            hits.albums.push(hit);
+        }
+    }
+
+    for track in found.tracks {
+        if !in_selection(&track.source, &None) {
+            continue;
+        }
+        let local = track.source == "local";
+        let mut song = track.into_song();
+        if !local {
+            song.id = strip_ns(song.id, "navidrome:track:");
+            // Stripped too, so the art lands on the key the album pages
+            // already cache the very same cover under.
+            song.album_id = song.album_id.map(|id| strip_ns(id, "navidrome:album:"));
+        }
+        let hit = SongHit {
+            cover: song_cover(&song, local),
+            song,
+            local,
+        };
+        if local {
+            hits.local_songs.push(hit);
+        } else {
+            hits.songs.push(hit);
+        }
+    }
+    hits
 }
 
 fn hits_from_server(result: SearchResult3) -> Hits {
@@ -416,6 +458,7 @@ fn hits_from_server(result: SearchResult3) -> Hits {
                 local: false,
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -440,6 +483,7 @@ fn song_cover(song: &Song, local: bool) -> Option<Cover> {
 /// (artists, then albums, then songs). Index into this list == `selected`.
 enum PaletteItem {
     Artist(String),
+    LocalArtist(String),
     Album { id: String, local: bool },
     Song(Box<Song>),
 }
@@ -605,6 +649,18 @@ impl SearchBar {
         for s in self.results.songs.iter().take(MAX_SONGS) {
             v.push(PaletteItem::Song(Box::new(s.song.clone())));
         }
+        for a in self.results.local_artists.iter().take(MAX_ARTISTS) {
+            v.push(PaletteItem::LocalArtist(a.id.clone()));
+        }
+        for a in self.results.local_albums.iter().take(MAX_ALBUMS) {
+            v.push(PaletteItem::Album {
+                id: a.id.clone(),
+                local: true,
+            });
+        }
+        for s in self.results.local_songs.iter().take(MAX_SONGS) {
+            v.push(PaletteItem::Song(Box::new(s.song.clone())));
+        }
         v
     }
 
@@ -628,14 +684,21 @@ impl SearchBar {
             self.results.artists.len().min(MAX_ARTISTS),
             self.results.albums.len().min(MAX_ALBUMS),
             self.results.songs.len().min(MAX_SONGS),
+            self.results.local_artists.len().min(MAX_ARTISTS),
+            self.results.local_albums.len().min(MAX_ALBUMS),
+            self.results.local_songs.len().min(MAX_SONGS),
         ];
         let mut child = 0;
         let mut item = 0;
-        for n in counts {
+        let mut local_title = false;
+        for (group, n) in counts.into_iter().enumerate() {
             if n == 0 {
                 continue;
             }
-            child += 1; // section title
+            if group < 3 || !local_title {
+                child += 1; // server section title, or shared local title
+                local_title |= group >= 3;
+            }
             for _ in 0..n {
                 if item == self.selected {
                     return Some(child);
@@ -655,6 +718,7 @@ impl SearchBar {
         };
         match item {
             PaletteItem::Artist(id) => cx.emit(SearchBarEvent::OpenArtist(id)),
+            PaletteItem::LocalArtist(id) => cx.emit(SearchBarEvent::OpenLocalArtist(id)),
             PaletteItem::Album { id, local: true } => cx.emit(SearchBarEvent::OpenLocalAlbum(id)),
             PaletteItem::Album { id, local: false } => cx.emit(SearchBarEvent::OpenAlbum(id)),
             PaletteItem::Song(song) => {
@@ -821,6 +885,24 @@ impl SearchBar {
                     .iter()
                     .take(MAX_ARTISTS)
                     .filter_map(|a| a.cover.clone()),
+            )
+            .chain(
+                hits.local_songs
+                    .iter()
+                    .take(MAX_SONGS)
+                    .filter_map(|s| s.cover.clone()),
+            )
+            .chain(
+                hits.local_albums
+                    .iter()
+                    .take(MAX_ALBUMS)
+                    .filter_map(|a| a.cover.clone()),
+            )
+            .chain(
+                hits.local_artists
+                    .iter()
+                    .take(MAX_ARTISTS)
+                    .filter_map(|a| a.cover.clone()),
             );
         for cover in covers {
             if self.art_paths.contains_key(&cover.key) {
@@ -891,19 +973,6 @@ impl SearchBar {
             .text_color(cx.theme().muted_foreground)
             .child(label)
             .into_any_element()
-    }
-
-    /// Marks a row that came from the local scanner, so an album present both
-    /// on disk and on the server can be told apart before it is opened.
-    fn local_badge(cx: &Context<Self>) -> impl IntoElement {
-        div()
-            .flex_none()
-            .px_1p5()
-            .rounded_sm()
-            .bg(cx.theme().muted)
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child("Local")
     }
 
     /// Selected-row highlight (palette arrow-key navigation). Mirrors the
@@ -1007,7 +1076,6 @@ impl SearchBar {
             rows.push(Self::section_title("Albums", cx));
             for album in self.results.albums.iter().take(MAX_ALBUMS) {
                 let id = album.id.clone();
-                let local = album.local;
                 rows.push(
                     self.row_shell(
                         Self::row_id("sb-album", album.local, &album.id),
@@ -1020,13 +1088,8 @@ impl SearchBar {
                         ),
                         cx,
                     )
-                    .when(local, |this| this.child(Self::local_badge(cx)))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.emit(if local {
-                            SearchBarEvent::OpenLocalAlbum(id.clone())
-                        } else {
-                            SearchBarEvent::OpenAlbum(id.clone())
-                        });
+                        cx.emit(SearchBarEvent::OpenAlbum(id.clone()));
                         this.dismiss(window, cx);
                     }))
                     .into_any_element(),
@@ -1053,7 +1116,6 @@ impl SearchBar {
                         ),
                         cx,
                     )
-                    .when(hit.local, |this| this.child(Self::local_badge(cx)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.player.update(cx, |p, cx| {
                             p.play_queue(vec![play.clone()], 0, cx);
@@ -1075,6 +1137,93 @@ impl SearchBar {
                 );
                 idx += 1;
             }
+        }
+
+        if !self.results.local_artists.is_empty()
+            || !self.results.local_albums.is_empty()
+            || !self.results.local_songs.is_empty()
+        {
+            rows.push(Self::section_title("Local music", cx));
+        }
+
+        for artist in self.results.local_artists.iter().take(MAX_ARTISTS) {
+            let id = artist.id.clone();
+            rows.push(
+                self.row_shell(
+                    Self::row_id("sb-local-artist", true, &artist.id),
+                    idx,
+                    artist.cover.as_ref(),
+                    IconName::CircleUser,
+                    (artist.name.clone(), None),
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.emit(SearchBarEvent::OpenLocalArtist(id.clone()));
+                    this.dismiss(window, cx);
+                }))
+                .into_any_element(),
+            );
+            idx += 1;
+        }
+
+        for album in self.results.local_albums.iter().take(MAX_ALBUMS) {
+            let id = album.id.clone();
+            rows.push(
+                self.row_shell(
+                    Self::row_id("sb-local-album", true, &album.id),
+                    idx,
+                    album.cover.as_ref(),
+                    IconName::LayoutDashboard,
+                    (
+                        album.title.clone(),
+                        Some(album.artist.clone().unwrap_or_default()),
+                    ),
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.emit(SearchBarEvent::OpenLocalAlbum(id.clone()));
+                    this.dismiss(window, cx);
+                }))
+                .into_any_element(),
+            );
+            idx += 1;
+        }
+
+        for hit in self.results.local_songs.iter().take(MAX_SONGS) {
+            let play = hit.song.clone();
+            let enqueue = hit.song.clone();
+            rows.push(
+                self.row_shell(
+                    Self::row_id("sb-local-song", true, &hit.song.id),
+                    idx,
+                    hit.cover.as_ref(),
+                    IconName::Star,
+                    (
+                        hit.song.title.clone(),
+                        Some(hit.song.artist.clone().unwrap_or_default()),
+                    ),
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.player.update(cx, |p, cx| {
+                        p.play_queue(vec![play.clone()], 0, cx);
+                    });
+                    this.dismiss(window, cx);
+                }))
+                .child(
+                    Button::new(Self::row_id("sb-local-enq", true, &hit.song.id))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::Plus))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.player
+                                .update(cx, |p, cx| p.enqueue(vec![enqueue.clone()], cx));
+                            cx.stop_propagation();
+                        })),
+                )
+                .into_any_element(),
+            );
+            idx += 1;
         }
 
         if rows.is_empty() {
@@ -1377,18 +1526,17 @@ mod tests {
     }
 
     #[test]
-    fn a_local_album_and_its_server_twin_are_both_kept() {
-        // Same record, two sources: opening one is not opening the other, so
-        // the id alone cannot dedupe them.
+    fn local_and_server_twins_stay_in_their_own_groups() {
         let mut hits = Hits {
-            albums: vec![album_hit("Kid A", "Radiohead", true)],
+            local_albums: vec![album_hit("Kid A", "Radiohead", true)],
             ..Default::default()
         };
         hits.merge(Hits {
             albums: vec![album_hit("Kid A", "Radiohead", false)],
             ..Default::default()
         });
-        assert_eq!(hits.albums.len(), 2);
+        assert_eq!(hits.albums.len(), 1);
+        assert_eq!(hits.local_albums.len(), 1);
     }
 
     fn cached_rows() -> CatalogSearch {
@@ -1453,16 +1601,18 @@ mod tests {
     }
 
     #[test]
-    fn cached_rows_become_hits_without_unopenable_local_artists() {
+    fn cached_rows_split_into_server_and_local_groups() {
         let hits = hits_from_cache(cached_rows(), &[]);
-        // The local artist is dropped: there is no local artist page to open.
         assert_eq!(hits.artists.len(), 1);
         assert_eq!(hits.artists[0].id, "ar-remote");
-        assert_eq!(hits.albums.len(), 3);
-        assert!(hits.albums.iter().any(|a| a.local && a.id == "al-local"));
-        assert!(hits.songs[0].local);
+        assert_eq!(hits.local_artists.len(), 1);
+        assert_eq!(hits.local_artists[0].id, "ar-local");
+        assert_eq!(hits.albums.len(), 2);
+        assert_eq!(hits.local_albums.len(), 1);
+        assert_eq!(hits.local_albums[0].id, "al-local");
+        assert!(hits.local_songs[0].local);
         assert_eq!(
-            hits.songs[0].song.local_path.as_deref(),
+            hits.local_songs[0].song.local_path.as_deref(),
             Some("/music/a.flac")
         );
     }
@@ -1489,6 +1639,17 @@ mod tests {
     fn a_library_subset_hides_other_libraries_but_keeps_local_files() {
         let hits = hits_from_cache(cached_rows(), &["1".to_string()]);
         let ids: Vec<_> = hits.albums.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["al-local", "al-remote"]);
+        assert_eq!(ids, ["al-remote"]);
+        assert_eq!(hits.local_albums[0].id, "al-local");
+    }
+
+    #[test]
+    fn local_groups_rank_independently() {
+        let mut hits = Hits {
+            local_artists: vec![artist_hit("Local Hits Extra"), artist_hit("Local Hits")],
+            ..Default::default()
+        };
+        hits.rank("local hits");
+        assert_eq!(hits.local_artists[0].name, "Local Hits");
     }
 }

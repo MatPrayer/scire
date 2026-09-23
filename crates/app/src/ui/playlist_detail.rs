@@ -410,4 +410,12 @@ impl PlaylistDetailView {
             self.play_from(i, cx);
         }
     }
+
+    pub fn vi_play(&mut self, cx: &mut Context<Self>) {
+        self.play_from(0, cx);
+    }
+
+    pub fn vi_shuffle(&mut self, cx: &mut Context<Self>) {
+        self.play_shuffled(cx);
+    }
 }

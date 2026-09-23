@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -893,6 +893,39 @@ impl LibraryDb {
         rows.collect()
     }
 
+    /// List one artist's albums for a source, alphabetically.
+    pub fn albums_by_artist(
+        &self,
+        source: &str,
+        artist_id: &str,
+    ) -> Result<Vec<AlbumRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
+                    created, play_count, starred_at, library_id
+             FROM albums WHERE source = ?1 AND artist_id = ?2
+             ORDER BY title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source, artist_id], |row| {
+            Ok(AlbumRow {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                title: row.get(2)?,
+                artist: row.get(3)?,
+                artist_id: row.get(4)?,
+                year: row.get(5)?,
+                cover_art: row.get(6)?,
+                song_count: row.get(7)?,
+                duration: row.get(8)?,
+                created: row.get(9)?,
+                play_count: row.get(10)?,
+                starred: row.get(11)?,
+                library_id: row.get(12)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// One album row by id, or `None` when the cache has never seen it.
     ///
     /// `source` is matched as well as the id. Ids are the table's primary key
@@ -1120,6 +1153,30 @@ impl LibraryDb {
             })
         })?;
         rows.collect()
+    }
+
+    /// Fetch one artist by source and id.
+    pub fn artist_by_id(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<ArtistRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, source, name, cover_art, library_id
+             FROM artists WHERE source = ?1 AND id = ?2",
+            rusqlite::params![source, id],
+            |row| {
+                Ok(ArtistRow {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    name: row.get(2)?,
+                    cover_art: row.get(3)?,
+                    library_id: row.get(4)?,
+                })
+            },
+        )
+        .optional()
     }
 
     /// Album count per artist id, for a given source.
@@ -2164,6 +2221,27 @@ mod tests {
             .unwrap();
         let artists = db.artists_by_source("local").unwrap();
         assert_eq!(artists.len(), 2);
+    }
+
+    #[test]
+    fn local_artist_queries_return_only_its_albums() {
+        let db = test_db();
+        db.upsert_artist("local:artist:A", "local", "Artist A", Some("cover"), None)
+            .unwrap();
+        db.upsert_artist("local:artist:B", "local", "Artist B", None, None)
+            .unwrap();
+        let mut a = AlbumRow::new("a", "local", "Album A");
+        a.artist_id = Some("local:artist:A".into());
+        let mut b = AlbumRow::new("b", "local", "Album B");
+        b.artist_id = Some("local:artist:B".into());
+        db.upsert_album(&a).unwrap();
+        db.upsert_album(&b).unwrap();
+
+        let artist = db.artist_by_id("local", "local:artist:A").unwrap().unwrap();
+        assert_eq!(artist.name, "Artist A");
+        let albums = db.albums_by_artist("local", "local:artist:A").unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].id, "a");
     }
 
     #[test]

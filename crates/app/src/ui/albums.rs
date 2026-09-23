@@ -589,6 +589,28 @@ impl AlbumsView {
         cx.emit(AlbumsEvent::OpenAlbum(id));
     }
 
+    pub fn vi_play(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.focused_album_id() {
+            self.queue_album(id, QueueMode::Play, cx);
+        }
+    }
+
+    pub fn vi_shuffle(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.focused_album_id() {
+            self.queue_album(id, QueueMode::Shuffle, cx);
+        }
+    }
+
+    fn focused_album_id(&self) -> Option<String> {
+        self.vi_cursor
+            .and_then(|c| {
+                self.tabs
+                    .get(&self.active_tab)
+                    .and_then(|t| t.albums.get(c))
+            })
+            .map(|a| a.id.clone())
+    }
+
     /// Cycle the filter tab (new/random/...) by `delta`.
     pub fn vi_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
         let idx = TABS.iter().position(|t| *t == self.active_tab).unwrap_or(0);
