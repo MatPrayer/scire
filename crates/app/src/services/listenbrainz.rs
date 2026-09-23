@@ -1,7 +1,7 @@
 //! ListenBrainz submissions for tracks played directly from local files.
 
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use serde::Serialize;
@@ -10,7 +10,7 @@ const API: &str = "https://api.listenbrainz.org/1/submit-listens";
 const UA: &str = concat!(
     "scire/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/LanaMirko04/scire)"
+    " (https://github.com/MatPrayer/scire)"
 );
 
 static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
@@ -33,6 +33,11 @@ pub struct ListenBrainzListen {
     pub album: Option<String>,
     /// Track duration in seconds.
     pub duration: Option<u32>,
+    /// Unix seconds the play *started* at, which is what ListenBrainz means by
+    /// `listened_at`. The submission itself is made at the halfway mark, so
+    /// reading the clock here would file every listen half a track late.
+    /// Ignored for a now-playing announcement, which carries no timestamp.
+    pub listened_at: u64,
 }
 
 #[derive(Serialize)]
@@ -78,12 +83,7 @@ pub async fn submit_listen(
     if artist.is_empty() || title.is_empty() || token.is_empty() {
         return Ok(());
     }
-    let listened_at = submission.then(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    });
+    let listened_at = submission.then_some(listen.listened_at);
     let body = Submission {
         listen_type: if submission { "single" } else { "playing_now" },
         payload: [Payload {
@@ -125,11 +125,12 @@ mod tests {
             title: "Track".into(),
             album: Some("Album".into()),
             duration: Some(123),
+            listened_at: 42,
         };
         let body = Submission {
             listen_type: "single",
             payload: [Payload {
-                listened_at: Some(42),
+                listened_at: Some(listen.listened_at),
                 track_metadata: TrackMetadata {
                     artist_name: &listen.artist,
                     track_name: &listen.title,

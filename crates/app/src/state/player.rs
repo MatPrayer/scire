@@ -2,7 +2,7 @@
 //! drives the play queue (shuffle/repeat/prefetch).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{AppContext as _, Context, Entity};
 use playback::{Event, Player, TrackSource};
@@ -289,11 +289,22 @@ impl PlayerState {
                 return;
             };
             let Some(artist) = track.artist else { return };
+            // Stamped at the start of the play, not at the 50% mark this call
+            // is made from. A tracker with nothing recorded is not a state the
+            // action can be emitted from, so the fallback is never reached.
+            let listened_at = self
+                .scrobble
+                .started_at()
+                .unwrap_or_else(SystemTime::now)
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let listen = crate::services::listenbrainz::ListenBrainzListen {
                 artist,
                 title: track.title,
                 album: track.album,
                 duration: track.duration,
+                listened_at,
             };
             cx.spawn(async move |_this, _cx| {
                 if let Err(error) = runtime::spawn_io(async move {
@@ -1125,7 +1136,7 @@ impl PlayerState {
         // current one, so the current one has to be settled by then.
         self.refresh_current_art(cx);
         self.refresh_prefetch(cx);
-        let action = self.scrobble.start(scrobble_track);
+        let action = self.scrobble.start(scrobble_track, SystemTime::now());
         self.fire_scrobble(action, cx);
         self.sync_media_metadata();
         if let Some(c) = &mut self.media_controls {
@@ -1256,7 +1267,7 @@ impl PlayerState {
                     // The gapless track carries its own ReplayGain.
                     self.recompute_gain();
                     if let Some(song) = self.queue.current_song() {
-                        let action = self.scrobble.start(scrobble_track(song));
+                        let action = self.scrobble.start(scrobble_track(song), SystemTime::now());
                         self.fire_scrobble(action, cx);
                     }
                     self.sync_media_metadata();
