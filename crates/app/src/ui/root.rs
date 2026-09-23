@@ -514,6 +514,20 @@ impl RootView {
             this.maybe_update_adaptive_accent(cx);
         });
 
+        if std::env::var("SCIRE_PROBE").is_ok() {
+            let player_probe = player.clone();
+            cx.spawn(async move |_this, cx| {
+                for i in 0..3u32 {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(10))
+                        .await;
+                    eprintln!("PROBE next #{i}");
+                    let _ = player_probe.update(cx, |p, cx| p.next(cx));
+                }
+            })
+            .detach();
+        }
+
         // Sidebar fold state is persisted, so restore it instead of reopening
         // every section on each start.
         let libraries_collapsed = session.read(cx).settings.sidebar_libraries_collapsed;
@@ -553,7 +567,7 @@ impl RootView {
             new_playlist_reveal: crate::ui::Reveal::new(170, 120),
             vi_help_reveal: crate::ui::Reveal::new(170, 120),
             command_reveal: crate::ui::Reveal::new(150, 110),
-            show_fullscreen: false,
+            show_fullscreen: std::env::var("SCIRE_PROBE").is_ok(),
             was_connected: false,
             library_db,
             jobs: cx.new(|_| MaintenanceJobs::default()),

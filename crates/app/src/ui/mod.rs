@@ -825,6 +825,11 @@ pub fn scrolling_line(
             })
     };
 
+    let width = if std::env::var("SCIRE_MARQUEE").is_ok() {
+        width * 0.4
+    } else {
+        width
+    };
     if text_width <= width {
         // Truncate anyway: the measurement is of the whole string, so anything
         // that reaches here fits, but a stale width would otherwise spill.
