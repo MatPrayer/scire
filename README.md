@@ -6,7 +6,7 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/), and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.26.1-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.27.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#installation)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
@@ -44,7 +44,7 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 - [x] **Format support**: everything Symphonia decodes: FLAC, MP3, AAC/M4A, ALAC, Vorbis, WAV, AIFF and more.
 - [x] **Interface sizing**: two separate knobs — **Font size** sets the interface's text, **UI scale** (90/100/110/125%) sets the space around it: gutters, card padding, row and bar heights (Settings → Appearance).
 - [x] **Album page layouts**: the cover and details above the track list, or — on a landscape widescreen window — in a tall panel down either side with a much bigger cover (Settings → Appearance).
-- [x] **Album & artist browsing**: album grid with infinite scroll and sort (name / new / recent / frequent / random / starred), artist index with bios and images. Covers can fill their card edge to edge, with no padding around the art (Settings → Browsing → Cover fills the card), optionally with the cover's bottom corners squared off so the art runs flat into the title (→ Square the album cover's bottom corners).
+- [x] **Album & artist browsing**: album grid with infinite scroll and sort (name / new / recent / frequent / random / starred), artist index with bios and images. Covers fill their card edge to edge, with no padding around the art and their bottom corners squared off so the art runs flat into the title; the padded, fully rounded card is still there behind Settings → Browsing → Classic album cards.
 - [x] **Artist page**: discography, singles/EPs and an "Appears on" section of the records they only guest on; every artist an album is credited to links to their own page, and the photo enlarges like a cover. Its album cards follow the grid's cover size or take one of their own (Settings → Browsing → Artist page covers).
 - [x] **Search**: a centered command palette (`Ctrl`/`Cmd`+`K`) with arrow-key navigation, answered from the local cache as you type — so it covers local files, works offline, and matches words in any order ("dark side moon") — then merged with the server's own results.
 - [x] **Advanced search**: a full page (sidebar, or "Advanced search" at the foot of the palette) listing *every* match rather than a few per section — artists, albums and tracks together by default, or one kind at a time — with filters for genre, year range, length, source, star, format and bitrate, and sorting by relevance, title, artist, year, date added, length or play count.

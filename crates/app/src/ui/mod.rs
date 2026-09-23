@@ -303,8 +303,8 @@ pub fn scaled(px: f32) -> f32 {
 
 /// Edge of the cover drawn inside a grid card `card_padding()` wider than it.
 ///
-/// `flush` is `Settings::flush_album_covers`: the cover takes the card's
-/// *inset* for itself instead of sitting inside it. The **card**
+/// `flush` is the default card — `!Settings::classic_album_cards`: the cover
+/// takes the card's *inset* for itself instead of sitting inside it. The **card**
 /// keeps the width the column maths gave it either way — the cover grows into
 /// the chrome rather than the card shrinking around a bigger cover — so
 /// `grid_fit` needs to know nothing about the setting and toggling it cannot
@@ -324,25 +324,25 @@ pub fn card_cover_edge(tile: f32, flush: bool) -> f32 {
     }
 }
 
-/// Whether a grid card's **cover art** squares off its bottom two corners.
+/// Whether a grid card's **cover art** squares off its bottom two corners,
+/// which is exactly whether the cover is flush.
 ///
-/// `Settings::square_cover_bottom`, and only under `flush_album_covers`: flush,
-/// the cover fills the card's whole width and its own rounded bottom corners
-/// cut two notches of card background out of the art just above the text block,
-/// so squaring them runs the art flat into the title — which is the look this
-/// setting exists for. Unflush the cover floats inside the card's padding with
-/// chrome all round it, and rounding half of it reads as a rendering fault
-/// rather than as a style. Pure so the rule lives in one place; the switch is
-/// disabled outside flush for the same reason.
-pub fn cover_square_bottom(flush: bool, square_bottom: bool) -> bool {
-    flush && square_bottom
+/// Flush, the cover fills the card's whole width and its own rounded bottom
+/// corners cut two notches of card background out of the art just above the
+/// text block, so squaring them runs the art flat into the title. A *classic*
+/// card's cover floats inside the padding with chrome all round it, and
+/// rounding half of it reads as a rendering fault rather than as a style — so
+/// the two go together and there is one setting, not two. Pure so the rule
+/// lives in one place.
+pub fn cover_square_bottom(flush: bool) -> bool {
+    flush
 }
 
 /// Apply a grid card cover's corner rounding — all four at `rounded_lg`, or the
 /// top two alone when [`cover_square_bottom`]. The card itself keeps its own
 /// rounding either way; only the art changes shape.
-pub fn cover_rounding<E: Styled>(el: E, flush: bool, square_bottom: bool) -> E {
-    match cover_square_bottom(flush, square_bottom) {
+pub fn cover_rounding<E: Styled>(el: E, flush: bool) -> E {
+    match cover_square_bottom(flush) {
         true => el.rounded_t_lg(),
         false => el.rounded_lg(),
     }
@@ -2431,16 +2431,13 @@ mod tests {
         );
     }
 
-    /// Squaring the cover's bottom is a flush-only style: a cover sitting
-    /// inside the card's padding keeps all four corners however the switch is
-    /// set.
+    /// Squaring the cover's bottom is a flush-only style: a classic card's
+    /// cover sits inside the padding and keeps all four corners.
     #[test]
     fn only_a_flush_cover_squares_its_bottom() {
         use super::cover_square_bottom;
-        assert!(cover_square_bottom(true, true));
-        assert!(!cover_square_bottom(true, false));
-        assert!(!cover_square_bottom(false, true));
-        assert!(!cover_square_bottom(false, false));
+        assert!(cover_square_bottom(true));
+        assert!(!cover_square_bottom(false));
     }
 
     #[test]

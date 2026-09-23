@@ -139,7 +139,7 @@ const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Fullscreen", 7),
     ("Player bar", 11),
     ("Playback", 14),
-    ("Browsing", 18),
+    ("Browsing", 16),
     ("Streaming", 5),
     ("Library", 16),
     ("Account", 3),
@@ -378,8 +378,7 @@ enum SettingsSwitch {
     ReducedMotion,
     PrecacheArt,
     PreferSyncedLyrics,
-    FlushAlbumCovers,
-    SquareCoverBottom,
+    ClassicAlbumCards,
 }
 
 /// A button-group entry or a standalone settings button.
@@ -812,16 +811,9 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn set_flush_album_covers(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    fn set_classic_album_cards(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
-            .update(cx, |s, _| s.settings.flush_album_covers = enabled);
-        self.persist(cx);
-        cx.notify();
-    }
-
-    fn set_square_cover_bottom(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.session
-            .update(cx, |s, _| s.settings.square_cover_bottom = enabled);
+            .update(cx, |s, _| s.settings.classic_album_cards = enabled);
         self.persist(cx);
         cx.notify();
     }
@@ -1259,8 +1251,7 @@ impl SettingsView {
             SettingsSwitch::ReducedMotion => s.reduced_motion,
             SettingsSwitch::PrecacheArt => s.precache_art,
             SettingsSwitch::PreferSyncedLyrics => s.prefer_synced_lyrics,
-            SettingsSwitch::FlushAlbumCovers => s.flush_album_covers,
-            SettingsSwitch::SquareCoverBottom => s.square_cover_bottom,
+            SettingsSwitch::ClassicAlbumCards => s.classic_album_cards,
         }
     }
 
@@ -1281,9 +1272,6 @@ impl SettingsView {
             SettingsSwitch::PlayerBarTranslucent => s.player_bar_style != PlayerBarStyle::Floating,
             // Only the side-panel layout has two columns to swap.
             SettingsSwitch::AlbumPanelRight => !s.album_layout.wants_side_panel(),
-            // A card whose cover sits inside its padding has chrome all round
-            // it; squaring half of it reads as a fault rather than a style.
-            SettingsSwitch::SquareCoverBottom => !s.flush_album_covers,
             _ => false,
         }
     }
@@ -1326,8 +1314,7 @@ impl SettingsView {
             SettingsSwitch::ReducedMotion => self.set_reduced_motion(value, cx),
             SettingsSwitch::PrecacheArt => self.set_precache_art(value, cx),
             SettingsSwitch::PreferSyncedLyrics => self.set_prefer_synced_lyrics(value, cx),
-            SettingsSwitch::FlushAlbumCovers => self.set_flush_album_covers(value, cx),
-            SettingsSwitch::SquareCoverBottom => self.set_square_cover_bottom(value, cx),
+            SettingsSwitch::ClassicAlbumCards => self.set_classic_album_cards(value, cx),
         }
     }
 
@@ -1852,9 +1839,7 @@ impl Render for SettingsView {
                 s.detailed_volume,
             )
         };
-        let flush_album_covers = self.session.read(cx).settings.flush_album_covers;
-        let square_cover_bottom = self.session.read(cx).settings.square_cover_bottom;
-        let square_bottom_disabled = self.switch_disabled(SettingsSwitch::SquareCoverBottom, cx);
+        let classic_album_cards = self.session.read(cx).settings.classic_album_cards;
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
         let hide_idle_player_bar = self.session.read(cx).settings.hide_idle_player_bar;
         let player_bar_style = self.session.read(cx).settings.player_bar_style;
@@ -2753,30 +2738,19 @@ impl Render for SettingsView {
                     )),
             )
             .child(self.vi_switch(
-                SettingsSwitch::FlushAlbumCovers,
-                "flush-album-covers",
-                flush_album_covers,
+                SettingsSwitch::ClassicAlbumCards,
+                "classic-album-cards",
+                classic_album_cards,
                 false,
-                "Cover fills the card",
+                "Classic album cards",
                 cx,
             ))
             .child(self.note(
-                "Drops the padding around the cover and gives that space to the \
-                 art instead. The border stays, and the cards keep the width \
-                 they had, so the grid's columns do not move.",
-                cx,
-            ))
-            .child(self.vi_switch(
-                SettingsSwitch::SquareCoverBottom,
-                "square-cover-bottom",
-                square_cover_bottom,
-                square_bottom_disabled,
-                "Square the album cover's bottom corners",
-                cx,
-            ))
-            .child(self.note(
-                "Keeps the cover rounded with the card on top and runs the art \
-                 flat into the title below. Needs the setting above.",
+                "Puts the padding back around the cover and rounds all four of \
+                 its corners. By default the cover fills the card instead, edge \
+                 to edge inside the border, and runs flat into the title below. \
+                 The cards keep the width they had either way, so the grid's \
+                 columns do not move.",
                 cx,
             ))
             .child(self.subheading("Artist page covers", cx))

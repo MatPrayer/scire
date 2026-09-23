@@ -862,8 +862,7 @@ impl AlbumsView {
         // border stays either way, since it is what separates one card from the
         // next. The card's own width is the same either way, so the grid's
         // columns do not move when the setting does.
-        let flush = self.session.read(cx).settings.flush_album_covers;
-        let square_bottom = self.session.read(cx).settings.square_cover_bottom;
+        let flush = !self.session.read(cx).settings.classic_album_cards;
         let cover = crate::ui::card_cover_edge(tile, flush);
 
         let card = v_flex()
@@ -894,17 +893,13 @@ impl AlbumsView {
             .child(
                 div()
                     .size(px(cover))
-                    .map(|c| crate::ui::cover_rounding(c, flush, square_bottom))
+                    .map(|c| crate::ui::cover_rounding(c, flush))
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
                     .relative()
                     .when_some(art, |this, path| {
-                        this.child(crate::ui::cover_rounding(
-                            img(path).size(px(cover)),
-                            flush,
-                            square_bottom,
-                        ))
+                        this.child(crate::ui::cover_rounding(img(path).size(px(cover)), flush))
                     })
                     // Hover play button over the artwork.
                     .child(

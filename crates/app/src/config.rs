@@ -138,25 +138,18 @@ pub struct Settings {
     pub album_sort: AlbumSort,
     /// Cover-art tile size in the album grid.
     pub cover_size: CoverSize,
-    /// Let the cover fill its card in the album grids, edge to edge, instead of
-    /// sitting inside the card's padding and border.
+    /// Put the padding back around a grid card's cover and round all four of
+    /// its corners — the card the grids drew before the cover was let fill
+    /// them.
     ///
-    /// The card keeps the width it always had — the cover grows into the
-    /// chrome rather than the card shrinking — so the column count and the
-    /// grid's rhythm are identical either way, and turning it on cannot
-    /// reflow the page.
+    /// Off (the default) the cover takes the card's inset for itself, edge to
+    /// edge inside the border, and squares its bottom two corners so the art
+    /// runs flat into the title below; the top two stay rounded with the card.
+    /// The card keeps the width it always had either way — the cover grows into
+    /// the chrome rather than the card shrinking — so the column count and the
+    /// grid's rhythm are identical, and toggling this cannot reflow the page.
     #[serde(default)]
-    pub flush_album_covers: bool,
-    /// Square off the *bottom* corners of a flush card's cover art, leaving the
-    /// top two rounded with the card.
-    ///
-    /// Only meaningful with `flush_album_covers`: there the cover fills the
-    /// card's whole width, so its own rounded bottom corners cut two notches of
-    /// card background out of the art just above the text block — squaring them
-    /// runs the art flat into the title. Unflush the cover floats inside the
-    /// card's padding and rounding half of it reads as a rendering fault.
-    #[serde(default, alias = "square_card_bottom")]
-    pub square_cover_bottom: bool,
+    pub classic_album_cards: bool,
     /// Cover size of the album cards on an artist's page. `Match` follows
     /// `cover_size`; the rest pick a size for that page alone.
     #[serde(default)]
@@ -873,8 +866,7 @@ impl Default for Settings {
             default_page: DefaultPage::default(),
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),
-            flush_album_covers: false,
-            square_cover_bottom: false,
+            classic_album_cards: false,
             artist_album_size: ArtistAlbumSize::default(),
             track_info: TrackInfo {
                 artist: true,
