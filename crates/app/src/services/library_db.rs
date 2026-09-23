@@ -262,7 +262,7 @@ fn escape_like(term: &str) -> String {
 /// lets "dark side moon" find "The Dark Side of the Moon" — a single LIKE only
 /// matches contiguous text, which is exactly what the words a user
 /// half-remembers are not.
-fn like_terms(query: &str) -> Vec<String> {
+pub(crate) fn like_terms(query: &str) -> Vec<String> {
     query
         .split_whitespace()
         .take(MAX_QUERY_TERMS)
@@ -272,7 +272,7 @@ fn like_terms(query: &str) -> Vec<String> {
 
 /// `(a LIKE ?n ESCAPE … OR b LIKE ?n …)` for each term, AND-ed together: every
 /// word must appear somewhere in the row, not necessarily in the same column.
-fn like_clause(columns: &[&str], terms: usize) -> String {
+pub(crate) fn like_clause(columns: &[&str], terms: usize) -> String {
     (1..=terms)
         .map(|i| {
             let any = columns
@@ -637,23 +637,7 @@ impl LibraryDb {
              ORDER BY title COLLATE NOCASE
              LIMIT {limit}",
         ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), |row| {
-            Ok(AlbumRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                title: row.get(2)?,
-                artist: row.get(3)?,
-                artist_id: row.get(4)?,
-                year: row.get(5)?,
-                cover_art: row.get(6)?,
-                song_count: row.get(7)?,
-                duration: row.get(8)?,
-                created: row.get(9)?,
-                play_count: row.get(10)?,
-                starred: row.get(11)?,
-                library_id: row.get(12)?,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), album_from_row)?;
         rows.collect()
     }
 
@@ -674,15 +658,7 @@ impl LibraryDb {
              ORDER BY name COLLATE NOCASE
              LIMIT {limit}",
         ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), |row| {
-            Ok(ArtistRow {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                name: row.get(2)?,
-                cover_art: row.get(3)?,
-                library_id: row.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(terms.iter()), artist_from_row)?;
         rows.collect()
     }
 
@@ -1492,7 +1468,42 @@ fn replay_gain_from_row(
     .then_some(replay_gain)
 }
 
-fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
+/// The two values the `source` column ever holds. A row's source decides which
+/// of the two worlds it belongs to — a server id that can be streamed, or a
+/// path on disk — and the strings are spelled out in enough places (the sync,
+/// the scanner, the search filters) to be worth naming once.
+pub const SOURCE_NAVIDROME: &str = "navidrome";
+pub const SOURCE_LOCAL: &str = "local";
+
+pub(crate) fn album_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlbumRow> {
+    Ok(AlbumRow {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        title: row.get(2)?,
+        artist: row.get(3)?,
+        artist_id: row.get(4)?,
+        year: row.get(5)?,
+        cover_art: row.get(6)?,
+        song_count: row.get(7)?,
+        duration: row.get(8)?,
+        created: row.get(9)?,
+        play_count: row.get(10)?,
+        starred: row.get(11)?,
+        library_id: row.get(12)?,
+    })
+}
+
+pub(crate) fn artist_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtistRow> {
+    Ok(ArtistRow {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        name: row.get(2)?,
+        cover_art: row.get(3)?,
+        library_id: row.get(4)?,
+    })
+}
+
+pub(crate) fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
     Ok(TrackRow {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -1544,7 +1555,7 @@ pub struct LibraryStats {
     pub duration_secs: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AlbumRow {
     pub id: String,
     pub source: String,
@@ -1587,7 +1598,7 @@ impl AlbumRow {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ArtistRow {
     pub id: String,
     pub source: String,

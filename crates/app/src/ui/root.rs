@@ -29,6 +29,7 @@ use crate::state::playlists::PlaylistsState;
 use crate::state::queue::RepeatMode;
 use crate::state::radio::RadioState;
 use crate::state::session::{ConnectionStatus, Session};
+use crate::ui::advanced_search::{AdvancedSearchEvent, AdvancedSearchView};
 use crate::ui::album_detail::{AlbumDetailEvent, AlbumDetailView};
 use crate::ui::albums::{AlbumsEvent, AlbumsView};
 use crate::ui::artists::{ArtistDetailEvent, ArtistDetailView, ArtistsEvent, ArtistsView};
@@ -179,6 +180,7 @@ enum NavEntry {
 enum Content {
     Albums(Entity<AlbumsView>),
     Artists(Entity<ArtistsView>),
+    Search(Entity<AdvancedSearchView>),
     ArtistDetail(Entity<ArtistDetailView>),
     AlbumDetail(Entity<AlbumDetailView>),
     Favorites(Entity<FavoritesView>),
@@ -195,6 +197,7 @@ fn command_section(name: &str) -> Option<NavSection> {
     match name.to_ascii_lowercase().as_str() {
         "albums" | "album" => Some(NavSection::Albums),
         "artists" | "artist" => Some(NavSection::Artists),
+        "search" | "find" => Some(NavSection::Search),
         "favorites" | "favourites" | "favorite" | "favourite" => Some(NavSection::Favorites),
         "recent" => Some(NavSection::Recent),
         "radio" => Some(NavSection::Radio),
@@ -328,6 +331,10 @@ pub struct RootView {
     /// cursor opens it on its way through the playlists, so it cannot be left
     /// to the popover's own internal state.
     rail_playlists_open: bool,
+    /// Query handed to the full-page search when it is next built, so opening
+    /// it from the palette carries what was already typed. Taken by
+    /// `navigate`, which is also reached with nothing pending.
+    pending_search_query: Option<String>,
     /// New-playlist dialog state.
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
@@ -413,12 +420,19 @@ impl RootView {
             )
         });
 
-        cx.subscribe(&search_bar, |this: &mut Self, _, event, cx| match event {
-            SearchBarEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
-            SearchBarEvent::OpenLocalAlbum(id) => this.open_local_album(id.clone(), cx),
-            SearchBarEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
-            SearchBarEvent::OpenLocalArtist(id) => this.open_local_artist(id.clone(), cx),
-        })
+        cx.subscribe_in(
+            &search_bar,
+            window,
+            |this: &mut Self, _, event, window, cx| match event {
+                SearchBarEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
+                SearchBarEvent::OpenLocalAlbum(id) => this.open_local_album(id.clone(), cx),
+                SearchBarEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+                SearchBarEvent::OpenLocalArtist(id) => this.open_local_artist(id.clone(), cx),
+                SearchBarEvent::OpenAdvancedSearch(query) => {
+                    this.open_advanced_search(query.clone(), window, cx)
+                }
+            },
+        )
         .detach();
 
         cx.subscribe(&queue_panel, |this: &mut Self, _, event, cx| match event {
@@ -698,6 +712,7 @@ impl RootView {
             sidebar_collapsed,
             portrait: None,
             rail_playlists_open: false,
+            pending_search_query: None,
             new_playlist_open: false,
             new_pl_name,
             new_pl_desc,
@@ -1184,6 +1199,38 @@ impl RootView {
                     view
                 }
             }),
+            NavSection::Search => {
+                let Some(window) = window else {
+                    return; // the query field needs a window to be built in
+                };
+                // The query is carried in rather than passed as an argument:
+                // `navigate` is also how the sidebar row and `:search` reach
+                // this page, and those arrive with nothing typed.
+                let query = self.pending_search_query.take().unwrap_or_default();
+                let view = cx.new(|cx| {
+                    AdvancedSearchView::new(
+                        self.session.clone(),
+                        self.player.clone(),
+                        self.library_db.clone(),
+                        query,
+                        window,
+                        cx,
+                    )
+                });
+                cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
+                    AdvancedSearchEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
+                    AdvancedSearchEvent::OpenLocalAlbum(id) => {
+                        this.open_local_album(id.clone(), cx)
+                    }
+                    AdvancedSearchEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+                })
+                .detach();
+                // A page whose whole point is a query field starts with the
+                // cursor in it; reaching it from the palette especially, where
+                // the user was already typing.
+                view.update(cx, |v, cx| v.focus_query(window, cx));
+                Content::Search(view)
+            }
             NavSection::Radio => {
                 let Some(window) = window else {
                     return; // radio's add-station form needs a window
@@ -1243,6 +1290,16 @@ impl RootView {
             self.history.push(entry);
             self.forward_stack.clear();
         }
+    }
+
+    /// Open the full-page search, carrying whatever was typed in the palette.
+    ///
+    /// The page is rebuilt each time rather than retained: it holds a query,
+    /// a filter set and a result list, and reopening it from the palette with
+    /// the *last* search still on screen would ignore what was just typed.
+    fn open_advanced_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_search_query = Some(query);
+        self.navigate_push(NavSection::Search, window, cx);
     }
 
     fn navigate_push(&mut self, section: NavSection, window: &mut Window, cx: &mut Context<Self>) {
@@ -1520,6 +1577,7 @@ impl RootView {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::ArtistDetail(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
@@ -1543,6 +1601,7 @@ impl RootView {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::ArtistDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
@@ -1560,6 +1619,7 @@ impl RootView {
     fn content_vi_play(&mut self, cx: &mut Context<Self>) {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
+            Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
             Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_play(cx)),
@@ -1596,6 +1656,7 @@ impl RootView {
     /// `i` on a content page with its own text field: focus that field.
     fn content_vi_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.content {
+            Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
             _ => {}
@@ -1606,6 +1667,7 @@ impl RootView {
     fn content_vi_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_tab(delta, cx)),
+            Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_tab(delta, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_tab(delta, window, cx)),
             _ => {}
         }
@@ -1621,6 +1683,7 @@ impl RootView {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Artists(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::ArtistDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::AlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Favorites(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
@@ -1696,6 +1759,7 @@ impl RootView {
     /// views that have any are listed.
     fn content_typing(&self, window: &Window, cx: &App) -> bool {
         match &self.content {
+            Some(Content::Search(v)) => v.read(cx).is_typing(window, cx),
             Some(Content::Settings(v)) => v.read(cx).is_typing(window, cx),
             Some(Content::Radio(v)) => v.read(cx).is_typing(window, cx),
             Some(Content::Playlist(v)) => v.read(cx).is_typing(window, cx),
@@ -3047,6 +3111,7 @@ impl Render for RootView {
         let content: gpui::AnyElement = match &self.content {
             Some(Content::Albums(v)) => v.clone().into_any_element(),
             Some(Content::Artists(v)) => v.clone().into_any_element(),
+            Some(Content::Search(v)) => v.clone().into_any_element(),
             Some(Content::ArtistDetail(v)) => v.clone().into_any_element(),
             Some(Content::AlbumDetail(v)) => v.clone().into_any_element(),
             Some(Content::LocalAlbumDetail(v)) => v.clone().into_any_element(),
@@ -3534,7 +3599,7 @@ pub fn player_bar_idle(playing: bool, has_now_playing: bool, queue_empty: bool) 
 #[cfg(test)]
 mod tests {
     use super::{RefreshStage, VI_COMMANDS, command_completion, player_bar_idle, vi_help_layout};
-    use crate::ui::sidebar::{NavSection, SidebarFocus, sidebar_targets};
+    use crate::ui::sidebar::{NavSection, SIDEBAR_SECTIONS, SidebarFocus, sidebar_targets};
 
     #[test]
     fn player_bar_is_idle_only_with_nothing_playing_loaded_or_queued() {
@@ -3633,13 +3698,20 @@ mod tests {
             false,
             &[("pl-a".into(), "A".into()), ("pl-b".into(), "B".into())],
         );
+        // Counted off `SIDEBAR_SECTIONS` rather than written out: what the
+        // walk must get right is the *order* of its three parts, and a literal
+        // index here breaks every time a nav row is added.
+        let n = SIDEBAR_SECTIONS.len();
         assert_eq!(targets[0], SidebarFocus::Section(NavSection::Albums));
-        assert_eq!(targets[5], SidebarFocus::Section(NavSection::LocalMusic));
-        assert_eq!(targets[6], SidebarFocus::Playlist("pl-a".into()));
-        assert_eq!(targets[7], SidebarFocus::Playlist("pl-b".into()));
-        assert_eq!(targets[8], SidebarFocus::Refresh);
-        assert_eq!(targets[9], SidebarFocus::Section(NavSection::Settings));
-        assert_eq!(targets.len(), 10);
+        assert_eq!(
+            targets[n - 1],
+            SidebarFocus::Section(NavSection::LocalMusic)
+        );
+        assert_eq!(targets[n], SidebarFocus::Playlist("pl-a".into()));
+        assert_eq!(targets[n + 1], SidebarFocus::Playlist("pl-b".into()));
+        assert_eq!(targets[n + 2], SidebarFocus::Refresh);
+        assert_eq!(targets[n + 3], SidebarFocus::Section(NavSection::Settings));
+        assert_eq!(targets.len(), n + 4);
     }
 
     #[test]
@@ -3649,12 +3721,16 @@ mod tests {
         // cursor entering their range is what opens the dropdown.
         let playlists = [("pl-a".into(), "A".into()), ("pl-b".into(), "B".into())];
         let collapsed = sidebar_targets(true, &playlists);
+        let n = SIDEBAR_SECTIONS.len();
         assert_eq!(collapsed, sidebar_targets(false, &playlists));
-        assert_eq!(collapsed[6], SidebarFocus::Playlist("pl-a".into()));
-        assert_eq!(collapsed[7], SidebarFocus::Playlist("pl-b".into()));
-        assert_eq!(collapsed[8], SidebarFocus::Refresh);
-        assert_eq!(collapsed[9], SidebarFocus::Section(NavSection::Settings));
-        assert_eq!(collapsed.len(), 10);
+        assert_eq!(collapsed[n], SidebarFocus::Playlist("pl-a".into()));
+        assert_eq!(collapsed[n + 1], SidebarFocus::Playlist("pl-b".into()));
+        assert_eq!(collapsed[n + 2], SidebarFocus::Refresh);
+        assert_eq!(
+            collapsed[n + 3],
+            SidebarFocus::Section(NavSection::Settings)
+        );
+        assert_eq!(collapsed.len(), n + 4);
     }
 
     #[test]
@@ -3662,9 +3738,10 @@ mod tests {
         // Nothing to walk into, so the cursor can never sit on a playlist and
         // the folded rail's dropdown is never opened by j/k.
         let targets = sidebar_targets(true, &[]);
-        assert_eq!(targets.len(), 8); // 6 sections + Refresh + Settings
-        assert_eq!(targets[6], SidebarFocus::Refresh);
-        assert_eq!(targets[7], SidebarFocus::Section(NavSection::Settings));
+        let n = SIDEBAR_SECTIONS.len();
+        assert_eq!(targets.len(), n + 2); // the sections + Refresh + Settings
+        assert_eq!(targets[n], SidebarFocus::Refresh);
+        assert_eq!(targets[n + 1], SidebarFocus::Section(NavSection::Settings));
     }
 
     #[test]

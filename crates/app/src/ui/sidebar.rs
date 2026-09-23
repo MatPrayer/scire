@@ -49,6 +49,10 @@ fn rail_trigger(cx: &App) -> ButtonCustomVariant {
 pub enum NavSection {
     Albums,
     Artists,
+    /// The full-page search. The palette reaches the same rows, but this is the
+    /// one with the filters and no cap, so it earns a row of its own rather
+    /// than being reachable only from inside another popup.
+    Search,
     Favorites,
     Recent,
     Radio,
@@ -72,6 +76,7 @@ pub enum SidebarFocus {
 pub const SIDEBAR_SECTIONS: &[NavSection] = &[
     NavSection::Albums,
     NavSection::Artists,
+    NavSection::Search,
     NavSection::Favorites,
     NavSection::Recent,
     NavSection::Radio,
@@ -650,6 +655,7 @@ pub fn render_sidebar(
             IconName::CircleUser,
             NavSection::Artists,
         ))
+        .child(nav_item("Search", IconName::Search, NavSection::Search))
         .child(nav_item(
             "Favorites",
             IconName::Heart,

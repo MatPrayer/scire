@@ -131,7 +131,9 @@ fn score(query: &str, primary: &str, secondary: Option<&str>) -> u8 {
 /// well, the one carrying less *around* the match is the one that is the
 /// answer, and everything longer is that answer plus somebody else. The final
 /// field only makes the order total, so it does not depend on the source's.
-fn sort_key(query: &str, primary: &str, secondary: Option<&str>) -> (u8, usize, String) {
+/// Shared with the full-page search, which offers the same ordering under
+/// the name "Relevance".
+pub(crate) fn sort_key(query: &str, primary: &str, secondary: Option<&str>) -> (u8, usize, String) {
     let text = primary.trim().to_lowercase();
     (score(query, primary, secondary), text.chars().count(), text)
 }
@@ -144,6 +146,9 @@ fn sort_key(query: &str, primary: &str, secondary: Option<&str>) -> (u8, usize, 
 #[allow(clippy::enum_variant_names)]
 pub enum SearchBarEvent {
     OpenAlbum(String),
+    /// Hand this query to the full-page search, which lists every match rather
+    /// than the few per section the palette has room for.
+    OpenAdvancedSearch(String),
     OpenLocalAlbum(String),
     OpenArtist(String),
     OpenLocalArtist(String),
@@ -484,8 +489,16 @@ fn song_cover(song: &Song, local: bool) -> Option<Cover> {
 enum PaletteItem {
     Artist(String),
     LocalArtist(String),
-    Album { id: String, local: bool },
+    Album {
+        id: String,
+        local: bool,
+    },
     Song(Box<Song>),
+    /// The footer row. It sits in this list rather than beside it so the
+    /// arrow keys reach it: a row that can only be clicked is a dead end for
+    /// anyone who opened the palette with a shortcut and never left the
+    /// keyboard.
+    Advanced,
 }
 
 pub struct SearchBar {
@@ -661,7 +674,17 @@ impl SearchBar {
         for s in self.results.local_songs.iter().take(MAX_SONGS) {
             v.push(PaletteItem::Song(Box::new(s.song.clone())));
         }
+        // Last, because it is where the list runs out: Down from the bottom
+        // result lands on it, which is the order the page is reached for in.
+        v.push(PaletteItem::Advanced);
         v
+    }
+
+    /// Index of the footer row in [`items`], for the highlight.
+    ///
+    /// [`items`]: Self::items
+    fn advanced_index(&self) -> usize {
+        self.items().len().saturating_sub(1)
     }
 
     /// Move the highlight by `delta`, wrapping at the ends.
@@ -724,6 +747,10 @@ impl SearchBar {
             PaletteItem::Song(song) => {
                 self.player
                     .update(cx, |p, cx| p.play_queue(vec![*song], 0, cx));
+            }
+            PaletteItem::Advanced => {
+                let query = self.input.read(cx).value().trim().to_string();
+                cx.emit(SearchBarEvent::OpenAdvancedSearch(query));
             }
         }
         self.dismiss(window, cx);
@@ -1338,6 +1365,39 @@ impl SearchBar {
                         .child("Type to search artists, albums and songs…"),
                 )
             })
+            // The way out of the palette's caps. It is always offered, not only
+            // when the results look truncated: the page is also where the
+            // filters are, and "every album I have a FLAC of" is a question the
+            // palette cannot be asked at all.
+            .child(
+                h_flex()
+                    .id("palette-advanced")
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted))
+                    // Same highlight the result rows carry, since arrow keys
+                    // walk onto it like any other row.
+                    .when(self.row_selected(self.advanced_index()), |s| {
+                        s.bg(cx.theme().muted)
+                            .border_l_2()
+                            .border_color(cx.theme().primary)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let query = this.input.read(cx).value().trim().to_string();
+                        cx.emit(SearchBarEvent::OpenAdvancedSearch(query));
+                        this.dismiss(window, cx);
+                    }))
+                    .child(Icon::new(IconName::Settings2).size_3())
+                    .child(div().flex_1().child("Advanced search")),
+            )
             // Fade off the reveal's clock rather than a `with_animation`
             // wrapper, so it plays on the way out too — an element dropped
             // from the tree the moment it closes animates nothing.

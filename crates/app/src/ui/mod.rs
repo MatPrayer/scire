@@ -1,3 +1,4 @@
+pub mod advanced_search;
 pub mod album_detail;
 pub mod albums;
 pub mod artists;

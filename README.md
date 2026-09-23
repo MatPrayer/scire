@@ -6,7 +6,7 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/), and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.23.0-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.24.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#installation)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
@@ -47,6 +47,7 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 - [x] **Album & artist browsing**: album grid with infinite scroll and sort (name / new / recent / frequent / random / starred), artist index with bios and images. Covers can fill their card edge to edge, with no padding or border around the art (Settings → Browsing → Cover fills the card).
 - [x] **Artist page**: discography, singles/EPs and an "Appears on" section of the records they only guest on; every artist an album is credited to links to their own page, and the photo enlarges like a cover. Its album cards follow the grid's cover size or take one of their own (Settings → Browsing → Artist page covers).
 - [x] **Search**: a centered command palette (`Ctrl`/`Cmd`+`K`) with arrow-key navigation, answered from the local cache as you type — so it covers local files, works offline, and matches words in any order ("dark side moon") — then merged with the server's own results.
+- [x] **Advanced search**: a full page (sidebar, or "Advanced search" at the foot of the palette) listing *every* match rather than a few per section — artists, albums and tracks together by default, or one kind at a time — with filters for genre, year range, length, source, star, format and bitrate, and sorting by relevance, title, artist, year, date added, length or play count.
 - [x] **Queue**: shuffle, repeat (off / all / one), reorder, play-next, clear, persisted across restarts, optional resume of the current track's position.
 - [x] **Playlists**: create, rename, delete, add/remove tracks; local `.m3u`/`.m3u8` files imported as playlists.
 - [x] **Favorites**: star and 1-5 star ratings with a dedicated starred view.
