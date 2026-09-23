@@ -687,6 +687,18 @@ impl SearchBar {
         self.items().len().saturating_sub(1)
     }
 
+    /// Whether the footer row should draw the highlight. It is last in
+    /// [`items`], so with no results at all it is *also* index 0 — which is
+    /// where `selected` starts, and a freshly opened palette would come up with
+    /// the footer already lit without anyone having walked onto it. The
+    /// highlight only means something once there are rows to walk from.
+    ///
+    /// [`items`]: Self::items
+    fn advanced_selected(&self) -> bool {
+        let ix = self.advanced_index();
+        ix > 0 && self.row_selected(ix)
+    }
+
     /// Move the highlight by `delta`, wrapping at the ends.
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let n = self.items().len();
@@ -1385,7 +1397,7 @@ impl SearchBar {
                     .hover(|s| s.bg(cx.theme().muted))
                     // Same highlight the result rows carry, since arrow keys
                     // walk onto it like any other row.
-                    .when(self.row_selected(self.advanced_index()), |s| {
+                    .when(self.advanced_selected(), |s| {
                         s.bg(cx.theme().muted)
                             .border_l_2()
                             .border_color(cx.theme().primary)
