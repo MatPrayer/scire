@@ -115,14 +115,25 @@ Command mode keeps history on `↑` / `↓` and supports:
 
 ## Installation
 
-Each tagged release carries prebuilt artifacts on the [releases page](https://github.com/MatPrayer/scire/releases): a Linux `x86_64` tarball and a macOS `arm64` disk image.
+Each tagged release carries prebuilt artifacts on the [releases page](https://github.com/MatPrayer/scire/releases): a Linux `x86_64` tarball, a `.deb` for Debian/Ubuntu, and a macOS `arm64` disk image. Arch has [`scire`](https://aur.archlinux.org/packages/scire) in the AUR, which builds from source.
 
 ```bash
-# Linux
+# Debian / Ubuntu
+sudo apt install ./scire_<version>_amd64.deb
+
+# Arch
+paru -S scire                 # or yay, or makepkg from packaging/aur
+
+# Any other distro
 tar xzf scire-<version>-linux-x86_64.tar.gz
 cd scire-<version>-linux-x86_64
 ./install.sh                  # into ~/.local  (sudo ./install.sh --system for /usr/local)
 ```
+
+The `.deb` is built on the current Ubuntu LTS, so it carries that glibc as a
+floor and will refuse to install on an older release — the tarball has no such
+requirement beyond the runtime libraries below, and the AUR package builds
+against whatever the machine has.
 
 The tarball is a static-as-it-gets build against the system graphics and audio stack, so the [Linux dependencies](#linux-dependencies) below still have to be present — as runtime libraries rather than `-dev` packages. `./install.sh --uninstall` removes exactly what it installed.
 
@@ -159,12 +170,18 @@ sudo packaging/linux/install-icon.sh --system  # installs into /usr/share (syste
 
 The script installs `scire.desktop` (launcher entry, `Icon=scire`) and the icon as an SVG plus the standard hicolor PNG sizes. It needs `rsvg-convert` (`librsvg`) to render the PNGs.
 
-To build the release tarball itself:
+To build the release artifacts themselves:
 
 ```bash
 cargo build --release
 packaging/linux/make-tarball.sh   # → target/linux/scire-<version>-linux-<arch>.tar.gz
+packaging/linux/make-deb.sh       # → target/linux/scire_<version>_<arch>.deb
 ```
+
+`make-deb.sh` derives its `Depends:` from the built binary's own shared
+libraries via `dpkg-query`, so it is only correct when run on the distribution
+it is for. On anything else it falls back to a static list and says so — build
+it on Debian or Ubuntu, or let CI do it.
 
 ### macOS
 

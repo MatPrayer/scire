@@ -1,0 +1,28 @@
+pkgbase = scire
+	pkgdesc = Desktop music client for Navidrome servers and local music files
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/MatPrayer/scire
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = alsa-lib
+	depends = dbus
+	depends = fontconfig
+	depends = freetype2
+	depends = libxkbcommon
+	depends = libxkbcommon-x11
+	depends = libxcb
+	depends = libx11
+	depends = wayland
+	depends = vulkan-icd-loader
+	optdepends = libpulse: output device switching on PulseAudio/PipeWire
+	optdepends = vulkan-radeon: Vulkan driver for AMD GPUs
+	optdepends = vulkan-intel: Vulkan driver for Intel GPUs
+	optdepends = nvidia-utils: Vulkan driver for NVIDIA GPUs
+	source = git+https://github.com/MatPrayer/scire.git#tag=v1.0.0
+	sha256sums = SKIP
+
+pkgname = scire

@@ -84,8 +84,10 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 ### Packaging
 
 - Prebuilt artifacts on the release page: a Linux `x86_64` tarball with an
-  `install.sh` that needs nothing but coreutils, and a macOS `arm64` disk image
-  to drag into Applications (ad-hoc signed, not notarised).
+  `install.sh` that needs nothing but coreutils, a `.deb` for Debian and
+  Ubuntu, and a macOS `arm64` disk image to drag into Applications (ad-hoc
+  signed, not notarised).
+- Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
 [1.0.0]: https://github.com/MatPrayer/scire/releases/tag/v1.0.0

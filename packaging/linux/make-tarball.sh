@@ -8,9 +8,10 @@
 # Output: target/linux/scire-<version>-linux-<arch>.tar.gz
 #
 # The tarball holds the binary, the desktop entry, the icon, an install.sh that
-# needs nothing but coreutils, and the licence/changelog. It is deliberately
-# not a .deb or an AppImage: those pin a packaging format and a support burden,
-# and a tarball plus a script is what every distro can read today.
+# needs nothing but coreutils, and the licence/changelog. It is the format with
+# no distro in it: make-deb.sh sits beside it for apt, and packaging/aur covers
+# Arch by building from source, but neither can serve a distro that is neither
+# — which this does, needing nothing a POSIX system does not already have.
 #
 # The binary is not rebuilt — this packages what is in target/release, the same
 # contract the macOS bundle.sh has.

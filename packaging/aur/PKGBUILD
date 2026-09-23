@@ -1,0 +1,69 @@
+# Maintainer: MatPrayer <zmattia2005@gmail.com>
+#
+# This is the canonical copy. The AUR holds its own git repository per package
+# (aur.archlinux.org/scire.git) containing only PKGBUILD and .SRCINFO, so a
+# release means copying both files there, not pushing this repo — see
+# packaging/aur/README.md.
+#
+# Builds from source at the tag rather than repackaging the release tarball:
+# that tarball is built on Ubuntu and carries its glibc floor with it, which is
+# precisely what an Arch user does not want, and building here also covers
+# aarch64 for free.
+pkgname=scire
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Desktop music client for Navidrome servers and local music files"
+arch=('x86_64' 'aarch64')
+url="https://github.com/MatPrayer/scire"
+license=('MIT')
+# The linked set is smaller than it looks: gpui loads Vulkan, Wayland and X11
+# at runtime rather than linking them, so they are listed here even though they
+# do not appear in the binary's NEEDED entries. Dropping them would give a
+# package that installs and then fails to open a window.
+depends=('alsa-lib' 'dbus' 'fontconfig' 'freetype2' 'libxkbcommon'
+         'libxkbcommon-x11' 'libxcb' 'libx11' 'wayland' 'vulkan-icd-loader')
+makedepends=('cargo' 'git')
+optdepends=('libpulse: output device switching on PulseAudio/PipeWire'
+            'vulkan-radeon: Vulkan driver for AMD GPUs'
+            'vulkan-intel: Vulkan driver for Intel GPUs'
+            'nvidia-utils: Vulkan driver for NVIDIA GPUs')
+source=("git+$url.git#tag=v$pkgver")
+# A git source pinned to a tag carries its own integrity: the tag names the
+# commit, so there is no tarball for a checksum to be about.
+sha256sums=('SKIP')
+
+prepare() {
+	cd "$pkgname"
+	# --locked: the workspace vendors two patched crates through
+	# [patch.crates-io], and resolving afresh would quietly take the upstream
+	# ones, which is a different program.
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "$pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release
+}
+
+check() {
+	cd "$pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	# The engine tests stream audio through a real output and skip themselves
+	# where a build host has none, so this is safe in a clean chroot.
+	cargo test --frozen --workspace
+}
+
+package() {
+	cd "$pkgname"
+	install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+	install -Dm644 "packaging/linux/$pkgname.desktop" \
+		"$pkgdir/usr/share/applications/$pkgname.desktop"
+	install -Dm644 "packaging/macos/$pkgname.svg" \
+		"$pkgdir/usr/share/icons/hicolor/scalable/apps/$pkgname.svg"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+}

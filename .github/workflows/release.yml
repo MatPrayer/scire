@@ -52,9 +52,16 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # Both, not one or the other: the tarball is what every distro can
+      # read, the .deb is for the share of desktop Linux where installing
+      # something means apt. make-deb.sh derives its Depends from the binary's
+      # own shared libraries with dpkg-query, so it is only correct when built
+      # on the distro it targets — here, which is the point of building it here.
       - name: Package (Linux)
         if: runner.os == 'Linux'
-        run: packaging/linux/make-tarball.sh
+        run: |
+          packaging/linux/make-tarball.sh
+          packaging/linux/make-deb.sh
 
       # A .dmg, the same artifact `cargo dmg` builds locally: the .app, an
       # Applications symlink to drag it onto, and the volume icon. What a runner
@@ -72,17 +79,21 @@ jobs:
           DMG_PLAIN: "1"
         run: packaging/macos/make-dmg.sh
 
-      # One path per step rather than one step listing both: upload-artifact
-      # roots the artifact at the least common ancestor of its *search paths*,
-      # so naming target/linux and target/macos together roots it at target/
-      # and the archive arrives under linux/. `files: artifacts/*` below then
-      # globs that directory instead of the archive inside it, and what reaches
-      # the release page is a container holding a container holding the tarball.
+      # One step per platform: upload-artifact roots the artifact at the least
+      # common ancestor of its *search paths*, so one step naming target/linux
+      # and target/macos together rooted it at target/ and the archives arrived
+      # under linux/ and macos/. `files: artifacts/*` below then globbed those
+      # directories instead of the archives inside them, and what reached the
+      # release page was a container holding a container holding the tarball.
+      # Several paths in one step are fine while they share a parent, which is
+      # why the Linux tarball and .deb can sit together.
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:
           name: ${{ matrix.name }}
-          path: target/linux/*.tar.gz
+          path: |
+            target/linux/*.tar.gz
+            target/linux/*.deb
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
@@ -115,8 +126,9 @@ jobs:
             See [CHANGELOG.md](https://github.com/MatPrayer/scire/blob/main/CHANGELOG.md)
             for what is in this release.
 
-            **Linux** — extract the tarball and run `./install.sh` (or
-            `sudo ./install.sh --system`).
+            **Linux** — on Debian/Ubuntu, `sudo apt install ./scire_*.deb`.
+            Otherwise extract the tarball and run `./install.sh` (or
+            `sudo ./install.sh --system`). On Arch, `scire` is in the AUR.
 
             **macOS** — open the `.dmg` and drag Scirè into Applications. The
             app is ad-hoc signed and not notarised, so the first launch needs
