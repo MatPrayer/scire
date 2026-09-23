@@ -115,7 +115,7 @@ Command mode keeps history on `↑` / `↓` and supports:
 
 ## Installation
 
-Each tagged release carries prebuilt artifacts on the [releases page](https://github.com/MatPrayer/scire/releases): a Linux `x86_64` tarball and a macOS `arm64` app bundle.
+Each tagged release carries prebuilt artifacts on the [releases page](https://github.com/MatPrayer/scire/releases): a Linux `x86_64` tarball and a macOS `arm64` disk image.
 
 ```bash
 # Linux
@@ -126,7 +126,7 @@ cd scire-<version>-linux-x86_64
 
 The tarball is a static-as-it-gets build against the system graphics and audio stack, so the [Linux dependencies](#linux-dependencies) below still have to be present — as runtime libraries rather than `-dev` packages. `./install.sh --uninstall` removes exactly what it installed.
 
-The macOS bundle is ad-hoc signed and not notarised, so the first launch needs **right-click → Open**; building from source avoids that.
+On macOS, open the `.dmg` and drag Scirè to Applications. The bundle is ad-hoc signed and not notarised, so the first launch needs **right-click → Open**; building from source avoids that.
 
 Building from source is the other way, and the only one on other architectures. Requirements: stable Rust ≥ 1.85 (edition 2024) and the platform build dependencies below.
 
@@ -176,7 +176,7 @@ Build a distributable `.app` and a drag-and-drop installer:
 cargo dmg                     # cargo alias → release build + .app + .dmg
 ```
 
-`cargo dmg` produces `target/macos/Scirè-<version>.dmg`, an installer disk image with the app, a symlinked Applications folder and a themed background. Building the `.dmg` needs `rsvg-convert` (`brew install librsvg`) for the background artwork; the `.app` bundle itself needs nothing extra.
+`cargo dmg` produces `target/macos/Scirè-<version>.dmg`, an installer disk image with the app, a symlinked Applications folder and a themed background. The themed background and the icon layout need `rsvg-convert` (`brew install librsvg`) and a Finder that answers Apple Events; without either the image is built plain — app, Applications symlink and volume icon — which is also what CI produces. The `.app` bundle itself needs nothing extra.
 
 ### Vendored dependencies
 

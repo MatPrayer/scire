@@ -56,23 +56,21 @@ jobs:
         if: runner.os == 'Linux'
         run: packaging/linux/make-tarball.sh
 
-      # The .app rather than the .dmg: make-dmg.sh arranges the disk image's
-      # window through Finder over AppleScript, which needs a desktop session
-      # the runner does not reliably have. The bundle is ad-hoc signed and not
-      # notarised either way, so Gatekeeper has to be answered on first launch
-      # — the release notes say so.
+      # A .dmg, the same artifact `cargo dmg` builds locally: the .app, an
+      # Applications symlink to drag it onto, and the volume icon. What a runner
+      # cannot do is the *presentation* — the background picture and the icon
+      # positions go through Finder over Apple Events, which needs a GUI session
+      # and an Automation consent an unattended machine cannot give, so
+      # make-dmg.sh skips that pass rather than failing (DMG_PLAIN makes the
+      # skip explicit instead of leaning on its Finder probe timing out).
+      # Ad-hoc signed and not notarised, so Gatekeeper has to be answered on
+      # first launch — the release notes say so.
       - name: Package (macOS)
         if: runner.os == 'macOS'
         env:
           CODESIGN_ID: "-"
-        run: |
-          packaging/macos/bundle.sh
-          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
-            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
-          cd target/macos
-          # ditto, not zip: it preserves the bundle's symlinks and resource
-          # forks, and a zipped .app that lost them will not launch.
-          ditto -c -k --keepParent "Scirè.app" "scire-$VERSION-macos-arm64.zip"
+          DMG_PLAIN: "1"
+        run: packaging/macos/make-dmg.sh
 
       # One path per step rather than one step listing both: upload-artifact
       # roots the artifact at the least common ancestor of its *search paths*,
@@ -91,7 +89,7 @@ jobs:
         if: runner.os == 'macOS'
         with:
           name: ${{ matrix.name }}
-          path: target/macos/*.zip
+          path: target/macos/*.dmg
           if-no-files-found: error
 
   release:
@@ -120,6 +118,7 @@ jobs:
             **Linux** — extract the tarball and run `./install.sh` (or
             `sudo ./install.sh --system`).
 
-            **macOS** — the app is ad-hoc signed and not notarised, so the
-            first launch needs *right-click → Open* rather than a double
-            click. Building from source avoids that entirely.
+            **macOS** — open the `.dmg` and drag Scirè into Applications. The
+            app is ad-hoc signed and not notarised, so the first launch needs
+            *right-click → Open* rather than a double click. Building from
+            source avoids that entirely.

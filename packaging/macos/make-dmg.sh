@@ -15,6 +15,17 @@
 #      image with the .app, an Applications symlink, and a themed background,
 #      then set the volume icon and arrange the Finder icons via AppleScript.
 #   3. Compress the staged image into the final .dmg.
+#
+# Step 2's *presentation* — the background picture and the icon positions — is
+# optional, and everything that makes the image an installer is not. A CI
+# runner has no usable Finder: arranging the window means driving Finder over
+# Apple Events, which needs a logged-in GUI session and an Automation consent
+# no unattended machine can give, so the call is denied or simply never
+# returns. Rather than ship a .zip from CI and a .dmg from a desk — two
+# different downloads for the same release — the themed pass is skipped where
+# it cannot run and the .dmg is built regardless: the .app, the Applications
+# symlink to drag it onto, and the volume icon. What is lost is the wallpaper
+# behind the two icons. Set DMG_PLAIN=1 to skip it deliberately.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,8 +35,39 @@ APP="$OUT_DIR/Scirè.app"
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "error: macOS only" >&2; exit 1; }
 command -v hdiutil >/dev/null 2>&1 || { echo "error: hdiutil not found" >&2; exit 1; }
-command -v osascript >/dev/null 2>&1 || { echo "error: osascript not found" >&2; exit 1; }
-command -v rsvg-convert >/dev/null 2>&1 || { echo "error: rsvg-convert not found (brew install librsvg)" >&2; exit 1; }
+
+# Does Finder answer an Apple Event? Asked with a deadline, because the failure
+# this guards against is not always an error: a denied or unattended Automation
+# request can leave osascript waiting indefinitely, and a packaging script that
+# hangs is worse than one that drops the wallpaper.
+FINDER_PROBE_TIMEOUT=10
+finder_available() {
+	command -v osascript >/dev/null 2>&1 || return 1
+	osascript -e 'tell application "Finder" to get name' >/dev/null 2>&1 &
+	local probe=$! waited=0
+	while kill -0 "$probe" 2>/dev/null; do
+		if (( waited >= FINDER_PROBE_TIMEOUT * 10 )); then
+			kill -9 "$probe" 2>/dev/null || true
+			wait "$probe" 2>/dev/null || true
+			return 1
+		fi
+		sleep 0.1
+		waited=$(( waited + 1 ))
+	done
+	wait "$probe"
+}
+
+THEMED=1
+if [[ "${DMG_PLAIN:-0}" == 1 ]]; then
+	THEMED=0
+	echo "DMG_PLAIN=1 — building a plain image (no background, no icon layout)"
+elif ! command -v rsvg-convert >/dev/null 2>&1; then
+	THEMED=0
+	echo "note: rsvg-convert not found (brew install librsvg) — no themed background"
+elif ! finder_available; then
+	THEMED=0
+	echo "note: Finder did not answer within ${FINDER_PROBE_TIMEOUT}s — no themed background"
+fi
 
 # Build the .app if needed, or reuse the one bundle.sh produced — but only
 # while it is not older than the binary it was made from. Reusing it
@@ -64,25 +106,39 @@ H=416
 
 # ---- 1. Themed background ---------------------------------------------------
 BG_PNG="$WORK/background.png"
-rsvg-convert -w "$W" -h "$H" "$HERE/dmg-background.svg" -o "$BG_PNG"
+if (( THEMED )); then
+	rsvg-convert -w "$W" -h "$H" "$HERE/dmg-background.svg" -o "$BG_PNG"
+fi
 
 # ---- 1b. Volume icon (PNG → .icns) ------------------------------------------
-ICONSET="$WORK/icon.iconset"
-mkdir -p "$ICONSET"
-ICON_SRC="$HERE/dmg-icon.png"
-command -v sips >/dev/null 2>&1 || { echo "error: sips not found" >&2; exit 1; }
-command -v iconutil >/dev/null 2>&1 || { echo "error: iconutil not found" >&2; exit 1; }
-for size in 16 32 128 256 512; do
-	sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-	two=$(( size * 2 ))
-	sips -z "$two" "$two" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-done
-ICON_ICNS="$WORK/volume-icon.icns"
-iconutil -c icns "$ICONSET" -o "$ICON_ICNS"
+# Independent of the themed pass: the icon is a file at the volume root plus a
+# flag, with no Finder scripting involved. sips, iconutil and SetFile ship with
+# the Command Line Tools, so a machine that can build the app has them — but a
+# missing one costs the icon, not the installer.
+ICON_ICNS=""
+if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1 \
+	&& command -v SetFile >/dev/null 2>&1; then
+	ICONSET="$WORK/icon.iconset"
+	mkdir -p "$ICONSET"
+	ICON_SRC="$HERE/dmg-icon.png"
+	for size in 16 32 128 256 512; do
+		sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+		two=$(( size * 2 ))
+		sips -z "$two" "$two" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+	done
+	ICON_ICNS="$WORK/volume-icon.icns"
+	iconutil -c icns "$ICONSET" -o "$ICON_ICNS"
+else
+	echo "note: sips/iconutil/SetFile not all present — no volume icon"
+fi
 
 # ---- 2. Stage & mount a writable image --------------------------------------
-mkdir -p "$STAGE/.background"
-cp "$BG_PNG" "$STAGE/.background/background.png"
+if (( THEMED )); then
+	mkdir -p "$STAGE/.background"
+	cp "$BG_PNG" "$STAGE/.background/background.png"
+else
+	mkdir -p "$STAGE"
+fi
 cp -R "$APP" "$STAGE/Scirè.app"
 ln -s /Applications "$STAGE/Applications"
 
@@ -103,17 +159,19 @@ MOUNT="$(hdiutil attach "$STAGEDMG" -nobrowse -readwrite 2>/dev/null \
 
 # Volume icon: Finder picks up .VolumeIcon.icns at the volume root once the
 # custom-icon flag is set. hdiutil has no direct "set icon" option.
-command -v SetFile >/dev/null 2>&1 || { echo "error: SetFile not found" >&2; exit 1; }
-cp "$ICON_ICNS" "$MOUNT/.VolumeIcon.icns"
-SetFile -a C "$MOUNT"
+if [[ -n "$ICON_ICNS" ]]; then
+	cp "$ICON_ICNS" "$MOUNT/.VolumeIcon.icns"
+	SetFile -a C "$MOUNT"
+fi
 
-# ---- 3. Volume icon, arrange icons & set the background via Finder -----------
+# ---- 3. Arrange icons & set the background via Finder ------------------------
 # Finder's icon coordinates are relative to the visible content area of the
 # window (below the title bar). We size the window to the background then
 # place the app bottom-left and Applications bottom-right. AppleScript blocks
 # until the window is drawn so the layout is captured into .DS_Store.
-BG_ON_VOL="$MOUNT/.background/background.png"
-osascript <<EOF
+if (( THEMED )); then
+	BG_ON_VOL="$MOUNT/.background/background.png"
+	osascript <<EOF
 tell application "Finder"
 	set win to make new Finder window
 	set target of win to POSIX file "$MOUNT"
@@ -142,6 +200,7 @@ tell application "Finder"
 	close win
 end tell
 EOF
+fi
 
 # ---- 4. Flush, detach, compress ---------------------------------------------
 sleep 1
