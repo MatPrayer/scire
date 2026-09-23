@@ -6,6 +6,23 @@ use playback::{Event, Player, TrackSource};
 use wiremock::matchers::path;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Whether this machine can play anything at all. A CI runner has no sound
+/// card, and every test below streams real audio through a real output, so
+/// there they skip rather than fail.
+///
+/// It is asked **before** the engine is built, not off the failure it would
+/// otherwise produce: `Event::Failed` carries whatever rodio's backend said
+/// (on a Linux runner, "Failed to get the config for the given device", which
+/// names neither audio nor a missing device), and treating any failure as a
+/// skip would hide a real decode regression behind a green run.
+fn no_audio_output() -> bool {
+    if playback::output_available() {
+        return false;
+    }
+    eprintln!("skipping: no audio output on this machine");
+    true
+}
+
 /// Minimal valid WAV: 16-bit mono 8kHz, ~0.5s of silence.
 fn wav_bytes() -> Vec<u8> {
     let sample_rate: u32 = 8000;
@@ -30,6 +47,9 @@ fn wav_bytes() -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plays_wav_stream_to_completion() {
+    if no_audio_output() {
+        return;
+    }
     let server = MockServer::start().await;
     Mock::given(path("/rest/stream"))
         .respond_with(
@@ -61,12 +81,6 @@ async fn plays_wav_stream_to_completion() {
                     Event::Playing => saw_playing = true,
                     Event::TrackEnded { .. } => break,
                     Event::Failed(msg) => {
-                        // Headless environments (CI) may have no audio device;
-                        // treat that as a skip rather than a failure.
-                        if msg.contains("audio output unavailable") {
-                            eprintln!("skipping: no audio device ({msg})");
-                            return;
-                        }
                         panic!("playback failed: {msg}");
                     }
                     _ => {}
@@ -84,6 +98,9 @@ async fn plays_wav_stream_to_completion() {
 /// seeking backwards through the HTTP source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plays_alac_m4a_stream() {
+    if no_audio_output() {
+        return;
+    }
     let server = MockServer::start().await;
     Mock::given(path("/rest/stream"))
         .respond_with(
@@ -113,10 +130,6 @@ async fn plays_alac_m4a_stream() {
                 match event.expect("event channel closed early") {
                     Event::TrackEnded { .. } => break,
                     Event::Failed(msg) => {
-                        if msg.contains("audio output unavailable") {
-                            eprintln!("skipping: no audio device ({msg})");
-                            return;
-                        }
                         panic!("ALAC playback failed: {msg}");
                     }
                     _ => {}
@@ -129,6 +142,9 @@ async fn plays_alac_m4a_stream() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefetched_track_auto_advances() {
+    if no_audio_output() {
+        return;
+    }
     let server = MockServer::start().await;
     Mock::given(path("/rest/stream"))
         .respond_with(
@@ -171,10 +187,6 @@ async fn prefetched_track_auto_advances() {
                         if ends.len() == 2 { break; }
                     }
                     Event::Failed(msg) => {
-                        if msg.contains("audio output unavailable") {
-                            eprintln!("skipping: no audio device ({msg})");
-                            return;
-                        }
                         panic!("playback failed: {msg}");
                     }
                     _ => {}
@@ -198,6 +210,9 @@ async fn prefetched_track_auto_advances() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plays_local_wav_to_completion() {
+    if no_audio_output() {
+        return;
+    }
     // Write a temporary WAV file.
     let dir = std::env::temp_dir().join("scire-test-local");
     let _ = std::fs::create_dir_all(&dir);
@@ -227,11 +242,6 @@ async fn plays_local_wav_to_completion() {
                     Event::Playing => saw_playing = true,
                     Event::TrackEnded { .. } => break,
                     Event::Failed(msg) => {
-                        if msg.contains("audio output unavailable") {
-                            eprintln!("skipping: no audio device ({msg})");
-                            let _ = std::fs::remove_file(&wav_path);
-                            return;
-                        }
                         panic!("local playback failed: {msg}");
                     }
                     _ => {}
@@ -304,6 +314,9 @@ fn wav_bytes_secs(secs: u32) -> Vec<u8> {
 /// track must actually arrive there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seek_at_playing_moves_the_track() {
+    if no_audio_output() {
+        return;
+    }
     let dir = std::env::temp_dir().join("scire-test-resume-seek");
     let _ = std::fs::create_dir_all(&dir);
     let wav_path = dir.join("resume.wav");
@@ -338,11 +351,6 @@ async fn seek_at_playing_moves_the_track() {
                     Event::Position(p) => reached |= p >= target,
                     Event::TrackEnded { .. } => break,
                     Event::Failed(msg) => {
-                        if msg.contains("audio output unavailable") {
-                            eprintln!("skipping: no audio device ({msg})");
-                            let _ = std::fs::remove_file(&wav_path);
-                            return;
-                        }
                         panic!("resume playback failed: {msg}");
                     }
                     _ => {}
@@ -450,6 +458,9 @@ fn slow_range_server(
 /// playback is going rather than where it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_slow_seek_does_not_stop_the_engine_answering() {
+    if no_audio_output() {
+        return;
+    }
     let url = slow_range_server(
         wav_bytes_secs(300),
         512 * 1024,
@@ -480,10 +491,6 @@ async fn a_slow_seek_does_not_stop_the_engine_answering() {
                 match event.expect("event channel closed early") {
                     Event::Playing => break,
                     Event::Failed(msg) => {
-                        if msg.contains("audio output unavailable") {
-                            eprintln!("skipping: no audio device ({msg})");
-                            return;
-                        }
                         panic!("playback failed: {msg}");
                     }
                     _ => {}
@@ -567,6 +574,9 @@ fn m4a_with_trailing_index(pad: usize) -> Vec<u8> {
 /// merely stall the album, it failed tracks outright.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_trailing_index_is_read_without_the_whole_download() {
+    if no_audio_output() {
+        return;
+    }
     // 4MB of padding at 32KB per 100ms is ~12s of trickle between the prefetch
     // and the index; playback must not wait for it.
     let url = slow_range_server(
@@ -595,10 +605,6 @@ async fn a_trailing_index_is_read_without_the_whole_download() {
                 match event.expect("event channel closed early") {
                     Event::Playing => break,
                     Event::Failed(msg) => {
-                        if msg.contains("audio output unavailable") {
-                            eprintln!("skipping: no audio device ({msg})");
-                            return;
-                        }
                         panic!("playback failed: {msg}");
                     }
                     _ => {}

@@ -106,6 +106,21 @@ fn cpal_output_devices() -> Vec<String> {
     names
 }
 
+/// Whether audio can be played at all: can an output stream be opened right
+/// now? Opens the default sink and drops it again, which is the only honest
+/// answer — a headless machine still enumerates ALSA devices (`output_devices`
+/// is non-empty on a CI runner with no sound card), and opening is where that
+/// turns into a failure.
+///
+/// This exists for the engine tests, which stream real audio and must skip
+/// rather than fail where there is nothing to play it on. Matching the
+/// engine's error text instead is matching whatever rodio's backend happened
+/// to say — on a Linux runner, "Failed to get the config for the given
+/// device", which names neither audio nor a device being absent.
+pub fn output_available() -> bool {
+    rodio::DeviceSinkBuilder::open_default_sink().is_ok()
+}
+
 /// Events emitted by the engine.
 #[derive(Debug, Clone)]
 pub enum Event {
