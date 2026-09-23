@@ -23,6 +23,7 @@ use crate::services::{
     art_precache, artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync,
     runtime,
 };
+use crate::state::maintenance::MaintenanceJobs;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::radio::RadioState;
@@ -185,6 +186,10 @@ pub struct RootView {
     portrait: Option<bool>,
     /// Shared music library database.
     library_db: Arc<LibraryDb>,
+    /// Status of the Settings page's long maintenance jobs. Held here because
+    /// that page is rebuilt on every visit and its own state died with it —
+    /// see [`crate::state::maintenance`].
+    jobs: Entity<MaintenanceJobs>,
     /// The two heavy catalog views, kept alive across navigation. Rebuilding
     /// them on every tab switch re-fetched the entire listing and dropped the
     /// scroll position; they're dropped only when the data behind them changes
@@ -551,6 +556,7 @@ impl RootView {
             show_fullscreen: false,
             was_connected: false,
             library_db,
+            jobs: cx.new(|_| MaintenanceJobs::default()),
             albums_view: None,
             artists_view: None,
             recent_view: None,
@@ -1091,6 +1097,7 @@ impl RootView {
                         self.session.clone(),
                         self.player.clone(),
                         self.library_db.clone(),
+                        self.jobs.clone(),
                         window,
                         cx,
                     )

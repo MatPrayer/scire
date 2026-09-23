@@ -1,3 +1,4 @@
+pub mod maintenance;
 pub mod player;
 pub mod playlists;
 pub mod queue;

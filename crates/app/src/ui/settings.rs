@@ -24,6 +24,7 @@ use crate::config::{
 use crate::services::library_db::LibraryDb;
 use crate::services::local_library::LocalScanner;
 use crate::services::{art_precache, artwork, navidrome_sync, runtime};
+use crate::state::maintenance::{MaintenanceJobs, TaskState};
 use crate::state::player::PlayerState;
 use crate::state::queue::RepeatMode;
 use crate::state::session::Session;
@@ -346,33 +347,6 @@ fn section_for_scroll(tops: &[f32], viewport_top: f32, offset: f32, max_offset: 
         .unwrap_or(0)
 }
 
-/// State of one of the maintenance jobs in the Library section.
-///
-/// Both are long, both can fail in ways the user needs told about (a server
-/// rescan is admin-only on Navidrome), and neither has a meaningful total — so
-/// they report a status line rather than a bar.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-enum TaskState {
-    #[default]
-    Idle,
-    Running(String),
-    Done(String),
-    Failed(String),
-}
-
-impl TaskState {
-    fn is_running(&self) -> bool {
-        matches!(self, TaskState::Running(_))
-    }
-
-    fn message(&self) -> Option<&str> {
-        match self {
-            TaskState::Idle => None,
-            TaskState::Running(m) | TaskState::Done(m) | TaskState::Failed(m) => Some(m),
-        }
-    }
-}
-
 /// Which of the on/off switches this is — enough to toggle it through the
 /// same `set_*` method the mouse path uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -485,11 +459,10 @@ pub struct SettingsView {
     player: Entity<PlayerState>,
     dir_input: Entity<InputState>,
     library_db: Arc<LibraryDb>,
-    server_scan: TaskState,
-    rebuild: TaskState,
-    /// Cover-art preload, when it was started from this page. A pass the root
-    /// view starts after a sync runs silently and leaves this Idle.
-    precache: TaskState,
+    /// The three maintenance jobs' statuses. Owned by the root view rather
+    /// than by this one, which is rebuilt on every visit — see
+    /// [`crate::state::maintenance`].
+    jobs: Entity<MaintenanceJobs>,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
     vi_cursor: Option<usize>,
@@ -544,10 +517,13 @@ impl SettingsView {
         session: Entity<Session>,
         player: Entity<PlayerState>,
         library_db: Arc<LibraryDb>,
+        jobs: Entity<MaintenanceJobs>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
+        // A job started on an earlier visit keeps reporting into this page.
+        cx.observe(&jobs, |_, _, cx| cx.notify()).detach();
         let dir_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/music"));
         let scroll = ScrollHandle::new();
         Self {
@@ -555,9 +531,7 @@ impl SettingsView {
             player,
             dir_input,
             library_db,
-            server_scan: TaskState::default(),
-            rebuild: TaskState::default(),
-            precache: TaskState::default(),
+            jobs,
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
@@ -585,28 +559,33 @@ impl SettingsView {
     /// actually been added to disk. Refresh reconciles against what the server
     /// already knows and is the one to reach for otherwise.
     fn scan_server(&mut self, cx: &mut Context<Self>) {
-        if self.server_scan.is_running() {
+        if self.jobs.read(cx).server_scan.is_running() {
             return;
         }
+        let jobs = self.jobs.clone();
         let Some(client) = self.session.read(cx).client.clone() else {
-            self.server_scan = TaskState::Failed("Not connected to a server".into());
-            cx.notify();
+            jobs.update(cx, |j, cx| {
+                j.server_scan = TaskState::Failed("Not connected to a server".into());
+                cx.notify();
+            });
             return;
         };
-        self.server_scan = TaskState::Running("Starting scan…".into());
-        cx.notify();
+        jobs.update(cx, |j, cx| {
+            j.server_scan = TaskState::Running("Starting scan…".into());
+            cx.notify();
+        });
 
         let files = Arc::new(AtomicU64::new(0));
         let watched = files.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_this, cx| {
             let work =
                 runtime::spawn_io(
                     async move { navidrome_sync::run_server_scan(&client, files).await },
                 );
             let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, work, |cx| {
                 let seen = watched.load(Ordering::Relaxed);
-                let _ = this.update(cx, |this, cx| {
-                    this.server_scan = TaskState::Running(if seen == 0 {
+                let _ = jobs.update(cx, |j, cx| {
+                    j.server_scan = TaskState::Running(if seen == 0 {
                         "Scanning…".into()
                     } else {
                         format!("Scanning… {seen} files")
@@ -615,8 +594,8 @@ impl SettingsView {
                 });
             })
             .await;
-            let _ = this.update(cx, |this, cx| {
-                this.server_scan = match result {
+            let _ = jobs.update(cx, |j, cx| {
+                j.server_scan = match result {
                     Ok(count) => TaskState::Done(format!(
                         "Server scan finished ({count} files). Refresh to pick up new albums."
                     )),
@@ -636,27 +615,30 @@ impl SettingsView {
     /// album's tracks when the listing's track count or duration moves, so an
     /// album re-tagged without either changing is the case it cannot see.
     fn rebuild_cache(&mut self, cx: &mut Context<Self>) {
-        if self.rebuild.is_running() {
+        if self.jobs.read(cx).rebuild.is_running() {
             return;
         }
         let client = self.session.read(cx).client.clone();
         let dirs = self.session.read(cx).settings.local_music_dirs.clone();
-        self.rebuild = TaskState::Running("Preparing local cache…".into());
-        cx.notify();
+        let jobs = self.jobs.clone();
+        jobs.update(cx, |j, cx| {
+            j.rebuild = TaskState::Running("Preparing local cache…".into());
+            cx.notify();
+        });
 
         let db = self.library_db.clone();
         let scanner = Arc::new(LocalScanner::new(db.clone()));
         let watched_scanner = scanner.clone();
         let progress = Arc::new(navidrome_sync::SyncProgress::default());
         let watched = progress.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_this, cx| {
             let local_scanner = scanner.clone();
             let local_work = runtime::spawn_blocking_io(move || local_scanner.rebuild_cache(&dirs));
             let local_result =
                 crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, local_work, |cx| {
                     let files = watched_scanner.progress();
-                    let _ = this.update(cx, |this, cx| {
-                        this.rebuild = TaskState::Running(if files == 0 {
+                    let _ = jobs.update(cx, |j, cx| {
+                        j.rebuild = TaskState::Running(if files == 0 {
                             "Scanning local files…".into()
                         } else {
                             format!("Scanning local files… {files} files")
@@ -666,23 +648,22 @@ impl SettingsView {
                 })
                 .await;
             if let Err(error) = local_result {
-                let _ = this.update(cx, |this, cx| {
-                    this.rebuild =
-                        TaskState::Failed(format!("Local cache rebuild failed: {error}"));
+                let _ = jobs.update(cx, |j, cx| {
+                    j.rebuild = TaskState::Failed(format!("Local cache rebuild failed: {error}"));
                     cx.notify();
                 });
                 return;
             }
 
             let Some(client) = client else {
-                let _ = this.update(cx, |this, cx| {
-                    this.rebuild = TaskState::Done("Local cache rebuilt.".into());
+                let _ = jobs.update(cx, |j, cx| {
+                    j.rebuild = TaskState::Done("Local cache rebuilt.".into());
                     cx.notify();
                 });
                 return;
             };
-            let _ = this.update(cx, |this, cx| {
-                this.rebuild = TaskState::Running("Reading server catalog…".into());
+            let _ = jobs.update(cx, |j, cx| {
+                j.rebuild = TaskState::Running("Reading server catalog…".into());
                 cx.notify();
             });
             let server_work = runtime::spawn_io(async move {
@@ -697,8 +678,8 @@ impl SettingsView {
             });
             let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, server_work, |cx| {
                 let (done, total) = watched.snapshot();
-                let _ = this.update(cx, |this, cx| {
-                    this.rebuild = TaskState::Running(if total == 0 {
+                let _ = jobs.update(cx, |j, cx| {
+                    j.rebuild = TaskState::Running(if total == 0 {
                         "Reading server catalog…".into()
                     } else {
                         format!("Importing server albums… {done}/{total}")
@@ -707,8 +688,8 @@ impl SettingsView {
                 });
             })
             .await;
-            let _ = this.update(cx, |this, cx| {
-                this.rebuild = match result {
+            let _ = jobs.update(cx, |j, cx| {
+                j.rebuild = match result {
                     Ok(()) => TaskState::Done("Local and server caches rebuilt.".into()),
                     Err(e) => TaskState::Failed(format!("Rebuild failed: {e}")),
                 };
@@ -725,32 +706,37 @@ impl SettingsView {
     /// been scrolled past, so a jump into the middle of the library downloads
     /// a screenful before it can draw one.
     fn precache_art(&mut self, cx: &mut Context<Self>) {
-        if self.precache.is_running() {
+        if self.jobs.read(cx).precache.is_running() {
             return;
         }
+        let jobs = self.jobs.clone();
         let Some(client) = self.session.read(cx).client.clone() else {
-            self.precache = TaskState::Failed("Not connected to a server".into());
-            cx.notify();
+            jobs.update(cx, |j, cx| {
+                j.precache = TaskState::Failed("Not connected to a server".into());
+                cx.notify();
+            });
             return;
         };
         // The rung the grids ask for, so what lands is what they look up.
         let size = artwork::bucket(self.session.read(cx).settings.cover_size.art_px());
-        self.precache = TaskState::Running("Checking cache…".into());
-        cx.notify();
+        jobs.update(cx, |j, cx| {
+            j.precache = TaskState::Running("Checking cache…".into());
+            cx.notify();
+        });
 
         let db = self.library_db.clone();
         let progress = Arc::new(art_precache::PrecacheProgress::default());
         let watched = progress.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_this, cx| {
             let work = runtime::spawn_io(async move {
                 art_precache::precache_art(db, client, size, progress).await
             });
             let result = crate::ui::poll_until_done(cx, LIBRARY_TASK_POLL, work, |cx| {
                 let (done, total) = watched.snapshot();
-                let _ = this.update(cx, |this, cx| {
+                let _ = jobs.update(cx, |j, cx| {
                     // `total` is 0 until the catalog walk finishes, and a walk
                     // over a warm cache never leaves that state.
-                    this.precache = TaskState::Running(if total == 0 {
+                    j.precache = TaskState::Running(if total == 0 {
                         "Checking cache…".into()
                     } else {
                         format!("Caching {done}/{total} covers")
@@ -759,8 +745,8 @@ impl SettingsView {
                 });
             })
             .await;
-            let _ = this.update(cx, |this, cx| {
-                this.precache = match result {
+            let _ = jobs.update(cx, |j, cx| {
+                j.precache = match result {
                     Ok(outcome) => TaskState::Done(art_precache::outcome_message(outcome)),
                     Err(e) => TaskState::Failed(format!("Cover preload failed: {e}")),
                 };
@@ -780,8 +766,13 @@ impl SettingsView {
         self.persist(cx);
         if enabled {
             self.precache_art(cx);
-        } else if !self.precache.is_running() {
-            self.precache = TaskState::Idle;
+        } else {
+            self.jobs.update(cx, |j, cx| {
+                if !j.precache.is_running() {
+                    j.precache = TaskState::Idle;
+                    cx.notify();
+                }
+            });
         }
         cx.notify();
     }
@@ -1805,10 +1796,10 @@ impl Render for SettingsView {
         let selection_glow_vi = self.session.read(cx).settings.selection_glow_vi;
         let selection_glow_hover = self.session.read(cx).settings.selection_glow_hover;
         let selection_glow_album_color = self.session.read(cx).settings.selection_glow_album_color;
-        let server_scan_state = self.server_scan.clone();
-        let rebuild_state = self.rebuild.clone();
+        let server_scan_state = self.jobs.read(cx).server_scan.clone();
+        let rebuild_state = self.jobs.read(cx).rebuild.clone();
         let precache_art = self.session.read(cx).settings.precache_art;
-        let precache_state = self.precache.clone();
+        let precache_state = self.jobs.read(cx).precache.clone();
         let lyrics_provider = self.session.read(cx).settings.lyrics_provider;
         let prefer_synced_lyrics = self.session.read(cx).settings.prefer_synced_lyrics;
         let lyrics_menu_view = cx.entity();
