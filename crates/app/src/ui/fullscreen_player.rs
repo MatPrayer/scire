@@ -347,24 +347,6 @@ struct Layout {
     pad_bottom: f32,
 }
 
-fn probe_on() -> bool {
-    std::env::var("SCIRE_PROBE").is_ok()
-}
-
-fn probe_tag(name: &'static str) -> gpui::AnyElement {
-    gpui::canvas(
-        move |bounds, _, _| {
-            if probe_on() {
-                eprintln!("PROBE {name}: {bounds:?}");
-            }
-        },
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .size_full()
-    .into_any_element()
-}
-
 impl Layout {
     fn resolve(
         width: f32,
@@ -1141,7 +1123,7 @@ impl FullscreenPlayer {
             bg_art_path: None,
             gradient_palette: None,
             last_art_key: None,
-            panel: probe_on().then_some(SidePanel::Lyrics),
+            panel: None,
             queue_scroll: gpui::UniformListScrollHandle::new(),
             queue_followed: None,
             lyrics: None,
@@ -1607,34 +1589,6 @@ impl FullscreenPlayer {
         self.lyrics = None;
         self.lyrics_source = None;
         self.lyrics_for = Some(id.clone());
-        if probe_on() {
-            self.lyrics_loading = true;
-            cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(1500))
-                    .await;
-                let _ = this.update(cx, |view: &mut Self, cx| {
-                    view.lyrics = Some(subsonic::StructuredLyrics {
-                        synced: false,
-                        lines: (0..120)
-                            .map(|i| subsonic::LyricLine {
-                                start: None,
-                                value: format!(
-                                    "(Standards, standards, standards, standards, standards {i})"
-                                ),
-                            })
-                            .collect(),
-                        ..Default::default()
-                    });
-                    view.lyrics_source = Some(LyricsSource::Online);
-                    view.lyrics_loading = false;
-                    cx.notify();
-                });
-            })
-            .detach();
-            cx.notify();
-            return;
-        }
         // A new song's lines are a new list; whatever line number the last one
         // was on means nothing here.
         self.lyrics_followed = None;
@@ -1853,8 +1807,6 @@ impl FullscreenPlayer {
         .track_scroll(self.queue_scroll.clone());
 
         v_flex()
-            .relative()
-            .child(probe_tag("lyricspanel"))
             .w(px(width))
             .flex_none()
             // Same card as the info column and the mini player, so an open
@@ -3205,8 +3157,6 @@ impl Render for FullscreenPlayer {
                     // row of toggles), so the three players read as one
                     // design at three sizes rather than three designs.
                     let card_el = v_flex()
-                        .relative()
-                        .child(probe_tag("card"))
                         .flex_none()
                         .w(px(layout.card))
                         .justify_center()
@@ -3494,18 +3444,8 @@ impl Render for FullscreenPlayer {
                     // Margin + fade so the motion is visible (gpui 0.2.2 has no
                     // translate/transform), off the reveal's clock so it plays
                     // on the way out too.
-                    if probe_on() {
-                        eprintln!(
-                            "PROBE layout {:?} lines={:?} loading={}",
-                            layout,
-                            self.lyrics.as_ref().map(|d| d.lines.len()),
-                            self.lyrics_loading
-                        );
-                    }
                     let panel_el = drawn_panel.map(|panel| {
                         div()
-                            .relative()
-                            .child(probe_tag("panelwrap"))
                             .h_full()
                             .opacity(panel_open)
                             .ml(px(28. * (1. - panel_open)))
@@ -3527,8 +3467,6 @@ impl Render for FullscreenPlayer {
                     let content = if layout.stacked && layout.panel_beside {
                         content.child(
                             h_flex()
-                                .relative()
-                                .child(probe_tag("row"))
                                 .items_center()
                                 .justify_center()
                                 .gap_8()
