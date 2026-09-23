@@ -324,23 +324,25 @@ pub fn card_cover_edge(tile: f32, flush: bool) -> f32 {
     }
 }
 
-/// Whether a grid card squares off its **bottom** two corners.
+/// Whether a grid card's **cover art** squares off its bottom two corners.
 ///
-/// `Settings::square_card_bottom`, and only under `flush_album_covers`: a card
-/// that is not flush has its cover floating inside its padding, so the card's
-/// corners are chrome around it and squaring half of them reads as a rendering
-/// fault rather than as a style. Flush, the cover *is* the card's top edge, and
-/// squaring the bottom leaves the art rounded above a flat-bottomed tile —
-/// which is the look this setting exists for. Pure so the rule lives in one
-/// place; the switch is disabled outside flush for the same reason.
-pub fn card_square_bottom(flush: bool, square_bottom: bool) -> bool {
+/// `Settings::square_cover_bottom`, and only under `flush_album_covers`: flush,
+/// the cover fills the card's whole width and its own rounded bottom corners
+/// cut two notches of card background out of the art just above the text block,
+/// so squaring them runs the art flat into the title — which is the look this
+/// setting exists for. Unflush the cover floats inside the card's padding with
+/// chrome all round it, and rounding half of it reads as a rendering fault
+/// rather than as a style. Pure so the rule lives in one place; the switch is
+/// disabled outside flush for the same reason.
+pub fn cover_square_bottom(flush: bool, square_bottom: bool) -> bool {
     flush && square_bottom
 }
 
-/// Apply a grid card's corner rounding — all four at `rounded_lg`, or the top
-/// two alone when [`card_square_bottom`].
-pub fn card_rounding<E: Styled>(el: E, flush: bool, square_bottom: bool) -> E {
-    match card_square_bottom(flush, square_bottom) {
+/// Apply a grid card cover's corner rounding — all four at `rounded_lg`, or the
+/// top two alone when [`cover_square_bottom`]. The card itself keeps its own
+/// rounding either way; only the art changes shape.
+pub fn cover_rounding<E: Styled>(el: E, flush: bool, square_bottom: bool) -> E {
+    match cover_square_bottom(flush, square_bottom) {
         true => el.rounded_t_lg(),
         false => el.rounded_lg(),
     }
@@ -2429,15 +2431,16 @@ mod tests {
         );
     }
 
-    /// Squaring the bottom is a flush-only style: a card whose cover sits
-    /// inside its padding keeps all four corners however the switch is set.
+    /// Squaring the cover's bottom is a flush-only style: a cover sitting
+    /// inside the card's padding keeps all four corners however the switch is
+    /// set.
     #[test]
-    fn only_a_flush_card_squares_its_bottom() {
-        use super::card_square_bottom;
-        assert!(card_square_bottom(true, true));
-        assert!(!card_square_bottom(true, false));
-        assert!(!card_square_bottom(false, true));
-        assert!(!card_square_bottom(false, false));
+    fn only_a_flush_cover_squares_its_bottom() {
+        use super::cover_square_bottom;
+        assert!(cover_square_bottom(true, true));
+        assert!(!cover_square_bottom(true, false));
+        assert!(!cover_square_bottom(false, true));
+        assert!(!cover_square_bottom(false, false));
     }
 
     #[test]

@@ -1139,7 +1139,7 @@ impl ArtistDetailView {
         // The album grid's setting, applied to the album cards here too —
         // these are the same card at a different size.
         let flush = self.session.read(cx).settings.flush_album_covers;
-        let square_bottom = self.session.read(cx).settings.square_card_bottom;
+        let square_bottom = self.session.read(cx).settings.square_cover_bottom;
         let cover = crate::ui::card_cover_edge(tile, flush);
         let card = v_flex()
             .id(gpui::SharedString::from(format!("aalbum-{}", album.id)))
@@ -1152,7 +1152,7 @@ impl ArtistDetailView {
                 false => c.p(px(card_inset())),
             })
             .gap_1p5()
-            .map(|c| crate::ui::card_rounding(c, flush, square_bottom))
+            .rounded_lg()
             .cursor_pointer()
             .hover(|s| {
                 let s = s.bg(cx.theme().muted);
@@ -1170,13 +1170,17 @@ impl ArtistDetailView {
             .child(
                 div()
                     .size(px(cover))
-                    .rounded_lg()
+                    .map(|c| crate::ui::cover_rounding(c, flush, square_bottom))
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
                     .relative()
                     .when_some(art, |this, path| {
-                        this.child(img(path).size(px(cover)).rounded_lg())
+                        this.child(crate::ui::cover_rounding(
+                            img(path).size(px(cover)),
+                            flush,
+                            square_bottom,
+                        ))
                     })
                     // Hover play button over the artwork, same as the
                     // album grid's cards.

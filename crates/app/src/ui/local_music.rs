@@ -374,7 +374,7 @@ impl LocalMusicView {
         // Same trade as the album grid's cards: the cover takes the card's
         // inset for itself, the border and the card's width are unchanged.
         let flush = self.session.read(cx).settings.flush_album_covers;
-        let square_bottom = self.session.read(cx).settings.square_card_bottom;
+        let square_bottom = self.session.read(cx).settings.square_cover_bottom;
         let cover = crate::ui::card_cover_edge(tile, flush);
 
         let card = v_flex()
@@ -388,7 +388,7 @@ impl LocalMusicView {
                 false => c.p(px(card_inset())),
             })
             .gap_1p5()
-            .map(|c| crate::ui::card_rounding(c, flush, square_bottom))
+            .rounded_lg()
             .cursor_pointer()
             .hover(|s| {
                 let s = s.bg(cx.theme().muted);
@@ -407,13 +407,17 @@ impl LocalMusicView {
             .child(
                 div()
                     .size(px(cover))
-                    .rounded_lg()
+                    .map(|c| crate::ui::cover_rounding(c, flush, square_bottom))
                     .bg(cx.theme().muted)
                     .overflow_hidden()
                     .shadow_sm()
                     .relative()
                     .when_some(art, |this, path| {
-                        this.child(img(path).size(px(cover)).rounded_lg())
+                        this.child(crate::ui::cover_rounding(
+                            img(path).size(px(cover)),
+                            flush,
+                            square_bottom,
+                        ))
                     })
                     .child(
                         div()
