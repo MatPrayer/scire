@@ -31,14 +31,19 @@ jobs:
       # gpui links against the system graphics, windowing and font stack; the
       # app itself needs alsa (audio) and dbus (media keys / MPRIS). Only
       # Linux: macOS ships every one of these with the SDK.
+      #
+      # The names are Ubuntu's, which differ from Debian's in places —
+      # `libfontconfig1-dev`, not `libfontconfig-1-dev`. `libxkbcommon-x11-dev`
+      # and `libxcb1-dev` are for gpui's X11 backend, which is compiled
+      # alongside the Wayland one whichever the runner happens to offer.
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libdbus-1-dev libfontconfig-1-dev libfreetype-dev \
-            libwayland-dev libxkbcommon-dev libx11-dev libvulkan-dev \
-            libssl-dev pkg-config
+            libasound2-dev libdbus-1-dev libfontconfig1-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libvulkan-dev libssl-dev pkg-config
 
       - name: Formatting
         run: cargo fmt --all --check
