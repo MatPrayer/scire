@@ -132,7 +132,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 ///
 /// Account is last because it is the one that may be absent (signed out), which
 /// makes "the sections that are present" a prefix of this list.
-const COMPACT_SECTIONS: [(&str, u16); 10] = [
+const COMPACT_SECTIONS: [(&str, u16); 11] = [
     ("Window", 4),
     ("Appearance", 14),
     ("Album pages", 8),
@@ -142,8 +142,26 @@ const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Browsing", 16),
     ("Streaming", 5),
     ("Library", 16),
+    ("About", 3),
     ("Account", 3),
 ];
+
+/// What the About card shows, and what its Copy button puts on the clipboard.
+///
+/// One string for both so a bug report quotes exactly what was on screen. The
+/// version is the workspace manifest's, read at compile time — there is no
+/// second place for it to drift from.
+fn version_line() -> String {
+    format!(
+        "Scirè {} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// How long the Copy button says "Copied" before going back.
+const COPIED_FOR: Duration = Duration::from_millis(1500);
 
 fn font_size_options() -> Vec<u8> {
     (UI_FONT_SIZE_MIN..=UI_FONT_SIZE_MAX).collect()
@@ -403,6 +421,7 @@ enum SettingsButton {
     RebuildCache,
     AddLocalDir,
     RemoveLocalDir(usize),
+    CopyVersion,
     SignOut,
 }
 
@@ -483,6 +502,10 @@ pub struct SettingsView {
     section_starts: Vec<(usize, &'static str)>,
     /// The quick-nav jump currently running, if any.
     scroll_anim: Option<SectionScroll>,
+    /// About card: whether the Copy button is showing its "Copied" label, and
+    /// the task that takes it back off.
+    version_copied: bool,
+    copied_reset: Option<gpui::Task<()>>,
     /// Content width of the scroll body, tracked across a resize so the cards
     /// reflow on the same frame as the window (see [`crate::ui::LiveWidth`]).
     live_width: crate::ui::LiveWidth,
@@ -558,6 +581,8 @@ impl SettingsView {
             vi_count: 0,
             section_starts: Vec::new(),
             scroll_anim: None,
+            version_copied: false,
+            copied_reset: None,
             live_width: crate::ui::LiveWidth::default(),
             card_width: None,
             compact: false,
@@ -1344,8 +1369,26 @@ impl SettingsView {
             SettingsButton::RebuildCache => self.rebuild_cache(cx),
             SettingsButton::AddLocalDir => self.add_local_dir(window, cx),
             SettingsButton::RemoveLocalDir(i) => self.remove_local_dir(i, cx),
+            SettingsButton::CopyVersion => self.copy_version(cx),
             SettingsButton::SignOut => self.sign_out(cx),
         }
+    }
+
+    /// Put the version line on the clipboard, and say so on the button for
+    /// [`COPIED_FOR`] — a copy that looks like nothing happened reads as a
+    /// button that does nothing.
+    fn copy_version(&mut self, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(version_line()));
+        self.version_copied = true;
+        cx.notify();
+        self.copied_reset = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            let _ = this.update(cx, |this, cx| {
+                this.version_copied = false;
+                this.copied_reset = None;
+                cx.notify();
+            });
+        }));
     }
 
     /// Register one control in document order and paint its focus ring when
@@ -3153,6 +3196,57 @@ impl Render for SettingsView {
                 cx,
             ));
 
+        // About: which build this is. Last but for Account, which is the one
+        // section that may be absent.
+        let copied = self.version_copied;
+        let about_section = self
+            .section("About", cx)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(format!("Scirè {}", env!("CARGO_PKG_VERSION"))),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(format!(
+                                        "{} · {}",
+                                        std::env::consts::OS,
+                                        std::env::consts::ARCH
+                                    )),
+                            ),
+                    )
+                    .child(
+                        self.vi_control(
+                            SettingsAction::Button(SettingsButton::CopyVersion),
+                            Button::new("copy-version")
+                                .outline()
+                                .small()
+                                .label(if copied { "Copied" } else { "Copy" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.copy_version(cx);
+                                })),
+                            cx,
+                        ),
+                    ),
+            )
+            .child(self.note(
+                "The version and platform, in the form a bug report wants. \
+                 Copy puts the same line on the clipboard.",
+                cx,
+            ));
+
         // Account (only when connected, so it stays the last section).
         let account_section = account.map(|(url, user)| {
             self.section("Account", cx)
@@ -3203,6 +3297,7 @@ impl Render for SettingsView {
             Some(browsing_section.into_any_element()),
             Some(streaming_section.into_any_element()),
             Some(library_section.into_any_element()),
+            Some(about_section.into_any_element()),
         ];
         cards.extend(account_section.map(Some));
 
@@ -3397,6 +3492,16 @@ mod tests {
             );
             assert!(w <= SECTION_MAX_W, "{body}px body produced a {w}px card");
         }
+    }
+
+    #[test]
+    fn the_about_card_names_this_build() {
+        let line = super::version_line();
+        // The card draws the version and the platform separately and the
+        // button copies this; all three have to say the same thing.
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
+        assert!(line.contains(std::env::consts::OS), "{line}");
+        assert!(line.contains(std::env::consts::ARCH), "{line}");
     }
 
     #[test]

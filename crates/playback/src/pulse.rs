@@ -11,7 +11,8 @@
 //! not ask", never "the answer is no", so callers fall back to cpal rather than
 //! act on a missing `pactl`.
 
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// An output sink: `name` is the stable id `pactl` takes as an argument,
 /// `description` the human string shown in the picker (and the one persisted in
@@ -189,17 +190,79 @@ fn parse_sinks(text: &str) -> Vec<Sink> {
     sinks
 }
 
-/// Run `pactl` and return its stdout, or None if it is missing or failed.
+/// Longest a `pactl` call may take before it is abandoned.
+///
+/// The route watch runs one or two of these on the engine's **control loop**
+/// every couple of seconds, and `Command::output()` has no timeout of its own.
+/// A sound server that stops answering — a PipeWire restart, a hung socket —
+/// would therefore block the loop for as long as it stayed wedged: no pause, no
+/// next, no position ticks, and one of the app's two IO workers gone with it,
+/// with nothing to recover from since the loop is the thing that would have to.
+/// Two seconds is ~300x the measured cost of the calls made here.
+const TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often the child is checked for having exited. `pactl` answers in
+/// milliseconds, so this is what decides the latency of the common case.
+const POLL: Duration = Duration::from_millis(2);
+
+/// Run `pactl` and return its stdout, or None if it is missing, failed, or did
+/// not answer within [`TIMEOUT`].
 fn pactl(args: &[&str]) -> Option<String> {
-    let out = Command::new("pactl")
+    let mut child = Command::new("pactl")
         .env("LC_ALL", "C") // keep field labels unlocalized
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    bounded_output(&mut child, args)
+}
+
+/// Wait out a spawned child, killing it if it runs past [`TIMEOUT`].
+///
+/// Split out from [`pactl`] so the deadline can be tested against a command
+/// that is guaranteed to miss it; `args` is only ever used for the log line.
+fn bounded_output(child: &mut Child, args: &[&str]) -> Option<String> {
+    // The pipe is drained by a second thread rather than after the wait: a
+    // `pactl list sinks` answer is tens of kilobytes, and a child that fills the
+    // pipe buffer blocks until somebody reads it — which would turn the deadline
+    // into a deadlock on exactly the biggest answers.
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut buf)
+            .ok()
+            .map(|_| buf)
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
+            // Out of time, or the wait itself failed. Kill the child so it
+            // cannot outlive us; the reader thread ends on its own once the
+            // pipe closes, so it is left rather than joined.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!("pactl {args:?} did not answer within {TIMEOUT:?}");
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    String::from_utf8(out.stdout).ok()
+    String::from_utf8(reader.join().ok()??).ok()
 }
 
 #[cfg(test)]
@@ -285,6 +348,43 @@ mod tests {
                 sink: UNATTACHED
             }]
         );
+    }
+
+    /// `bounded_output` on a command shaped like `pactl`: piped stdout, no
+    /// stdin, stderr discarded.
+    fn run(program: &str, args: &[&str]) -> Option<String> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test command");
+        bounded_output(&mut child, args)
+    }
+
+    #[test]
+    fn a_command_that_answers_is_read_in_full() {
+        // Longer than a pipe buffer would be if the reader waited on the exit:
+        // 200k of output has to come back whole.
+        let out = run("sh", &["-c", "yes abcdefghij | head -n 20000"]).expect("output");
+        assert_eq!(out.lines().count(), 20_000);
+    }
+
+    #[test]
+    fn a_failing_command_yields_nothing() {
+        assert_eq!(run("sh", &["-c", "echo out; exit 1"]), None);
+    }
+
+    #[test]
+    fn a_command_that_never_answers_is_killed_at_the_deadline() {
+        let started = Instant::now();
+        assert_eq!(run("sh", &["-c", "sleep 600"]), None);
+        // The point of the bound: it returns, and it returns *at* the deadline
+        // rather than after the command's own ten minutes.
+        let waited = started.elapsed();
+        assert!(waited >= TIMEOUT, "returned early: {waited:?}");
+        assert!(waited < TIMEOUT * 3, "overshot the deadline: {waited:?}");
     }
 
     #[test]

@@ -1864,8 +1864,7 @@ fn paint_bloom(
         }
     }
 
-    for layer in 0..BLOOM_LAYERS {
-        let sectors = BLOOM_LAYER_SECTORS[layer];
+    for (layer, &sectors) in BLOOM_LAYER_SECTORS.iter().enumerate().take(BLOOM_LAYERS) {
         let sector = std::f32::consts::TAU / sectors as f32;
         let l = layer as f32 / BLOOM_LAYERS as f32;
         let scale = 1. - 0.3 * l;

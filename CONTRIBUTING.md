@@ -11,10 +11,10 @@ Thanks for stopping by. Scirè is a small, friendly project — it grew mostly a
 
 ## Environment
 
-- Stable Rust ≥ 1.85 (edition 2024). On Linux, install the [dependencies](https://github.com/LanaMirko04/scire#linux-dependencies) first.
+- Stable Rust ≥ 1.85 (edition 2024). On Linux, install the [dependencies](https://github.com/MatPrayer/scire#linux-dependencies) first.
 
 ```bash
-git clone https://github.com/LanaMirko04/scire.git
+git clone https://github.com/MatPrayer/scire.git
 cd scire
 cargo run
 ```

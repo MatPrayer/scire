@@ -47,8 +47,14 @@ pub enum Error {
     #[error("server error {code:?}: {message}")]
     Api { code: ApiErrorCode, message: String },
 
+    // No `#[from]`: the only conversion from `reqwest::Error` goes through
+    // `client::http_error`, which calls `without_url()` first. Every request
+    // URL carries `u`, `t` and `s` (the auth token and its salt) and
+    // `reqwest::Error`'s `Display` prints the URL it failed on, so a derived
+    // `From` is a standing invitation to paint the account's token into
+    // whatever renders the error.
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
 
     #[error("invalid server url: {0}")]
     InvalidUrl(String),

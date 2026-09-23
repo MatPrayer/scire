@@ -1478,11 +1478,8 @@ fn persist_queue(queue: &Queue) {
     let Ok(path) = crate::config::queue_path() else {
         return;
     };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(json) = serde_json::to_string(queue) {
-        let _ = std::fs::write(path, json);
+        let _ = crate::config::write_atomic(&path, json.as_bytes(), false);
     }
 }
 
@@ -1517,11 +1514,8 @@ fn persist_resume_state(state: &ResumeState) {
 }
 
 fn write_resume_at(path: &std::path::Path, state: &ResumeState) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(json) = serde_json::to_string(state) {
-        let _ = std::fs::write(path, json);
+        let _ = crate::config::write_atomic(path, json.as_bytes(), false);
     }
 }
 

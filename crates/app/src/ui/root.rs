@@ -54,6 +54,11 @@ use crate::ui::sidebar::{
 /// How often a running refresh resamples its workers' progress counters.
 const REFRESH_POLL: Duration = Duration::from_millis(400);
 
+/// How long the window's position has to hold still before it is written to
+/// disk. Long enough that a resize drag costs one write rather than one per
+/// frame; short enough that a window moved and then quit is still remembered.
+const GEOMETRY_FLUSH: Duration = Duration::from_millis(700);
+
 #[derive(Clone, Copy, PartialEq)]
 enum FocusRegion {
     Content,
@@ -303,6 +308,10 @@ pub struct RootView {
     /// content — and turning landscape again restores whatever the user had
     /// persisted, so the automatic fold never eats their choice.
     portrait: Option<bool>,
+    /// Where the window was at the last frame, and the deferred write that
+    /// persists it. See [`RootView::track_window_geometry`].
+    window_geometry: Option<crate::config::WindowGeometry>,
+    geometry_flush: Option<gpui::Task<()>>,
     /// Shared music library database.
     library_db: Arc<LibraryDb>,
     /// Status of the Settings page's long maintenance jobs. Held here because
@@ -711,6 +720,8 @@ impl RootView {
             playlists_collapsed,
             sidebar_collapsed,
             portrait: None,
+            window_geometry: None,
+            geometry_flush: None,
             rail_playlists_open: false,
             pending_search_query: None,
             new_playlist_open: false,
@@ -777,6 +788,57 @@ impl RootView {
         if self.sidebar_collapsed != was {
             settle_reflow(window, cx);
         }
+    }
+
+    /// Remember where the window is, so the next launch opens there.
+    ///
+    /// gpui publishes no bounds-changed callback, so this rides `render`: a
+    /// move or a resize repaints anyway, and a frame that is not one leaves
+    /// after the comparison.
+    ///
+    /// The write is deferred by [`GEOMETRY_FLUSH`] rather than made on the
+    /// spot. A resize drag is hundreds of frames and each would otherwise
+    /// rewrite `settings.toml` — and the only rect worth keeping is the one
+    /// the drag ends on. It cannot ride `render` either: the last frame of a
+    /// drag is the last frame, and nothing repaints afterwards to flush it.
+    fn track_window_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = window.window_bounds();
+        let rect = bounds.get_bounds();
+        let geometry = crate::config::WindowGeometry {
+            x: f32::from(rect.origin.x),
+            y: f32::from(rect.origin.y),
+            width: f32::from(rect.size.width),
+            height: f32::from(rect.size.height),
+            // Fullscreen is not persisted as a state: its rect is the one the
+            // window goes back to, and a session left fullscreen should not
+            // reopen with no way out but the keyboard.
+            maximized: matches!(bounds, gpui::WindowBounds::Maximized(_)),
+        };
+        if self.window_geometry == Some(geometry) {
+            return;
+        }
+        self.window_geometry = Some(geometry);
+        // A flush already scheduled will read whatever the latest rect is when
+        // it fires, so a drag schedules exactly one write.
+        if self.geometry_flush.is_some() {
+            return;
+        }
+        self.geometry_flush = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(GEOMETRY_FLUSH).await;
+            let _ = this.update(cx, |this, cx| {
+                this.geometry_flush = None;
+                let Some(geometry) = this.window_geometry else {
+                    return;
+                };
+                this.session.update(cx, |session, _| {
+                    if session.settings.window == Some(geometry) {
+                        return;
+                    }
+                    session.settings.window = Some(geometry);
+                    session.persist_settings();
+                });
+            });
+        }));
     }
 
     /// Rescan everything on demand: the server's own media scan, the local
@@ -3073,6 +3135,7 @@ impl Focusable for RootView {
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_orientation(window, cx);
+        self.track_window_geometry(window, cx);
         let connected = self.session.read(cx).status == ConnectionStatus::Connected;
         let palette_open = self.search_bar.read(cx).is_palette();
         // The backdrop belongs to the palette and has to leave with it, so it

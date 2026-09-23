@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext as _, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBounds, actions,
-    px, size,
+    point, px, size,
 };
 use gpui_component::Root;
 use services::library_db::LibraryDb;
@@ -46,6 +46,50 @@ fn init_app_keys(cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// Size of the window on a machine that has never opened one.
+const DEFAULT_WINDOW: gpui::Size<gpui::Pixels> = gpui::size(px(1100.), px(720.));
+
+/// Where to open the window: where it was left, or centred at the default size.
+///
+/// A saved rect is only honoured while it still lands on an attached display.
+/// The failure that guards against is a monitor unplugged between sessions:
+/// the rect then names coordinates on no screen at all and the window opens
+/// invisible, with no way to reach it short of deleting the settings file.
+///
+/// Wayland compositors place windows themselves and do not tell a client where
+/// it is, so on Wayland this restores the *size* and the maximized state and
+/// the origin is the compositor's to pick. Nothing here depends on the origin
+/// being honoured.
+fn startup_bounds(settings: &config::Settings, cx: &App) -> WindowBounds {
+    let displays: Vec<(f32, f32, f32, f32)> = cx
+        .displays()
+        .iter()
+        .map(|d| {
+            let b = d.bounds();
+            (
+                f32::from(b.origin.x),
+                f32::from(b.origin.y),
+                f32::from(b.size.width),
+                f32::from(b.size.height),
+            )
+        })
+        .collect();
+    match settings.window.filter(|w| w.usable_on(&displays)) {
+        Some(w) => {
+            let rect = Bounds {
+                origin: point(px(w.x), px(w.y)),
+                size: size(px(w.width), px(w.height)),
+            };
+            if w.maximized {
+                WindowBounds::Maximized(rect)
+            } else {
+                WindowBounds::Windowed(rect)
+            }
+        }
+        None => WindowBounds::Windowed(Bounds::centered(None, DEFAULT_WINDOW, cx)),
+    }
 }
 
 fn main() {
@@ -105,9 +149,8 @@ fn main() {
             // the persisted scale rather than at 100% and then corrected.
             ui::init_ui_scale(settings.ui_scale);
 
-            let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
             cx.open_window(
-                ui::window_options(settings.client_titlebar, WindowBounds::Windowed(bounds)),
+                ui::window_options(settings.client_titlebar, startup_bounds(&settings, cx)),
                 |window, cx| {
                     ui::apply_theme(settings.theme, settings.font_size, window, cx);
                     ui::apply_window_chrome(settings.client_titlebar, window, cx);

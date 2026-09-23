@@ -6,12 +6,12 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/), and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.27.0-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#installation)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg?style=flat-square)](#license)
-[![Repo Size](https://img.shields.io/github/repo-size/LanaMirko04/scire?style=flat-square&color=6f7ce8)](https://github.com/LanaMirko04/scire)
+[![Repo Size](https://img.shields.io/github/repo-size/MatPrayer/scire?style=flat-square&color=6f7ce8)](https://github.com/MatPrayer/scire)
 
 Built with [GPUI](https://www.gpui.rs/), Zed's UI framework, and [gpui-component](https://github.com/longbridge/gpui-component).<br>
 GPU-rendered UI, gapless audio, a real-time 3D visualizer, and no Electron in sight.
@@ -115,12 +115,23 @@ Command mode keeps history on `↑` / `↓` and supports:
 
 ## Installation
 
-There are no prebuilt binaries on the release page yet. For now, everything builds from source.
-
-Requirements: stable Rust ≥ 1.85 (edition 2024) and the platform build dependencies below.
+Each tagged release carries prebuilt artifacts on the [releases page](https://github.com/MatPrayer/scire/releases): a Linux `x86_64` tarball and a macOS `arm64` app bundle.
 
 ```bash
-git clone https://github.com/LanaMirko04/scire.git
+# Linux
+tar xzf scire-<version>-linux-x86_64.tar.gz
+cd scire-<version>-linux-x86_64
+./install.sh                  # into ~/.local  (sudo ./install.sh --system for /usr/local)
+```
+
+The tarball is a static-as-it-gets build against the system graphics and audio stack, so the [Linux dependencies](#linux-dependencies) below still have to be present — as runtime libraries rather than `-dev` packages. `./install.sh --uninstall` removes exactly what it installed.
+
+The macOS bundle is ad-hoc signed and not notarised, so the first launch needs **right-click → Open**; building from source avoids that.
+
+Building from source is the other way, and the only one on other architectures. Requirements: stable Rust ≥ 1.85 (edition 2024) and the platform build dependencies below.
+
+```bash
+git clone https://github.com/MatPrayer/scire.git
 cd scire
 cargo run                     # build + launch
 ```
@@ -148,6 +159,13 @@ sudo packaging/linux/install-icon.sh --system  # installs into /usr/share (syste
 
 The script installs `scire.desktop` (launcher entry, `Icon=scire`) and the icon as an SVG plus the standard hicolor PNG sizes. It needs `rsvg-convert` (`librsvg`) to render the PNGs.
 
+To build the release tarball itself:
+
+```bash
+cargo build --release
+packaging/linux/make-tarball.sh   # → target/linux/scire-<version>-linux-<arch>.tar.gz
+```
+
 ### macOS
 
 macOS needs nothing extra to build, just Xcode Command Line Tools (GPUI's `runtime_shaders` feature avoids requiring `xcrun metal`).
@@ -160,9 +178,12 @@ cargo dmg                     # cargo alias → release build + .app + .dmg
 
 `cargo dmg` produces `target/macos/Scirè-<version>.dmg`, an installer disk image with the app, a symlinked Applications folder and a themed background. Building the `.dmg` needs `rsvg-convert` (`brew install librsvg`) for the background artwork; the `.app` bundle itself needs nothing extra.
 
-### Vendored dependency
+### Vendored dependencies
 
-`vendor/gpui-component` is a local fork of gpui-component 0.5.1, wired in via `[patch.crates-io]`, carrying a one-line change: the popover shadow is removed so context menus don't cast a halo over a bright album grid.
+Two crates are local forks under `vendor/`, wired in via `[patch.crates-io]`:
+
+- **gpui-component 0.5.1** — one line: the popover shadow is removed so context menus don't cast a halo over a bright album grid.
+- **stream-download 0.24.4** — the downloader's prefetch path now wakes a reader waiting on a position. Upstream it does not, so a seek to a file's trailing index (every m4a not written with faststart) waited for the whole download: measured at 12s on a 4.5MB track, against 0.85s patched.
 
 > [!IMPORTANT]
 > gpui `0.2.2` and gpui-component `0.5.1` are a matched pair. Don't bump one without the other.
@@ -298,4 +319,4 @@ Scirè is a small, friendly project. Whether you're fixing a bug, adding a featu
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE). Release notes live in [CHANGELOG.md](CHANGELOG.md).

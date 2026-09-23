@@ -1,7 +1,7 @@
 //! Settings persistence (TOML) and credential storage (OS keyring).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use directories::ProjectDirs;
@@ -17,6 +17,43 @@ pub(crate) fn project_dirs() -> Result<ProjectDirs> {
 
 pub fn settings_path() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().join("settings.toml"))
+}
+
+/// Write `bytes` to `path` through a temp file in the same directory and a
+/// rename, so a crash or a SIGKILL partway leaves the previous file intact
+/// rather than a truncated one. Every file this module and the player write is
+/// state the app reloads at launch — a half-written `settings.toml` loses the
+/// server, and a half-written `queue.json` loses the queue, both silently,
+/// since a parse failure falls back to the defaults.
+///
+/// `secret` restricts the file to the owner on unix: the settings file carries
+/// the plaintext password fallback and the ListenBrainz token, and the default
+/// mode is world-readable.
+pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    // The temp file has to sit beside the target: a rename across filesystems
+    // fails, and the config dir and the system temp dir are routinely on
+    // different ones.
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    if secret {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Before the rename, so the file is never world-readable at its real
+        // name, not even for an instant.
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = secret;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e.into())
+        }
+    }
 }
 
 pub fn artwork_cache_dir() -> Result<PathBuf> {
@@ -282,6 +319,74 @@ pub struct Settings {
     /// draw a colour from.
     #[serde(default)]
     pub selection_glow_album_color: bool,
+    /// Where the window was and how big it was when it was last moved or
+    /// resized. Absent until the first launch that writes one, which is what
+    /// keeps a fresh install on the centred default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowGeometry>,
+}
+
+/// The window's last position, size and maximized state, in logical pixels.
+///
+/// Stored as bare `f32`s rather than a gpui `Bounds`: this module is the one
+/// part of the app crate with no gpui in it, and the restore rule below is the
+/// sort of thing that has to be unit-testable without opening a window.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Maximized windows are restored maximized; the rest of the rect is the
+    /// size the window goes back to when it is un-maximized, which is what
+    /// gpui's `WindowBounds::Maximized` carries too.
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+/// A window narrower or shorter than this is not restored: it is the smallest
+/// thing the layout is meant for, and a rect saved from a broken frame (or
+/// hand-edited) should not open a sliver.
+const MIN_WINDOW_SIDE: f32 = 320.;
+
+/// How much of the window has to land on a display for the rect to be usable.
+/// The failure this exists for is a monitor that is no longer attached: the
+/// saved rect then names coordinates that are on no screen at all, and the
+/// window opens invisible, which is strictly worse than ignoring the setting.
+/// The numbers are "enough of the title bar to grab", not a share of the area —
+/// a large window hanging mostly off the edge is still usable if its top-left
+/// corner is reachable, and a small one fully on screen must not fail a
+/// percentage test.
+const MIN_VISIBLE_W: f32 = 180.;
+const MIN_VISIBLE_H: f32 = 80.;
+
+impl WindowGeometry {
+    /// Whether this rect may be reopened against the displays currently
+    /// attached, each given as `(x, y, width, height)` in the same logical
+    /// pixel space.
+    ///
+    /// No display list at all (a platform that reports none) counts as "cannot
+    /// tell", and the rect is kept: refusing to restore is the fallback for
+    /// knowing the rect is off-screen, not for not knowing.
+    pub fn usable_on(&self, displays: &[(f32, f32, f32, f32)]) -> bool {
+        if !self.width.is_finite()
+            || !self.height.is_finite()
+            || !self.x.is_finite()
+            || !self.y.is_finite()
+            || self.width < MIN_WINDOW_SIDE
+            || self.height < MIN_WINDOW_SIDE
+        {
+            return false;
+        }
+        if displays.is_empty() {
+            return true;
+        }
+        displays.iter().any(|&(dx, dy, dw, dh)| {
+            let w = (self.x + self.width).min(dx + dw) - self.x.max(dx);
+            let h = (self.y + self.height).min(dy + dh) - self.y.max(dy);
+            w >= MIN_VISIBLE_W.min(self.width) && h >= MIN_VISIBLE_H.min(self.height)
+        })
+    }
 }
 
 /// ReplayGain normalization source. Track uses per-track gain; Album keeps
@@ -905,6 +1010,7 @@ impl Default for Settings {
             selection_glow_vi: false,
             selection_glow_hover: false,
             selection_glow_album_color: false,
+            window: None,
         }
     }
 }
@@ -1086,11 +1192,7 @@ impl Settings {
 
     pub fn save(&self) -> Result<()> {
         let path = settings_path()?;
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::write(&path, toml::to_string_pretty(self)?)?;
-        Ok(())
+        write_atomic(&path, toml::to_string_pretty(self)?.as_bytes(), true)
     }
 }
 
@@ -1162,8 +1264,107 @@ pub fn delete_lb_token() {
 mod tests {
     use super::{
         ArtistAlbumSize, CoverSize, ImportedThemesFile, Settings, UI_FONT_SIZE_DEFAULT,
-        UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize,
+        UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize, WindowGeometry, write_atomic,
     };
+
+    fn geometry(x: f32, y: f32, width: f32, height: f32) -> WindowGeometry {
+        WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+            maximized: false,
+        }
+    }
+
+    /// 1440p on the left, 1080p to its right — the layout in this project's own
+    /// CLAUDE.md, and the one that makes "the second monitor is gone" concrete.
+    const DISPLAYS: [(f32, f32, f32, f32); 2] = [(0., 0., 2560., 1440.), (2560., 0., 1920., 1080.)];
+
+    #[test]
+    fn a_window_on_an_attached_display_is_restored() {
+        assert!(geometry(100., 80., 1100., 720.).usable_on(&DISPLAYS));
+        // Entirely on the second monitor.
+        assert!(geometry(3000., 100., 1100., 720.).usable_on(&DISPLAYS));
+        // Straddling the two, which is a perfectly ordinary place to leave it.
+        assert!(geometry(2200., 100., 1100., 720.).usable_on(&DISPLAYS));
+    }
+
+    #[test]
+    fn a_window_on_a_display_that_is_gone_is_not_restored() {
+        // Saved on the 1080p monitor, reopened with only the 1440p one
+        // attached: the rect names coordinates on no screen, so restoring it
+        // would open the window where it cannot be seen or grabbed.
+        let saved = geometry(3000., 100., 1100., 720.);
+        assert!(!saved.usable_on(&DISPLAYS[..1]));
+    }
+
+    #[test]
+    fn a_window_hanging_off_an_edge_keeps_enough_to_grab() {
+        // Mostly off the right edge, but the corner is still reachable.
+        assert!(geometry(2300., 100., 1100., 720.).usable_on(&DISPLAYS[..1]));
+        // All but a sliver past it.
+        assert!(!geometry(2540., 100., 1100., 720.).usable_on(&DISPLAYS[..1]));
+        // Dragged up under a top bar until only a strip is left.
+        assert!(!geometry(100., -700., 1100., 720.).usable_on(&DISPLAYS[..1]));
+    }
+
+    #[test]
+    fn a_nonsense_rect_is_ignored() {
+        assert!(!geometry(0., 0., 40., 30.).usable_on(&DISPLAYS));
+        assert!(!geometry(f32::NAN, 0., 1100., 720.).usable_on(&DISPLAYS));
+        assert!(!geometry(0., 0., f32::INFINITY, 720.).usable_on(&DISPLAYS));
+    }
+
+    #[test]
+    fn with_no_displays_reported_the_saved_rect_is_kept() {
+        // "Cannot tell" is not "off-screen": the check exists to catch a
+        // monitor that is gone, and a platform that reports no displays at all
+        // has told us nothing about where the window would land.
+        assert!(geometry(3000., 100., 1100., 720.).usable_on(&[]));
+    }
+
+    /// The settings file carries the plaintext password fallback and the
+    /// ListenBrainz token, and the default mode is world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_file_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("scire-perm-{}", std::process::id()));
+        let path = dir.join("settings.toml");
+        write_atomic(&path, b"server = {}", true).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "settings must not be world-readable");
+
+        // And an ordinary file is left at whatever the umask says.
+        let plain = dir.join("queue.json");
+        write_atomic(&plain, b"{}", false).unwrap();
+        assert_ne!(
+            std::fs::metadata(&plain).unwrap().permissions().mode() & 0o077,
+            0o000,
+            "only the secret files are tightened"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename over the old file, so an interrupted write cannot leave a
+    /// truncated one behind — and nothing is left in the directory either way.
+    #[test]
+    fn an_atomic_write_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("scire-atomic-{}", std::process::id()));
+        let path = dir.join("settings.toml");
+        write_atomic(&path, b"first", false).unwrap();
+        write_atomic(&path, b"second", false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "temp file not cleaned up: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct FontSizeFixture {

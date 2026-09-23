@@ -38,7 +38,7 @@ const API: &str = "https://lrclib.net/api";
 const UA: &str = concat!(
     "scire/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/LanaMirko04/scire)"
+    " (https://github.com/MatPrayer/scire)"
 );
 
 /// How long a "nobody has this song" answer stays cached.

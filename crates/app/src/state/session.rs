@@ -93,12 +93,18 @@ impl Session {
         cx: &mut Context<Self>,
     ) {
         // Persist the server config immediately so first-run detection works
-        // across restarts even if the async ping never completes.
+        // across restarts even if the async ping never completes. The password
+        // is deliberately *not* part of this write: it is only ever stored
+        // after the ping succeeds, and then in the keyring, with the plaintext
+        // field used only where the keyring itself failed. Writing it here put
+        // the password in cleartext on disk for every connect attempt — a
+        // typo'd URL or an offline server left it there indefinitely, since
+        // nothing reached the branch that replaces it.
         if persist {
             self.settings.server = Some(ServerConfig {
                 url: url.clone(),
                 username: username.clone(),
-                password_plaintext: Some(password.clone()),
+                password_plaintext: None,
             });
             self.persist_settings();
         }

@@ -364,8 +364,13 @@ impl AlbumDetailView {
                 if in_album(&prev) || in_album(&cur) {
                     this.load(cx);
                 }
+                // Inside the change branch: `PlayerState` notifies on every
+                // event, `Event::Position` included, so an unconditional
+                // notify here repaints the whole track list twice a second
+                // for a page whose only playback-dependent mark is the
+                // playing row — which moves when the song id does.
+                cx.notify();
             }
-            cx.notify();
         })
         .detach();
         let last_playing_id = player.read(cx).current_song().map(|s| s.id.clone());

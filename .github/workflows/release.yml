@@ -1,0 +1,113 @@
+name: Release
+
+# Tag-driven: `git tag v1.0.0 && git push --tags` builds both platforms and
+# attaches the artifacts to a **draft** release. Draft on purpose — publishing
+# is the one step a person should do, after checking that what the runners
+# built actually launches.
+on:
+  push:
+    tags: ["v*"]
+  # So the pipeline can be exercised without minting a tag. No release is
+  # created then; the artifacts are left on the run.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same list the CI workflow installs: gpui links against the system
+      # graphics, windowing and font stack, and the app needs alsa and dbus.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libdbus-1-dev libfontconfig-1-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libx11-dev libvulkan-dev \
+            libssl-dev pkg-config
+
+      # The release profile is fat LTO on one codegen unit, which is minutes of
+      # a single core. That is the right trade for something people download.
+      - name: Build
+        run: cargo build --release
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: packaging/linux/make-tarball.sh
+
+      # The .app rather than the .dmg: make-dmg.sh arranges the disk image's
+      # window through Finder over AppleScript, which needs a desktop session
+      # the runner does not reliably have. The bundle is ad-hoc signed and not
+      # notarised either way, so Gatekeeper has to be answered on first launch
+      # — the release notes say so.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        env:
+          CODESIGN_ID: "-"
+        run: |
+          packaging/macos/bundle.sh
+          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
+          cd target/macos
+          # ditto, not zip: it preserves the bundle's symlinks and resource
+          # forks, and a zipped .app that lost them will not launch.
+          ditto -c -k --keepParent "Scirè.app" "scire-$VERSION-macos-arm64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            target/linux/*.tar.gz
+            target/macos/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Draft the release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*
+          body: |
+            See [CHANGELOG.md](https://github.com/MatPrayer/scire/blob/main/CHANGELOG.md)
+            for what is in this release.
+
+            **Linux** — extract the tarball and run `./install.sh` (or
+            `sudo ./install.sh --system`).
+
+            **macOS** — the app is ad-hoc signed and not notarised, so the
+            first launch needs *right-click → Open* rather than a double
+            click. Building from source avoids that entirely.
