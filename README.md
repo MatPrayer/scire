@@ -6,7 +6,7 @@
 
 **A fast, native desktop music client for [Navidrome](https://www.navidrome.org/), and for the music already on your disk.**
 
-[![Version](https://img.shields.io/badge/version-0.19.0-6f7ce8?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.20.0-6f7ce8?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-b7410e?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-4c8bf5?style=flat-square)](#installation)
 [![Subsonic](https://img.shields.io/badge/Subsonic-v1.16.1%20%2B%20OpenSubsonic-3fb950?style=flat-square)](http://www.subsonic.org/pages/api.jsp)
@@ -61,6 +61,55 @@ The name comes from [Scirè](https://en.wikipedia.org/wiki/Italian_submarine_Sci
 - [x] **One-shot cache repair**: Rebuild local cache re-reads local metadata and covers first, then rebuilds the connected server catalog; local-only libraries work without a server.
 - [x] **Self-laying settings page**: the panels wrap into a centred multi-column grid whenever the window can hold the whole page at once, and fall back to the scrolling column — captions and all — when it cannot. No setting to find.
 - [x] **Navigation**: mouse back/forward buttons, bracket keys, configurable default page, and optional vi-mode navigation with a **Reduce motion** toggle.
+
+### Vi mode
+
+Enable vi mode under **Settings → General**. Press `?` for complete in-app help.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move focused item |
+| `Enter` | Open or activate focused item |
+| `p` / `s` | Play / shuffle focused album or list |
+| `h` / `l` | Back / forward in navigation history |
+| `f` | Toggle fullscreen player |
+| `Space` | Play / pause |
+| `←` / `→` | Previous / next track |
+| `[` / `]` | Cycle album tabs or Settings sections |
+| `Ctrl+h` | Focus sidebar |
+| `Ctrl+j` | Focus player bar |
+| `Ctrl+k` / `Ctrl+l` | Focus content |
+| `/` | Search |
+| `i` / `:` | Enter insert / command mode |
+| `?` / `Esc` | Open help / dismiss |
+
+Player-bar region (`Ctrl+j`) uses dedicated controls:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Next / previous track |
+| `h` / `l` | Seek backward / forward 5 seconds |
+| `0` / `$` | Seek to track start / end |
+| `Space` | Play / pause |
+| `s` | Toggle shuffle |
+| `r` | Cycle repeat: off → all → one |
+| `m` | Mute / unmute |
+| `+` / `-` | Volume up / down 5% |
+
+Command mode keeps history on `↑` / `↓` and supports:
+
+| Command | Action |
+|---------|--------|
+| `:q`, `:help` | Quit / open vi help |
+| `:fs`, `:queue`, `:refresh` | Toggle fullscreen / queue / refresh library |
+| `:vol <0-100>` | Set volume percent |
+| `:shuffle`, `:noshuffle` | Enable / disable shuffle |
+| `:repeat [off\|all\|one]` | Cycle or set repeat mode |
+| `:next`, `:prev`, `:toggle`, `:stop` | Transport controls |
+| `:goto <section>` | Go to albums, artists, favorites, recent, radio, local, or settings |
+| `:albums` … `:settings` | Direct section aliases, including `:local` |
+| `:newpl <name>` | Create playlist |
+| `:pl add <name>`, `:pl list` | Add current song / list playlists |
 
 ## Installation
 

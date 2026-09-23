@@ -323,6 +323,24 @@ impl LocalMusicView {
         cx.emit(LocalMusicEvent::OpenAlbum(id));
     }
 
+    pub fn vi_play(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.focused_album_id() {
+            self.queue_album(id, QueueMode::Play, cx);
+        }
+    }
+
+    pub fn vi_shuffle(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.focused_album_id() {
+            self.queue_album(id, QueueMode::Shuffle, cx);
+        }
+    }
+
+    fn focused_album_id(&self) -> Option<String> {
+        self.vi_cursor
+            .and_then(|c| self.albums.get(c))
+            .map(|a| a.id.clone())
+    }
+
     fn render_card(
         &self,
         entity: &Entity<Self>,

@@ -5,7 +5,7 @@ use gpui::{
     div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::switch::Switch;
 use gpui_component::{
@@ -137,7 +137,7 @@ const COMPACT_SECTIONS: [(&str, u16); 10] = [
     ("Album pages", 7),
     ("Fullscreen", 7),
     ("Player bar", 11),
-    ("Playback", 10),
+    ("Playback", 14),
     ("Browsing", 15),
     ("Streaming", 5),
     ("Library", 14),
@@ -389,6 +389,7 @@ enum SettingsSwitch {
     SelectionGlowAlbumColor,
     FullscreenVolume,
     Scrobble,
+    ListenBrainz,
     ResumePlayback,
     DefaultShuffle,
     WaveformSeekbar,
@@ -461,6 +462,7 @@ enum SettingsAction {
     Button(SettingsButton),
     FontSize,
     DirInput,
+    LbInput,
 }
 
 /// A quick-nav jump in flight: the scroll offsets it runs between, the section
@@ -481,6 +483,7 @@ pub struct SettingsView {
     session: Entity<Session>,
     player: Entity<PlayerState>,
     dir_input: Entity<InputState>,
+    lb_input: Entity<InputState>,
     library_db: Arc<LibraryDb>,
     server_scan: TaskState,
     rebuild: TaskState,
@@ -546,11 +549,25 @@ impl SettingsView {
     ) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         let dir_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/music"));
+        let token = crate::config::load_lb_token(&session.read(cx).settings).unwrap_or_default();
+        let lb_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("ListenBrainz API token")
+                .default_value(token)
+                .masked(true)
+        });
+        cx.subscribe(&lb_input, |this: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                this.save_lb_token(cx);
+            }
+        })
+        .detach();
         let scroll = ScrollHandle::new();
         Self {
             session,
             player,
             dir_input,
+            lb_input,
             library_db,
             server_scan: TaskState::default(),
             rebuild: TaskState::default(),
@@ -864,6 +881,36 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_listenbrainz(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.listenbrainz_enabled = enabled);
+        self.save_lb_token(cx);
+    }
+
+    fn save_lb_token(&mut self, cx: &mut Context<Self>) {
+        let token = self.lb_input.read(cx).value().trim().to_string();
+        let fallback = if token.is_empty() {
+            crate::config::delete_lb_token();
+            None
+        } else if let Err(error) = crate::config::store_lb_token(&token) {
+            tracing::warn!(
+                "keyring unavailable ({error:#}); storing ListenBrainz token in settings"
+            );
+            Some(token.clone())
+        } else {
+            None
+        };
+        let enabled = self.session.update(cx, |session, _| {
+            session.settings.listenbrainz_token_plaintext = fallback;
+            session.settings.listenbrainz_enabled
+        });
+        self.player.update(cx, |player, cx| {
+            player.set_listenbrainz(enabled, (!token.is_empty()).then_some(token), cx)
+        });
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_resume_playback(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.resume_playback = enabled);
@@ -1164,6 +1211,7 @@ impl SettingsView {
             SettingsSwitch::SelectionGlowAlbumColor => s.selection_glow_album_color,
             SettingsSwitch::FullscreenVolume => s.fullscreen_volume,
             SettingsSwitch::Scrobble => s.scrobble_enabled,
+            SettingsSwitch::ListenBrainz => s.listenbrainz_enabled,
             SettingsSwitch::ResumePlayback => s.resume_playback,
             SettingsSwitch::DefaultShuffle => s.default_shuffle,
             SettingsSwitch::WaveformSeekbar => s.waveform_seekbar,
@@ -1224,6 +1272,7 @@ impl SettingsView {
             }
             SettingsSwitch::FullscreenVolume => self.set_fullscreen_volume(value, cx),
             SettingsSwitch::Scrobble => self.set_scrobble(value, cx),
+            SettingsSwitch::ListenBrainz => self.set_listenbrainz(value, cx),
             SettingsSwitch::ResumePlayback => self.set_resume_playback(value, cx),
             SettingsSwitch::DefaultShuffle => self.set_default_shuffle(value, cx),
             SettingsSwitch::WaveformSeekbar => self.set_waveform(value, cx),
@@ -1417,10 +1466,10 @@ impl SettingsView {
         }
     }
 
-    /// True while the music-folder path box has the keyboard. A path can hold
-    /// a space, and the root view's shortcuts must not eat it.
+    /// True while either free-text settings field has the keyboard.
     pub fn is_typing(&self, window: &Window, cx: &App) -> bool {
         self.dir_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.lb_input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     /// Cycle sections with `[`/`]`: jump the vi cursor to the next/prev
@@ -1564,12 +1613,24 @@ impl SettingsView {
                 self.dir_input.update(cx, |s, cx| s.focus(window, cx));
                 cx.notify();
             }
+            SettingsAction::LbInput => {
+                self.lb_input.update(cx, |s, cx| s.focus(window, cx));
+                cx.notify();
+            }
         }
     }
 
-    /// `i` on the settings page: focus the local-directory field.
+    /// `i` focuses the selected text field, or the local-directory field when
+    /// the cursor is elsewhere.
     pub fn vi_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dir_input.update(cx, |s, cx| s.focus(window, cx));
+        if matches!(
+            self.vi_cursor.and_then(|i| self.vi_actions.get(i)),
+            Some(SettingsAction::LbInput)
+        ) {
+            self.lb_input.update(cx, |s, cx| s.focus(window, cx));
+        } else {
+            self.dir_input.update(cx, |s, cx| s.focus(window, cx));
+        }
         cx.notify();
     }
 
@@ -1749,6 +1810,7 @@ impl Render for SettingsView {
         let album_panel_right = self.session.read(cx).settings.album_panel_right;
         let hide_album_stars = self.session.read(cx).settings.hide_album_stars;
         let resume_playback = self.session.read(cx).settings.resume_playback;
+        let listenbrainz_enabled = self.session.read(cx).settings.listenbrainz_enabled;
         let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
         let replay_gain = self.session.read(cx).settings.replay_gain;
         let queue_end = self.session.read(cx).settings.queue_end;
@@ -2371,6 +2433,27 @@ impl Render for SettingsView {
                 scrobble_enabled,
                 false,
                 "Scrobble plays to server",
+                cx,
+            ))
+            .child(self.subheading("ListenBrainz", cx))
+            .child(self.vi_switch(
+                SettingsSwitch::ListenBrainz,
+                "listenbrainz",
+                listenbrainz_enabled,
+                false,
+                "Scrobble local plays to ListenBrainz",
+                cx,
+            ))
+            .child(self.vi_control(
+                SettingsAction::LbInput,
+                div().w_full().child(Input::new(&self.lb_input)),
+                cx,
+            ))
+            .child(self.note(
+                "Server tracks keep using Navidrome, which can forward them to \
+                 ListenBrainz or Last.fm. Local files never reach the server, \
+                 so this sends them directly to api.listenbrainz.org with a \
+                 free API token.",
                 cx,
             ))
             .child(self.subheading("ReplayGain", cx))
@@ -3198,16 +3281,14 @@ mod tests {
             .collect()
     }
 
-    /// A content area tall enough to hold the page in two columns. Tracks the
-    /// weights above: the two-column split of the current page comes to 1550px,
-    /// and a `TALL` under that stops meaning what it says — the tall window
-    /// takes the same column count as the short one and the test reads as a
-    /// regression in the layout rather than a stale constant.
+    /// A content area tall enough for a roomy compact grid.
     const TALL: f32 = 1650.;
+    /// Short, but tall enough for the expanded Playback card in four columns.
+    const SHORT: f32 = 1000.;
 
     #[test]
     fn the_grid_places_every_section_in_page_order() {
-        for (body, height) in [(1200., TALL), (2600., TALL), (2600., 900.)] {
+        for (body, height) in [(1200., TALL), (2600., TALL), (2600., SHORT)] {
             let grid = compact_grid(&weights(), body, height);
             assert!(!grid.is_empty(), "{body}x{height} planned no grid");
             // Flattened column by column, the grid *is* the page in order:
@@ -3286,7 +3367,7 @@ mod tests {
     fn a_taller_window_takes_fewer_columns() {
         let w = weights();
         let tall = compact_grid(&w, 2600., TALL);
-        let short = compact_grid(&w, 2600., 900.);
+        let short = compact_grid(&w, 2600., SHORT);
         assert!(
             tall.len() < short.len(),
             "{} columns in a tall window against {} in a shorter one",
@@ -3295,7 +3376,7 @@ mod tests {
         );
         // And every column of either is inside the height it was given —
         // fitting comes before the aspect.
-        for (grid, height) in [(&tall, TALL), (&short, 900.)] {
+        for (grid, height) in [(&tall, TALL), (&short, SHORT)] {
             for h in column_heights(grid, &w) {
                 assert!(h <= height, "a column came out {h}px tall in {height}px");
             }
@@ -3305,17 +3386,23 @@ mod tests {
     #[test]
     fn the_columns_come_out_close_to_the_same_height() {
         // A contiguous split cannot balance as well as packing by size, but it
-        // must not leave one column half again its neighbour either.
+        // must not leave one column dramatically taller than its neighbour.
+        // Playback's token field makes one indivisible card larger than most.
         let w = weights();
-        let heights = column_heights(&compact_grid(&w, 2600., 900.), &w);
+        let heights = column_heights(&compact_grid(&w, 2600., SHORT), &w);
         let min = heights.iter().copied().fold(f32::MAX, f32::min);
         let max = heights.iter().copied().fold(0., f32::max);
-        assert!(max <= 1.5 * min, "columns came out at {heights:?}");
+        assert!(max <= 1.6 * min, "columns came out at {heights:?}");
     }
 
     #[test]
     fn the_grid_never_overruns_the_page_and_is_not_stretched_across_it() {
-        for (body, height) in [(1000., 4000.), (1200., TALL), (1600., 900.), (2600., 900.)] {
+        for (body, height) in [
+            (1000., 4000.),
+            (1200., TALL),
+            (1600., 1200.),
+            (2600., SHORT),
+        ] {
             let grid = compact_grid(&weights(), body, height);
             let cols = grid.len();
             assert!(cols >= 2, "{body}x{height} planned no grid");

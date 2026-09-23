@@ -439,6 +439,31 @@ impl FavoritesView {
             cx.emit(FavoritesEvent::OpenArtist(artist.id.clone()));
         }
     }
+
+    pub fn vi_play(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.vi_cursor else {
+            return;
+        };
+        if self
+            .starred
+            .as_ref()
+            .is_some_and(|starred| index < starred.song.len())
+        {
+            self.play_from(index, cx);
+        }
+    }
+
+    pub fn vi_shuffle(&mut self, cx: &mut Context<Self>) {
+        let Some(song) = self
+            .vi_cursor
+            .and_then(|index| self.starred.as_ref()?.song.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        self.player
+            .update(cx, |player, cx| player.play_queue_shuffled(vec![song], cx));
+    }
 }
 
 fn section_title(label: &'static str, cx: &Context<FavoritesView>) -> gpui::AnyElement {
