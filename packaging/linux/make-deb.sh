@@ -57,37 +57,63 @@ else
 	esac
 fi
 
-# Resolve the binary's shared libraries to the packages that own them. Each
-# library is followed to its real path first: dpkg owns the versioned file
-# (libssl.so.3), while the loader may have reported a symlink to it.
-FALLBACK_DEPENDS="libc6, libasound2t64 | libasound2, libdbus-1-3, libfontconfig1, libfreetype6, libwayland-client0, libxkbcommon0, libx11-6, libxcb1, libvulkan1, libssl3t64 | libssl3"
+# Libraries the binary loads at runtime rather than linking, which is to say
+# the ones no amount of looking at the ELF can find: gpui opens Vulkan (through
+# ash), Wayland and the X11 client libraries with dlopen, and a package without
+# them installs perfectly and then fails to open a window. They are unioned
+# with the derived set below rather than replacing it.
+RUNTIME_DEPENDS="libvulkan1 libwayland-client0 libwayland-cursor0 libx11-6 libfontconfig1 libfreetype6"
 
+# Used only where dpkg-query cannot answer — i.e. when building on something
+# that is not Debian, which is for testing this script, not for shipping.
+FALLBACK_DEPENDS="libc6 libasound2t64 libdbus-1-3 libxkbcommon0 libxkbcommon-x11-0 libxcb1 $RUNTIME_DEPENDS"
+
+# Resolve the binary's shared libraries to the packages that own them.
+#
+# Only the **direct** NEEDED entries, not everything ldd prints: ldd walks the
+# whole transitive closure, so depending on all of it means naming libbsd0,
+# liblz4-1, libmd0 and a dozen others that are properly the business of the
+# packages that do link them. Debian expects a package to depend on what it
+# links and to let those depend onwards.
+#
+# Each library is followed to its real path first: dpkg owns the versioned file
+# (libssl.so.3), while the loader may have reported a symlink to it.
 derive_depends() {
 	command -v dpkg-query >/dev/null 2>&1 || return 1
+	command -v readelf >/dev/null 2>&1 || return 1
+
+	local needed resolved so target paths=()
+	needed="$(readelf -d "$BIN" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')"
+	[[ -n "$needed" ]] || return 1
+	# soname → absolute path, as the loader itself resolved them.
+	resolved="$(ldd "$BIN" | sed -n 's/^[[:space:]]*\([^ ]*\) => \(\/[^ ]*\).*/\1 \2/p')"
+
+	while read -r so; do
+		[[ -n "$so" ]] || continue
+		target="$(awk -v s="$so" '$1 == s { print $2; exit }' <<<"$resolved")"
+		[[ -n "$target" ]] || continue
+		paths+=("$(readlink -f "$target")")
+	done <<<"$needed"
+	(( ${#paths[@]} )) || return 1
+
 	local pkgs
-	pkgs="$(ldd "$BIN" \
-		| sed -n 's/.*=> \(\/[^ ]*\).*/\1/p' \
-		| while read -r so; do
-			readlink -f "$so"
-		done \
-		| sort -u \
+	pkgs="$(printf '%s\n' "${paths[@]}" | sort -u \
 		| xargs -r dpkg-query -S 2>/dev/null \
-		| cut -d: -f1 \
-		| sort -u \
-		| paste -sd, - \
-		| sed 's/,/, /g')"
+		| cut -d: -f1)"
 	[[ -n "$pkgs" ]] || return 1
-	printf '%s' "$pkgs"
+	printf '%s\n%s\n' "$pkgs" "$(tr ' ' '\n' <<<"$RUNTIME_DEPENDS")"
 }
 
-if DEPENDS="$(derive_depends)"; then
-	echo "depends (derived): $DEPENDS"
+if RAW_DEPENDS="$(derive_depends)"; then
+	echo "dependencies derived from the binary, plus the dlopened set"
 else
-	DEPENDS="$FALLBACK_DEPENDS"
+	RAW_DEPENDS="$(tr ' ' '\n' <<<"$FALLBACK_DEPENDS")"
 	echo "warning: could not derive dependencies with dpkg-query — using the" >&2
 	echo "         fallback list, which is only as fresh as the last time it was" >&2
 	echo "         checked. Do not ship a .deb built this way." >&2
 fi
+DEPENDS="$(grep -v '^$' <<<"$RAW_DEPENDS" | sort -u | paste -sd, - | sed 's/,/, /g')"
+echo "depends: $DEPENDS"
 
 STAGE="$OUT_DIR/deb/scire_${VERSION}_${ARCH}"
 DEB="$OUT_DIR/scire_${VERSION}_${ARCH}.deb"
@@ -130,6 +156,7 @@ Architecture: $ARCH
 Maintainer: the Scirè authors <https://github.com/MatPrayer/scire/issues>
 Installed-Size: $INSTALLED_KB
 Depends: $DEPENDS
+Recommends: mesa-vulkan-drivers, pulseaudio-utils
 Section: sound
 Priority: optional
 Homepage: https://github.com/MatPrayer/scire

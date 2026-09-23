@@ -93,7 +93,9 @@ VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/p' "$ROOT/Cargo.toml" \
 DMG="$OUT_DIR/Scirè-$VERSION.dmg"
 WORK="$(mktemp -d -t scire-dmg)"
 MOUNT=""
-trap '[[ -n "$MOUNT" ]] && hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+# Cleanup detaches with -force from the start: this only runs when something
+# has already gone wrong, and a leaked mount outlives the script.
+trap '[[ -n "$MOUNT" ]] && hdiutil detach "$MOUNT" -force >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
 STAGE="$WORK/stage"
 STAGEDMG="$WORK/staged.dmg"
@@ -203,8 +205,29 @@ EOF
 fi
 
 # ---- 4. Flush, detach, compress ---------------------------------------------
+# Detaching is where this fails on a machine nobody is sitting at: mounting a
+# volume wakes whatever indexes it (Spotlight, fsevents), which holds it open
+# for a moment and hdiutil answers "Resource busy" — and unlike the Finder
+# pass, this step is not optional, so a single `sleep 1` before it is a guess
+# that the CI runner lost. Ask repeatedly, then insist: -force cuts the volume
+# loose, which is safe here because nothing of ours is still writing to it (the
+# staging copy finished before the mount, and the image being compressed is the
+# file underneath, read after the detach returns).
 sleep 1
-hdiutil detach "$MOUNT" >/dev/null
+detached=0
+for attempt in 1 2 3 4 5; do
+	if hdiutil detach "$MOUNT" >/dev/null 2>&1; then
+		detached=1
+		break
+	fi
+	echo "note: volume busy, retrying detach ($attempt)"
+	sleep 2
+done
+if (( ! detached )); then
+	echo "note: forcing detach"
+	hdiutil detach "$MOUNT" -force >/dev/null \
+		|| { echo "error: could not detach $MOUNT" >&2; exit 1; }
+fi
 MOUNT=""
 hdiutil convert "$STAGEDMG" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
 
