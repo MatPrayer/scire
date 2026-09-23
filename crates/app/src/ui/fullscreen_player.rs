@@ -22,7 +22,7 @@ use subsonic::{LyricLine, StructuredLyrics, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::config::{
-    FullscreenBackground, FullscreenCoverSize, VisualizerMode, VisualizerSettings,
+    FullscreenBackground, FullscreenCoverSize, LyricsProvider, VisualizerMode, VisualizerSettings,
 };
 use crate::services::{artwork, lyrics, runtime};
 use crate::state::player::PlayerState;
@@ -815,6 +815,14 @@ enum LyricsSource {
 }
 
 impl LyricsSource {
+    /// The other of the two, which is what the badge offers to switch to.
+    fn other(self) -> Self {
+        match self {
+            Self::Library => Self::Online,
+            Self::Online => Self::Library,
+        }
+    }
+
     fn badge(self) -> &'static str {
         match self {
             Self::Library => "Library",
@@ -828,6 +836,85 @@ impl LyricsSource {
             Self::Online => "Fetched from LRCLIB; your library has none for this track",
         }
     }
+}
+
+/// The source the badge offers to switch to, if any.
+///
+/// The lookup picks one document per track and the two sources genuinely
+/// disagree — a tag-scraped copy against someone else's transcription, one of
+/// them often timed where the other is not — so the badge is a switch as well
+/// as a label. What it may offer is narrower than "the other one":
+///
+/// - the provider setting decides which sources the app talks to at all, and a
+///   manual switch does not get to overrule it; `OnlineOnly` in particular is
+///   the user saying the library's copy is not wanted, and `LibraryOnly` is the
+///   one setting that keeps the app from ever contacting lrclib.net.
+/// - a source already asked and found empty (`alt_empty`) is not offered again:
+///   the switch would land on "No lyrics found" and strand the panel there.
+/// - the library side needs something to ask — a local file or a connected
+///   server — or it can only ever miss.
+fn lyrics_switch_target(
+    current: LyricsSource,
+    provider: LyricsProvider,
+    has_library: bool,
+    alt_empty: bool,
+) -> Option<LyricsSource> {
+    if !provider.has_fallback() || alt_empty {
+        return None;
+    }
+    let other = current.other();
+    (other != LyricsSource::Library || has_library).then_some(other)
+}
+
+/// The file's own words, wherever they live: read off disk for a local file,
+/// asked of the server for a streamed one. Both are the Library badge — the
+/// difference is only who indexed them.
+async fn library_lyrics(
+    local_path: Option<String>,
+    server: Option<SubsonicClient>,
+    id: String,
+    query: lyrics::Query,
+) -> Option<StructuredLyrics> {
+    if let Some(path) = local_path {
+        // On the blocking pool — it opens and parses a file, and the two IO
+        // workers must stay free for the requests below.
+        let docs = runtime::spawn_blocking_io(move || {
+            anyhow::Ok(lyrics::from_file(std::path::Path::new(&path)))
+        })
+        .await
+        .unwrap_or_default();
+        if let Some(doc) = best_lyrics(docs) {
+            return Some(doc);
+        }
+    }
+    let client = server?;
+    // getLyricsBySongId is what actually answers: Navidrome collects lyrics at
+    // scan time out of the file's tags and out of a sidecar .lrc, and only
+    // publishes them under the song's own id. Classic getLyrics searches the
+    // library by artist/title instead, which misses everything whose tags don't
+    // match what we sent — most of the library. It is kept as the fallback for
+    // servers without the songLyrics extension, which answer the by-id call
+    // with error 70.
+    let structured = client.get_lyrics_by_song_id(&id).await.unwrap_or_default();
+    if let Some(doc) = best_lyrics(structured) {
+        return Some(doc);
+    }
+    client
+        .get_lyrics(query.artist.as_deref(), Some(query.title.as_str()))
+        .await
+        .ok()
+        .and_then(|l| l.value)
+        .map(|text| vec![plain_lyrics(text)])
+        .and_then(best_lyrics)
+}
+
+/// LRCLIB has what was never tagged, and answers with an LRC document when it
+/// has one, so this can come back better than the server's own copy — which is
+/// what `prefer_synced` is for.
+async fn online_lyrics(query: lyrics::Query) -> Option<StructuredLyrics> {
+    // A lookup that fails is not an answer — leave it uncached and let the next
+    // open try again.
+    lyrics::fetch(query).await.ok().flatten()
 }
 
 /// Where down the panel the line being sung is parked, as a share of its
@@ -967,6 +1054,14 @@ pub struct FullscreenPlayer {
     /// Which of the two paths answered, for the panel's badge. `Some` exactly
     /// when `lyrics` is.
     lyrics_source: Option<LyricsSource>,
+    /// What each source answered for the song in `lyrics_for`: the outer `None`
+    /// means never asked, `Some(None)` asked and empty. Held so the badge's
+    /// switch is instant for the copy the lookup passed over, and so a source
+    /// already known empty is not offered.
+    lyrics_library: Option<Option<StructuredLyrics>>,
+    lyrics_online: Option<Option<StructuredLyrics>>,
+    /// A switch the badge asked for is in flight.
+    lyrics_switching: bool,
     /// Scroll handle of the lyrics list, so the line being sung can be kept on
     /// screen. A plain `ScrollHandle` rather than a uniform list's: the lines
     /// wrap, so they are not all the same height.
@@ -1143,6 +1238,9 @@ impl FullscreenPlayer {
             lyrics_for: None,
             lyrics_loading: false,
             lyrics_source: None,
+            lyrics_library: None,
+            lyrics_online: None,
+            lyrics_switching: false,
             lyrics_scroll: gpui::ScrollHandle::new(),
             lyrics_active: None,
             lyrics_prev: None,
@@ -1647,6 +1745,9 @@ impl FullscreenPlayer {
         let Some((id, query, local_path)) = current else {
             self.lyrics = None;
             self.lyrics_source = None;
+            self.lyrics_library = None;
+            self.lyrics_online = None;
+            self.lyrics_switching = false;
             self.lyrics_for = None;
             self.lyrics_loading = false;
             self.settle_lyrics_panel(cx);
@@ -1657,6 +1758,11 @@ impl FullscreenPlayer {
         }
         self.lyrics = None;
         self.lyrics_source = None;
+        // A switch still in flight belongs to the song being left; its own id
+        // check drops the result.
+        self.lyrics_library = None;
+        self.lyrics_online = None;
+        self.lyrics_switching = false;
         self.lyrics_for = Some(id.clone());
         // A new song's lines are a new list; whatever line number the last one
         // was on means nothing here.
@@ -1681,71 +1787,27 @@ impl FullscreenPlayer {
         cx.spawn(async move |this, cx| {
             let by_id = id.clone();
             let online_query = query.clone();
-            let found = runtime::spawn_io(async move {
-                // The file's own words, wherever they live: read off disk for a
-                // local file, asked of the server for a streamed one. Both are
-                // the Library badge — the difference is only who indexed them.
-                let library = async move {
-                    if let Some(path) = local_path {
-                        // On the blocking pool — it opens and parses a file,
-                        // and the two IO workers must stay free for the
-                        // requests below.
-                        let docs = runtime::spawn_blocking_io(move || {
-                            anyhow::Ok(lyrics::from_file(std::path::Path::new(&path)))
-                        })
-                        .await
-                        .unwrap_or_default();
-                        if let Some(doc) = best_lyrics(docs) {
-                            return Some((doc, LyricsSource::Library));
-                        }
-                    }
-                    let client = server?;
-                    // getLyricsBySongId is what actually answers: Navidrome
-                    // collects lyrics at scan time out of the file's tags and
-                    // out of a sidecar .lrc, and only publishes them under the
-                    // song's own id. Classic getLyrics searches the library by
-                    // artist/title instead, which misses everything whose tags
-                    // don't match what we sent — most of the library. It is
-                    // kept as the fallback for servers without the songLyrics
-                    // extension, which answer the by-id call with error 70.
-                    let structured = client
-                        .get_lyrics_by_song_id(&by_id)
-                        .await
-                        .unwrap_or_default();
-                    if let Some(doc) = best_lyrics(structured) {
-                        return Some((doc, LyricsSource::Library));
-                    }
-                    client
-                        .get_lyrics(query.artist.as_deref(), Some(query.title.as_str()))
-                        .await
-                        .ok()
-                        .and_then(|l| l.value)
-                        .map(|text| vec![plain_lyrics(text)])
-                        .and_then(best_lyrics)
-                        .map(|doc| (doc, LyricsSource::Library))
-                };
-                // LRCLIB has what was never tagged, and answers with an LRC
-                // document when it has one, so this can come back better than
-                // the server's own copy — which is what `prefer_synced` is for.
-                let online = async move {
-                    // A lookup that fails is not an answer — leave it uncached
-                    // and let the next open try again.
-                    let found = lyrics::fetch(online_query).await.ok().flatten();
-                    found.map(|doc| (doc, LyricsSource::Online))
-                };
+            let outcome = runtime::spawn_io(async move {
+                let library = library_lyrics(local_path, server, by_id, query);
+                let online = online_lyrics(online_query);
                 // Only the enabled sources, in the provider's order. Boxed
                 // because the two blocks are different types and the order is
                 // a runtime choice; a source left out of the list is never
                 // polled, which is what makes `LibraryOnly` cost no request.
-                type Lookup<'a> = Pin<
-                    Box<dyn Future<Output = Option<(StructuredLyrics, LyricsSource)>> + Send + 'a>,
-                >;
+                type Lookup<'a> =
+                    Pin<Box<dyn Future<Output = Option<StructuredLyrics>> + Send + 'a>>;
                 let library: Lookup = Box::pin(library);
                 let online: Lookup = Box::pin(online);
-                let mut sources: Vec<Lookup> = Vec::with_capacity(2);
+                let mut sources: Vec<(LyricsSource, Lookup)> = Vec::with_capacity(2);
                 let (first, second) = match provider.library_first() {
-                    true => (library, online),
-                    false => (online, library),
+                    true => (
+                        (LyricsSource::Library, library),
+                        (LyricsSource::Online, online),
+                    ),
+                    false => (
+                        (LyricsSource::Online, online),
+                        (LyricsSource::Library, library),
+                    ),
                 };
                 let (wants_first, wants_second) = match provider.library_first() {
                     true => (provider.uses_library(), provider.uses_online()),
@@ -1759,30 +1821,153 @@ impl FullscreenPlayer {
                 }
 
                 let mut found: Option<(StructuredLyrics, LyricsSource)> = None;
-                for source in sources {
+                // What each source answered, kept so the badge's switch knows
+                // what it can offer without asking again — including the copy
+                // `prefer_synced` passed over, which is a real document the
+                // user may well want back.
+                let mut tried: Vec<(LyricsSource, Option<StructuredLyrics>)> =
+                    Vec::with_capacity(2);
+                for (source, lookup) in sources {
+                    let hit = lookup.await;
+                    tried.push((source, hit.clone()));
                     let held = found.as_ref().map(|(doc, _)| doc.synced);
-                    if let Some(hit) = source.await
-                        && takes_over(held, hit.0.synced, prefer_synced)
+                    if let Some(doc) = hit
+                        && takes_over(held, doc.synced, prefer_synced)
                     {
-                        found = Some(hit);
+                        found = Some((doc, source));
                     }
                     if settled(found.as_ref().map(|(doc, _)| doc.synced), prefer_synced) {
                         break;
                     }
                 }
-                anyhow::Ok(found)
+                anyhow::Ok((found, tried))
             })
             .await
-            .ok()
-            .flatten();
+            .ok();
             let _ = this.update(cx, |view, cx| {
                 if view.lyrics_for.as_deref() == Some(id.as_str()) {
                     view.lyrics_loading = false;
+                    let (found, tried) = outcome.unwrap_or_default();
+                    for (source, doc) in tried {
+                        view.cache_lyrics(source, doc);
+                    }
                     let (doc, source) = found.unzip();
                     view.lyrics = doc;
                     view.lyrics_source = source;
                     view.settle_lyrics_panel(cx);
                     cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// What `source` answered for the song on screen: `None` for a source never
+    /// asked, `Some(None)` for one asked and empty.
+    fn cached_lyrics(&self, source: LyricsSource) -> &Option<Option<StructuredLyrics>> {
+        match source {
+            LyricsSource::Library => &self.lyrics_library,
+            LyricsSource::Online => &self.lyrics_online,
+        }
+    }
+
+    fn cache_lyrics(&mut self, source: LyricsSource, doc: Option<StructuredLyrics>) {
+        match source {
+            LyricsSource::Library => self.lyrics_library = Some(doc),
+            LyricsSource::Online => self.lyrics_online = Some(doc),
+        }
+    }
+
+    /// The source the badge offers to switch to, given what this song has
+    /// already been asked and what there is to ask.
+    fn lyrics_switch(&self, cx: &Context<Self>) -> Option<LyricsSource> {
+        let source = self.lyrics_source?;
+        let provider = self.session.read(cx).settings.lyrics_provider;
+        let alt = source.other();
+        let alt_empty = matches!(self.cached_lyrics(alt), Some(None));
+        // A local file is its own library; a streamed one needs the server.
+        let has_library = self
+            .player
+            .read(cx)
+            .current_song()
+            .is_some_and(|song| song.local_path.is_some() || self.client(cx).is_some());
+        lyrics_switch_target(source, provider, has_library, alt_empty)
+    }
+
+    /// Put a document up, from either source. The lines are a new list, so
+    /// everything the follow state remembers about the old one goes.
+    fn apply_lyrics(
+        &mut self,
+        doc: StructuredLyrics,
+        source: LyricsSource,
+        cx: &mut Context<Self>,
+    ) {
+        self.lyrics = Some(doc);
+        self.lyrics_source = Some(source);
+        self.lyrics_followed = None;
+        self.lyrics_prev = None;
+        self.lyrics_scroll_anim = None;
+        self.lyrics_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Show the other source's words for the song on screen — the badge's click.
+    ///
+    /// A source already asked is answered out of `lyrics_library`/`lyrics_online`
+    /// with no request at all, which is the common case: under either two-source
+    /// provider both were polled, and the one not on screen is the copy
+    /// `prefer_synced` passed over. Only a source the first pass never reached
+    /// (it settled on the first hit) costs a lookup.
+    fn switch_lyrics_source(&mut self, target: LyricsSource, cx: &mut Context<Self>) {
+        if self.lyrics_switching {
+            return;
+        }
+        if let Some(doc) = self.cached_lyrics(target).clone().flatten() {
+            self.apply_lyrics(doc, target, cx);
+            return;
+        }
+        let Some((id, query, local_path)) = self.player.read(cx).current_song().map(|song| {
+            (
+                song.id.clone(),
+                lyrics::Query {
+                    title: song.title.clone(),
+                    artist: song.artist.clone(),
+                    album: song.album.clone(),
+                    duration: song.duration,
+                },
+                song.local_path.clone(),
+            )
+        }) else {
+            return;
+        };
+        if self.lyrics_for.as_deref() != Some(id.as_str()) {
+            return;
+        }
+        let server = local_path.is_none().then(|| self.client(cx)).flatten();
+        self.lyrics_switching = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let for_id = id.clone();
+            let found = runtime::spawn_io(async move {
+                anyhow::Ok(match target {
+                    LyricsSource::Library => library_lyrics(local_path, server, id, query).await,
+                    LyricsSource::Online => online_lyrics(query).await,
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+            let _ = this.update(cx, |view, cx| {
+                if view.lyrics_for.as_deref() != Some(for_id.as_str()) {
+                    return;
+                }
+                view.lyrics_switching = false;
+                view.cache_lyrics(target, found.clone());
+                match found {
+                    Some(doc) => view.apply_lyrics(doc, target, cx),
+                    // Nothing there: the badge stops offering this source
+                    // rather than emptying a panel that has words in it.
+                    None => cx.notify(),
                 }
             });
         })
@@ -2112,6 +2297,22 @@ impl FullscreenPlayer {
                     // or "No lyrics found" would be naming the source of
                     // nothing.
                     .when_some(self.lyrics_source, |this, source| {
+                        // The badge is also the switch: the two sources
+                        // disagree about the words as often as about the
+                        // timings, so the one not on screen is a click away
+                        // wherever it is there to be had.
+                        let switch = self.lyrics_switch(cx);
+                        let switching = self.lyrics_switching;
+                        let tip = match switch {
+                            Some(alt) => {
+                                format!(
+                                    "{} — click to show {} instead",
+                                    source.tooltip(),
+                                    alt.badge()
+                                )
+                            }
+                            None => source.tooltip().to_string(),
+                        };
                         this.child(
                             div()
                                 .id("fs-lyrics-source")
@@ -2122,9 +2323,22 @@ impl FullscreenPlayer {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .tooltip(move |window, cx| {
-                                    Tooltip::new(source.tooltip()).build(window, cx)
+                                    Tooltip::new(tip.clone()).build(window, cx)
                                 })
-                                .child(source.badge()),
+                                .when_some(switch, |el, alt| {
+                                    el.cursor_pointer()
+                                        .hover(|s| s.bg(cx.theme().accent))
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            view.switch_lyrics_source(alt, cx)
+                                        }))
+                                })
+                                // A lookup the cache could not answer is a
+                                // round trip; saying so beats a badge that
+                                // ignores the click for a second.
+                                .child(match switching {
+                                    true => format!("{} …", source.badge()),
+                                    false => source.badge().to_string(),
+                                }),
                         )
                     }),
             )
@@ -3647,12 +3861,12 @@ impl Render for FullscreenPlayer {
 mod tests {
     use super::{
         ART_LEAD, ART_MAX, ART_MAX_STACKED, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity,
-        EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, PANEL_LYRICS_MAX, PANEL_MAX,
-        PANEL_MIN, SidePanel, VOLUME_W, active_line, best_lyrics, blob_base, blob_field, hash01,
-        line_emphasis, lyric_color, lyric_seek_target, lyric_wrap, plain_lyrics, queue_chrome_h,
-        queue_row_h, queue_visible_rows, settled, takes_over,
+        EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, LyricsSource, PANEL_LYRICS_MAX,
+        PANEL_MAX, PANEL_MIN, SidePanel, VOLUME_W, active_line, best_lyrics, blob_base, blob_field,
+        hash01, line_emphasis, lyric_color, lyric_seek_target, lyric_wrap, lyrics_switch_target,
+        plain_lyrics, queue_chrome_h, queue_row_h, queue_visible_rows, settled, takes_over,
     };
-    use crate::config::FullscreenCoverSize;
+    use crate::config::{FullscreenCoverSize, LyricsProvider};
     use std::time::Duration;
     use subsonic::{LyricLine, StructuredLyrics};
 
@@ -3669,6 +3883,84 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_badge_offers_the_other_source_under_a_two_source_provider() {
+        assert_eq!(
+            lyrics_switch_target(
+                LyricsSource::Library,
+                LyricsProvider::LibraryFirst,
+                true,
+                false
+            ),
+            Some(LyricsSource::Online)
+        );
+        assert_eq!(
+            lyrics_switch_target(
+                LyricsSource::Online,
+                LyricsProvider::OnlineFirst,
+                true,
+                false
+            ),
+            Some(LyricsSource::Library)
+        );
+    }
+
+    /// A single-source provider is the user saying which one they want — and
+    /// under `LibraryOnly` a switch would be the one thing that setting exists
+    /// to prevent, a request to lrclib.net.
+    #[test]
+    fn a_single_source_provider_offers_no_switch() {
+        for provider in [LyricsProvider::LibraryOnly, LyricsProvider::OnlineOnly] {
+            assert_eq!(
+                lyrics_switch_target(LyricsSource::Library, provider, true, false),
+                None
+            );
+            assert_eq!(
+                lyrics_switch_target(LyricsSource::Online, provider, true, false),
+                None
+            );
+        }
+    }
+
+    /// Already asked and empty: switching would land the panel on "No lyrics
+    /// found", which is worse than the words that are up.
+    #[test]
+    fn a_source_known_empty_is_not_offered() {
+        assert_eq!(
+            lyrics_switch_target(
+                LyricsSource::Library,
+                LyricsProvider::LibraryFirst,
+                true,
+                true
+            ),
+            None
+        );
+    }
+
+    /// No local file and no server: the library side has nothing to ask.
+    #[test]
+    fn the_library_is_not_offered_with_nothing_to_ask() {
+        assert_eq!(
+            lyrics_switch_target(
+                LyricsSource::Online,
+                LyricsProvider::LibraryFirst,
+                false,
+                false
+            ),
+            None
+        );
+        // The online side needs no library at all.
+        assert_eq!(
+            lyrics_switch_target(
+                LyricsSource::Library,
+                LyricsProvider::LibraryFirst,
+                false,
+                false
+            ),
+            Some(LyricsSource::Online)
+        );
     }
 
     #[test]
