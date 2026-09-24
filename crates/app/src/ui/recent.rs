@@ -155,28 +155,42 @@ impl RecentView {
     }
 
     fn fetch_missing_art(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client(cx) else {
-            return;
-        };
         // Keyed by album, so a run of tracks off one album downloads its art
         // once instead of once per file (Navidrome ids covers per song).
-        let covers: Vec<(String, String)> = self
-            .songs
-            .iter()
-            .filter_map(artwork::song_cover)
-            .filter(|(_, key)| !self.art_paths.contains_key(key) && !self.fetching.contains(key))
-            // key → cover id: one entry (one download) per album.
-            .map(|(cover_id, key)| (key, cover_id))
-            .collect::<std::collections::HashMap<_, _>>()
-            .into_iter()
-            .collect();
-
-        for (key, cover_id) in covers {
-            // Synchronous cache hit: render instantly on restart, no task.
-            if let Some(path) = artwork::cached(&key, ART_SIZE) {
+        let mut covers: HashMap<String, String> = HashMap::new();
+        for song in &self.songs {
+            let Some((cover_id, key)) = artwork::song_cover(song) else {
+                continue;
+            };
+            if self.art_paths.contains_key(&key) || self.fetching.contains(&key) {
+                continue;
+            }
+            // A local track's cover id is the scanner's art hash, already on
+            // disk — the server has never heard of it.
+            if song.local_path.is_some() {
+                if let Some(path) =
+                    crate::services::local_library::local_art_path(&cover_id).filter(|p| p.exists())
+                {
+                    self.art_paths.insert(key, path);
+                }
+                continue;
+            }
+            // Synchronous cache hit at *any* rung: the thumbnail is 44px, so
+            // the player bar's or the grid's copy looks identical here, and
+            // asking for one exact rung re-downloaded art already on disk.
+            // Checked before the client, so a page opened offline or before
+            // the connect lands still draws what the cache holds.
+            if let Some(path) = artwork::cached_best(&key, ART_SIZE) {
                 self.art_paths.insert(key, path);
                 continue;
             }
+            covers.entry(key).or_insert(cover_id);
+        }
+
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        for (key, cover_id) in covers {
             self.fetching.insert(key.clone());
             let client = client.clone();
             cx.spawn(async move |this, cx| {

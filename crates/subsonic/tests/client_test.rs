@@ -127,6 +127,28 @@ async fn album_list2_parses_opensubsonic_release_dates() {
     assert_eq!(albums[1].release_key(), Some((1999, 0, 0)));
 }
 
+/// `releaseTypes` is what the artist page splits albums from singles/EPs on;
+/// a server without it leaves the list empty rather than failing the decode.
+#[tokio::test]
+async fn get_artist_parses_release_types() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getArtist"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""artist":{"id":"ar-1","name":"Band","album":[
+                {"id":"al-1","name":"Record","releaseTypes":["Album","Compilation"]},
+                {"id":"al-2","name":"Deep","releaseTypes":["EP"]},
+                {"id":"al-3","name":"Plain"}
+            ]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let artist = client(&server.uri()).get_artist("ar-1").await.unwrap();
+    assert_eq!(artist.album[0].release_types, ["Album", "Compilation"]);
+    assert_eq!(artist.album[1].release_types, ["EP"]);
+    assert!(artist.album[2].release_types.is_empty());
+}
+
 #[tokio::test]
 async fn get_album_parses_songs() {
     let server = MockServer::start().await;

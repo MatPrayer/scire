@@ -4,6 +4,20 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The artist page's Albums / Singles / EPs split follows the release type the
+  server publishes (OpenSubsonic `releaseTypes`, from the files' tags). Untagged
+  releases fall back to the title and length, and that guess is tighter now:
+  "EP" or "Single" must be the title's last word ("Deep" and "Sleep" were filed
+  as EPs), and a release counts as short at six tracks or fewer in under 30
+  minutes rather than four tracks or fewer at any length.
+- A year below 1000 is treated as missing. A date written day-first into a
+  year-first tag (`0003-09-2026`) used to show as "3" under the album's cover
+  and sort as the oldest record in the library.
+
 ## [1.0.0] — 2026-09-24
 
 First stable release. Everything below landed across the 0.x series; this entry
@@ -90,4 +104,5 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/MatPrayer/scire/releases/tag/v1.0.0

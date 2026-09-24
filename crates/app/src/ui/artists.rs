@@ -1604,10 +1604,42 @@ fn in_libraries(library: Option<&str>, selected: &[String]) -> bool {
 /// Collapsed-bio length; roughly four lines at typical window widths.
 const BIO_PREVIEW_CHARS: usize = 400;
 
+/// Whether an album belongs under "Singles / EPs" rather than "Albums".
+///
+/// The server's own `releaseTypes` decide it when present: they come from the
+/// files' tags, i.e. from whoever released the record, and no guess made from
+/// the title or the length can overrule that. Only an untagged album (or a
+/// vanilla server) falls through to the heuristic.
 fn is_single_or_ep(album: &Album) -> bool {
-    let name = album.name.to_lowercase();
-    let song_count = album.song_count.unwrap_or_default();
-    name.contains("single") || name.contains("ep") || song_count <= 4
+    if !album.release_types.is_empty() {
+        return album
+            .release_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("single") || t.eq_ignore_ascii_case("ep"));
+    }
+    titled_single_or_ep(&album.name) || short_release(album.song_count, album.duration)
+}
+
+/// A title *ending* in "EP" or "Single" as a word of its own — "Title - EP",
+/// "Title (Single)", "Title [EP]". Matching the letters anywhere filed "Deep",
+/// "Sleep" and "Epic" under EPs.
+fn titled_single_or_ep(name: &str) -> bool {
+    name.split(|c: char| !c.is_alphanumeric())
+        .rfind(|w| !w.is_empty())
+        .is_some_and(|w| w.eq_ignore_ascii_case("ep") || w.eq_ignore_ascii_case("single"))
+}
+
+/// Length rule for untagged releases, after the common store convention:
+/// under 30 minutes and at most six tracks is an EP (three or fewer, a
+/// single). Without a duration only the single's track count is trusted, and
+/// an album with no track count at all is kept an album — unknown is not short.
+fn short_release(song_count: Option<u32>, duration: Option<u32>) -> bool {
+    const MAX_SECS: u32 = 30 * 60;
+    match (song_count, duration) {
+        (Some(n), Some(d)) => n > 0 && n <= 6 && d < MAX_SECS,
+        (Some(n), None) => n > 0 && n <= 3,
+        (None, _) => false,
+    }
 }
 
 async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
@@ -1637,46 +1669,108 @@ mod tests {
     use super::is_single_or_ep;
     use subsonic::Album;
 
+    fn release(name: &str, songs: Option<u32>, secs: Option<u32>, types: &[&str]) -> Album {
+        Album {
+            id: name.into(),
+            name: name.into(),
+            artist: None,
+            artist_id: None,
+            cover_art: None,
+            song_count: songs,
+            duration: secs,
+            created: None,
+            year: None,
+            genre: None,
+            starred: None,
+            user_rating: None,
+            play_count: None,
+            artists: Vec::new(),
+            original_release_date: None,
+            release_date: None,
+            release_types: types.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn singles_and_eps_are_grouped_separately() {
-        let single = Album {
-            id: "1".into(),
-            name: "Single".into(),
-            artist: None,
-            artist_id: None,
-            cover_art: None,
-            song_count: Some(2),
-            duration: None,
-            created: None,
-            year: None,
-            genre: None,
-            starred: None,
-            user_rating: None,
-            play_count: None,
-            artists: Vec::new(),
-            original_release_date: None,
-            release_date: None,
-        };
-        let album = Album {
-            id: "2".into(),
-            name: "Studio Album".into(),
-            artist: None,
-            artist_id: None,
-            cover_art: None,
-            song_count: Some(10),
-            duration: None,
-            created: None,
-            year: None,
-            genre: None,
-            starred: None,
-            user_rating: None,
-            play_count: None,
-            artists: Vec::new(),
-            original_release_date: None,
-            release_date: None,
-        };
-        assert!(is_single_or_ep(&single));
-        assert!(!is_single_or_ep(&album));
+        assert!(is_single_or_ep(&release("Single", Some(2), None, &[])));
+        assert!(!is_single_or_ep(&release(
+            "Studio Album",
+            Some(10),
+            None,
+            &[]
+        )));
+    }
+
+    #[test]
+    fn release_types_decide_when_present() {
+        // Tagged EP with a long runtime, and a tagged album with two tracks:
+        // the tags win over the length rule both ways.
+        assert!(is_single_or_ep(&release(
+            "Anything",
+            Some(8),
+            Some(3600),
+            &["EP"]
+        )));
+        assert!(is_single_or_ep(&release(
+            "Anything",
+            Some(1),
+            None,
+            &["single"]
+        )));
+        assert!(!is_single_or_ep(&release(
+            "Drone",
+            Some(2),
+            Some(4000),
+            &["Album"]
+        )));
+        assert!(!is_single_or_ep(&release(
+            "Hits - EP",
+            Some(3),
+            None,
+            &["Album", "Compilation"]
+        )));
+    }
+
+    #[test]
+    fn ep_in_the_title_must_be_its_own_trailing_word() {
+        assert!(is_single_or_ep(&release("Something - EP", None, None, &[])));
+        assert!(is_single_or_ep(&release("Something (EP)", None, None, &[])));
+        assert!(is_single_or_ep(&release("Song [Single]", None, None, &[])));
+        for name in [
+            "Deep Purple",
+            "Sleep",
+            "Epic",
+            "Repeat",
+            "EP Collection",
+            "The Singles",
+        ] {
+            assert!(!is_single_or_ep(&release(name, None, None, &[])), "{name}");
+        }
+    }
+
+    #[test]
+    fn length_rule_for_untagged_releases() {
+        // Six tracks in 22 minutes: an EP the old four-track cutoff missed.
+        assert!(is_single_or_ep(&release(
+            "Short",
+            Some(6),
+            Some(22 * 60),
+            &[]
+        )));
+        // Three long tracks: an album, not a single.
+        assert!(!is_single_or_ep(&release(
+            "Long",
+            Some(3),
+            Some(45 * 60),
+            &[]
+        )));
+        // No duration: only the single's count is trusted.
+        assert!(is_single_or_ep(&release("A", Some(3), None, &[])));
+        assert!(!is_single_or_ep(&release("B", Some(5), None, &[])));
+        // Unknown track count is not short.
+        assert!(!is_single_or_ep(&release("C", None, None, &[])));
+        assert!(!is_single_or_ep(&release("D", Some(0), Some(0), &[])));
     }
 }
 
@@ -1757,6 +1851,7 @@ mod grid_tests {
             artists: Vec::new(),
             original_release_date: None,
             release_date: None,
+            release_types: Vec::new(),
         }
     }
 

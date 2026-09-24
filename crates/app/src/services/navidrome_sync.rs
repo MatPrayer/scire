@@ -610,6 +610,7 @@ mod tests {
             artists: Vec::new(),
             original_release_date: None,
             release_date: None,
+            release_types: Vec::new(),
         }
     }
 

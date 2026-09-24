@@ -5,6 +5,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A `year` field, with a year no release can have read as missing.
+///
+/// Servers publish whatever the tag held, and a date written day-first into a
+/// year-first field (`©day = "0003-09-2026"`) comes back as year 3, which the
+/// views would print under the cover and the sort would file as the oldest
+/// record in the library. Nothing recorded predates 1000, so anything below it
+/// is a broken tag rather than a date.
+fn plausible_year<'de, D>(de: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i32>::deserialize(de)?.filter(|y| *y >= 1000))
+}
+
 /// Identifier of a music library ("music folder" in Subsonic terms).
 pub type LibraryId = String;
 
@@ -56,6 +70,7 @@ pub struct Album {
     pub song_count: Option<u32>,
     pub duration: Option<u32>,
     pub created: Option<String>,
+    #[serde(default, deserialize_with = "plausible_year")]
     pub year: Option<i32>,
     pub genre: Option<String>,
     pub starred: Option<String>,
@@ -76,6 +91,12 @@ pub struct Album {
     pub original_release_date: Option<ItemDate>,
     #[serde(default)]
     pub release_date: Option<ItemDate>,
+    /// OpenSubsonic release types, MusicBrainz vocabulary: the primary type
+    /// (`Album`, `EP`, `Single`, …) followed by any secondary ones
+    /// (`Compilation`, `Live`, …). Navidrome fills it from the files'
+    /// `RELEASETYPE` tags; empty on vanilla servers and untagged libraries.
+    #[serde(default)]
+    pub release_types: Vec<String>,
 }
 
 /// An OpenSubsonic `ItemDate`: a partial date, any component of which may be
@@ -83,6 +104,7 @@ pub struct Album {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemDate {
+    #[serde(default, deserialize_with = "plausible_year")]
     pub year: Option<i32>,
     pub month: Option<u32>,
     pub day: Option<u32>,
@@ -130,6 +152,7 @@ pub struct Song {
     pub artist_id: Option<String>,
     pub track: Option<u32>,
     pub disc_number: Option<u32>,
+    #[serde(default, deserialize_with = "plausible_year")]
     pub year: Option<i32>,
     pub genre: Option<String>,
     pub cover_art: Option<String>,
@@ -282,5 +305,24 @@ mod tests {
         let serialized = serde_json::to_string(&song).unwrap();
         let deserialized: Song = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.local_path.as_deref(), Some("/music/test.flac"));
+    }
+
+    /// Navidrome's answer for an m4a tagged `©day = "0003-09-2026"`: the
+    /// year field and the release date both carry the broken year.
+    #[test]
+    fn an_implausible_year_reads_as_missing() {
+        let json = r#"{"id":"a","name":"advice","year":3,
+            "releaseDate":{"year":3,"month":9,"day":20}}"#;
+        let album: Album = serde_json::from_str(json).unwrap();
+        assert_eq!(album.year, None);
+        assert_eq!(album.release_key(), None);
+
+        let song: Song = serde_json::from_str(r#"{"id":"1","title":"t","year":27}"#).unwrap();
+        assert_eq!(song.year, None);
+
+        let dated: Album = serde_json::from_str(r#"{"id":"b","name":"b","year":2021}"#).unwrap();
+        assert_eq!(dated.year, Some(2021));
+        let missing: Album = serde_json::from_str(r#"{"id":"c","name":"c"}"#).unwrap();
+        assert_eq!(missing.year, None);
     }
 }
