@@ -1184,7 +1184,9 @@ impl Render for AlbumsView {
             .child(
                 h_flex()
                     .items_center()
+                    .flex_wrap()
                     .gap_4()
+                    .gap_y_1()
                     .px_4()
                     .child(div().text_lg().child("Albums"))
                     .child(tabs)
@@ -1211,12 +1213,12 @@ impl Render for AlbumsView {
                     })
                     // Totals ride the right edge; the spinner keeps its place
                     // beside the tabs so it reads as part of the listing.
-                    .child(div().flex_1())
                     // Nothing to summarise until a sync has written rows —
                     // zeros next to a grid full of live cards read as a bug.
                     .when(self.stats.albums > 0, |this| {
                         this.child(
                             div()
+                                .ml_auto()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(crate::ui::library_summary(

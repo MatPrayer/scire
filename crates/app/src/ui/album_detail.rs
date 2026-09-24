@@ -883,6 +883,12 @@ const PAGE_PADDING_X: f32 = 32.;
 /// Cover edge in the stacked header. The side panel draws a much larger one —
 /// `ui::album_side_panel` sizes it from the panel it fits in.
 const HEADER_ART: f32 = 220.;
+/// The header card's own `p_4`, both sides.
+const HEADER_CARD_PADDING: f32 = 32.;
+/// The `gap_4` between the cover and the info column.
+const HEADER_GAP: f32 = 16.;
+/// Narrowest the info column goes beside the cover before it moves under it.
+const INFO_MIN_W: f32 = 260.;
 
 impl AlbumDetailView {
     /// Width the page has to lay out in, or `0.` on the first frame — before
@@ -1028,6 +1034,33 @@ impl Render for AlbumDetailView {
             // shows what it has rather than waiting on nothing.
             let header_pending = self.album.is_none() && loading_album;
 
+            // A stacked card too narrow for the cover and the info column side
+            // by side (a portrait window) is laid out as a column outright
+            // rather than left to the row's `flex_wrap`: wrapped, the column is
+            // measured for height at its `min_w` rather than at the line it
+            // lands on, so its title and chips wrap to more lines than get
+            // drawn and the card kept a band of empty wash under the buttons.
+            let narrow =
+                header_w > 0. && header_w - HEADER_CARD_PADDING < art_px + HEADER_GAP + INFO_MIN_W;
+            // A clearly portrait window takes the column too, even where the row
+            // would fit: the row's info column wraps under the cover anyway
+            // once its chips outgrow what is left beside it, and a portrait
+            // page reads as one centred column rather than a header hugging
+            // its left edge.
+            let narrow = narrow || crate::ui::header_stacks_for_shape(viewport);
+            // That column is centred, cover and every line under it: the card
+            // spans the window there, and a left-aligned stack leaves the
+            // cover hanging off one edge of it. The side panel keeps its
+            // left-aligned column, which reads down beside the track list.
+            let centred = narrow && panel.is_none();
+            // With the card's whole width to itself the cover grows, rather
+            // than sitting as a thumbnail in the middle of it.
+            let art_px = if centred {
+                crate::ui::centred_header_art(header_w - HEADER_CARD_PADDING, art_px)
+            } else {
+                art_px
+            };
+
             // Chips: genre / added date first (album-level), then the file
             // facts derived from the tracks.
             let mut chips: Vec<String> = Vec::new();
@@ -1070,6 +1103,7 @@ impl Render for AlbumDetailView {
             let chip_row = h_flex()
                 .gap_1p5()
                 .flex_wrap()
+                .when(centred, |this| this.justify_center())
                 .when(chips_pending, |this| {
                     this.children(
                         CHIP_SAMPLES
@@ -1098,22 +1132,25 @@ impl Render for AlbumDetailView {
                 .as_ref()
                 .and_then(|a| album_replaygain_line(&a.song));
 
-            let rating_stars = h_flex().gap_0p5().children((1..=5u8).map(|r| {
-                div()
-                    .id(("rate", r as usize))
-                    .cursor_pointer()
-                    .text_color(if r <= album_rating {
-                        cx.theme().accent
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| this.rate_album(r, cx)))
-                    .child(app_icon(if r <= album_rating {
-                        icons::STAR_FILLED
-                    } else {
-                        icons::STAR_OUTLINE
-                    }))
-            }));
+            let rating_stars = h_flex()
+                .gap_0p5()
+                .when(centred, |this| this.justify_center())
+                .children((1..=5u8).map(|r| {
+                    div()
+                        .id(("rate", r as usize))
+                        .cursor_pointer()
+                        .text_color(if r <= album_rating {
+                            cx.theme().accent
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.rate_album(r, cx)))
+                        .child(app_icon(if r <= album_rating {
+                            icons::STAR_FILLED
+                        } else {
+                            icons::STAR_OUTLINE
+                        }))
+                }));
 
             let cover = div()
                 .id("album-cover")
@@ -1135,12 +1172,16 @@ impl Render for AlbumDetailView {
                     h_flex()
                         .gap_2()
                         .items_center()
+                        .when(centred, |this| this.justify_center())
                         .child(
                             // flex_1 + min_w_0 so a long title wraps
                             // inside the header instead of pushing the
-                            // star button off the row.
+                            // star button off the row. Centred, it keeps
+                            // its content width instead, so the title and
+                            // the star sit together in the middle.
                             div()
-                                .flex_1()
+                                .when(!centred, |this| this.flex_1())
+                                .when(centred, |this| this.text_center())
                                 .min_w_0()
                                 .text_2xl()
                                 .font_medium()
@@ -1177,6 +1218,7 @@ impl Render for AlbumDetailView {
                     h_flex()
                         .flex_wrap()
                         .items_center()
+                        .when(centred, |this| this.justify_center())
                         .when(header_pending, |this| {
                             this.child(skeleton_text(
                                 "al-credits-sk",
@@ -1213,6 +1255,7 @@ impl Render for AlbumDetailView {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
+                        .when(centred, crate::ui::centre_text)
                         .map(|this| match header_pending {
                             true => {
                                 this.child(skeleton_text("al-meta-sk", show_album, META_SAMPLE, cx))
@@ -1226,6 +1269,7 @@ impl Render for AlbumDetailView {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
+                            .when(centred, crate::ui::centre_text)
                             .child(line.clone()),
                     ),
                     // Reserved whether or not this album turns out to carry gain
@@ -1236,18 +1280,19 @@ impl Render for AlbumDetailView {
                     // it is grey; loaded, it is an empty line of the same
                     // metrics, which costs an album without gain tags one faint
                     // blank row and costs every album the step.
-                    None => this.child(div().text_xs().child(skeleton_text(
-                        "al-rg-sk",
-                        show_album,
-                        REPLAYGAIN_SAMPLE,
-                        cx,
-                    ))),
+                    None => this.child(
+                        div()
+                            .text_xs()
+                            .when(centred, crate::ui::centre_text)
+                            .child(skeleton_text("al-rg-sk", show_album, REPLAYGAIN_SAMPLE, cx)),
+                    ),
                 })
                 .child(rating_stars)
                 .child(
                     h_flex()
                         .gap_2()
                         .mt_1()
+                        .when(centred, |this| this.justify_center())
                         .child({
                             let play = Button::new("album-play")
                                 .icon(app_icon(icons::PLAY))
@@ -1269,11 +1314,16 @@ impl Render for AlbumDetailView {
                         ),
                 );
 
-            match panel.is_some() {
+            match panel.is_some() || narrow {
                 // In the panel the cover leads and the details read down under
                 // it: there is no width to put them side by side in, and the
                 // cover is the reason the layout was chosen.
-                true => v_flex().gap_4().child(cover).child(info).into_any_element(),
+                true => v_flex()
+                    .gap_4()
+                    .when(centred, |this| this.items_center())
+                    .child(cover)
+                    .child(info.w_full())
+                    .into_any_element(),
                 // Centred, not top-aligned: the info column's height depends on
                 // how many chips and lines this album has, so a fixed-height
                 // cover pinned to the top leaves the card visibly lopsided —
@@ -1292,7 +1342,7 @@ impl Render for AlbumDetailView {
                     // at the content's natural width instead, and the shrink
                     // brings it back to the room the cover leaves. In the panel
                     // the column has no row to share, so none of it applies.
-                    .child(info.flex_grow().flex_shrink().min_w(px(260.)))
+                    .child(info.flex_grow().flex_shrink().min_w(px(INFO_MIN_W)))
                     .into_any_element(),
             }
         };
@@ -1387,19 +1437,12 @@ impl Render for AlbumDetailView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(gpui::relative(crate::ui::TRACK_TITLE_MIN_SHARE))
                             .truncate()
                             .child(song.title.clone()),
                     )
                     .when(!extras.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .max_w(px(320.))
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .truncate()
-                                .child(extras),
-                        )
+                        this.child(crate::ui::extras_column(extras, 320., cx))
                     })
                     // Hover actions: play-next, enqueue, star, add-to-playlist.
                     .child(

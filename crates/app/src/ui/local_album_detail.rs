@@ -27,6 +27,12 @@ use crate::ui::{
 
 /// Cover edge in the stacked header; the side panel sizes its own.
 const HEADER_ART: f32 = 220.;
+/// The header card's own `p_4`, both sides.
+const HEADER_CARD_PADDING: f32 = 32.;
+/// The `gap_4` between the cover and the info column.
+const HEADER_GAP: f32 = 16.;
+/// Narrowest the info column goes beside the cover before it moves under it.
+const INFO_MIN_W: f32 = 260.;
 
 /// Horizontal padding the columns lay their cards out within (`p_4` a side).
 const PAGE_PADDING_X: f32 = 32.;
@@ -322,6 +328,31 @@ impl Render for LocalAlbumDetailView {
             };
             let has_songs = !self.tracks.is_empty();
 
+            // Too narrow for cover and info side by side (a portrait window):
+            // a column outright, as on the server album page — a wrapped row
+            // measures the info column's height at its `min_w` and leaves a
+            // band of empty card under it. That column is centred, as there.
+            let narrow = content_w > 0.
+                && content_w - PAGE_PADDING_X - HEADER_CARD_PADDING
+                    < art_px + HEADER_GAP + INFO_MIN_W;
+            // A clearly portrait window takes the column too, even where the row
+            // would fit: the row's info column wraps under the cover anyway
+            // once its chips outgrow what is left beside it, and a portrait
+            // page reads as one centred column rather than a header hugging
+            // its left edge.
+            let narrow = narrow || crate::ui::header_stacks_for_shape(viewport);
+            let centred = narrow && panel.is_none();
+            // With the card's whole width to itself the cover grows, rather
+            // than sitting as a thumbnail in the middle of it.
+            let art_px = if centred {
+                crate::ui::centred_header_art(
+                    content_w - PAGE_PADDING_X - HEADER_CARD_PADDING,
+                    art_px,
+                )
+            } else {
+                art_px
+            };
+
             let cover = div()
                 .id("local-album-cover")
                 .flex_none()
@@ -333,20 +364,30 @@ impl Render for LocalAlbumDetailView {
                     this.child(img(path).size(px(art_px)).rounded_2xl())
                 });
 
-            let info =
-                v_flex()
-                    .gap_2()
-                    .child(div().text_2xl().font_medium().child(name))
-                    .child(div().child(artist))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(meta),
-                    )
-                    .when(!chips.is_empty(), |this| {
-                        this.child(h_flex().gap_1p5().flex_wrap().children(
-                            chips.iter().cloned().map(|chip| {
+            let info = v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_medium()
+                        .when(centred, crate::ui::centre_text)
+                        .child(name),
+                )
+                .child(div().when(centred, crate::ui::centre_text).child(artist))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .when(centred, crate::ui::centre_text)
+                        .child(meta),
+                )
+                .when(!chips.is_empty(), |this| {
+                    this.child(
+                        h_flex()
+                            .gap_1p5()
+                            .flex_wrap()
+                            .when(centred, |this| this.justify_center())
+                            .children(chips.iter().cloned().map(|chip| {
                                 div()
                                     .px_2()
                                     .py_0p5()
@@ -355,52 +396,59 @@ impl Render for LocalAlbumDetailView {
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(chip)
-                            }),
-                        ))
-                    })
-                    .when_some(replaygain.clone(), |this, line| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(line),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .mt_1()
-                            .child({
-                                let play = Button::new("local-album-play")
-                                    .icon(app_icon(icons::PLAY))
-                                    .label("Play")
-                                    .disabled(!has_songs)
-                                    .on_click(cx.listener(|this, _, _, cx| this.play_from(0, cx)));
-                                match page_accent {
-                                    Some(a) => play.custom(crate::ui::accent_button(a, cx)),
-                                    None => play.primary(),
-                                }
-                            })
-                            .child(
-                                Button::new("local-album-shuffle")
-                                    .ghost()
-                                    .icon(app_icon(icons::SHUFFLE))
-                                    .label("Shuffle")
-                                    .disabled(!has_songs)
-                                    .on_click(cx.listener(|this, _, _, cx| this.play_shuffled(cx))),
-                            ),
-                    );
+                            })),
+                    )
+                })
+                .when_some(replaygain.clone(), |this, line| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .when(centred, crate::ui::centre_text)
+                            .child(line),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .mt_1()
+                        .when(centred, |this| this.justify_center())
+                        .child({
+                            let play = Button::new("local-album-play")
+                                .icon(app_icon(icons::PLAY))
+                                .label("Play")
+                                .disabled(!has_songs)
+                                .on_click(cx.listener(|this, _, _, cx| this.play_from(0, cx)));
+                            match page_accent {
+                                Some(a) => play.custom(crate::ui::accent_button(a, cx)),
+                                None => play.primary(),
+                            }
+                        })
+                        .child(
+                            Button::new("local-album-shuffle")
+                                .ghost()
+                                .icon(app_icon(icons::SHUFFLE))
+                                .label("Shuffle")
+                                .disabled(!has_songs)
+                                .on_click(cx.listener(|this, _, _, cx| this.play_shuffled(cx))),
+                        ),
+                );
 
-            match panel.is_some() {
+            match panel.is_some() || narrow {
                 // In the panel the cover leads and the details read down under
                 // it; the flex props below belong to the row layout only.
-                true => v_flex().gap_4().child(cover).child(info).into_any_element(),
+                true => v_flex()
+                    .gap_4()
+                    .when(centred, |this| this.items_center())
+                    .child(cover)
+                    .child(info.w_full())
+                    .into_any_element(),
                 false => h_flex()
                     .gap_4()
                     .items_start()
                     .flex_wrap()
                     .child(cover)
-                    .child(info.flex_1().min_w(px(260.)))
+                    .child(info.flex_1().min_w(px(INFO_MIN_W)))
                     .into_any_element(),
             }
         };
@@ -468,19 +516,12 @@ impl Render for LocalAlbumDetailView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(gpui::relative(crate::ui::TRACK_TITLE_MIN_SHARE))
                             .truncate()
                             .child(track.title.clone()),
                     )
                     .when(!extras.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .max_w(px(320.))
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .truncate()
-                                .child(extras),
-                        )
+                        this.child(crate::ui::extras_column(extras, 320., cx))
                     })
                     // Hover actions: play-next, enqueue
                     .child(

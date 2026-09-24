@@ -301,19 +301,12 @@ impl Render for PlaylistDetailView {
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(gpui::relative(crate::ui::TRACK_TITLE_MIN_SHARE))
                             .truncate()
                             .child(song.title.clone()),
                     )
                     .when(!extras.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .max_w(px(360.))
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .truncate()
-                                .child(extras),
-                        )
+                        this.child(crate::ui::extras_column(extras, 360., cx))
                     })
                     .child(
                         div()

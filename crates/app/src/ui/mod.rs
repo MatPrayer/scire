@@ -191,6 +191,80 @@ pub fn error_banner(
         })
 }
 
+/// Centres a block of text on its own line, wrapped or not — and whatever
+/// stands in for it, since a skeleton placeholder is a box that `text_center`
+/// alone would leave at the start of the line.
+pub fn centre_text(el: gpui::Div) -> gpui::Div {
+    el.flex().flex_col().items_center().text_center()
+}
+
+/// How much taller than wide a window has to be before an album header is
+/// stacked into a centred column on shape alone. Plain `height > width` also
+/// caught square windows, where the row fits comfortably and a centred stack
+/// leaves wide empty flanks either side of a narrow column. Set further from
+/// square than [`SIDE_PANEL_MIN_ASPECT`]: the row still reads well a good way
+/// into portrait, and only a window clearly taller than wide wants the column.
+const HEADER_STACK_ASPECT: f32 = 1.25;
+
+/// Whether the window is tall enough that an album header should be one
+/// centred column even where cover and info would fit side by side.
+pub fn header_stacks_for_shape(viewport: gpui::Size<Pixels>) -> bool {
+    let (w, h) = (f32::from(viewport.width), f32::from(viewport.height));
+    w > 0. && h >= w * HEADER_STACK_ASPECT
+}
+
+/// Share of the header card's inner width the cover takes in the centred
+/// column, and the most it grows to. The column has the card's whole width to
+/// itself, so the row's fixed cover reads as a thumbnail in the middle of it;
+/// the cap keeps the album page's 512px fetch sharp at 1.5x scale.
+const CENTRED_ART_SHARE: f32 = 0.55;
+const CENTRED_ART_MAX: f32 = 340.;
+
+/// Cover size for the centred album header column, given the header card's
+/// inner width (0 when not yet measured) and the row layout's cover size,
+/// which is the floor — except where the card itself is narrower.
+pub fn centred_header_art(inner_w: f32, base: f32) -> f32 {
+    if inner_w <= 0. {
+        return base;
+    }
+    (inner_w * CENTRED_ART_SHARE)
+        .clamp(base, CENTRED_ART_MAX.max(base))
+        .min(inner_w)
+        .floor()
+}
+
+/// Largest share of a track row the artist/credits column may take.
+const TRACK_EXTRAS_SHARE: f32 = 0.3;
+/// Share of a track row the title keeps however narrow the row gets. The
+/// number, hover actions, play count and duration are fixed widths, so in a
+/// portrait window they alone can leave the title nothing; the credits column
+/// can shrink to zero and gives this up first.
+pub const TRACK_TITLE_MIN_SHARE: f32 = 0.35;
+
+/// The muted artist/credits column of a track row, beside a `flex_1` title.
+///
+/// Capped at `cap` px *and* at `TRACK_EXTRAS_SHARE` of the row. The px cap
+/// alone is right for a wide window, but the title is `flex_1` from a zero
+/// basis while this column keeps its content width — so in a narrow (portrait)
+/// window a long credit line took everything the fixed columns left and the
+/// title, the one thing the row is for, came out four characters wide. Two
+/// boxes because one `max_w` takes one length: the outer holds the share, the
+/// inner the px cap and the ellipsis.
+pub fn extras_column(extras: impl Into<SharedString>, cap: f32, cx: &App) -> gpui::Div {
+    div()
+        .flex_shrink()
+        .min_w_0()
+        .max_w(gpui::relative(TRACK_EXTRAS_SHARE))
+        .child(
+            div()
+                .max_w(px(cap))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .truncate()
+                .child(extras.into()),
+        )
+}
+
 /// One-line library summary for a catalog page header: the count of whatever
 /// that page lists, then the totals behind it.
 ///
@@ -389,15 +463,31 @@ pub fn grid_columns_padded(element_width: f32, tile: f32) -> Option<usize> {
 /// spending the leftover on the tiles themselves removes the remainder instead
 /// of centring it: the grid fills the width until the covers hit `max_tile`,
 /// past which the gutters come back rather than the art growing without limit.
+///
+/// The one exception is a pane too narrow for two cards at `min_tile` — a
+/// portrait window, or a landscape one tiled down to a strip. One column
+/// there is a single cover stranded between two gutters, capped at
+/// `max_tile`, and scrolling a library one album at a time; two columns
+/// drawn below the minimum (down to [`NARROW_TILE_FLOOR`] of it) are what
+/// the pane has room for.
 pub fn grid_fit(width: f32, min_tile: f32, max_tile: f32) -> Option<(usize, f32)> {
     let cols = grid_columns(width, min_tile)?;
     // Inverse of `grid_columns`: the row is `cols` cards plus `cols - 1` gaps,
     // so each card gets `(width + grid_gap()) / cols` and the tile is what's left
     // of it once the gap and the card's own padding are taken off.
-    let tile = ((width + grid_gap()) / cols as f32 - grid_gap() - card_padding())
-        .clamp(min_tile, max_tile);
-    Some((cols, tile))
+    let fill = |cols: usize| (width + grid_gap()) / cols as f32 - grid_gap() - card_padding();
+    if cols == 1 {
+        let pair = fill(2);
+        if pair >= min_tile * NARROW_TILE_FLOOR {
+            return Some((2, pair.min(max_tile)));
+        }
+    }
+    Some((cols, fill(cols).clamp(min_tile, max_tile)))
 }
+
+/// How far under its size setting's minimum [`grid_fit`] will draw a tile to
+/// keep a narrow pane at two columns.
+const NARROW_TILE_FLOOR: f32 = 0.7;
 
 /// [`grid_fit`] inside a scrolling grid element, minus the padding the rows are
 /// laid out within.
@@ -408,10 +498,13 @@ pub fn grid_fit_padded(element_width: f32, min_tile: f32, max_tile: f32) -> Opti
 /// Narrowest window the album page's side panel is offered on. Under this the
 /// panel and a readable track list cannot both be had, whatever the ratio.
 const SIDE_PANEL_MIN_WINDOW_W: f32 = 1100.;
-/// How wide against its height the *window* has to be. "Landscape widescreen"
-/// is the condition the layout was asked for, and a 4:3 or portrait window
-/// keeps the stacked page even when it is wide enough in pixels.
-const SIDE_PANEL_MIN_ASPECT: f32 = 1.3;
+/// How wide against its height the *window* has to be. A square or portrait
+/// window keeps the stacked page even when it is wide enough in pixels. Kept
+/// close to square, like [`HEADER_STACK_ASPECT`] on the other side of it: the
+/// stacked row between the two leaves a short header over a full-width track
+/// list, and on a landscape window it strands most of the height under a
+/// short album, so the band it owns is kept narrow.
+const SIDE_PANEL_MIN_ASPECT: f32 = 1.1;
 /// Room the track list keeps for itself: title, the hover actions, play count
 /// and duration all sit on one row, and below this they start colliding.
 const SIDE_PANEL_TRACKS_MIN: f32 = 520.;
@@ -2092,6 +2185,37 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_a_clearly_portrait_window_stacks_the_header_on_shape() {
+        use super::header_stacks_for_shape;
+        let win = |w: f32, h: f32| gpui::size(gpui::px(w), gpui::px(h));
+        // A tiled portrait monitor stacks.
+        assert!(header_stacks_for_shape(win(1352., 1706.)));
+        assert!(header_stacks_for_shape(win(480., 1000.)));
+        // Near-square and mildly portrait keep the row: it fits, and a stack
+        // leaves empty flanks.
+        assert!(!header_stacks_for_shape(win(1300., 1396.)));
+        assert!(!header_stacks_for_shape(win(1147., 1396.)));
+        assert!(!header_stacks_for_shape(win(1400., 800.)));
+        // No viewport yet reads as nothing, not as portrait.
+        assert!(!header_stacks_for_shape(win(0., 0.)));
+    }
+
+    #[test]
+    fn the_centred_column_grows_its_cover_within_bounds() {
+        use super::centred_header_art;
+        // Unmeasured: the row's cover.
+        assert_eq!(centred_header_art(0., 220.), 220.);
+        // A wide portrait card caps it.
+        assert_eq!(centred_header_art(1200., 220.), 340.);
+        // A middling one takes its share.
+        assert_eq!(centred_header_art(500., 220.), 275.);
+        // Narrow: never under the row's cover...
+        assert_eq!(centred_header_art(300., 220.), 220.);
+        // ...unless the card itself is narrower than that.
+        assert_eq!(centred_header_art(180., 220.), 180.);
+    }
+
+    #[test]
     fn credits_spell_a_collaboration_out_and_fall_back_to_the_single_pair() {
         use super::{artist_credits, artist_links};
         let refs = |pairs: &[(&str, &str)]| -> Vec<subsonic::ArtistRef> {
@@ -2256,6 +2380,8 @@ mod tests {
         // Wide enough in pixels, too square: the layout was asked for on a
         // *widescreen* window.
         assert!(album_side_panel(1300., 1400., 1400.).is_none());
+        // A landscape window only a little short of 16:10 takes it.
+        assert!(album_side_panel(1750., 1801., 1396.).is_some());
         // Portrait.
         assert!(album_side_panel(1000., 1080., 1920.).is_none());
         // Landscape but small.
@@ -2513,10 +2639,24 @@ mod tests {
         assert!(row_width(cols, tile) < 2298.);
     }
 
+    /// A portrait pane that cannot fit two cards at the minimum still gets two,
+    /// drawn smaller, rather than one cover between two gutters — down to the
+    /// floor, under which one column is all there is.
+    #[test]
+    fn grid_fit_keeps_two_columns_in_a_narrow_pane() {
+        // Two 200 tiles need 2 * 214 + 16 = 444.
+        let (cols, tile) = grid_fit(400., 200., 262.).unwrap();
+        assert_eq!(cols, 2);
+        assert!((140. ..200.).contains(&tile), "tile {tile}");
+        assert!((row_width(cols, tile) - 400.).abs() < 0.5);
+        // Too narrow even for the floor: one column, filling the pane.
+        assert_eq!(grid_fit(260., 200., 262.), Some((1, 246.)));
+    }
+
     #[test]
     fn grid_fit_takes_the_grid_padding_off_like_the_column_maths_does() {
         assert_eq!(grid_fit_padded(412., 168., 168.), Some((2, 168.)));
-        assert_eq!(grid_fit_padded(411., 168., 168.), Some((1, 168.)));
+        assert_eq!(grid_fit_padded(250., 168., 168.), Some((1, 168.)));
         assert_eq!(grid_fit_padded(0., 168., 200.), None);
         // The tile fills the padded width, not the element's own.
         let (cols, tile) = grid_fit_padded(1200., 150., 198.).unwrap();

@@ -17,6 +17,16 @@ follows [Semantic Versioning](https://semver.org/).
 - A year below 1000 is treated as missing. A date written day-first into a
   year-first tag (`0003-09-2026`) used to show as "3" under the album's cover
   and sort as the oldest record in the library.
+- Portrait windows: the album page header (server and local) becomes one
+  centred column with a bigger cover once the window is clearly taller than
+  wide, instead of a stack hugging the left edge. The side-panel layout now
+  takes any landscape window a little wider than square rather than only
+  widescreen ones, so the header-over-tracks layout is left to near-square
+  windows.
+- Track titles keep a share of the row in narrow windows instead of being
+  squeezed to nothing by the artist column, and the grid headers wrap their
+  summary under the tabs rather than pushing it off the edge. A narrow pane
+  keeps two grid columns at a slightly smaller tile.
 
 ## [1.0.0] — 2026-09-24
 

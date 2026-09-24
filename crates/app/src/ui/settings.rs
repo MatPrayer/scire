@@ -2278,7 +2278,7 @@ impl Render for SettingsView {
             .child(self.note(
                 "Stacked puts the cover and details above the track list. Side \
                  panel moves them into a tall panel on the right, with a much \
-                 bigger cover — on a landscape widescreen window; anything \
+                 bigger cover — on any landscape window wide enough for it; anything \
                  narrower or squarer stays stacked.",
                 cx,
             ))
