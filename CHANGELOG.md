@@ -4,7 +4,7 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
-## [1.0.0] — 2026-09-23
+## [1.0.0] — 2026-09-24
 
 First stable release. Everything below landed across the 0.x series; this entry
 is the feature set 1.0 ships with rather than a diff against a previous tag.
