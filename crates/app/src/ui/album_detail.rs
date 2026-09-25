@@ -7,21 +7,21 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnimationExt as _, AnyElement, App, Context, Entity, EventEmitter, IntoElement, Render,
-    ScrollAnchor, ScrollHandle, Window, div, img, linear_color_stop, linear_gradient, prelude::*,
-    px, relative,
+    ScrollAnchor, ScrollHandle, SharedString, Window, div, img, linear_color_stop, linear_gradient,
+    prelude::*, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::link::Link;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::popover::Popover;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    StyledExt as _, h_flex, v_flex,
 };
 use subsonic::{AlbumInfo2, AlbumWithSongs, Song, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
 use crate::config::ThemePref;
+use crate::services::album_info::{self, AlbumInfo, LinkKind};
 use crate::services::library_db::LibraryDb;
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
@@ -133,6 +133,112 @@ const PLACEHOLDER_DELAY: Duration = Duration::from_millis(220);
 /// True once a request has been in flight long enough to be worth showing.
 fn placeholding(since: Option<Instant>) -> bool {
     since.is_some_and(|t| t.elapsed() >= PLACEHOLDER_DELAY)
+}
+
+/// How long the About card waits for the online lookup before showing the
+/// server's text on its own. A cached answer is back in milliseconds; a cold
+/// one is several requests, MusicBrainz's spaced a second apart.
+pub(crate) const ONLINE_WAIT: Duration = Duration::from_millis(4000);
+
+/// The About card's prose stops widening here. Below the track list in a wide
+/// stacked page the card spans the window, and a Wikipedia intro set 150
+/// characters to the line is hard to keep your place in.
+pub(crate) const ABOUT_PROSE_MAX_W: f32 = 760.;
+
+/// The online lookup is running and still inside its wait.
+pub(crate) fn waiting_online(since: Option<Instant>) -> bool {
+    since.is_some_and(|t| t.elapsed() < ONLINE_WAIT)
+}
+
+/// Where the About card's prose comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AboutSource {
+    /// Wikipedia's article intro, via MusicBrainz and Wikidata.
+    Wikipedia,
+    /// `getAlbumInfo2`'s notes — Last.fm's summary, on Navidrome.
+    Server,
+    /// The release group's MusicBrainz annotation.
+    MusicBrainz,
+}
+
+/// The sources with something to show, in pill order, and the one shown: the
+/// user's pick while it is on offer, otherwise the first. Wikipedia leads
+/// because it is the whole intro, where the server's Last.fm summary stops at
+/// a fixed length mid-sentence.
+pub(crate) fn about_sources(
+    wikipedia: bool,
+    server: bool,
+    musicbrainz: bool,
+    pick: Option<AboutSource>,
+) -> (Vec<AboutSource>, Option<AboutSource>) {
+    let all = [
+        (AboutSource::Wikipedia, wikipedia),
+        (AboutSource::Server, server),
+        (AboutSource::MusicBrainz, musicbrainz),
+    ];
+    let on: Vec<_> = all
+        .iter()
+        .filter(|(_, has)| *has)
+        .map(|(s, _)| *s)
+        .collect();
+    let shown = pick.filter(|p| on.contains(p)).or(on.first().copied());
+    (on, shown)
+}
+
+/// The online services the album page may ask, per the settings.
+fn online_sources(settings: &crate::config::Settings) -> album_info::Sources {
+    album_info::Sources {
+        wikipedia: settings.album_info_wikipedia,
+        musicbrainz: settings.album_info_musicbrainz,
+    }
+}
+
+/// Merge the server's links and the online ones into display order, one per
+/// site. The server's MusicBrainz link names the exact entity in the user's
+/// own files (the *release*, or the artist), so it wins over what the lookup
+/// resolved it to.
+pub(crate) fn ext_links(
+    musicbrainz_release: Option<String>,
+    lastfm: Option<String>,
+    online: &[album_info::Link],
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let find = |kind: LinkKind| {
+        online
+            .iter()
+            .find(|l| l.kind == kind)
+            .map(|l| l.url.clone())
+    };
+    let order = [
+        (LinkKind::Wikipedia.label(), find(LinkKind::Wikipedia)),
+        (
+            LinkKind::MusicBrainz.label(),
+            musicbrainz_release.or_else(|| find(LinkKind::MusicBrainz)),
+        ),
+        ("Last.fm", lastfm),
+        (LinkKind::Discogs.label(), find(LinkKind::Discogs)),
+        (LinkKind::AllMusic.label(), find(LinkKind::AllMusic)),
+        (LinkKind::Bandcamp.label(), find(LinkKind::Bandcamp)),
+        (LinkKind::Homepage.label(), find(LinkKind::Homepage)),
+    ];
+    for (label, url) in order {
+        if let Some(url) = url {
+            out.push((label, url));
+        }
+    }
+    out
+}
+
+pub(crate) fn link_icon(label: &str) -> Icon {
+    match label {
+        "Wikipedia" => app_icon(icons::BRAND_WIKIPEDIA),
+        "MusicBrainz" => app_icon(icons::BRAND_MUSICBRAINZ),
+        "Last.fm" => app_icon(icons::BRAND_LASTFM),
+        "Discogs" => app_icon(icons::BRAND_DISCOGS),
+        "Bandcamp" => app_icon(icons::BRAND_BANDCAMP),
+        "Official site" => Icon::new(IconName::ExternalLink),
+        _ => Icon::new(IconName::Globe),
+    }
 }
 
 /// The pulse every placeholder here shares, over gpui-component's `Skeleton`
@@ -272,6 +378,17 @@ pub struct AlbumDetailView {
     info: Option<AlbumInfo2>,
     /// Album description expanded past its preview length.
     notes_expanded: bool,
+    /// What `services::album_info` found outside the server (Wikipedia,
+    /// MusicBrainz): `None` until it answers or when it is switched off.
+    online: Option<AlbumInfo>,
+    /// Which services the online lookup for this page asked, once it has
+    /// been started. It runs again only when a service it did not ask has
+    /// since been switched on.
+    online_asked: Option<album_info::Sources>,
+    /// When it started, while it is still running.
+    online_since: Option<Instant>,
+    /// The About card's description source the user picked from its pills.
+    about_pick: Option<AboutSource>,
     art_path: Option<PathBuf>,
     error: Option<crate::errors::ErrorNote>,
     /// Last observed playing-song id; used to refresh play counts when a track
@@ -383,6 +500,10 @@ impl AlbumDetailView {
             album: None,
             info: None,
             notes_expanded: false,
+            online: None,
+            online_asked: None,
+            online_since: None,
+            about_pick: None,
             art_path: None,
             error: None,
             last_playing_id,
@@ -515,6 +636,7 @@ impl AlbumDetailView {
                     }
                     Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
+                view.maybe_load_online(cx);
                 cx.notify();
             });
         })
@@ -554,10 +676,81 @@ impl AlbumDetailView {
                 if let Ok(info) = result {
                     view.info = Some(info);
                 }
+                view.maybe_load_online(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Ask MusicBrainz / Wikipedia about the album, once per page, behind
+    /// `Settings::album_info_wikipedia`/`album_info_musicbrainz`.
+    ///
+    /// Waits for `getAlbumInfo2` to settle, since its MusicBrainz release id is
+    /// the one lookup that cannot pick the wrong record, and for a title to
+    /// search by (the cache seed or `getAlbum`).
+    fn maybe_load_online(&mut self, cx: &mut Context<Self>) {
+        let sources = online_sources(&self.session.read(cx).settings);
+        if !self.info_loaded
+            || !sources.any()
+            || self.online_asked.is_some_and(|asked| asked.covers(sources))
+        {
+            return;
+        }
+        let Some(album) = self.album.as_ref().map(|a| &a.album) else {
+            return;
+        };
+        let query = album_info::Query {
+            album: album.name.clone(),
+            artist: album.artist.clone(),
+            year: album.year,
+            mbid: self
+                .info
+                .as_ref()
+                .and_then(|i| i.music_brainz_id.as_deref())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            sources,
+        };
+        self.online_asked = Some(sources);
+        self.online_since = Some(Instant::now());
+        // The card holds its placeholder for at most `ONLINE_WAIT`; the clock
+        // running out has to repaint, or the server's text only appears at the
+        // next unrelated notify.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ONLINE_WAIT).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(album_info::fetch(query)).await;
+            let _ = this.update(cx, |view, cx| {
+                // Past the wait the card is already showing the server's text,
+                // and swapping it for Wikipedia's under somebody reading it is
+                // worse than the pill that offers the switch.
+                if !waiting_online(view.online_since) && view.about_pick.is_none() {
+                    view.about_pick = view.info_notes().map(|_| AboutSource::Server);
+                }
+                view.online_since = None;
+                match result {
+                    Ok(info) => view.online = info,
+                    Err(e) => tracing::warn!("album info lookup failed: {e:#}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The server's notes, tags stripped, if there are any.
+    fn info_notes(&self) -> Option<String> {
+        self.info
+            .as_ref()
+            .and_then(|i| i.notes.as_deref())
+            .map(strip_html)
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
     }
 
     fn fetch_art(&self, cover_id: String, cx: &mut Context<Self>) {
@@ -997,7 +1190,6 @@ impl Render for AlbumDetailView {
         let loading_album = self.album_pending && !self.album_loaded;
         let loading_info = self.info_pending && !self.info_loaded;
         let show_album = loading_album && placeholding(self.album_since);
-        let show_info = loading_info && placeholding(self.info_since);
 
         let hide_stars = self.session.read(cx).settings.hide_album_stars;
         let detailed_dates = self.session.read(cx).settings.detailed_album_dates;
@@ -1633,17 +1825,81 @@ impl Render for AlbumDetailView {
             })
             .collect();
 
-        // Description + external links (getAlbumInfo2). Collapsed by truncating
+        // Description + external links: the server's `getAlbumInfo2` and
+        // whatever `services::album_info` found online. Collapsed by truncating
         // the string: gpui's line_clamp can't do it (see the artist bio).
-        let notes = self
+        let settings = &self.session.read(cx).settings;
+        let server_notes_on = settings.server_album_notes;
+        let want = online_sources(settings);
+        let server_notes = self.info_notes().filter(|_| server_notes_on);
+        // Switching a service off hides what it already answered, and
+        // switching one on fetches (`maybe_load_online`, from `render`).
+        let online_on = want.any();
+        if online_on {
+            self.maybe_load_online(cx);
+        }
+        let online = self.online.as_ref().filter(|_| online_on);
+        let wikipedia = online
+            .and_then(|o| o.wikipedia.as_ref())
+            .filter(|_| want.wikipedia);
+        let annotation = online
+            .and_then(|o| o.annotation.as_ref())
+            .filter(|_| want.musicbrainz);
+        // Held back while the online lookup is inside its wait, so the card
+        // does not open on the server's cut-off summary and then swap it for
+        // Wikipedia's article under the reader a second later.
+        let waiting = waiting_online(self.online_since);
+        let (sources, shown) = about_sources(
+            wikipedia.is_some(),
+            server_notes.is_some(),
+            annotation.is_some(),
+            self.about_pick,
+        );
+        let lastfm_url = self
             .info
             .as_ref()
-            .and_then(|i| i.notes.as_deref())
-            .map(strip_html)
-            .filter(|n| !n.is_empty());
+            .and_then(|i| i.last_fm_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty() && server_notes_on)
+            .map(str::to_string);
+        let server_label = if lastfm_url.is_some() {
+            "Last.fm"
+        } else {
+            "Server"
+        };
+        // The rest of a cut summary lives on Last.fm's own page — the "Read
+        // more" Navidrome strips, put back. Only for text that looks cut: a
+        // summary that ends where the album's wiki does has no rest to read.
+        let read_more = match shown {
+            Some(AboutSource::Server)
+                if server_notes
+                    .as_deref()
+                    .is_some_and(album_info::looks_truncated) =>
+            {
+                lastfm_url.clone()
+            }
+            _ => None,
+        };
+        let notes = match shown {
+            Some(AboutSource::Wikipedia) => wikipedia.map(|d| d.text.clone()),
+            Some(AboutSource::MusicBrainz) => annotation.map(|d| d.text.clone()),
+            Some(AboutSource::Server) => server_notes.map(|n| {
+                // Last.fm's summary is cut at a fixed length and Navidrome
+                // drops the "Read more" that followed; say it is cut rather
+                // than end the card on half a sentence.
+                if album_info::looks_truncated(&n) {
+                    format!("{n} …")
+                } else {
+                    n
+                }
+            }),
+            None => None,
+        };
         let notes_long = notes
             .as_ref()
             .is_some_and(|n| n.chars().count() > NOTES_PREVIEW_CHARS);
+        // Offered at the end of the text, so under More only once expanded.
+        let read_more = read_more.filter(|_| self.notes_expanded || !notes_long);
         let notes_text = notes.map(|n| {
             if self.notes_expanded || !notes_long {
                 n
@@ -1658,114 +1914,181 @@ impl Render for AlbumDetailView {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(|id| format!("https://musicbrainz.org/release/{id}"));
-        let lastfm_url = self
-            .info
-            .as_ref()
-            .and_then(|i| i.last_fm_url.as_deref())
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(str::to_string);
-        let has_links = musicbrainz_url.is_some() || lastfm_url.is_some();
+        let online_links: Vec<album_info::Link> = online
+            .map(|o| o.links.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter(|l| want.allows(l.kind))
+            .cloned()
+            .collect();
+        let links = ext_links(musicbrainz_url, lastfm_url, &online_links);
+        let has_links = !links.is_empty();
         let notes_expanded = self.notes_expanded;
-        let about = (notes_text.is_some() || has_links).then(|| {
+        // The card is still loading while either lookup is: `getAlbumInfo2`,
+        // or the online one — which runs after it, and past `ONLINE_WAIT` too
+        // when the server had nothing to show in the meantime. An album still
+        // loading counts, since the online lookup needs its title to start.
+        let online_pending = online_on
+            && self.online.is_none()
+            && (self.online_since.is_some() || (self.online_asked.is_none() && loading_album));
+        let about_loading = loading_info || online_pending;
+        // Grey from `PLACEHOLDER_DELAY` after the first request went out, and
+        // for as long as either is in flight — not only the first.
+        let show_about = about_loading && placeholding(self.info_since.or(self.online_since));
+        let about = (!waiting && (notes_text.is_some() || has_links)).then(|| {
+            let pills = (sources.len() > 1).then(|| {
+                h_flex().gap_1().children(sources.iter().map(|&source| {
+                    let label = match source {
+                        AboutSource::Wikipedia => "Wikipedia",
+                        AboutSource::Server => server_label,
+                        AboutSource::MusicBrainz => "MusicBrainz",
+                    };
+                    Button::new(SharedString::from(format!("about-src-{label}")))
+                        .ghost()
+                        .xsmall()
+                        .label(label)
+                        .selected(shown == Some(source))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.about_pick = Some(source);
+                            cx.notify();
+                        }))
+                }))
+            });
             v_flex()
                 .rounded_2xl()
                 .p_4()
-                .gap_2()
+                .gap_3()
                 .bg(cx.theme().sidebar)
                 // Header only when there is prose under it: servers without a
                 // metadata agent return links alone, and an "About" heading
-                // over a bare Last.fm link reads like something failed to load.
+                // over a bare row of links reads like something failed to load.
                 .when_some(notes_text, |this, text| {
-                    this.child(div().text_sm().font_medium().child("About"))
-                        .child(div().text_sm().child(text))
-                })
-                .when(notes_long, |this| {
-                    this.child(
-                        h_flex().child(
-                            Button::new("notes-toggle")
-                                .ghost()
-                                .xsmall()
-                                .label(if notes_expanded { "Less" } else { "More" })
-                                .icon(Icon::new(if notes_expanded {
-                                    IconName::ChevronUp
-                                } else {
-                                    IconName::ChevronDown
-                                }))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.notes_expanded = !this.notes_expanded;
-                                    cx.notify();
-                                })),
-                        ),
-                    )
-                })
-                .when(has_links, |this| {
                     this.child(
                         h_flex()
-                            .gap_3()
+                            .justify_between()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(div().text_sm().font_medium().child("About"))
+                            .children(pills),
+                    )
+                    // One element per paragraph: Wikipedia's intro is several,
+                    // and run together they read as one wall of text.
+                    .child(
+                        v_flex()
+                            .max_w(px(ABOUT_PROSE_MAX_W))
+                            .gap_2()
                             .text_sm()
-                            .when_some(musicbrainz_url, |this, url| {
-                                this.child(Link::new("al-mb-link").href(url).child("MusicBrainz"))
-                            })
-                            .when_some(lastfm_url, |this, url| {
-                                this.child(Link::new("al-lastfm-link").href(url).child("Last.fm"))
-                            }),
+                            .children(
+                                text.split('\n')
+                                    .map(str::trim)
+                                    .filter(|p| !p.is_empty())
+                                    .map(|p| div().child(p.to_string()))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .children(read_more.map(|url| {
+                                h_flex().child(
+                                    Button::new("notes-read-more")
+                                        .link()
+                                        .xsmall()
+                                        .label("Read more on Last.fm")
+                                        .icon(Icon::new(IconName::ExternalLink))
+                                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                                )
+                            })),
+                    )
+                })
+                .when(notes_long || has_links, |this| {
+                    this.child(
+                        // The icons sit opposite the More button; with no
+                        // button to balance they start the row instead of
+                        // floating alone at its far end.
+                        h_flex()
+                            .when(notes_long, |this| this.justify_between())
+                            .gap_2()
+                            .child(h_flex().when(notes_long, |this| {
+                                this.child(
+                                    Button::new("notes-toggle")
+                                        .ghost()
+                                        .xsmall()
+                                        .label(if notes_expanded { "Less" } else { "More" })
+                                        .icon(Icon::new(if notes_expanded {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
+                                        }))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.notes_expanded = !this.notes_expanded;
+                                            cx.notify();
+                                        })),
+                                )
+                            }))
+                            .child(h_flex().gap_1().children(links.into_iter().map(
+                                |(label, url)| {
+                                    Button::new(SharedString::from(format!("al-link-{label}")))
+                                        .ghost()
+                                        .small()
+                                        .icon(link_icon(label))
+                                        .tooltip(label)
+                                        .on_click(move |_, _, cx| cx.open_url(&url))
+                                },
+                            ))),
                     )
                 })
                 .into_any_element()
         });
-        // `getAlbumInfo2` is a second round trip, and the card it fills cannot
-        // be placeheld accurately even in principle: the prose is an unknown
-        // number of words wrapped in an unknown column, the More button exists
-        // only when it runs past `NOTES_PREVIEW_CHARS`, the links exist only
-        // when the server has them, and a server with no metadata agent answers
-        // with nothing at all and the card never appears. Every one of those is
-        // a height nothing can predict — so in the **stacked** layout the card
-        // is drawn *below* the track list instead (see `scroll`), where its
-        // arrival has nothing above it to push and no placeholder is needed.
-        // The panel layout keeps it in the panel, where it has always been and
-        // where it can only push itself, and there the placeholder is still
-        // worth holding.
+        // `getAlbumInfo2` is a second round trip and the online lookup a third,
+        // and the card they fill cannot be placeheld accurately even in
+        // principle: the prose is an unknown number of words wrapped in an
+        // unknown column, the More button exists only when it runs past
+        // `NOTES_PREVIEW_CHARS`, the links exist only when there are some, and
+        // an album nobody has written about never gets a card at all. So in
+        // the **stacked** layout the card is drawn *below* the track list
+        // (see `scroll`), where whatever size it lands at has nothing under it
+        // to push — the placeholder there only says something is coming. In
+        // the panel it can only push itself, and there its size is worth
+        // holding too.
         let about = about.or_else(|| {
-            (loading_info && panel.is_some()).then(|| {
+            about_loading.then(|| {
                 v_flex()
                     .rounded_2xl()
                     .p_4()
-                    .gap_2()
+                    .gap_3()
                     .bg(cx.theme().sidebar)
-                    .child(skeleton_text("al-about-head-sk", show_info, "About", cx))
+                    .child(skeleton_text("al-about-head-sk", show_about, "About", cx))
                     .child(
                         // The notes are text_sm prose, so the block is laid out
                         // in the same styles and at the same character count
                         // the collapsed paragraph will be.
                         div().text_sm().child(skeleton_block(
                             "al-about-sk",
-                            show_info,
+                            show_about,
                             &notes_sample(),
                             cx,
                         )),
                     )
-                    // The two rows under the prose are the rest of the card's
-                    // height, and leaving them out meant the card still grew by
-                    // a button and a line of links when the request landed —
-                    // which in the stacked layout is the track list stepping
-                    // down. Held as invisible copies of the real controls,
-                    // since it is their own metrics that are wanted.
-                    .child(
-                        h_flex().invisible().child(
-                            Button::new("notes-toggle-sk")
-                                .ghost()
-                                .xsmall()
-                                .label("More")
-                                .icon(Icon::new(IconName::ChevronDown)),
-                        ),
-                    )
+                    // The row under the prose is the rest of the card's height,
+                    // and leaving it out meant the card still grew by a button
+                    // row when the request landed — which in the stacked
+                    // layout is the track list stepping down. Held as an
+                    // invisible copy of the real controls, since it is their
+                    // own metrics that are wanted.
                     .child(
                         h_flex()
-                            .gap_3()
-                            .text_sm()
-                            .child(skeleton_text("al-mb-link-sk", show_info, "MusicBrainz", cx))
-                            .child(skeleton_text("al-lastfm-link-sk", show_info, "Last.fm", cx)),
+                            .invisible()
+                            .justify_between()
+                            .child(
+                                Button::new("notes-toggle-sk")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("More")
+                                    .icon(Icon::new(IconName::ChevronDown)),
+                            )
+                            .child(
+                                Button::new("al-link-sk")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(IconName::Globe)),
+                            ),
                     )
                     .into_any_element()
             })
@@ -1994,6 +2317,56 @@ impl AlbumDetailView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn about_prefers_wikipedia_but_keeps_the_users_pick() {
+        use super::{AboutSource::*, about_sources};
+        assert_eq!(
+            about_sources(true, true, false, None),
+            (vec![Wikipedia, Server], Some(Wikipedia))
+        );
+        assert_eq!(
+            about_sources(true, true, true, Some(MusicBrainz)).1,
+            Some(MusicBrainz)
+        );
+        // A pick that has nothing to show (the setting went off) falls back.
+        assert_eq!(
+            about_sources(false, true, false, Some(Wikipedia)),
+            (vec![Server], Some(Server))
+        );
+        assert_eq!(about_sources(false, false, false, None), (vec![], None));
+    }
+
+    #[test]
+    fn link_row_is_one_per_site_in_order() {
+        use crate::services::album_info::{Link, LinkKind};
+        let online = [
+            Link {
+                kind: LinkKind::Discogs,
+                url: "d".into(),
+            },
+            Link {
+                kind: LinkKind::MusicBrainz,
+                url: "rg".into(),
+            },
+            Link {
+                kind: LinkKind::Wikipedia,
+                url: "w".into(),
+            },
+        ];
+        let links = super::ext_links(Some("rel".into()), Some("lfm".into()), &online);
+        assert_eq!(
+            links,
+            vec![
+                ("Wikipedia", "w".to_string()),
+                // The server's release link wins over the resolved group.
+                ("MusicBrainz", "rel".to_string()),
+                ("Last.fm", "lfm".to_string()),
+                ("Discogs", "d".to_string()),
+            ]
+        );
+        assert_eq!(super::ext_links(None, None, &online)[1].1, "rg");
+    }
+
     use super::{album_credits, album_from_row, cached_album};
     use crate::services::library_db::{AlbumRow, LibraryDb};
     use crate::ui::{album_quality_chips, album_replaygain_line, format_bytes, format_khz};

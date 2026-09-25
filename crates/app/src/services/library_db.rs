@@ -1047,6 +1047,20 @@ impl LibraryDb {
         rows.collect()
     }
 
+    /// Every album's cover id, keyed by album id — what a sync compares the
+    /// listing against to notice art replaced on the server.
+    pub fn album_cover_ids(
+        &self,
+        source: &str,
+    ) -> Result<HashMap<String, Option<String>>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, cover_art FROM albums WHERE source = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect()
+    }
+
     /// Drop one album's tracks, leaving the album row in place.
     pub fn delete_tracks_for_album(&self, album_id: &str) -> Result<usize, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();

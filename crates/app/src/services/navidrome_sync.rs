@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 use subsonic::SubsonicClient;
 
+use crate::services::artwork;
 use crate::services::library_db::{AlbumFingerprint, AlbumRow, LibraryDb, TrackMetadata};
 
 const PAGE_SIZE: u32 = 500;
@@ -205,6 +206,9 @@ pub async fn sync_navidrome(
     // A full sync wipes first and so finds no fingerprints, which makes every
     // album stale; an incremental one keeps the rows and only re-fetches what
     // the listing says has moved.
+    // Read before a full sync wipes them: the cover ids the art cache was
+    // filled under, to notice art replaced on the server.
+    let old_covers = db.album_cover_ids("navidrome").unwrap_or_default();
     if mode == SyncMode::Full {
         let count = remove_navidrome(&db)?;
         tracing::info!("removed {count} stale navidrome tracks/albums/artists");
@@ -273,6 +277,15 @@ pub async fn sync_navidrome(
     // whole incremental sync — a thousand commits against a library where
     // nothing had changed.
     db.upsert_catalog("navidrome", &album_rows, &artist_rows, &album_credit_rows)?;
+
+    // The art cache ignores the cover id's cache-busting suffix, so replaced
+    // art has to be looked for. In the background: it is cosmetic, and the
+    // sync's own progress should not wait on cover downloads.
+    let recheck = covers_to_revalidate(&old_covers, &album_rows, mode);
+    if !recheck.is_empty() {
+        tracing::info!("navidrome sync: rechecking {} album covers", recheck.len());
+        tokio::spawn(artwork::revalidate_album_covers(client.clone(), recheck));
+    }
 
     // Albums the server no longer lists. `seen` holds bare server ids; the
     // cache keys are namespaced, so compare on the namespaced form.
@@ -476,6 +489,25 @@ const SCAN_GRACE: Duration = Duration::from_secs(5);
 /// `files` is updated with the running file count for the UI. Navidrome
 /// restricts `startScan` to admins and answers error 50 for everyone else, so
 /// an `Err` here is a normal outcome to report, not a bug.
+/// Cover ids whose cached art should be checked against the server: albums
+/// whose cover id moved since the last sync, or — on a full rebuild, the
+/// escape hatch for art the server replaced without minting a new id — every
+/// album with a cover.
+fn covers_to_revalidate(
+    old: &HashMap<String, Option<String>>,
+    albums: &[AlbumRow],
+    mode: SyncMode,
+) -> Vec<String> {
+    albums
+        .iter()
+        .filter_map(|album| {
+            let cover = album.cover_art.as_ref()?;
+            let moved = matches!(old.get(&album.id), Some(Some(before)) if before != cover);
+            (mode == SyncMode::Full || moved).then(|| cover.clone())
+        })
+        .collect()
+}
+
 pub async fn run_server_scan(client: &SubsonicClient, files: Arc<AtomicU64>) -> Result<u64> {
     let started = client.start_scan().await?;
     files.store(started.count.unwrap_or(0), Ordering::Relaxed);
@@ -590,6 +622,51 @@ mod tests {
     fn a_song_with_no_artist_at_all_is_credited_to_nobody() {
         let s = song(serde_json::json!({}));
         assert!(song_credits(&s, None).is_empty());
+    }
+
+    fn album_row(id: &str, cover: Option<&str>) -> AlbumRow {
+        AlbumRow {
+            id: id.into(),
+            source: "navidrome".into(),
+            title: "Album".into(),
+            artist: None,
+            artist_id: None,
+            year: None,
+            cover_art: cover.map(Into::into),
+            song_count: 1,
+            duration: 1.,
+            created: None,
+            play_count: None,
+            starred: None,
+            library_id: None,
+        }
+    }
+
+    #[test]
+    fn a_moved_cover_id_is_rechecked_and_nothing_else_is() {
+        let old: HashMap<String, Option<String>> = [
+            ("same".to_string(), Some("al-same_aa".to_string())),
+            ("moved".to_string(), Some("al-moved_aa".to_string())),
+            ("was-bare".to_string(), None),
+        ]
+        .into_iter()
+        .collect();
+        let rows = [
+            album_row("same", Some("al-same_aa")),
+            album_row("moved", Some("al-moved_bb")),
+            album_row("was-bare", Some("al-was-bare_cc")),
+            album_row("new", Some("al-new_dd")),
+            album_row("coverless", None),
+        ];
+        assert_eq!(
+            covers_to_revalidate(&old, &rows, SyncMode::Incremental),
+            vec!["al-moved_bb"]
+        );
+        // A rebuild rechecks every album that has a cover at all.
+        assert_eq!(
+            covers_to_revalidate(&old, &rows, SyncMode::Full),
+            vec!["al-same_aa", "al-moved_bb", "al-was-bare_cc", "al-new_dd"]
+        );
     }
 
     fn listed_album(song_count: u32, duration: u32) -> subsonic::Album {

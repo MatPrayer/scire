@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::direct::{self, DirectFormat, OpenError, Want};
 #[cfg(target_os = "linux")]
 use crate::pulse;
 use crate::source::{self, EndSignal, Hint, Opened, SourceReader};
@@ -38,6 +39,32 @@ const ROUTE_CHECK_TICKS: u8 = 4;
 /// was never dropped. Checking costs a `pactl` subprocess on Linux, hence the
 /// slower cadence; a Play or Resume forces a check anyway.
 const IDLE_ROUTE_CHECK_TICKS: u8 = 16;
+
+/// How long a direct open keeps retrying a busy card after we let go of a
+/// shared stream on it: PipeWire holds an idle device open for its suspend
+/// timeout (5s by default) before releasing it.
+const DIRECT_BUSY_PATIENCE: Duration = Duration::from_secs(7);
+const DIRECT_BUSY_RETRY: Duration = Duration::from_millis(250);
+
+/// Where audio is asked to go: a sound-server device (None = the default) and,
+/// overriding it, a card to open directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Target {
+    shared: Option<String>,
+    direct: Option<String>,
+}
+
+/// The open audio output.
+struct Output {
+    sink: rodio::MixerDeviceSink,
+    /// Set when this is a card opened directly, with what it was opened at.
+    direct: Option<DirectOutput>,
+}
+
+struct DirectOutput {
+    name: String,
+    format: DirectFormat,
+}
 
 /// A fully-opened, decoded-and-ready track, not yet handed to rodio.
 struct Prepared {
@@ -75,7 +102,7 @@ async fn control_loop(
 ) {
     // rodio output must outlive all players; created lazily on first Play so
     // a missing audio device only fails playback, not app startup.
-    let mut output: Option<rodio::MixerDeviceSink> = None;
+    let mut output: Option<Output> = None;
     // Shared rather than owned outright because a seek runs on the blocking
     // pool and has to keep the player alive for as long as it takes (see
     // `spawn_seek`).
@@ -88,7 +115,10 @@ async fn control_loop(
     // working, i.e. normalization only ever made things quieter.
     // Chosen output device name (None = OS default) and the currently-loaded
     // track, retained so a device switch can reopen and resume in place.
-    let mut selected_device: Option<String> = None;
+    let mut target = Target::default();
+    // Set when the direct card could not be opened and the shared output was
+    // used instead, so the consumer can say why the output is not direct.
+    let mut direct_error: Option<String> = None;
     // Resolved name of the device `output` was actually opened on, and the
     // device playback was auto-paused for when it disappeared. macOS hands a
     // Bluetooth disconnect (earbuds off, AirPods out of the ear) to us as a
@@ -153,15 +183,18 @@ async fn control_loop(
                         // would keep this track on the old device until the tick
                         // below tore it down mid-playback. Drop it here instead
                         // and let `start_track` open on the current route.
-                        if output.is_some() && route_lost(&selected_device, &open_device) {
+                        if target.direct.is_none()
+                            && output.is_some()
+                            && route_lost(&target.shared, &open_device)
+                        {
                             output = None;
                         }
                         route_ticks = 0;
                         route_grace = true;
-                        let output_was_open = output.is_some();
                         match start_track(
                             &mut output,
-                            &selected_device,
+                            &target,
+                            &mut direct_error,
                             track,
                             volume,
                             &mut serials,
@@ -171,12 +204,9 @@ async fn control_loop(
                         )
                         .await
                         {
-                            Ok((new_sink, loaded)) => {
-                                if !output_was_open {
-                                    open_device = resolved_device_name(&selected_device);
-                                    let _ = event_tx.send(Event::OutputOpened {
-                                        device: open_device.clone(),
-                                    });
+                            Ok((new_sink, loaded, opened)) => {
+                                if opened {
+                                    announce(&output, &target, &direct_error, &mut open_device, &event_tx);
                                 }
                                 if let Some(d) = loaded.duration {
                                     let _ = event_tx.send(Event::DurationKnown(d));
@@ -225,14 +255,17 @@ async fn control_loop(
                         current = None;
                         playing = false;
                     }
-                    Command::SetOutputDevice(name) => {
-                        if name != selected_device {
-                            selected_device = name;
+                    Command::SetOutputDevice(_) | Command::SetDirectOutput(_) => {
+                        let mut wanted = target.clone();
+                        match cmd {
+                            Command::SetOutputDevice(name) => wanted.shared = name,
+                            Command::SetDirectOutput(id) => wanted.direct = id,
+                            _ => unreachable!(),
+                        }
+                        if wanted != target {
+                            target = wanted;
                             lost_device = None;
-                            open_device = resolved_device_name(&selected_device);
-                            let _ = event_tx.send(Event::OutputOpened {
-                                device: open_device.clone(),
-                            });
+                            direct_error = None;
                             // Reopen on the new device, resuming the current
                             // track at its position (paused stays paused).
                             let resume = playing;
@@ -252,7 +285,8 @@ async fn control_loop(
                                 let _ = event_tx.send(Event::Buffering);
                                 match start_track(
                                     &mut output,
-                                    &selected_device,
+                                    &target,
+                                    &mut direct_error,
                                     loaded.track,
                                     volume,
                                     &mut serials,
@@ -262,7 +296,7 @@ async fn control_loop(
                                 )
                                 .await
                                 {
-                                    Ok((new_sink, loaded)) => {
+                                    Ok((new_sink, loaded, _)) => {
                                         if !resume {
                                             new_sink.pause();
                                         }
@@ -296,6 +330,7 @@ async fn control_loop(
                                     }
                                 }
                             }
+                            announce(&output, &target, &direct_error, &mut open_device, &event_tx);
                             if let Some(track) = requeue {
                                 start_prefetch(
                                     track,
@@ -324,7 +359,7 @@ async fn control_loop(
                     Command::SetVolume(v) => {
                         volume = v.clamp(0.0, MAX_VOLUME);
                         if let Some(s) = &sink {
-                            s.set_volume(volume);
+                            s.set_volume(applied_volume(volume, &output));
                         }
                     }
                     Command::PrefetchNext(track) => {
@@ -362,6 +397,7 @@ async fn control_loop(
                                 &mut queued,
                                 sink.as_deref(),
                                 current.as_ref(),
+                                &output,
                                 &mut serials,
                                 &end_tx,
                                 &tap,
@@ -452,11 +488,13 @@ async fn control_loop(
                 } else {
                     IDLE_ROUTE_CHECK_TICKS
                 };
-                let check_route = output.is_some() && route_ticks >= due;
+                // A card opened directly is not routed by anyone: there is no
+                // default to follow, and asking the sound server is moot.
+                let check_route = target.direct.is_none() && output.is_some() && route_ticks >= due;
                 if check_route {
                     route_ticks = 0;
                 }
-                if check_route && route_lost(&selected_device, &open_device) {
+                if check_route && route_lost(&target.shared, &open_device) {
                     // A device pulled out from under playback is not the same
                     // event as a new one taking the route over, and only the
                     // first should stop the music.
@@ -478,7 +516,8 @@ async fn control_loop(
                     if let Some(loaded) = current.take() {
                         match start_track(
                             &mut output,
-                            &selected_device,
+                            &target,
+                            &mut direct_error,
                             loaded.track,
                             volume,
                             &mut serials,
@@ -488,7 +527,7 @@ async fn control_loop(
                         )
                         .await
                         {
-                            Ok((new_sink, loaded)) => {
+                            Ok((new_sink, loaded, _)) => {
                                 if !resume {
                                     new_sink.pause();
                                 }
@@ -518,10 +557,7 @@ async fn control_loop(
                             }
                         }
                     }
-                    open_device = resolved_device_name(&selected_device);
-                    let _ = event_tx.send(Event::OutputOpened {
-                        device: open_device.clone(),
-                    });
+                    announce(&output, &target, &direct_error, &mut open_device, &event_tx);
                     // The device that was pulled out is back: pick playback up
                     // where it stopped. Anything else stays paused — the user
                     // asked for audio in the earbuds, not in the room.
@@ -564,6 +600,7 @@ async fn control_loop(
                             &mut queued,
                             sink.as_deref(),
                             current.as_ref(),
+                            &output,
                             &mut serials,
                             &end_tx,
                             &tap,
@@ -743,16 +780,29 @@ fn drop_prefetch(
 /// is within `COMMIT_LEAD` of its end, making the hand-over gapless. Nothing
 /// happens while the window is still far off, since an appended track cannot be
 /// withdrawn if the queue changes.
+// Engine-loop state threaded by reference, as for `start_track`.
+#[allow(clippy::too_many_arguments)]
 fn commit_next(
     pending: &mut Option<Prepared>,
     queued: &mut Option<Loaded>,
     sink: Option<&rodio::Player>,
     current: Option<&Loaded>,
+    output: &Option<Output>,
     serials: &mut u64,
     end_tx: &mpsc::UnboundedSender<u64>,
     tap: &Arc<SpectrumTap>,
 ) {
     if pending.is_none() || queued.is_some() {
+        return;
+    }
+    // A card opened directly plays one rate. A next track at another one
+    // cannot join this output without resampling, so it is not appended: the
+    // current track ends, and starting the next reopens the card at its rate.
+    if let (Some(prepared), Some(direct)) = (
+        pending.as_ref(),
+        output.as_ref().and_then(|o| o.direct.as_ref()),
+    ) && !direct.format.serves(want_of(&prepared.decoder))
+    {
         return;
     }
     let Some(s) = sink else { return };
@@ -944,29 +994,131 @@ fn is_mp4(hint: Option<&Hint>) -> bool {
 // out.
 #[allow(clippy::too_many_arguments)]
 async fn start_track(
-    output: &mut Option<rodio::MixerDeviceSink>,
-    selected_device: &Option<String>,
+    output: &mut Option<Output>,
+    target: &Target,
+    direct_error: &mut Option<String>,
     track: TrackSource,
     volume: f32,
     serials: &mut u64,
     end_tx: &mpsc::UnboundedSender<u64>,
     tap: &Arc<SpectrumTap>,
     event_tx: &mpsc::UnboundedSender<Event>,
-) -> Result<(rodio::Player, Loaded), PlaybackError> {
+) -> Result<(rodio::Player, Loaded, bool), PlaybackError> {
     let prepared = prepare(track, event_tx).await?;
 
+    let mut opened = false;
+    if let Some(id) = &target.direct {
+        let want = want_of(&prepared.decoder);
+        let serves = output
+            .as_ref()
+            .and_then(|o| o.direct.as_ref())
+            .is_some_and(|d| d.format.serves(want));
+        // Dropping a shared output of ours gives the sound server's hold on
+        // the card a moment to lapse. Not once the card was found busy with
+        // something else, though: then every track would sit through the wait
+        // again. That fallback holds until the output is chosen again.
+        if !serves {
+            let dropped_ours = output.take().is_some();
+            let patience = if dropped_ours && direct_error.is_none() {
+                DIRECT_BUSY_PATIENCE
+            } else {
+                Duration::ZERO
+            };
+            match open_direct(id, want, patience).await {
+                Ok(out) => {
+                    *direct_error = None;
+                    *output = Some(out);
+                }
+                Err(e) => {
+                    tracing::warn!("direct output unavailable, using the shared one: {e}");
+                    *direct_error = Some(e);
+                    *output = Some(Output {
+                        sink: open_output(&target.shared)?,
+                        direct: None,
+                    });
+                }
+            }
+            opened = true;
+        }
+    }
     if output.is_none() {
-        *output = Some(open_output(selected_device)?);
+        *output = Some(Output {
+            sink: open_output(&target.shared)?,
+            direct: None,
+        });
+        opened = true;
     }
     let out = output
         .as_ref()
         .ok_or(PlaybackError("no output sink".into()))?;
 
-    let player = rodio::Player::connect_new(out.mixer());
-    player.set_volume(volume);
+    let player = rodio::Player::connect_new(out.sink.mixer());
+    player.set_volume(applied_volume(volume, output));
     let loaded = append(&player, prepared, serials, end_tx, tap);
     player.play();
-    Ok((player, loaded))
+    Ok((player, loaded, opened))
+}
+
+/// Open card `id` for `want`, retrying while it is busy for up to `patience`.
+async fn open_direct(id: &str, want: Want, patience: Duration) -> Result<Output, String> {
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        match direct::open(id, want) {
+            Ok((sink, format, name)) => {
+                tracing::info!("direct output on {name}: {}", format.label());
+                return Ok(Output {
+                    sink,
+                    direct: Some(DirectOutput { name, format }),
+                });
+            }
+            Err(OpenError::Busy(_)) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(DIRECT_BUSY_RETRY).await;
+            }
+            Err(e) => return Err(e.message()),
+        }
+    }
+}
+
+/// The rate and channel count a decoder produces.
+fn want_of(decoder: &rodio::Decoder<SourceReader>) -> Want {
+    Want {
+        rate: rodio::Source::sample_rate(decoder).get(),
+        channels: rodio::Source::channels(decoder).get(),
+    }
+}
+
+/// The multiplier the player applies. Exactly 1.0 on a card opened directly:
+/// any other factor changes every sample, and unchanged samples are the point.
+fn applied_volume(volume: f32, output: &Option<Output>) -> f32 {
+    if output.as_ref().is_some_and(|o| o.direct.is_some()) {
+        1.0
+    } else {
+        volume
+    }
+}
+
+/// Tell the consumer where audio goes now, and remember it for the route
+/// watch.
+fn announce(
+    output: &Option<Output>,
+    target: &Target,
+    direct_error: &Option<String>,
+    open_device: &mut Option<String>,
+    event_tx: &mpsc::UnboundedSender<Event>,
+) {
+    let direct = output.as_ref().and_then(|o| o.direct.as_ref());
+    *open_device = match (direct, output) {
+        (Some(d), _) => Some(d.name.clone()),
+        // A card chosen but not opened yet (it is opened per track, at the
+        // track's rate): naming the shared device would say audio goes there.
+        (None, None) if target.direct.is_some() => None,
+        (None, _) => resolved_device_name(&target.shared),
+    };
+    let _ = event_tx.send(Event::OutputOpened {
+        device: open_device.clone(),
+        direct: direct.map(|d| d.format.label()),
+        direct_error: direct_error.clone(),
+    });
 }
 
 /// Open the sink for `selected` (a name as `output_devices` reports it), falling

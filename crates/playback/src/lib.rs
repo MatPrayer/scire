@@ -6,6 +6,7 @@
 //! Must be constructed inside a tokio runtime (stream-download needs the
 //! reactor; the control loop is a tokio task).
 
+mod direct;
 mod engine;
 pub mod icy;
 #[cfg(target_os = "linux")]
@@ -66,6 +67,19 @@ pub enum Command {
     /// Switch the OS output device by its description name; None = system
     /// default. Reopens the sink and resumes the current track in place.
     SetOutputDevice(Option<String>),
+    /// Open a card directly, bypassing the sound server (see
+    /// [`direct_devices`]); None = back to the shared output. Overrides
+    /// `SetOutputDevice` while set. Volume is fixed at unity while a card is
+    /// open this way, and the output reopens at each track's sample rate.
+    SetDirectOutput(Option<String>),
+}
+
+pub use direct::DirectDevice;
+
+/// The cards that can be opened directly — ALSA `hw:` devices on Linux,
+/// nothing elsewhere. Opens nothing, but asks ALSA; call off the UI thread.
+pub fn direct_devices() -> Vec<DirectDevice> {
+    direct::devices()
 }
 
 /// Enumerate the output devices a user could pick, de-duplicated. Best-effort:
@@ -150,8 +164,14 @@ pub enum Event {
     /// Playback of the current track is unaffected; the gapless hand-over will
     /// not happen and starting that track will fail the same way.
     PrefetchFailed { id: Option<String>, error: String },
-    /// Audio output was opened; reports the OS output device name.
-    OutputOpened { device: Option<String> },
+    /// Audio output was opened; reports the OS output device name. `direct`
+    /// is the format a directly-opened card runs at (`44.1 kHz · 32-bit`);
+    /// `direct_error` says why a direct card was asked for and not opened.
+    OutputOpened {
+        device: Option<String>,
+        direct: Option<String>,
+        direct_error: Option<String>,
+    },
     /// The source that just started is a live stream, and this is what it says
     /// about itself (ICY response headers).
     StationInfo(icy::StationInfo),
@@ -275,6 +295,11 @@ impl Player {
     /// Switch output device by name (None = system default).
     pub fn set_output_device(&self, name: Option<String>) {
         let _ = self.tx.send(Command::SetOutputDevice(name));
+    }
+
+    /// Open a card directly by its [`DirectDevice::id`] (None = shared output).
+    pub fn set_direct_output(&self, id: Option<String>) {
+        let _ = self.tx.send(Command::SetDirectOutput(id));
     }
 }
 

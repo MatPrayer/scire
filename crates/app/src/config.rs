@@ -74,6 +74,16 @@ pub fn lyrics_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("lyrics"))
 }
 
+/// On-disk answers from `services::album_info`.
+pub fn album_info_cache_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("album_info"))
+}
+
+/// On-disk answers from `services::artist_info`.
+pub fn artist_info_cache_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("artist_info"))
+}
+
 pub fn queue_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("queue.json"))
 }
@@ -208,12 +218,25 @@ pub struct Settings {
     pub hide_idle_player_bar: bool,
     /// ReplayGain loudness-normalization mode.
     pub replay_gain: ReplayGainMode,
+    /// Pre-amplification added to every ReplayGain adjustment, in dB. Tags
+    /// target 89 dB SPL (-18 LUFS for R128), which many listeners find quiet
+    /// next to unnormalized audio; a few dB back evens that out.
+    pub replay_gain_preamp: f32,
+    /// Cap the ReplayGain factor at `1/peak` so a boost never clips. Off lets
+    /// a quiet track with a hot peak be raised all the way, clipping included.
+    pub replay_gain_prevent_clipping: bool,
     /// Chosen audio output device, named as `playback::output_devices` reports
     /// it (a PulseAudio/PipeWire sink description on Linux, a cpal one
     /// elsewhere); None = OS default. A name that no longer matches any device
     /// falls back to the default rather than failing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_device: Option<String>,
+    /// A card opened directly, bypassing the sound server — an ALSA id as
+    /// `playback::direct_devices` reports it. Overrides `output_device` while
+    /// set: bit-perfect playback at each track's own rate, volume and
+    /// ReplayGain bypassed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_direct: Option<String>,
     /// What to do when the play queue reaches its end.
     pub queue_end: QueueEndBehavior,
     /// Background style of the fullscreen now-playing overlay.
@@ -271,6 +294,28 @@ pub struct Settings {
     /// line is sized for, and a release date is a year to most people.
     #[serde(default)]
     pub detailed_album_dates: bool,
+    /// Look albums up on Wikipedia (through Wikidata) for the About card
+    /// (`services::album_info`). On by default: the server's own notes are
+    /// Last.fm's *summary*, cut off mid-sentence, and most libraries have none
+    /// at all.
+    pub album_info_wikipedia: bool,
+    /// Look albums up on MusicBrainz: its annotation, its links (Discogs,
+    /// AllMusic, Bandcamp) and the most reliable route to the right Wikipedia
+    /// article. Off, Wikipedia is found by a title search instead.
+    pub album_info_musicbrainz: bool,
+    /// Show the album notes the server forwards (Last.fm, via
+    /// `getAlbumInfo2`). Nothing is sent either way — the server fetches them
+    /// — so this only decides whether the card offers them.
+    pub server_album_notes: bool,
+    /// Show the artist biography the server forwards (`getArtistInfo2`).
+    pub server_artist_bios: bool,
+    /// Look artists up on Wikipedia for the artist page's bio
+    /// (`services::artist_info`). On by default, like the album one: the
+    /// server's bio is Last.fm's summary, cut off mid-sentence.
+    pub artist_info_wikipedia: bool,
+    /// Look artists up on MusicBrainz: its annotation, its links (official
+    /// site, Discogs, AllMusic, Bandcamp) and the route to the right article.
+    pub artist_info_musicbrainz: bool,
     /// How the bottom player bar sits against the rest of the UI. `Docked`
     /// (default) reserves its own row, same as every other panel. `Floating`
     /// draws it as a translucent, rounded card hovering over the content
@@ -706,22 +751,34 @@ pub enum LyricsProvider {
 }
 
 impl LyricsProvider {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::LibraryOnly => "Library only",
-            Self::OnlineOnly => "LRCLIB only",
-            Self::LibraryFirst => "Library, then LRCLIB",
-            Self::OnlineFirst => "LRCLIB, then library",
+    /// The provider for a set of per-source switches: which sources are on,
+    /// and — only meaningful with both — whether LRCLIB is asked first.
+    /// `None` with both off, since the panel has no "no lyrics" provider.
+    pub fn from_parts(library: bool, online: bool, online_first: bool) -> Option<Self> {
+        match (library, online) {
+            (true, true) if online_first => Some(Self::OnlineFirst),
+            (true, true) => Some(Self::LibraryFirst),
+            (true, false) => Some(Self::LibraryOnly),
+            (false, true) => Some(Self::OnlineOnly),
+            (false, false) => None,
         }
     }
 
-    /// Every provider, in the order the settings page offers them.
-    pub const ALL: [Self; 4] = [
-        Self::LibraryFirst,
-        Self::OnlineFirst,
-        Self::LibraryOnly,
-        Self::OnlineOnly,
-    ];
+    /// This provider with the library switched on or off.
+    pub fn with_library(self, on: bool) -> Option<Self> {
+        Self::from_parts(on, self.uses_online(), self == Self::OnlineFirst)
+    }
+
+    /// This provider with LRCLIB switched on or off.
+    pub fn with_online(self, on: bool) -> Option<Self> {
+        Self::from_parts(self.uses_library(), on, self == Self::OnlineFirst)
+    }
+
+    /// This provider asking LRCLIB first or not; a single-source provider has
+    /// no order to change and is returned as it is.
+    pub fn with_online_first(self, first: bool) -> Self {
+        Self::from_parts(self.uses_library(), self.uses_online(), first).unwrap_or(self)
+    }
 
     /// Whether the file's / server's own lyrics are consulted at all.
     pub fn uses_library(self) -> bool {
@@ -983,7 +1040,10 @@ impl Default for Settings {
             show_queue_button: true,
             hide_idle_player_bar: true,
             replay_gain: ReplayGainMode::Off,
+            replay_gain_preamp: 0.0,
+            replay_gain_prevent_clipping: true,
             output_device: None,
+            output_direct: None,
             queue_end: QueueEndBehavior::Keep,
             fullscreen_bg: FullscreenBackground::Gradient,
             local_music_dirs: Vec::new(),
@@ -1001,6 +1061,12 @@ impl Default for Settings {
             adaptive_page_gradient: false,
             album_layout: AlbumPageLayout::default(),
             detailed_album_dates: false,
+            album_info_wikipedia: true,
+            album_info_musicbrainz: true,
+            server_album_notes: true,
+            server_artist_bios: true,
+            artist_info_wikipedia: true,
+            artist_info_musicbrainz: true,
             player_bar_style: PlayerBarStyle::default(),
             player_bar_tint: true,
             player_bar_translucent: false,
@@ -1263,9 +1329,26 @@ pub fn delete_lb_token() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtistAlbumSize, CoverSize, ImportedThemesFile, Settings, UI_FONT_SIZE_DEFAULT,
-        UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize, WindowGeometry, write_atomic,
+        ArtistAlbumSize, CoverSize, ImportedThemesFile, LyricsProvider, Settings,
+        UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize, WindowGeometry,
+        write_atomic,
     };
+
+    #[test]
+    fn lyrics_switches_map_onto_providers() {
+        use LyricsProvider::*;
+        assert_eq!(LibraryFirst.with_online(false), Some(LibraryOnly));
+        assert_eq!(LibraryOnly.with_online(true), Some(LibraryFirst));
+        assert_eq!(LibraryFirst.with_library(false), Some(OnlineOnly));
+        assert_eq!(OnlineOnly.with_library(true), Some(LibraryFirst));
+        // The last source on cannot be switched off.
+        assert_eq!(OnlineFirst.with_online(false), Some(LibraryOnly));
+        assert_eq!(LibraryOnly.with_library(false), None);
+        assert_eq!(OnlineOnly.with_online(false), None);
+        assert_eq!(LibraryFirst.with_online_first(true), OnlineFirst);
+        assert_eq!(OnlineFirst.with_online_first(false), LibraryFirst);
+        assert_eq!(LibraryOnly.with_online_first(true), LibraryOnly);
+    }
 
     fn geometry(x: f32, y: f32, width: f32, height: f32) -> WindowGeometry {
         WindowGeometry {

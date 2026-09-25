@@ -9,9 +9,10 @@ members = ["crates/subsonic", "crates/playback", "crates/app", "crates/dmg"]
 default-members = ["crates/app"]
 
 [workspace.package]
-version = "1.0.2"
+version = "1.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/MatPrayer/scire"
 
 [workspace.dependencies]
 # UI
@@ -127,6 +128,13 @@ codegen-units = 16
 # downloaded. Measured at 12s on a 4.5MB m4a, which is also how long the
 # decoder took to be built. See vendor/stream-download/src/source/mod.rs
 # (`notify_if_position_reached`).
+#
+# Local fork of gpui 0.2.2 (examples and their tests left out) — the line
+# wrapper treated every non-word character as a break point before itself, so
+# a caption could wrap as `mode` / `).` or `song` / `;`. Closing punctuation
+# now clings to the word before it. See `clings_to_previous` in
+# vendor/gpui/src/text_system/line_wrapper.rs.
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
+gpui = { path = "vendor/gpui" }
 stream-download = { path = "vendor/stream-download" }

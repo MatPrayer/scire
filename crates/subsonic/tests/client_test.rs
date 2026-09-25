@@ -476,3 +476,77 @@ async fn start_scan_maps_not_authorized_error() {
     let err = client(&server.uri()).start_scan().await.unwrap_err();
     assert!(matches!(err, Error::Api { .. }));
 }
+
+#[tokio::test]
+async fn scrobble_forwarding_reads_navidromes_link_status() {
+    use wiremock::matchers::{body_json, header, method};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .and(body_json(
+            serde_json::json!({"username": "joe", "password": "sesame"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"1","token":"jwt"}"#))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/listenbrainz/link"))
+        .and(header("X-ND-Authorization", "Bearer jwt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":true}"#))
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/lastfm/link"))
+        .and(header("X-ND-Authorization", "Bearer jwt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"apiKey":"k","status":false}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let fwd = client(&server.uri())
+        .scrobble_forwarding()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fwd.listenbrainz, subsonic::ScrobbleLink::Linked);
+    assert_eq!(fwd.lastfm, subsonic::ScrobbleLink::NotLinked);
+}
+
+#[tokio::test]
+async fn scrobble_forwarding_a_missing_agent_route_is_disabled() {
+    use wiremock::matchers::method;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"token":"jwt"}"#))
+        .mount(&server)
+        .await;
+    // Navidrome only mounts /api/{agent}/link with the agent enabled; nothing
+    // else is mounted here, so both answer 404.
+    let fwd = client(&server.uri())
+        .scrobble_forwarding()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fwd.listenbrainz, subsonic::ScrobbleLink::Disabled);
+    assert_eq!(fwd.lastfm, subsonic::ScrobbleLink::Disabled);
+}
+
+#[tokio::test]
+async fn scrobble_forwarding_on_a_non_navidrome_server_is_none() {
+    let server = MockServer::start().await;
+    assert_eq!(
+        client(&server.uri()).scrobble_forwarding().await.unwrap(),
+        None
+    );
+}
+
+#[test]
+fn secure_transport_is_tls_or_a_local_host() {
+    assert!(client("https://music.example.com").is_secure_transport());
+    assert!(client("http://192.168.1.10:4533").is_secure_transport());
+    assert!(client("http://localhost:4533").is_secure_transport());
+    assert!(client("http://[::1]:4533").is_secure_transport());
+    assert!(!client("http://music.example.com").is_secure_transport());
+    assert!(!client("http://8.8.8.8").is_secure_transport());
+}

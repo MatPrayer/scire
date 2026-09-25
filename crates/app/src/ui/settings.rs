@@ -8,14 +8,16 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::switch::Switch;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::assets::{app_icon, icons};
 use crate::config::{
     AlbumPageLayout, ArtistAlbumSize, CoverSize, DefaultPage, FullscreenBackground,
     FullscreenCoverSize, LyricsProvider, PlayerBarStyle, QueueEndBehavior, ReplayGainMode,
@@ -25,9 +27,9 @@ use crate::services::library_db::LibraryDb;
 use crate::services::local_library::LocalScanner;
 use crate::services::{art_precache, artwork, navidrome_sync, runtime};
 use crate::state::maintenance::{MaintenanceJobs, TaskState};
-use crate::state::player::PlayerState;
+use crate::state::player::{PlayerState, RgTuning};
 use crate::state::queue::RepeatMode;
-use crate::state::session::Session;
+use crate::state::session::{ConnectionStatus, Session};
 use crate::ui::{
     apply_font_size, apply_theme, apply_window_chrome, sync_focus_scroll, transition,
     with_focus_cursor,
@@ -111,9 +113,11 @@ const COMPACT_RUNOUT: f32 = 16.;
 /// is a weights table that wants fixing, not a rounding error, and a scale
 /// beyond this only pushes every window onto the scrolling column.
 const COMPACT_SCALE_MAX: f32 = 1.25;
-/// Past four columns the cards are short and far apart — the page reads as a
-/// scattering rather than a grid.
-const COMPACT_COL_MAX: usize = 4;
+/// Past five columns the cards are short and far apart — the page reads as a
+/// scattering rather than a grid. Five, not four: Connections is a column on
+/// its own, and on a 1440p window Account and About under it no longer fit, so
+/// a fifth column is what keeps the page a grid there.
+const COMPACT_COL_MAX: usize = 5;
 /// How far a column's width may fall below and rise above an even split. The
 /// asymmetry is the point — a column carrying more gets more room, so its rows
 /// wrap less and the columns come out closer to the same height — but a column
@@ -130,21 +134,34 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 /// titles against this list, so a section added without a weight is caught in
 /// development rather than silently shifting the layout.
 ///
-/// Account is last because it is the one that may be absent (signed out), which
-/// makes "the sections that are present" a prefix of this list.
-const COMPACT_SECTIONS: [(&str, u16); 11] = [
+/// Account is the one section that may be absent (signed out); see
+/// [`present_sections`].
+const COMPACT_SECTIONS: [(&str, u16); 13] = [
     ("Window", 4),
     ("Appearance", 14),
     ("Album pages", 8),
     ("Fullscreen", 7),
     ("Player bar", 11),
-    ("Playback", 14),
+    ("Audio", 9),
+    ("Playback", 8),
     ("Browsing", 16),
     ("Streaming", 5),
-    ("Library", 16),
-    ("About", 3),
+    ("Library", 12),
+    ("Connections", 30),
     ("Account", 3),
+    ("About", 4),
 ];
+
+/// The sections drawn, in document order: all of [`COMPACT_SECTIONS`] but
+/// Account while signed out. What the grid plans with and what `section`
+/// checks its titles against.
+fn present_sections(signed_in: bool) -> Vec<(&'static str, u16)> {
+    COMPACT_SECTIONS
+        .iter()
+        .copied()
+        .filter(|(title, _)| signed_in || *title != "Account")
+        .collect()
+}
 
 /// What the About card shows, and what its Copy button puts on the clipboard.
 ///
@@ -158,6 +175,64 @@ fn version_line() -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     )
+}
+
+/// The About card's links, all into the repository the manifest names — the
+/// one place the address is written down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AboutLink {
+    Repository,
+    Releases,
+    Changelog,
+    Issues,
+}
+
+impl AboutLink {
+    const ALL: [AboutLink; 4] = [
+        AboutLink::Repository,
+        AboutLink::Releases,
+        AboutLink::Changelog,
+        AboutLink::Issues,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            AboutLink::Repository => "GitHub",
+            AboutLink::Releases => "Releases",
+            AboutLink::Changelog => "Changelog",
+            AboutLink::Issues => "Report an issue",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            AboutLink::Repository => "about-repository",
+            AboutLink::Releases => "about-releases",
+            AboutLink::Changelog => "about-changelog",
+            AboutLink::Issues => "about-issues",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            AboutLink::Repository => IconName::GitHub,
+            AboutLink::Releases => IconName::Inbox,
+            AboutLink::Changelog => IconName::BookOpen,
+            AboutLink::Issues => IconName::TriangleAlert,
+        }
+    }
+
+    fn url(self) -> String {
+        let repo = env!("CARGO_PKG_REPOSITORY");
+        match self {
+            AboutLink::Repository => repo.to_string(),
+            AboutLink::Releases => format!("{repo}/releases"),
+            // `main`, not the version's tag: a build ahead of its tag would
+            // point at a page that doesn't exist yet.
+            AboutLink::Changelog => format!("{repo}/blob/main/CHANGELOG.md"),
+            AboutLink::Issues => format!("{repo}/issues"),
+        }
+    }
 }
 
 /// How long the Copy button says "Copied" before going back.
@@ -191,8 +266,8 @@ fn card_height(weight: u16) -> f32 {
 /// page.
 ///
 /// Binary search on "could every run fit under this height", which a left-to-
-/// right greedy answers in one pass, then one more pass to cut at the height
-/// the search settled on.
+/// right greedy answers in one pass; then, under the height the search settled
+/// on, the split whose shortest run is tallest.
 fn split_runs(heights: &[f32], cols: usize) -> Vec<Vec<usize>> {
     let runs_under = |cap: f32| -> usize {
         let mut runs = 1;
@@ -221,25 +296,59 @@ fn split_runs(heights: &[f32], cols: usize) -> Vec<Vec<usize>> {
         }
     }
 
-    let mut runs: Vec<Vec<usize>> = vec![Vec::new()];
-    let mut used = 0.;
+    // Of the splits into exactly `cols` runs that stay under the cap, the one
+    // whose shortest run is tallest. The cap fixes how tall the grid is; this
+    // decides where the slack goes, and a greedy fill puts all of it in the
+    // last column — a card or two left alone at the top of an empty one.
+    // Exactly `cols`, because the count was chosen for the shape it makes and
+    // the caller zips the runs against one width per column; a split under the
+    // cap in fewer runs can always be cut further without getting taller.
+    //
+    // `best[k][i]`: the tallest shortest-run over splitting `heights[i..]` into
+    // `k` runs, `None` where that cannot be done under the cap. Pages are a
+    // dozen cards, so the cubic table is nothing.
+    let n = heights.len();
+    let cols = cols.clamp(1, n.max(1));
+    let mut prefix = vec![0f32; n + 1];
     for (i, &h) in heights.iter().enumerate() {
-        // A cap the greedy meets in fewer runs than asked still has to produce
-        // `cols` of them: the count was chosen for the shape it makes, and the
-        // caller zips the runs against one width per column, so a short split
-        // silently draws a narrower grid than it planned. Once only as many
-        // cards are left as there are runs still to open, each one opens its
-        // own — which only ever cuts a run shorter, never taller.
-        let must_open = heights.len() - i == cols - runs.len()
-            && !runs.last().expect("a run is always open").is_empty();
-        // The last run takes whatever is left: with `cols` runs already open,
-        // a rounding error in the cap must not open one more.
-        if (must_open || (used + h > hi && used > 0.)) && runs.len() < cols {
-            runs.push(Vec::new());
-            used = 0.;
+        prefix[i + 1] = prefix[i] + h;
+    }
+    // The cap came out of sums added up another way; a hair of slack keeps
+    // rounding from turning the split the search proved possible into none.
+    let cap = hi + 0.01;
+    let mut best = vec![vec![None::<(f32, usize)>; n + 1]; cols + 1];
+    for i in 0..n {
+        let rest = prefix[n] - prefix[i];
+        if rest <= cap {
+            best[1][i] = Some((rest, n));
         }
-        runs.last_mut().expect("a run is always open").push(i);
-        used += h;
+    }
+    for k in 2..=cols {
+        for i in 0..n {
+            // Leave at least one card for each of the `k - 1` runs after this.
+            for j in i + 1..=n.saturating_sub(k - 1) {
+                let run = prefix[j] - prefix[i];
+                if run > cap {
+                    break;
+                }
+                if let Some((after, _)) = best[k - 1][j] {
+                    let shortest = run.min(after);
+                    if best[k][i].is_none_or(|(b, _)| shortest > b) {
+                        best[k][i] = Some((shortest, j));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut runs = Vec::with_capacity(cols);
+    let mut start = 0;
+    for k in (1..=cols).rev() {
+        // Unreachable while the search above is right; everything left in one
+        // last run is still a page, if an uneven one.
+        let end = best[k][start].map_or(n, |(_, j)| j);
+        runs.push((start..end).collect());
+        start = end;
     }
     runs
 }
@@ -377,6 +486,15 @@ enum SettingsSwitch {
     AlbumPanelRight,
     HideAlbumStars,
     DetailedAlbumDates,
+    AlbumInfoWikipedia,
+    AlbumInfoMusicBrainz,
+    ServerAlbumNotes,
+    ServerArtistBios,
+    ArtistInfoWikipedia,
+    ArtistInfoMusicBrainz,
+    LyricsLibrary,
+    LyricsOnline,
+    LyricsOnlineFirst,
     SelectionGlowVi,
     SelectionGlowHover,
     SelectionGlowAlbumColor,
@@ -397,6 +515,7 @@ enum SettingsSwitch {
     PrecacheArt,
     PreferSyncedLyrics,
     ClassicAlbumCards,
+    ReplayGainClipGuard,
 }
 
 /// A button-group entry or a standalone settings button.
@@ -408,6 +527,9 @@ enum SettingsButton {
     AlbumLayout(AlbumPageLayout),
     PlayerBarStyle(PlayerBarStyle),
     ReplayGain(ReplayGainMode),
+    /// ReplayGain pre-amp, in whole dB.
+    Preamp(i8),
+    RefreshDevices,
     QueueEnd(QueueEndBehavior),
     Repeat(RepeatMode),
     DefaultPage(DefaultPage),
@@ -421,8 +543,236 @@ enum SettingsButton {
     RebuildCache,
     AddLocalDir,
     RemoveLocalDir(usize),
+    ClearCache(OnlineCache),
     CopyVersion,
+    OpenLink(AboutLink),
     SignOut,
+}
+
+/// Shown under the output dropdown.
+const DIRECT_OUTPUT_NOTE: &str = "Direct devices bypass the sound server: the \
+     card is opened on its own at each track's sample rate and gets the file's \
+     samples unchanged (bit-perfect for 16- and 24-bit files). Volume and \
+     ReplayGain are off — set the level on your DAC or amp — and nothing else \
+     can play through that card meanwhile. If the card is busy, the system \
+     output is used instead.";
+
+/// The output dropdown's value: a sound-server device (None = the system
+/// default), or a card opened directly by its ALSA id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OutputChoice {
+    Shared(Option<String>),
+    Direct(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputGroup {
+    Shared,
+    Direct,
+}
+
+impl OutputGroup {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Shared => "System output",
+            Self::Direct => "Direct (bit-perfect)",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OutputOption {
+    group: OutputGroup,
+    choice: OutputChoice,
+    label: String,
+}
+
+/// The devices on offer, listed off the UI thread.
+#[derive(Clone, Default)]
+struct DeviceLists {
+    shared: Vec<String>,
+    direct: Vec<playback::DirectDevice>,
+}
+
+/// What the player reports about the open output: device, direct format, and
+/// why a direct card was not opened.
+type OutputStatus = (Option<String>, Option<String>, Option<String>);
+
+fn output_status(player: &PlayerState) -> OutputStatus {
+    (
+        player.output_device.clone(),
+        player.output_direct.clone(),
+        player.direct_error.clone(),
+    )
+}
+
+/// The on-disk answer caches of the online services on the Connections card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnlineCache {
+    AlbumInfo,
+    ArtistInfo,
+    Lyrics,
+}
+
+impl OnlineCache {
+    const ALL: [Self; 3] = [Self::AlbumInfo, Self::ArtistInfo, Self::Lyrics];
+
+    fn dir(self) -> anyhow::Result<std::path::PathBuf> {
+        match self {
+            Self::AlbumInfo => crate::config::album_info_cache_dir(),
+            Self::ArtistInfo => crate::config::artist_info_cache_dir(),
+            Self::Lyrics => crate::config::lyrics_cache_dir(),
+        }
+    }
+}
+
+/// Where the app's own ListenBrainz path stands, for its Connections row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionState {
+    On,
+    Off,
+    /// Switched on but missing what it needs to work, i.e. doing nothing.
+    NeedsToken,
+}
+
+impl ConnectionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::On => "On",
+            Self::Off => "Off",
+            Self::NeedsToken => "Needs token",
+        }
+    }
+
+    fn dot(self, cx: &App) -> gpui::Hsla {
+        match self {
+            Self::On => cx.theme().success,
+            Self::NeedsToken => cx.theme().warning,
+            Self::Off => cx.theme().muted_foreground.opacity(0.5),
+        }
+    }
+
+    /// The app's own ListenBrainz path is only live with both the switch and
+    /// a token: an enabled switch with an empty token sends nothing, and
+    /// saying "On" there is how a user ends up wondering where their listens
+    /// went.
+    fn listenbrainz(enabled: bool, token: &str) -> Self {
+        match (enabled, token.trim().is_empty()) {
+            (true, false) => Self::On,
+            (true, true) => Self::NeedsToken,
+            (false, _) => Self::Off,
+        }
+    }
+}
+
+/// How a service on the Connections card is reached.
+#[derive(Clone, Copy)]
+enum Route {
+    /// Navidrome talks to it; the app only talks to Navidrome.
+    Server,
+    /// The app contacts it itself.
+    Direct,
+}
+
+/// One service inside a feature on the Connections card — see
+/// `SettingsView::service_list`.
+struct Service {
+    mark: gpui_component::Icon,
+    name: &'static str,
+    route: Route,
+    /// The host for a direct service, what passes through for a server one.
+    detail: &'static str,
+    /// Where it stands, with its dot — `None` for a row whose switch already
+    /// says it, unless there is something the switch cannot (a missing token,
+    /// a server that has not answered).
+    status: Option<(&'static str, gpui::Hsla)>,
+    /// Its own on/off switch, where the app decides whether it is used.
+    switch: Option<gpui::AnyElement>,
+    /// Whether the feature is using it; an unused one is drawn dimmed.
+    lit: bool,
+    /// What the service needs set up, drawn inside its row under the name —
+    /// the ListenBrainz token. `None` while the service is off, like any
+    /// control waiting on another setting.
+    extra: Option<gpui::AnyElement>,
+}
+
+/// What the server was found to do with the scrobbles it is sent — see
+/// `SubsonicClient::scrobble_forwarding`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Forwarding {
+    /// Not asked yet (no client when the page opened).
+    Unasked,
+    Checking,
+    Known(subsonic::ScrobbleForwarding),
+    /// Not a Navidrome server: nothing publishes where it forwards to.
+    Unsupported,
+    /// Asking means sending the password itself, which is not done over plain
+    /// HTTP to a host off the local network.
+    Insecure,
+    Failed,
+}
+
+/// Why there is no server to go through, for the status of every service the
+/// server reaches — `None` when connected. A connect still in flight or one
+/// being retried is not "no server": the account is there, it has not
+/// answered yet, and saying otherwise sent a user looking for a problem in
+/// their setup.
+fn server_offline(status: &ConnectionStatus, configured: bool) -> Option<&'static str> {
+    match status {
+        ConnectionStatus::Connected => None,
+        ConnectionStatus::Connecting => Some("Connecting…"),
+        ConnectionStatus::Failed(_) if configured => Some("Unreachable"),
+        _ => Some("No server"),
+    }
+}
+
+/// A service's status as a scrobble target of the server: what it says, and
+/// whether plays are actually reaching the service that way.
+fn server_scrobble_status(
+    forwarding: &Forwarding,
+    service: fn(&subsonic::ScrobbleForwarding) -> subsonic::ScrobbleLink,
+    offline: Option<&'static str>,
+    scrobble_to_server: bool,
+) -> (&'static str, bool) {
+    use subsonic::ScrobbleLink;
+    if let Some(why) = offline {
+        return (why, false);
+    }
+    match forwarding {
+        Forwarding::Unasked | Forwarding::Checking => ("Checking…", false),
+        Forwarding::Unsupported => ("Unknown", false),
+        Forwarding::Insecure => ("Not checked over HTTP", false),
+        Forwarding::Failed => ("Couldn't check", false),
+        Forwarding::Known(f) => match service(f) {
+            // Linked is only half of it: with the app's own switch off the
+            // server is never told about a play in the first place.
+            ScrobbleLink::Linked if !scrobble_to_server => ("Scrobbling to server off", false),
+            ScrobbleLink::Linked => ("Forwarded", true),
+            ScrobbleLink::NotLinked => ("Not linked", false),
+            ScrobbleLink::Disabled => ("Off on server", false),
+        },
+    }
+}
+
+/// How many cached answers a cache directory holds. A missing directory is
+/// an empty cache, not an error: nothing has been looked up yet.
+fn count_cache_entries(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn cache_entries_label(n: usize) -> String {
+    match n {
+        0 => "Nothing cached".to_string(),
+        1 => "1 answer cached".to_string(),
+        n => format!("{n} answers cached"),
+    }
 }
 
 /// Which track-info chip to toggle; maps back to the accessor the mouse path
@@ -457,7 +807,8 @@ enum SettingsAction {
     Button(SettingsButton),
     FontSize,
     UiScale,
-    LyricsProvider,
+    /// The output device dropdown; Enter steps to the next device.
+    OutputDevice,
     DirInput,
     LbInput,
 }
@@ -500,12 +851,30 @@ pub struct SettingsView {
     /// is what `ScrollHandle::bounds_for_item` is asked about — so the pills,
     /// the vi cursor and the measured positions cannot drift apart.
     section_starts: Vec<(usize, &'static str)>,
+    /// The titles of the sections this render draws, in order — what `section`
+    /// checks each card it opens against (see [`present_sections`]).
+    section_titles: Vec<&'static str>,
     /// The quick-nav jump currently running, if any.
     scroll_anim: Option<SectionScroll>,
     /// About card: whether the Copy button is showing its "Copied" label, and
     /// the task that takes it back off.
     version_copied: bool,
     copied_reset: Option<gpui::Task<()>>,
+    /// Connections card: how many answers each online cache holds on disk,
+    /// `None` until counted. Counted off the UI thread on construction and
+    /// after a clear, since it is a directory walk.
+    album_info_cached: Option<usize>,
+    artist_info_cached: Option<usize>,
+    lyrics_cached: Option<usize>,
+    /// Where the server forwards scrobbles, asked once per page visit.
+    forwarding: Forwarding,
+    /// Audio card: the output devices on offer, `None` while being listed.
+    /// Listed off the UI thread (`pactl` can take up to its 2s timeout) on
+    /// construction and on Refresh, never from `render`.
+    devices: Option<DeviceLists>,
+    /// Where the engine actually opened audio, mirrored from `PlayerState` so
+    /// the page repaints only when it changes (the player notifies per tick).
+    open_device: OutputStatus,
     /// Content width of the scroll body, tracked across a resize so the cards
     /// reflow on the same frame as the window (see [`crate::ui::LiveWidth`]).
     live_width: crate::ui::LiveWidth,
@@ -551,6 +920,16 @@ impl SettingsView {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         // A job started on an earlier visit keeps reporting into this page.
         cx.observe(&jobs, |_, _, cx| cx.notify()).detach();
+        // Gated: the player notifies on every position tick.
+        cx.observe(&player, |this: &mut Self, player, cx| {
+            let output = output_status(player.read(cx));
+            if output != this.open_device {
+                this.open_device = output;
+                cx.notify();
+            }
+        })
+        .detach();
+        let open_device = output_status(player.read(cx));
         let dir_input = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/music"));
         let token = crate::config::load_lb_token(&session.read(cx).settings).unwrap_or_default();
         let lb_input = cx.new(|cx| {
@@ -566,7 +945,7 @@ impl SettingsView {
         })
         .detach();
         let scroll = ScrollHandle::new();
-        Self {
+        let mut view = Self {
             session,
             player,
             dir_input,
@@ -580,9 +959,16 @@ impl SettingsView {
             vi_actions: Vec::new(),
             vi_count: 0,
             section_starts: Vec::new(),
+            section_titles: Vec::new(),
             scroll_anim: None,
             version_copied: false,
             copied_reset: None,
+            album_info_cached: None,
+            artist_info_cached: None,
+            lyrics_cached: None,
+            forwarding: Forwarding::Unasked,
+            devices: None,
+            open_device,
             live_width: crate::ui::LiveWidth::default(),
             card_width: None,
             compact: false,
@@ -592,7 +978,111 @@ impl SettingsView {
             compact_viewport: (0., 0.),
             compact_plan: (0., 0.),
             compact_checked: false,
+        };
+        view.count_online_caches(cx);
+        view.maybe_check_forwarding(cx);
+        view.refresh_devices(cx);
+        view
+    }
+
+    /// List the output devices off the UI thread.
+    fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+        self.devices = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let devices = runtime::spawn_blocking_io(|| {
+                Ok(DeviceLists {
+                    shared: playback::output_devices(),
+                    direct: playback::direct_devices(),
+                })
+            })
+            .await
+            .unwrap_or_default();
+            let _ = this.update(cx, |this, cx| {
+                this.devices = Some(devices);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What the output is set to, as the dropdown names it.
+    fn output_choice(&self, cx: &App) -> OutputChoice {
+        let s = &self.session.read(cx).settings;
+        match &s.output_direct {
+            Some(id) => OutputChoice::Direct(id.clone()),
+            None => OutputChoice::Shared(s.output_device.clone()),
         }
+    }
+
+    /// Every entry of the output dropdown, in menu order: the sound server's
+    /// devices, then the cards that can be opened directly. A saved choice
+    /// that is not connected stays listed, so it is clear why audio went
+    /// elsewhere.
+    fn output_options(&self, cx: &App) -> Vec<OutputOption> {
+        let lists = self.devices.clone().unwrap_or_default();
+        let mut options = vec![OutputOption {
+            group: OutputGroup::Shared,
+            choice: OutputChoice::Shared(None),
+            label: "System default".into(),
+        }];
+        options.extend(lists.shared.iter().map(|name| OutputOption {
+            group: OutputGroup::Shared,
+            choice: OutputChoice::Shared(Some(name.clone())),
+            label: name.clone(),
+        }));
+        options.extend(lists.direct.iter().map(|d| OutputOption {
+            group: OutputGroup::Direct,
+            choice: OutputChoice::Direct(d.id.clone()),
+            label: d.name.clone(),
+        }));
+        // Only once listed: before that, everything would read as missing.
+        if self.devices.is_some() {
+            match self.output_choice(cx) {
+                OutputChoice::Shared(Some(name)) if !lists.shared.contains(&name) => {
+                    options.insert(
+                        1 + lists.shared.len(),
+                        OutputOption {
+                            group: OutputGroup::Shared,
+                            label: format!("{name} (not connected)"),
+                            choice: OutputChoice::Shared(Some(name)),
+                        },
+                    );
+                }
+                OutputChoice::Direct(id) if !lists.direct.iter().any(|d| d.id == id) => {
+                    options.push(OutputOption {
+                        group: OutputGroup::Direct,
+                        label: format!("{id} (not connected)"),
+                        choice: OutputChoice::Direct(id),
+                    });
+                }
+                _ => {}
+            }
+        }
+        options
+    }
+
+    fn set_output(&mut self, choice: OutputChoice, cx: &mut Context<Self>) {
+        match choice {
+            OutputChoice::Shared(name) => {
+                self.player.update(cx, |p, cx| {
+                    p.set_direct_output(None, cx);
+                    p.set_output_device(name.clone(), cx);
+                });
+                self.session.update(cx, |s, _| {
+                    s.settings.output_direct = None;
+                    s.settings.output_device = name;
+                });
+            }
+            OutputChoice::Direct(id) => {
+                self.player
+                    .update(cx, |p, cx| p.set_direct_output(Some(id.clone()), cx));
+                self.session
+                    .update(cx, |s, _| s.settings.output_direct = Some(id));
+            }
+        }
+        self.persist(cx);
+        cx.notify();
     }
 
     /// Ask Navidrome to walk its music directories.
@@ -1162,6 +1652,21 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_replay_gain_tuning(
+        &mut self,
+        apply: impl FnOnce(&mut crate::config::Settings),
+        cx: &mut Context<Self>,
+    ) {
+        let tuning = self.session.update(cx, |s, _| {
+            apply(&mut s.settings);
+            RgTuning::from_settings(&s.settings)
+        });
+        self.player
+            .update(cx, |p, cx| p.set_replay_gain_tuning(tuning, cx));
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_fullscreen_bg(&mut self, mode: FullscreenBackground, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.fullscreen_bg = mode);
@@ -1207,6 +1712,14 @@ impl SettingsView {
     fn set_detailed_album_dates(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.detailed_album_dates = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Store one plain setting and repaint: the switches whose effect is read
+    /// straight off `Settings` by the views that use it.
+    fn set_flag(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut crate::config::Settings)) {
+        self.session.update(cx, |s, _| f(&mut s.settings));
         self.persist(cx);
         cx.notify();
     }
@@ -1257,6 +1770,15 @@ impl SettingsView {
             SettingsSwitch::AlbumPanelRight => s.album_panel_right,
             SettingsSwitch::HideAlbumStars => s.hide_album_stars,
             SettingsSwitch::DetailedAlbumDates => s.detailed_album_dates,
+            SettingsSwitch::AlbumInfoWikipedia => s.album_info_wikipedia,
+            SettingsSwitch::AlbumInfoMusicBrainz => s.album_info_musicbrainz,
+            SettingsSwitch::ServerAlbumNotes => s.server_album_notes,
+            SettingsSwitch::ServerArtistBios => s.server_artist_bios,
+            SettingsSwitch::ArtistInfoWikipedia => s.artist_info_wikipedia,
+            SettingsSwitch::ArtistInfoMusicBrainz => s.artist_info_musicbrainz,
+            SettingsSwitch::LyricsLibrary => s.lyrics_provider.uses_library(),
+            SettingsSwitch::LyricsOnline => s.lyrics_provider.uses_online(),
+            SettingsSwitch::LyricsOnlineFirst => s.lyrics_provider == LyricsProvider::OnlineFirst,
             SettingsSwitch::SelectionGlowVi => s.selection_glow_vi,
             SettingsSwitch::SelectionGlowHover => s.selection_glow_hover,
             SettingsSwitch::SelectionGlowAlbumColor => s.selection_glow_album_color,
@@ -1277,11 +1799,12 @@ impl SettingsView {
             SettingsSwitch::PrecacheArt => s.precache_art,
             SettingsSwitch::PreferSyncedLyrics => s.prefer_synced_lyrics,
             SettingsSwitch::ClassicAlbumCards => s.classic_album_cards,
+            SettingsSwitch::ReplayGainClipGuard => s.replay_gain_prevent_clipping,
         }
     }
 
-    /// A switch the UI would currently refuse to toggle (greyed out), so the
-    /// vi cursor lands on it but Enter/Space does nothing.
+    /// A switch waiting on another setting. `vi_switch` hides it (and so the
+    /// vi cursor never lands on it); Enter/Space refusing it is the backstop.
     fn switch_disabled(&self, which: SettingsSwitch, cx: &Context<Self>) -> bool {
         let s = &self.session.read(cx).settings;
         match which {
@@ -1297,6 +1820,17 @@ impl SettingsView {
             SettingsSwitch::PlayerBarTranslucent => s.player_bar_style != PlayerBarStyle::Floating,
             // Only the side-panel layout has two columns to swap.
             SettingsSwitch::AlbumPanelRight => !s.album_layout.wants_side_panel(),
+            SettingsSwitch::SelectionGlowAlbumColor => {
+                !(s.selection_glow_vi || s.selection_glow_hover)
+            }
+            SettingsSwitch::LyricsOnlineFirst | SettingsSwitch::PreferSyncedLyrics => {
+                !s.lyrics_provider.has_fallback()
+            }
+            // Nothing is being normalised, so there is no peak to hold under.
+            // A card opened directly plays at unity: nothing is normalised.
+            SettingsSwitch::ReplayGainClipGuard => {
+                s.replay_gain == ReplayGainMode::Off || s.output_direct.is_some()
+            }
             _ => false,
         }
     }
@@ -1318,6 +1852,36 @@ impl SettingsView {
             SettingsSwitch::AlbumPanelRight => self.set_album_panel_right(value, cx),
             SettingsSwitch::HideAlbumStars => self.set_hide_album_stars(value, cx),
             SettingsSwitch::DetailedAlbumDates => self.set_detailed_album_dates(value, cx),
+            SettingsSwitch::AlbumInfoWikipedia => {
+                self.set_flag(cx, |s| s.album_info_wikipedia = value)
+            }
+            SettingsSwitch::AlbumInfoMusicBrainz => {
+                self.set_flag(cx, |s| s.album_info_musicbrainz = value)
+            }
+            SettingsSwitch::ServerAlbumNotes => self.set_flag(cx, |s| s.server_album_notes = value),
+            SettingsSwitch::ServerArtistBios => self.set_flag(cx, |s| s.server_artist_bios = value),
+            SettingsSwitch::ArtistInfoWikipedia => {
+                self.set_flag(cx, |s| s.artist_info_wikipedia = value)
+            }
+            SettingsSwitch::ArtistInfoMusicBrainz => {
+                self.set_flag(cx, |s| s.artist_info_musicbrainz = value)
+            }
+            SettingsSwitch::LyricsLibrary => {
+                let current = self.session.read(cx).settings.lyrics_provider;
+                if let Some(next) = current.with_library(value) {
+                    self.set_lyrics_provider(next, cx);
+                }
+            }
+            SettingsSwitch::LyricsOnline => {
+                let current = self.session.read(cx).settings.lyrics_provider;
+                if let Some(next) = current.with_online(value) {
+                    self.set_lyrics_provider(next, cx);
+                }
+            }
+            SettingsSwitch::LyricsOnlineFirst => {
+                let current = self.session.read(cx).settings.lyrics_provider;
+                self.set_lyrics_provider(current.with_online_first(value), cx);
+            }
             SettingsSwitch::SelectionGlowVi => self.set_selection_glow_vi(value, cx),
             SettingsSwitch::SelectionGlowHover => self.set_selection_glow_hover(value, cx),
             SettingsSwitch::SelectionGlowAlbumColor => {
@@ -1340,6 +1904,9 @@ impl SettingsView {
             SettingsSwitch::PrecacheArt => self.set_precache_art(value, cx),
             SettingsSwitch::PreferSyncedLyrics => self.set_prefer_synced_lyrics(value, cx),
             SettingsSwitch::ClassicAlbumCards => self.set_classic_album_cards(value, cx),
+            SettingsSwitch::ReplayGainClipGuard => {
+                self.set_replay_gain_tuning(|s| s.replay_gain_prevent_clipping = value, cx)
+            }
         }
     }
 
@@ -1356,6 +1923,10 @@ impl SettingsView {
             SettingsButton::AlbumLayout(l) => self.set_album_layout(l, cx),
             SettingsButton::PlayerBarStyle(s) => self.set_player_bar_style(s, cx),
             SettingsButton::ReplayGain(m) => self.set_replay_gain(m, cx),
+            SettingsButton::Preamp(db) => {
+                self.set_replay_gain_tuning(|s| s.replay_gain_preamp = f32::from(db), cx)
+            }
+            SettingsButton::RefreshDevices => self.refresh_devices(cx),
             SettingsButton::QueueEnd(m) => self.set_queue_end(m, cx),
             SettingsButton::Repeat(m) => self.set_default_repeat(m, cx),
             SettingsButton::DefaultPage(p) => self.set_default_page(p, cx),
@@ -1369,9 +1940,93 @@ impl SettingsView {
             SettingsButton::RebuildCache => self.rebuild_cache(cx),
             SettingsButton::AddLocalDir => self.add_local_dir(window, cx),
             SettingsButton::RemoveLocalDir(i) => self.remove_local_dir(i, cx),
+            SettingsButton::ClearCache(cache) => self.clear_online_cache(cache, cx),
             SettingsButton::CopyVersion => self.copy_version(cx),
+            SettingsButton::OpenLink(link) => cx.open_url(&link.url()),
             SettingsButton::SignOut => self.sign_out(cx),
         }
+    }
+
+    /// Ask the server where it forwards scrobbles, once there is a server to
+    /// ask. Called from `render` as well, for a page opened before connecting.
+    fn maybe_check_forwarding(&mut self, cx: &mut Context<Self>) {
+        if self.forwarding != Forwarding::Unasked {
+            return;
+        }
+        let Some(client) = self.session.read(cx).client.clone() else {
+            return;
+        };
+        if !client.is_secure_transport() {
+            self.forwarding = Forwarding::Insecure;
+            return;
+        }
+        self.forwarding = Forwarding::Checking;
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client
+                    .scrobble_forwarding()
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.forwarding = match result {
+                    Ok(Some(f)) => Forwarding::Known(f),
+                    Ok(None) => Forwarding::Unsupported,
+                    Err(error) => {
+                        tracing::warn!("asking the server where it scrobbles: {error:#}");
+                        Forwarding::Failed
+                    }
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Count what each online cache holds, off the UI thread.
+    fn count_online_caches(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let counts = runtime::spawn_blocking_io(|| {
+                Ok(OnlineCache::ALL.map(|cache| {
+                    cache
+                        .dir()
+                        .map(|dir| count_cache_entries(&dir))
+                        .unwrap_or(0)
+                }))
+            })
+            .await;
+            if let Ok([album_info, artist_info, lyrics]) = counts {
+                let _ = this.update(cx, |this, cx| {
+                    this.album_info_cached = Some(album_info);
+                    this.artist_info_cached = Some(artist_info);
+                    this.lyrics_cached = Some(lyrics);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Forget every answer one service has given, misses included, so the
+    /// next lookup asks again. Only the service's own cache directory goes;
+    /// nothing else under the cache root is touched.
+    fn clear_online_cache(&mut self, cache: OnlineCache, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let cleared = runtime::spawn_blocking_io(move || {
+                let dir = cache.dir()?;
+                match std::fs::remove_dir_all(&dir) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                    _ => Ok(()),
+                }
+            })
+            .await;
+            if let Err(error) = cleared {
+                tracing::warn!("clearing {cache:?} cache: {error:#}");
+            }
+            let _ = this.update(cx, |this, cx| this.count_online_caches(cx));
+        })
+        .detach();
     }
 
     /// Put the version line on the clipboard, and say so on the button for
@@ -1450,11 +2105,45 @@ impl SettingsView {
         disabled: bool,
         label: &'static str,
         cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        // A switch waiting on another setting is hidden rather than greyed
+        // out, and registers nothing for the vi cursor — it comes back once
+        // the setting it depends on is turned on. `hidden()` rather than no
+        // element, so the card's gap goes with it (see `note`).
+        if disabled {
+            return div().hidden().into_any_element();
+        }
+        self.vi_switch_with(which, id, checked, false, Some(label), cx)
+            .into_any_element()
+    }
+
+    /// A switch with no label of its own, for a row that names what it
+    /// switches elsewhere (a service in a Connections list).
+    fn vi_toggle(
+        &mut self,
+        which: SettingsSwitch,
+        id: &'static str,
+        checked: bool,
+        disabled: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        self.vi_switch_with(which, id, checked, disabled, None, cx)
+            .into_any_element()
+    }
+
+    fn vi_switch_with(
+        &mut self,
+        which: SettingsSwitch,
+        id: &'static str,
+        checked: bool,
+        disabled: bool,
+        label: Option<&'static str>,
+        cx: &Context<Self>,
     ) -> impl IntoElement {
         let control = Switch::new(id)
             .checked(checked)
             .disabled(disabled)
-            .label(label)
+            .when_some(label, |this, label| this.label(label))
             .on_click(cx.listener(move |this, &checked, window, cx| {
                 this.dispatch_switch(which, checked, window, cx)
             }));
@@ -1681,20 +2370,20 @@ impl SettingsView {
                 };
                 self.set_font_size(UiFontSize::new(next), cx);
             }
+            SettingsAction::OutputDevice => {
+                let options = self.output_options(cx);
+                let current = self.output_choice(cx);
+                let at = options.iter().position(|o| o.choice == current);
+                let next = at.map_or(0, |i| (i + 1) % options.len().max(1));
+                if let Some(option) = options.get(next) {
+                    self.set_output(option.choice.clone(), cx);
+                }
+            }
             SettingsAction::UiScale => {
                 let current = self.session.read(cx).settings.ui_scale;
                 let at = UiScale::ALL.iter().position(|s| *s == current).unwrap_or(0);
                 let next = UiScale::ALL[(at + 1) % UiScale::ALL.len()];
                 self.set_ui_scale(next, cx);
-            }
-            SettingsAction::LyricsProvider => {
-                let current = self.session.read(cx).settings.lyrics_provider;
-                let at = LyricsProvider::ALL
-                    .iter()
-                    .position(|p| *p == current)
-                    .unwrap_or(0);
-                let next = LyricsProvider::ALL[(at + 1) % LyricsProvider::ALL.len()];
-                self.set_lyrics_provider(next, cx);
             }
             SettingsAction::DirInput => {
                 self.dir_input.update(cx, |s, cx| s.focus(window, cx));
@@ -1739,6 +2428,15 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// A caption belonging to a control that is only drawn while `shown` —
+    /// see `vi_switch`, which hides a switch waiting on another setting.
+    fn note_if(&self, shown: bool, text: &str, cx: &Context<Self>) -> gpui::AnyElement {
+        if !shown {
+            return div().hidden().into_any_element();
+        }
+        self.note(text, cx)
+    }
+
     /// Bold group subheading inside a section card.
     fn subheading(&self, text: &str, cx: &Context<Self>) -> gpui::AnyElement {
         div()
@@ -1746,6 +2444,141 @@ impl SettingsView {
             .font_semibold()
             .text_color(cx.theme().foreground)
             .child(text.to_string())
+            .into_any_element()
+    }
+
+    /// A subheading carrying its group's captions. The scrolling column draws
+    /// them as `note`s where they belong; the compact grid hides those, so here
+    /// they move into an info icon's hover card instead of being lost.
+    fn subheading_with_notes(
+        &self,
+        text: &'static str,
+        notes: &'static [&'static str],
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(self.subheading(text, cx))
+            .when(self.compact, |row| row.child(info_hint(text, notes, cx)))
+            .into_any_element()
+    }
+
+    /// One feature's services on the Connections card, as a boxed list: each
+    /// service's mark and name, how it is reached (a server icon for what
+    /// Navidrome fetches, a globe and the host for what the app asks itself)
+    /// and where it stands. A service the feature is not using dims, so which
+    /// of them a switch turns off is read off the list rather than a caption.
+    fn service_list(&self, services: Vec<Service>, cx: &Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let row = |s: Service| {
+            let route = match s.route {
+                Route::Server => app_icon(icons::SERVER),
+                Route::Direct => gpui_component::Icon::new(gpui_component::IconName::Globe),
+            };
+            // Only the description dims: a dimmed switch reads as disabled,
+            // and it is the one thing on the row still waiting to be used.
+            let body = h_flex()
+                .min_w_0()
+                .flex_1()
+                .gap_2p5()
+                .items_center()
+                .when(!s.lit, |this| this.opacity(0.4))
+                .child(s.mark.small().flex_none().text_color(cx.theme().foreground))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .child(div().text_sm().child(s.name))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(route.xsmall().flex_none().text_color(muted))
+                                .child(
+                                    // Truncated in a narrow column; the hover
+                                    // card has the rest.
+                                    div()
+                                        .id(gpui::SharedString::from(format!(
+                                            "svc-{}-{}",
+                                            s.name, s.detail
+                                        )))
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .truncate()
+                                        .child(s.detail)
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(s.detail).build(window, cx)
+                                        }),
+                                ),
+                        ),
+                )
+                .children(s.status.map(|(text, dot)| {
+                    h_flex()
+                        .flex_none()
+                        .gap_1p5()
+                        .items_center()
+                        .child(div().size(px(7.)).rounded_full().bg(dot))
+                        .child(div().text_xs().text_color(muted).child(text))
+                }));
+            let head = h_flex()
+                .w_full()
+                .gap_3()
+                .items_center()
+                .child(body)
+                .children(s.switch);
+            v_flex().w_full().gap_2().child(head).children(s.extra)
+        };
+        v_flex()
+            .w_full()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .children(services.into_iter().map(row))
+            .into_any_element()
+    }
+
+    /// A service's cached answers and the button that forgets them.
+    fn cache_row(
+        &mut self,
+        cache: OnlineCache,
+        count: Option<usize>,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let id = match cache {
+            OnlineCache::AlbumInfo => "clear-album-info-cache",
+            OnlineCache::ArtistInfo => "clear-artist-info-cache",
+            OnlineCache::Lyrics => "clear-lyrics-cache",
+        };
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(count.map_or_else(|| "Counting…".to_string(), cache_entries_label)),
+            )
+            .child(
+                self.vi_control(
+                    SettingsAction::Button(SettingsButton::ClearCache(cache)),
+                    Button::new(id)
+                        .outline()
+                        .small()
+                        .label("Clear cache")
+                        .disabled(count == Some(0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.clear_online_cache(cache, cx);
+                        })),
+                    cx,
+                ),
+            )
             .into_any_element()
     }
 
@@ -1762,9 +2595,20 @@ impl SettingsView {
     /// `ScrollHandle::bounds_for_item` to measure them, which is what tells the
     /// pills where each section sits.
     fn section(&mut self, title: &'static str, cx: &Context<Self>) -> gpui::Div {
+        self.section_with_notes(title, &[], cx)
+    }
+
+    /// `section`, with the card's own captions behind an info icon beside its
+    /// title in the compact grid — see `subheading_with_notes`.
+    fn section_with_notes(
+        &mut self,
+        title: &'static str,
+        notes: &'static [&'static str],
+        cx: &Context<Self>,
+    ) -> gpui::Div {
         let index = self.section_starts.len();
         debug_assert_eq!(
-            COMPACT_SECTIONS.get(index).map(|(t, _)| *t),
+            self.section_titles.get(index).copied(),
             Some(title),
             "section {index} is {title}, but COMPACT_SECTIONS says otherwise — \
              the compact grid's weights are keyed by document order"
@@ -1795,8 +2639,44 @@ impl SettingsView {
             .border_1()
             .border_color(gpui::hsla(0., 0., 0.5, 0.15))
             .bg(cx.theme().sidebar)
-            .child(div().text_sm().font_medium().child(title))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(div().text_sm().font_medium().child(title))
+                    .when(self.compact && !notes.is_empty(), |row| {
+                        row.child(info_hint(title, notes, cx))
+                    }),
+            )
     }
+}
+
+/// A muted info icon whose hover card holds `notes`, one paragraph each —
+/// the captions the compact grid has no room to draw.
+fn info_hint(
+    id: &'static str,
+    notes: &'static [&'static str],
+    cx: &Context<SettingsView>,
+) -> gpui::AnyElement {
+    div()
+        .id(gpui::SharedString::from(format!("info-{id}")))
+        .flex_none()
+        .cursor_default()
+        .text_color(cx.theme().muted_foreground)
+        .hover(|s| s.text_color(cx.theme().foreground))
+        .child(gpui_component::Icon::new(gpui_component::IconName::Info).xsmall())
+        .tooltip(move |window, cx| {
+            Tooltip::element(move |_, _| {
+                v_flex()
+                    .w(px(300.))
+                    .py_1()
+                    .gap_2()
+                    .text_xs()
+                    .children(notes.iter().map(|n| div().child(*n)))
+            })
+            .build(window, cx)
+        })
+        .into_any_element()
 }
 
 impl Render for SettingsView {
@@ -1899,6 +2779,19 @@ impl Render for SettingsView {
         let album_panel_right = self.session.read(cx).settings.album_panel_right;
         let hide_album_stars = self.session.read(cx).settings.hide_album_stars;
         let detailed_album_dates = self.session.read(cx).settings.detailed_album_dates;
+        let (album_wikipedia, album_musicbrainz, album_notes, artist_bios) = {
+            let s = &self.session.read(cx).settings;
+            (
+                s.album_info_wikipedia,
+                s.album_info_musicbrainz,
+                s.server_album_notes,
+                s.server_artist_bios,
+            )
+        };
+        let (artist_wikipedia, artist_musicbrainz) = {
+            let s = &self.session.read(cx).settings;
+            (s.artist_info_wikipedia, s.artist_info_musicbrainz)
+        };
         let resume_playback = self.session.read(cx).settings.resume_playback;
         let listenbrainz_enabled = self.session.read(cx).settings.listenbrainz_enabled;
         let local_music_dirs = self.session.read(cx).settings.local_music_dirs.clone();
@@ -1918,7 +2811,6 @@ impl Render for SettingsView {
         let precache_state = self.jobs.read(cx).precache.clone();
         let lyrics_provider = self.session.read(cx).settings.lyrics_provider;
         let prefer_synced_lyrics = self.session.read(cx).settings.prefer_synced_lyrics;
-        let lyrics_menu_view = cx.entity();
 
         // Rebuilt from scratch each render: `section` re-registers every card
         // it opens, in the order they are laid out.
@@ -1926,18 +2818,17 @@ impl Render for SettingsView {
 
         // The grid is planned before a single card is built: each one is laid
         // out at its column's width, and `section` reads that as it goes.
-        // Account is the only section that can be absent, and it is last in
-        // `COMPACT_SECTIONS`, so the present sections are a prefix of it.
+        // Account is the only section that can be absent; the plan indexes
+        // the sections that are present (`present_sections`).
         //
         // The plan is also the decision: a window that can hold the whole page
         // at once gets it, and one that cannot gets the scrolling column with
         // its captions back. There is no setting — the page is one or the other
         // depending on the window it is in.
-        let present = COMPACT_SECTIONS.len() - usize::from(account.is_none());
-        let weights: Vec<u16> = COMPACT_SECTIONS[..present]
-            .iter()
-            .map(|(_, w)| *w)
-            .collect();
+        let sections = present_sections(account.is_some());
+        let present = sections.len();
+        let weights: Vec<u16> = sections.iter().map(|(_, w)| *w).collect();
+        self.section_titles = sections.iter().map(|(t, _)| *t).collect();
         // The floating player bar is drawn *over* the content area rather than
         // beside it, so the bottom of the scroll body is behind the card. A
         // page that scrolls can run out under it, but the grid is planned to
@@ -2064,11 +2955,6 @@ impl Render for SettingsView {
                 "Use in-app title bar",
                 cx,
             ))
-            .child(self.note(
-                "Disable to use your desktop environment's native window \
-                 decorations (recommended on some Linux setups).",
-                cx,
-            ))
             .child(self.vi_switch(
                 SettingsSwitch::MinimalTitlebar,
                 "minimal-titlebar",
@@ -2077,10 +2963,11 @@ impl Render for SettingsView {
                 "Minimal title bar",
                 cx,
             ))
-            .child(self.note(
+            .child(self.note_if(
+                client_titlebar,
                 "Drops the app name and the separator and paints the bar \
                  in the window background, leaving only the window \
-                 controls. Needs the in-app title bar.",
+                 controls.",
                 cx,
             ))
             .child(self.vi_switch(
@@ -2236,11 +3123,6 @@ impl Render for SettingsView {
                 "Reduce motion",
                 cx,
             ))
-            .child(self.note(
-                "Panels, dialogs and the overlay appear in place instead of \
-                 sliding and fading in.",
-                cx,
-            ))
             .child(self.subheading("Selection", cx))
             .child(self.vi_switch(
                 SettingsSwitch::SelectionGlowVi,
@@ -2344,7 +3226,8 @@ impl Render for SettingsView {
                 "Album pages tint from their own cover",
                 cx,
             ))
-            .child(self.note(
+            .child(self.note_if(
+                theme == ThemePref::Adaptive,
                 "An album page takes its colour from the album \
                  you're looking at. The sidebar, player and \
                  fullscreen keep the playing track's.",
@@ -2453,8 +3336,8 @@ impl Render for SettingsView {
             );
 
         // Player bar: how the bar looks, then what it carries. The two
-        // switches that only apply to one style follow the style itself, so a
-        // disabled switch is read right under the button that enables it.
+        // switches that only apply to one style follow the style itself, so
+        // one appearing turns up right under the button that brought it.
         let player_bar_section = self
             .section("Player bar", cx)
             .child(self.subheading("Style", cx))
@@ -2490,7 +3373,8 @@ impl Render for SettingsView {
                 "See-through floating player bar",
                 cx,
             ))
-            .child(self.note(
+            .child(self.note_if(
+                !translucent_disabled,
                 "Lets the page show through the floating card. Off is the \
                  solid card, which stays readable over cover art.",
                 cx,
@@ -2503,7 +3387,8 @@ impl Render for SettingsView {
                 "Cover tint behind player bar",
                 cx,
             ))
-            .child(self.note(
+            .child(self.note_if(
+                !tint_disabled,
                 "The Adaptive theme washes the player bar with the playing \
                  track's colour. Turn it off for the plain panel background — \
                  the accent stays on the buttons, sliders and seek bar.",
@@ -2557,7 +3442,201 @@ impl Render for SettingsView {
                 cx,
             ));
 
-        // Playback: what happens to the audio and to the queue.
+        // Audio: where the sound goes and how loud it is.
+        let chosen = self.output_choice(cx);
+        let direct_chosen = matches!(chosen, OutputChoice::Direct(_));
+        let (preamp, clip_guard) = {
+            let s = &self.session.read(cx).settings;
+            (s.replay_gain_preamp, s.replay_gain_prevent_clipping)
+        };
+        let clip_guard_disabled = self.switch_disabled(SettingsSwitch::ReplayGainClipGuard, cx);
+        let options = self.output_options(cx);
+        let trigger_label = options
+            .iter()
+            .find(|o| o.choice == chosen)
+            .map(|o| o.label.clone())
+            .unwrap_or_else(|| "System default".to_string());
+        // Opened before its controls: `section` records where its first vi
+        // control lands.
+        let audio_section = self
+            .section("Audio", cx)
+            .child(self.subheading("Output device", cx));
+        let output_menu_view = cx.entity();
+        let menu_options = options.clone();
+        let listing = self.devices.is_none();
+        let output_dropdown = self.vi_control(
+            SettingsAction::OutputDevice,
+            Button::new("output-device")
+                .label(trigger_label)
+                .dropdown_caret(true)
+                .outline()
+                .small()
+                .h(px(32.))
+                .text_size(px(14.))
+                .dropdown_menu(move |menu, _window, _cx| {
+                    let mut menu = menu.max_h(px(FONT_SIZE_MENU_MAX_H)).scrollable(true);
+                    let mut group = None;
+                    for option in &menu_options {
+                        if group != Some(option.group) {
+                            if group.is_some() {
+                                menu = menu.separator();
+                            }
+                            group = Some(option.group);
+                            menu = menu.label(option.group.title());
+                        }
+                        let view = output_menu_view.clone();
+                        let choice = option.choice.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(option.label.clone())
+                                .checked(option.choice == chosen)
+                                .on_click(move |_, _, cx: &mut gpui::App| {
+                                    view.update(cx, |settings, cx| {
+                                        settings.set_output(choice.clone(), cx);
+                                    });
+                                }),
+                        );
+                    }
+                    if listing {
+                        menu = menu.label("Looking for devices…");
+                    }
+                    menu
+                }),
+            cx,
+        );
+        let refresh = self
+            .label_btn(
+                SettingsButton::RefreshDevices,
+                "refresh-devices",
+                "Refresh",
+                false,
+                cx,
+            )
+            .into_any_element();
+        let status = {
+            let p = self.player.read(cx);
+            match (&p.output_direct, &p.direct_error, &p.output_device) {
+                (Some(format), _, _) => format!("Direct: {format}"),
+                (None, Some(err), Some(d)) if direct_chosen => {
+                    format!("Direct output unavailable ({err}); playing through {d}")
+                }
+                (_, _, Some(d)) => format!("Output open on {d}"),
+                _ => "No output open yet".to_string(),
+            }
+        };
+        let rg_on = replay_gain != ReplayGainMode::Off && !direct_chosen;
+        let mut audio_section = audio_section
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(output_dropdown))
+                    .child(refresh),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status),
+            )
+            .child(self.note(
+                "System default follows the desktop's choice. A chosen device \
+                 that disconnects pauses playback until it comes back.",
+                cx,
+            ))
+            .child(self.note(DIRECT_OUTPUT_NOTE, cx));
+        // ReplayGain is a volume change, and a card opened directly takes the
+        // samples untouched — the whole group stands down until it is left.
+        if !direct_chosen {
+            audio_section = audio_section
+                .child(self.subheading("ReplayGain", cx))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(self.label_btn(
+                            SettingsButton::ReplayGain(ReplayGainMode::Off),
+                            "Off",
+                            "Off",
+                            replay_gain == ReplayGainMode::Off,
+                            cx,
+                        ))
+                        .child(self.label_btn(
+                            SettingsButton::ReplayGain(ReplayGainMode::Track),
+                            "Track",
+                            "Track",
+                            replay_gain == ReplayGainMode::Track,
+                            cx,
+                        ))
+                        .child(self.label_btn(
+                            SettingsButton::ReplayGain(ReplayGainMode::Album),
+                            "Album",
+                            "Album",
+                            replay_gain == ReplayGainMode::Album,
+                            cx,
+                        ))
+                        .child(self.label_btn(
+                            SettingsButton::ReplayGain(ReplayGainMode::Auto),
+                            "Auto",
+                            "Auto",
+                            replay_gain == ReplayGainMode::Auto,
+                            cx,
+                        )),
+                )
+                .child(self.note(
+                    "Evens out perceived volume using each file's ReplayGain tags. \
+                     Track normalizes every song; Album keeps an album's relative \
+                     loudness; Auto uses album gain when playing a whole album and \
+                     track gain otherwise. The player bar shows the applied gain \
+                     (and the auto-chosen mode).",
+                    cx,
+                ));
+        }
+        // The pre-amp only matters while something is being normalised —
+        // hidden rather than greyed out, like a dependent switch.
+        if rg_on {
+            let mut preamp_row = h_flex().gap_2().flex_wrap();
+            for db in [-6i8, -3, 0, 3, 6] {
+                let label = if db > 0 {
+                    format!("+{db} dB")
+                } else {
+                    format!("{db} dB")
+                };
+                preamp_row = preamp_row.child(self.label_btn(
+                    SettingsButton::Preamp(db),
+                    ("rg-preamp", (db + 6) as usize),
+                    label,
+                    (preamp - f32::from(db)).abs() < 0.05,
+                    cx,
+                ));
+            }
+            audio_section = audio_section
+                .child(self.subheading("Pre-amp", cx))
+                .child(preamp_row)
+                .child(self.note(
+                    "Added to every ReplayGain adjustment. Tags aim for a \
+                     fairly quiet reference level; a few dB brings normalised \
+                     tracks closer to everything else. Untagged tracks are \
+                     left alone.",
+                    cx,
+                ));
+        }
+        let audio_section = audio_section
+            .child(self.vi_switch(
+                SettingsSwitch::ReplayGainClipGuard,
+                "rg-clip-guard",
+                clip_guard,
+                clip_guard_disabled,
+                "Prevent clipping",
+                cx,
+            ))
+            .child(self.note_if(
+                !clip_guard_disabled,
+                "Holds each boost under the track's peak so it never \
+                 distorts. Off lets quiet tracks with loud peaks reach the \
+                 full target.",
+                cx,
+            ));
+
+        // Playback: what happens to the queue.
         let playback_section = self
             .section("Playback", cx)
             .child(self.vi_switch(
@@ -2584,66 +3663,10 @@ impl Render for SettingsView {
                 "Scrobble plays to server",
                 cx,
             ))
-            .child(self.subheading("ListenBrainz", cx))
-            .child(self.vi_switch(
-                SettingsSwitch::ListenBrainz,
-                "listenbrainz",
-                listenbrainz_enabled,
-                false,
-                "Scrobble local plays to ListenBrainz",
-                cx,
-            ))
-            .child(self.vi_control(
-                SettingsAction::LbInput,
-                div().w_full().child(Input::new(&self.lb_input)),
-                cx,
-            ))
             .child(self.note(
-                "Server tracks keep using Navidrome, which can forward them to \
-                 ListenBrainz or Last.fm. Local files never reach the server, \
-                 so this sends them directly to api.listenbrainz.org with a \
-                 free API token.",
-                cx,
-            ))
-            .child(self.subheading("ReplayGain", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.label_btn(
-                        SettingsButton::ReplayGain(ReplayGainMode::Off),
-                        "Off",
-                        "Off",
-                        replay_gain == ReplayGainMode::Off,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::ReplayGain(ReplayGainMode::Track),
-                        "Track",
-                        "Track",
-                        replay_gain == ReplayGainMode::Track,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::ReplayGain(ReplayGainMode::Album),
-                        "Album",
-                        "Album",
-                        replay_gain == ReplayGainMode::Album,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::ReplayGain(ReplayGainMode::Auto),
-                        "Auto",
-                        "Auto",
-                        replay_gain == ReplayGainMode::Auto,
-                        cx,
-                    )),
-            )
-            .child(self.note(
-                "Evens out perceived volume using each file's ReplayGain tags. \
-                 Track normalizes every song; Album keeps an album's relative \
-                 loudness; Auto uses album gain when playing a whole album and \
-                 track gain otherwise. The player bar shows the applied gain \
-                 (and the auto-chosen mode).",
+                "Server tracks are scrobbled to Navidrome, which forwards them to \
+                 Last.fm or ListenBrainz if it is set up to. Local plays are \
+                 under Connections.",
                 cx,
             ))
             .child(self.subheading("When the queue ends", cx))
@@ -3036,7 +4059,6 @@ impl Render for SettingsView {
             ))
             .child(crate::ui::divider())
             .child(self.subheading("Local music", cx))
-            .child(self.note("Directories scanned for local music files", cx))
             .child(v_flex().gap_1().children(dir_rows))
             .child(
                 h_flex()
@@ -3129,125 +4151,314 @@ impl Render for SettingsView {
                         })
                         .child(msg),
                 )
-            })
-            .child(crate::ui::divider())
-            .child(self.subheading("Lyrics", cx))
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(div().text_sm().child("Source"))
-                    .child(
-                        self.vi_control(
-                            SettingsAction::LyricsProvider,
-                            Button::new("lyrics-provider")
-                                .label(lyrics_provider.label())
-                                .dropdown_caret(true)
-                                .outline()
-                                .small()
-                                .h(px(32.))
-                                .text_size(px(14.))
-                                .dropdown_menu(move |menu, _window, _cx| {
-                                    LyricsProvider::ALL
-                                        .into_iter()
-                                        .fold(menu, |menu, provider| {
-                                            let view = lyrics_menu_view.clone();
-                                            menu.item(
-                                                PopupMenuItem::new(provider.label())
-                                                    .checked(provider == lyrics_provider)
-                                                    .on_click(move |_, _, cx: &mut gpui::App| {
-                                                        view.update(cx, |settings, cx| {
-                                                            settings
-                                                                .set_lyrics_provider(provider, cx);
-                                                        });
-                                                    }),
-                                            )
-                                        })
-                                }),
-                            cx,
-                        ),
-                    ),
+            });
+
+        // Connections: every outside service the app's features rely on,
+        // grouped by the feature — what a service is *for* is the question a
+        // user arrives with, and one service can serve several (Last.fm is
+        // descriptions, bios and scrobbles). Inside each feature the list says
+        // how each is reached and whether it is in use, so "what does this app
+        // send where" still has one answer.
+        let lb_token = self.lb_input.read(cx).value().to_string();
+        self.maybe_check_forwarding(cx);
+        let offline = {
+            let session = self.session.read(cx);
+            server_offline(&session.status, session.settings.server.is_some())
+        };
+        let connected = offline.is_none();
+        let lb_server = server_scrobble_status(
+            &self.forwarding,
+            |f| f.listenbrainz,
+            offline,
+            scrobble_enabled,
+        );
+        let lastfm_server =
+            server_scrobble_status(&self.forwarding, |f| f.lastfm, offline, scrobble_enabled);
+        let lb_local = ConnectionState::listenbrainz(listenbrainz_enabled, &lb_token);
+        let album_info_cached = self.album_info_cached;
+        let artist_info_cached = self.artist_info_cached;
+        let lyrics_cached = self.lyrics_cached;
+        let live = |on: bool| {
+            if on {
+                cx.theme().success
+            } else {
+                cx.theme().muted_foreground.opacity(0.5)
+            }
+        };
+        // A row the server answers for says so only while it cannot: its
+        // switch covers the rest.
+        let server_note = offline.map(|why| (why, live(false)));
+        let library_on = lyrics_provider.uses_library();
+        let lrclib_on = lyrics_provider.uses_online();
+
+        let album_services = vec![
+            Service {
+                mark: app_icon(icons::BRAND_LASTFM),
+                name: "Last.fm",
+                route: Route::Server,
+                detail: "album notes",
+                status: server_note,
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::ServerAlbumNotes,
+                    "server-album-notes",
+                    album_notes,
+                    false,
+                    cx,
+                )),
+                lit: album_notes && connected,
+                extra: None,
+            },
+            Service {
+                mark: app_icon(icons::BRAND_WIKIPEDIA),
+                name: "Wikipedia",
+                route: Route::Direct,
+                detail: "wikipedia.org · wikidata.org",
+                status: None,
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::AlbumInfoWikipedia,
+                    "album-info-wikipedia",
+                    album_wikipedia,
+                    false,
+                    cx,
+                )),
+                lit: album_wikipedia,
+                extra: None,
+            },
+            Service {
+                mark: app_icon(icons::BRAND_MUSICBRAINZ),
+                name: "MusicBrainz",
+                route: Route::Direct,
+                detail: "musicbrainz.org · links to Discogs, AllMusic, Bandcamp",
+                status: None,
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::AlbumInfoMusicBrainz,
+                    "album-info-musicbrainz",
+                    album_musicbrainz,
+                    false,
+                    cx,
+                )),
+                lit: album_musicbrainz,
+                extra: None,
+            },
+        ];
+        let album_list = self.service_list(album_services, cx);
+        let album_cache = self.cache_row(OnlineCache::AlbumInfo, album_info_cached, cx);
+
+        let lyrics_services = vec![
+            Service {
+                mark: app_icon(icons::LIBRARY),
+                name: "Library",
+                route: Route::Server,
+                detail: "tags and .lrc files · local files read off disk",
+                status: None,
+                // The last source on cannot go off: the panel has no "no
+                // lyrics" setting to fall into.
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::LyricsLibrary,
+                    "lyrics-library",
+                    library_on,
+                    library_on && !lrclib_on,
+                    cx,
+                )),
+                lit: library_on,
+                extra: None,
+            },
+            Service {
+                mark: gpui_component::Icon::new(gpui_component::IconName::BookOpen),
+                name: "LRCLIB",
+                route: Route::Direct,
+                detail: "lrclib.net",
+                status: None,
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::LyricsOnline,
+                    "lyrics-online",
+                    lrclib_on,
+                    lrclib_on && !library_on,
+                    cx,
+                )),
+                lit: lrclib_on,
+                extra: None,
+            },
+        ];
+        let lyrics_list = self.service_list(lyrics_services, cx);
+        let lyrics_first = self
+            .vi_switch(
+                SettingsSwitch::LyricsOnlineFirst,
+                "lyrics-online-first",
+                lyrics_provider == LyricsProvider::OnlineFirst,
+                !lyrics_provider.has_fallback(),
+                "Ask LRCLIB first",
+                cx,
             )
-            .child(self.vi_switch(
+            .into_any_element();
+        let prefer_synced = self
+            .vi_switch(
                 SettingsSwitch::PreferSyncedLyrics,
                 "prefer-synced-lyrics",
                 prefer_synced_lyrics,
                 !lyrics_provider.has_fallback(),
                 "Prefer synced lyrics",
                 cx,
-            ))
-            .child(self.note(
-                "\"Library\" is a file's own words — its tags or a sidecar .lrc, \
-                 the server's copy for streamed tracks and read off disk for \
-                 local ones. \"LRCLIB\" looks the song up on lrclib.net, which \
-                 means sending it the track's artist, title, album and length; \
-                 it is only ever asked while the lyrics panel is open, and its \
-                 answers are cached on disk. Library only never contacts it at \
-                 all.",
-                cx,
-            ))
-            .child(self.note(
-                "Prefer synced lyrics lets the second source win when the first \
-                 has only untimed words: the words are usually the same and only \
-                 timed ones can be followed line by line. It costs one extra \
-                 lookup on those tracks, and needs a second source to be on.",
-                cx,
-            ));
-
-        // About: which build this is. Last but for Account, which is the one
-        // section that may be absent.
-        let copied = self.version_copied;
-        let about_section = self
-            .section("About", cx)
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_start()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child(format!("Scirè {}", env!("CARGO_PKG_VERSION"))),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .truncate()
-                                    .child(format!(
-                                        "{} · {}",
-                                        std::env::consts::OS,
-                                        std::env::consts::ARCH
-                                    )),
-                            ),
-                    )
-                    .child(
-                        self.vi_control(
-                            SettingsAction::Button(SettingsButton::CopyVersion),
-                            Button::new("copy-version")
-                                .outline()
-                                .small()
-                                .label(if copied { "Copied" } else { "Copy" })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.copy_version(cx);
-                                })),
-                            cx,
-                        ),
-                    ),
             )
-            .child(self.note(
-                "The version and platform, in the form a bug report wants. \
-                 Copy puts the same line on the clipboard.",
-                cx,
-            ));
+            .into_any_element();
+        let lyrics_cache = self.cache_row(OnlineCache::Lyrics, lyrics_cached, cx);
 
-        // Account (only when connected, so it stays the last section).
+        let lb_switch = self.vi_toggle(
+            SettingsSwitch::ListenBrainz,
+            "listenbrainz",
+            listenbrainz_enabled,
+            false,
+            cx,
+        );
+        // After the switch, so the vi cursor reaches the token right under
+        // the switch that brought it.
+        let lb_input = listenbrainz_enabled.then(|| {
+            self.vi_control(
+                SettingsAction::LbInput,
+                div().w_full().child(Input::new(&self.lb_input)),
+                cx,
+            )
+        });
+        let scrobble_services = vec![
+            Service {
+                mark: app_icon(icons::BRAND_LASTFM),
+                name: "Last.fm",
+                route: Route::Server,
+                detail: "server tracks",
+                status: Some((lastfm_server.0, live(lastfm_server.1))),
+                switch: None,
+                lit: lastfm_server.1,
+                extra: None,
+            },
+            Service {
+                mark: app_icon(icons::HEADPHONES),
+                name: "ListenBrainz",
+                route: Route::Server,
+                detail: "server tracks",
+                status: Some((lb_server.0, live(lb_server.1))),
+                switch: None,
+                lit: lb_server.1,
+                extra: None,
+            },
+            Service {
+                mark: app_icon(icons::HEADPHONES),
+                name: "ListenBrainz",
+                route: Route::Direct,
+                detail: "local files · api.listenbrainz.org",
+                status: (lb_local == ConnectionState::NeedsToken)
+                    .then(|| (lb_local.label(), lb_local.dot(cx))),
+                switch: Some(lb_switch),
+                lit: lb_local == ConnectionState::On,
+                extra: lb_input,
+            },
+        ];
+        let scrobble_list = self.service_list(scrobble_services, cx);
+
+        let bio_services = vec![
+            Service {
+                mark: app_icon(icons::BRAND_LASTFM),
+                name: "Last.fm",
+                route: Route::Server,
+                detail: "artist bios",
+                status: server_note,
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::ServerArtistBios,
+                    "server-artist-bios",
+                    artist_bios,
+                    false,
+                    cx,
+                )),
+                lit: artist_bios && connected,
+                extra: None,
+            },
+            Service {
+                mark: app_icon(icons::BRAND_WIKIPEDIA),
+                name: "Wikipedia",
+                route: Route::Direct,
+                detail: "wikipedia.org · wikidata.org",
+                status: None,
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::ArtistInfoWikipedia,
+                    "artist-info-wikipedia",
+                    artist_wikipedia,
+                    false,
+                    cx,
+                )),
+                lit: artist_wikipedia,
+                extra: None,
+            },
+            Service {
+                mark: app_icon(icons::BRAND_MUSICBRAINZ),
+                name: "MusicBrainz",
+                route: Route::Direct,
+                detail: "musicbrainz.org · links to the official site, Discogs, AllMusic, Bandcamp",
+                status: None,
+                switch: Some(self.vi_toggle(
+                    SettingsSwitch::ArtistInfoMusicBrainz,
+                    "artist-info-musicbrainz",
+                    artist_musicbrainz,
+                    false,
+                    cx,
+                )),
+                lit: artist_musicbrainz,
+                extra: None,
+            },
+        ];
+        let bio_list = self.service_list(bio_services, cx);
+        let artist_cache = self.cache_row(OnlineCache::ArtistInfo, artist_info_cached, cx);
+
+        // Each caption is drawn in place by the scrolling column and moved
+        // behind its heading's info icon by the compact grid, so both read
+        // the same text.
+        const INTRO: &[&str] = &[
+            "What each feature asks outside your library. Services marked \
+             with a server are reached by Navidrome; the rest are contacted by \
+             Scirè itself, and sent only what their feature says.",
+        ];
+        const ALBUM_NOTES: &[&str] =
+            &["Wikipedia and MusicBrainz are sent the album and artist name."];
+        const ARTIST_NOTES: &[&str] = &[
+            "Wikipedia and MusicBrainz are sent the artist's name, and to tell \
+             artists of one name apart, the titles of up to two of their albums.",
+        ];
+        const LYRICS_NOTES: &[&str] = &[
+            "LRCLIB is sent the track's artist, title, album and length, \
+             only while the lyrics panel is open. Prefer synced lyrics lets the \
+             second source win when the first has only untimed words.",
+        ];
+        const SCROBBLE_NOTES: &[&str] = &[
+            "Server tracks are scrobbled to Navidrome, which forwards them to the \
+             accounts linked under Personal in its own interface.",
+            "Local files never reach the server, so Scirè sends their plays \
+             itself: artist, title, album and length. Needs a free API token \
+             from your ListenBrainz profile.",
+        ];
+        let connections_section = self
+            .section_with_notes("Connections", INTRO, cx)
+            .child(self.note(INTRO[0], cx))
+            .child(self.subheading_with_notes("Album descriptions", ALBUM_NOTES, cx))
+            .child(album_list)
+            .child(self.note(ALBUM_NOTES[0], cx))
+            .child(album_cache)
+            .child(crate::ui::divider())
+            .child(self.subheading_with_notes("Lyrics", LYRICS_NOTES, cx))
+            .child(lyrics_list)
+            .child(lyrics_first)
+            .child(prefer_synced)
+            .child(self.note(LYRICS_NOTES[0], cx))
+            .child(lyrics_cache)
+            .child(crate::ui::divider())
+            .child(self.subheading_with_notes("Scrobbling", SCROBBLE_NOTES, cx))
+            .child(scrobble_list)
+            .child(self.note(SCROBBLE_NOTES[0], cx))
+            .child(self.note(SCROBBLE_NOTES[1], cx))
+            .child(crate::ui::divider())
+            .child(self.subheading_with_notes("Artist bios", ARTIST_NOTES, cx))
+            .child(bio_list)
+            .child(self.note(ARTIST_NOTES[0], cx))
+            .child(artist_cache);
+
+        // Account (only when connected).
         let account_section = account.map(|(url, user)| {
             self.section("Account", cx)
                 .child(
@@ -3284,6 +4495,75 @@ impl Render for SettingsView {
                 .into_any_element()
         });
 
+        // About: which build this is. Last, under Account.
+        let copied = self.version_copied;
+        let about_section = self
+            .section("About", cx)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(format!("Scirè {}", env!("CARGO_PKG_VERSION"))),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(format!(
+                                        "{} · {} · {} License",
+                                        std::env::consts::OS,
+                                        std::env::consts::ARCH,
+                                        env!("CARGO_PKG_LICENSE"),
+                                    )),
+                            ),
+                    )
+                    .child(
+                        self.vi_control(
+                            SettingsAction::Button(SettingsButton::CopyVersion),
+                            Button::new("copy-version")
+                                .outline()
+                                .small()
+                                .label(if copied { "Copied" } else { "Copy" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.copy_version(cx);
+                                })),
+                            cx,
+                        ),
+                    ),
+            )
+            .child(self.note(
+                "A desktop music client for Navidrome and the music on \
+                         your disk. Built with GPUI and gpui-component.",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .children(AboutLink::ALL.map(|link| {
+                        self.vi_control(
+                            SettingsAction::Button(SettingsButton::OpenLink(link)),
+                            Button::new(link.id())
+                                .outline()
+                                .small()
+                                .icon(link.icon())
+                                .label(link.label())
+                                .tooltip(link.url())
+                                .on_click(move |_, _, cx| cx.open_url(&link.url())),
+                            cx,
+                        )
+                    })),
+            );
+
         // The sections in document order, which is what both layouts and the
         // compact plan index by. `Option` so a column can take its own out
         // without cloning an element.
@@ -3293,13 +4573,15 @@ impl Render for SettingsView {
             Some(album_pages_section.into_any_element()),
             Some(fullscreen_section.into_any_element()),
             Some(player_bar_section.into_any_element()),
+            Some(audio_section.into_any_element()),
             Some(playback_section.into_any_element()),
             Some(browsing_section.into_any_element()),
             Some(streaming_section.into_any_element()),
             Some(library_section.into_any_element()),
-            Some(about_section.into_any_element()),
+            Some(connections_section.into_any_element()),
         ];
         cards.extend(account_section.map(Some));
+        cards.push(Some(about_section.into_any_element()));
 
         // Quick-nav pills, built from the sections that were actually
         // registered above — the filled one is whatever the page is scrolled
@@ -3505,6 +4787,15 @@ mod tests {
     }
 
     #[test]
+    fn the_about_links_all_point_into_the_repository() {
+        let repo = env!("CARGO_PKG_REPOSITORY");
+        assert!(repo.starts_with("https://github.com/"), "{repo}");
+        for link in super::AboutLink::ALL {
+            assert!(link.url().starts_with(repo), "{link:?}: {}", link.url());
+        }
+    }
+
+    #[test]
     fn a_roomy_page_caps_the_card_and_a_tight_one_shrinks_it() {
         assert_eq!(section_width(3000.), Some(SECTION_MAX_W));
         // 672 = the cap plus the body's padding: the first width that fills it.
@@ -3537,6 +4828,74 @@ mod tests {
         assert_eq!(section_for_scroll(&[], VIEWPORT_TOP, 0., 0.), 0);
     }
 
+    #[test]
+    fn listenbrainz_without_a_token_is_not_on() {
+        use ConnectionState::*;
+        assert_eq!(ConnectionState::listenbrainz(false, "abc"), Off);
+        assert_eq!(ConnectionState::listenbrainz(true, "  "), NeedsToken);
+        assert_eq!(ConnectionState::listenbrainz(true, "abc"), On);
+    }
+
+    #[test]
+    fn server_scrobbling_needs_the_link_and_the_apps_own_switch() {
+        use subsonic::{ScrobbleForwarding, ScrobbleLink};
+        let known = |lb| {
+            Forwarding::Known(ScrobbleForwarding {
+                lastfm: ScrobbleLink::Disabled,
+                listenbrainz: lb,
+            })
+        };
+        let lb = |f: &ScrobbleForwarding| f.listenbrainz;
+        let live = |fwd, connected: bool, on| {
+            server_scrobble_status(&fwd, lb, (!connected).then_some("No server"), on).1
+        };
+        assert!(live(known(ScrobbleLink::Linked), true, true));
+        // Linked on the server, but the app never tells the server a play.
+        assert!(!live(known(ScrobbleLink::Linked), true, false));
+        assert!(!live(known(ScrobbleLink::NotLinked), true, true));
+        assert!(!live(known(ScrobbleLink::Disabled), true, true));
+        // Nothing learned from a server that is not there any more.
+        assert!(!live(known(ScrobbleLink::Linked), false, true));
+        for unknown in [
+            Forwarding::Checking,
+            Forwarding::Unsupported,
+            Forwarding::Insecure,
+            Forwarding::Failed,
+        ] {
+            assert!(!live(unknown, true, true));
+        }
+    }
+
+    #[test]
+    fn a_server_not_answering_yet_is_not_no_server() {
+        assert_eq!(server_offline(&ConnectionStatus::Connected, true), None);
+        assert_eq!(
+            server_offline(&ConnectionStatus::Connecting, true),
+            Some("Connecting…")
+        );
+        let failed = ConnectionStatus::Failed("timed out".into());
+        assert_eq!(server_offline(&failed, true), Some("Unreachable"));
+        assert_eq!(server_offline(&failed, false), Some("No server"));
+        assert_eq!(
+            server_offline(&ConnectionStatus::Disconnected, false),
+            Some("No server")
+        );
+    }
+
+    #[test]
+    fn cache_count_is_the_cached_answers_only() {
+        let dir = std::env::temp_dir().join(format!("scire-conn-cache-{}", std::process::id()));
+        // Never looked anything up: an empty cache, not an error.
+        assert_eq!(count_cache_entries(&dir), 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), "{}").unwrap();
+        std::fs::write(dir.join("b.json"), "{}").unwrap();
+        // A write still in flight is not an answer.
+        std::fs::write(dir.join("c.json.part"), "").unwrap();
+        assert_eq!(count_cache_entries(&dir), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every section present, i.e. signed in.
     fn weights() -> Vec<u16> {
         COMPACT_SECTIONS.iter().map(|(_, w)| *w).collect()
@@ -3556,8 +4915,9 @@ mod tests {
 
     /// A content area tall enough for a roomy compact grid.
     const TALL: f32 = 1800.;
-    /// Short, but tall enough for the expanded Playback card in four columns.
-    const SHORT: f32 = 1100.;
+    /// Short, but tall enough for four columns — the tallest being
+    /// Connections with Account and About under it.
+    const SHORT: f32 = 1250.;
 
     #[test]
     fn the_grid_places_every_section_in_page_order() {
@@ -3574,9 +4934,46 @@ mod tests {
             );
         }
         // Signed out, the Account card is absent and the rest still fit.
-        let signed_out = COMPACT_SECTIONS.len() - 1;
-        let grid = compact_grid(&weights()[..signed_out], 1200., TALL);
-        assert_eq!(placed(&grid), (0..signed_out).collect::<Vec<_>>());
+        let signed_out: Vec<u16> = present_sections(false).iter().map(|(_, w)| *w).collect();
+        assert_eq!(signed_out.len(), COMPACT_SECTIONS.len() - 1);
+        let grid = compact_grid(&signed_out, 1200., TALL);
+        assert_eq!(placed(&grid), (0..signed_out.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn signing_out_drops_only_account() {
+        let titles: Vec<&str> = present_sections(false).iter().map(|(t, _)| *t).collect();
+        assert!(!titles.contains(&"Account"));
+        assert_eq!(titles.last(), Some(&"About"));
+    }
+
+    #[test]
+    fn the_slack_goes_to_the_shortest_column_not_the_last() {
+        // Too short for four columns, so five: Connections stands alone and
+        // Account and About share the last column, rather than Account filling
+        // Connections' column and leaving About on its own.
+        let w = weights();
+        let grid = compact_grid(&w, 2600., 1180.);
+        assert_eq!(grid.len(), 5);
+        let titles: Vec<&str> = grid[4]
+            .sections
+            .iter()
+            .map(|&i| COMPACT_SECTIONS[i].0)
+            .collect();
+        assert_eq!(titles, ["Account", "About"]);
+        assert_eq!(grid[3].sections.len(), 1);
+    }
+
+    #[test]
+    fn split_runs_balances_under_the_cap() {
+        // A greedy fill would cut [4, 1] + [1]; both keep the tallest at 5,
+        // and [4] + [1, 1] leaves the short column less short.
+        assert_eq!(split_runs(&[4., 1., 1.], 2), vec![vec![0], vec![1, 2]]);
+        // Every run non-empty even where fewer would fit under the cap.
+        assert_eq!(
+            split_runs(&[1., 1., 1.], 3),
+            vec![vec![0], vec![1], vec![2]]
+        );
     }
 
     #[test]
@@ -3680,7 +5077,7 @@ mod tests {
         for (body, height) in [
             (1000., 4000.),
             (1200., TALL),
-            (1600., 1200.),
+            (1600., SHORT),
             (2600., SHORT),
         ] {
             let grid = compact_grid(&weights(), body, height);
@@ -3718,7 +5115,12 @@ mod tests {
         // column is the one carrying more. Where the split is already even the
         // nudge is either nothing or below the label floor, and the widths come
         // back even by design — that is `columns_never_go_under_the_label_floor`.
-        let grid = compact_grid(&weights(), 1000., 4000.);
+        //
+        // A fixed table rather than `weights()`: whether the live one splits
+        // evenly is an accident of what the page holds today, and this is
+        // about what the nudge does to a split that is not even.
+        let uneven = [4, 14, 9, 7, 11, 14, 16, 5, 16, 3, 3];
+        let grid = compact_grid(&uneven, 1000., 4000.);
         let widths: Vec<f32> = grid.iter().map(|c| c.width).collect();
         let min = widths.iter().copied().fold(f32::MAX, f32::min);
         let max = widths.iter().copied().fold(0., f32::max);

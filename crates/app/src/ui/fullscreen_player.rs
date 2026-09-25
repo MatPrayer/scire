@@ -3810,7 +3810,17 @@ impl Render for FullscreenPlayer {
                                                 .flex()
                                                 .items_center()
                                                 .justify_center()
-                                                .child(Slider::new(&self.volume).vertical()),
+                                                .child(
+                                                    Slider::new(&self.volume)
+                                                        .vertical()
+                                                        // Unity on a card opened directly.
+                                                        .disabled(
+                                                            self.player
+                                                                .read(cx)
+                                                                .output_direct
+                                                                .is_some(),
+                                                        ),
+                                                ),
                                         )
                                         .child(
                                             div()

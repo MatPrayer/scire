@@ -62,8 +62,8 @@ fn cache_cap_bytes() -> u64 {
 /// so keying the cache on it re-downloads identical album art for every track —
 /// group by album instead, and fetch whichever track's id we saw first.
 ///
-/// The key drops the server's cache-busting suffix, so art replaced on the
-/// server keeps serving from cache here until the entry is evicted.
+/// The key drops the server's cache-busting suffix; art replaced on the server
+/// is picked up by the next sync instead ([`revalidate_album_covers`]).
 pub fn song_cover(song: &Song) -> Option<(String, String)> {
     let cover_id = song.cover_art.clone()?;
     let key = song
@@ -118,8 +118,9 @@ pub fn bucket(size: u32) -> u32 {
 /// normalizing here covers the album, artist and detail views, which fetch by
 /// cover id directly.
 ///
-/// The trade is the one `song_cover` already documents: art genuinely replaced
-/// on the server keeps serving from cache until the entry is evicted. Only a
+/// The trade: art genuinely replaced on the server is not noticed here. A sync
+/// that sees an album's cover id move rechecks its cached art
+/// ([`revalidate_album_covers`]); artist photos are not rechecked. Only a
 /// trailing `_` followed by hex is removed, so an `album-<id>` key — or any id
 /// without that shape — passes through untouched.
 fn stable_key(key: &str) -> &str {
@@ -260,6 +261,123 @@ pub async fn fetch_as(
         Ok(path2)
     })
     .await
+}
+
+/// Covers rewritten in place by [`revalidate_album_covers`], waiting for the
+/// UI to drop gpui's decoded copy (it caches images by path, and the path did
+/// not move). Drained by [`take_replaced`].
+static REPLACED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Paths whose bytes changed since the last call. The caller evicts each from
+/// gpui's asset cache and repaints.
+pub fn take_replaced() -> Vec<PathBuf> {
+    std::mem::take(&mut *REPLACED.lock().unwrap())
+}
+
+/// Albums whose art alone needs checking against the server this many at a
+/// time — a background chore, kept below the grids' own fetches.
+const REVALIDATE_CONCURRENCY: usize = 2;
+
+/// Re-check the cached art of albums whose cover may have been replaced on
+/// the server, rewriting what changed in place.
+///
+/// The cache ignores the server's cache-busting suffix ([`stable_key`]), so a
+/// replaced cover would otherwise keep serving the old picture until evicted.
+/// A sync calls this with the albums whose cover id moved (or every album, on
+/// a full rebuild). Both entries an album's art lives under are checked: the
+/// `al-<id>` one the grids and detail pages fetch, and the `album-<id>` one
+/// [`song_cover`] files the player's art under.
+///
+/// Only rungs already on disk are touched — nothing new is downloaded — and
+/// the smallest one is probed first: if its bytes are unchanged the rest are
+/// assumed to be too, so a rebuild over an unchanged library costs a
+/// thumbnail per cached album. Failures are logged and skipped.
+pub async fn revalidate_album_covers(client: SubsonicClient, cover_ids: Vec<String>) {
+    let mut queue = cover_ids.into_iter();
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut replaced = 0usize;
+    loop {
+        while jobs.len() < REVALIDATE_CONCURRENCY {
+            let Some(cover_id) = queue.next() else { break };
+            let client = client.clone();
+            jobs.spawn(async move { revalidate_album(&client, &cover_id).await });
+        }
+        let Some(done) = jobs.join_next().await else {
+            break;
+        };
+        match done {
+            Ok(Ok(paths)) => {
+                replaced += paths.len();
+                REPLACED.lock().unwrap().extend(paths);
+            }
+            Ok(Err(e)) => tracing::debug!("cover revalidation failed: {e:#}"),
+            Err(e) => tracing::debug!("cover revalidation task failed: {e}"),
+        }
+    }
+    if replaced > 0 {
+        tracing::info!("replaced {replaced} cached cover files changed on the server");
+    }
+}
+
+/// The cache entries one album's art is held under, given its cover id.
+fn album_art_keys(cover_id: &str) -> Vec<String> {
+    let key = stable_key(cover_id);
+    let mut keys = vec![key.to_string()];
+    if let Some(album) = key.strip_prefix("al-") {
+        keys.push(album_cover_key(album));
+    }
+    keys
+}
+
+/// Check one album's cached art; returns the paths rewritten.
+async fn revalidate_album(client: &SubsonicClient, cover_id: &str) -> Result<Vec<PathBuf>> {
+    let dir = config::artwork_cache_dir()?;
+    let mut replaced = Vec::new();
+    for key in album_art_keys(cover_id) {
+        let rungs: Vec<u32> = SIZE_LADDER
+            .into_iter()
+            .filter(|&rung| cached(&key, rung).is_some())
+            .collect();
+        let mut changed = false;
+        for (ix, rung) in rungs.into_iter().enumerate() {
+            let path = dir.join(format!("{}-{rung}.img", config::sanitize(&key)));
+            let url = client.cover_art_url(cover_id, Some(rung))?;
+            let bytes = http()
+                .get(url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            let out = path.clone();
+            let wrote = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let bytes = square_crop(&bytes).unwrap_or_else(|| bytes.to_vec());
+                if std::fs::read(&out).is_ok_and(|old| old == bytes) {
+                    return Ok(false);
+                }
+                write_atomic(&out, &bytes)?;
+                Ok(true)
+            })
+            .await??;
+            if wrote {
+                changed = true;
+                replaced.push(path);
+            } else if ix == 0 {
+                // The smallest rung is unchanged: so is the art.
+                break;
+            }
+        }
+        // The fullscreen background is derived from this art, not fetched.
+        if changed
+            && let Some(blurred) = blurred_cached(&key)
+            && let Some(source) = cached_best(&key, BLUR_EDGE)
+        {
+            let out = blurred.clone();
+            tokio::task::spawn_blocking(move || blur_into(&source, &out)).await??;
+            replaced.push(blurred);
+        }
+    }
+    Ok(replaced)
 }
 
 /// Write `bytes` to `out` through a temp file nobody else can be writing.
@@ -605,8 +723,8 @@ fn evict_if_over_cap(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SIZE_LADDER, bucket, search_order, square_crop, stable_key, thumbnail_from_bytes,
-        write_atomic,
+        SIZE_LADDER, album_art_keys, bucket, search_order, square_crop, stable_key,
+        thumbnail_from_bytes, write_atomic,
     };
 
     fn encode(width: u32, height: u32) -> Vec<u8> {
@@ -743,6 +861,16 @@ mod tests {
         }
         // Anything past the top rung is capped there — that is full art.
         assert_eq!(bucket(4000), SIZE_LADDER[SIZE_LADDER.len() - 1]);
+    }
+
+    #[test]
+    fn an_albums_art_is_checked_under_both_keys_it_is_cached_under() {
+        assert_eq!(
+            album_art_keys("al-78pOkKiaaNTZTFHwl5YKDg_3b5cf1e3b4faec3c"),
+            vec!["al-78pOkKiaaNTZTFHwl5YKDg", "album-78pOkKiaaNTZTFHwl5YKDg"]
+        );
+        // A server whose cover id is not Navidrome's shape has one entry.
+        assert_eq!(album_art_keys("12345"), vec!["12345"]);
     }
 
     #[test]

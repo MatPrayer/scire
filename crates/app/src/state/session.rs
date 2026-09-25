@@ -23,6 +23,12 @@ pub struct Session {
     /// Libraries the user can access (from getMusicFolders). The switcher only
     /// shows when there is more than one.
     pub music_folders: Vec<MusicFolder>,
+    /// Bumped by every connect and by logout, so a scheduled reconnect can
+    /// tell it has been overtaken and stand down.
+    connect_generation: u64,
+    /// Consecutive failed attempts of the automatic reconnect, which picks the
+    /// next wait (`reconnect_delay`). Reset by a successful connect.
+    reconnect_attempt: u32,
 }
 
 impl Session {
@@ -39,6 +45,8 @@ impl Session {
             status: ConnectionStatus::Disconnected,
             library_ids,
             music_folders: Vec::new(),
+            connect_generation: 0,
+            reconnect_attempt: 0,
         };
         if let Some(server) = this.settings.server.clone() {
             this.connect_saved(server, cx);
@@ -110,6 +118,8 @@ impl Session {
         }
 
         self.status = ConnectionStatus::Connecting;
+        self.connect_generation += 1;
+        let generation = self.connect_generation;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -154,6 +164,7 @@ impl Session {
             let _ = this.update(cx, |session, cx| {
                 match result {
                     Ok(_info) => {
+                        session.reconnect_attempt = 0;
                         session.client = Some(client);
                         session.status = ConnectionStatus::Connected;
                         session.load_music_folders(cx);
@@ -176,6 +187,15 @@ impl Session {
                     Err(e) => {
                         session.client = None;
                         session.status = ConnectionStatus::Failed(friendly_error(&e));
+                        // A saved server that did not answer is tried again:
+                        // one stalled request at startup otherwise left the
+                        // whole session offline until a restart, with the
+                        // cached catalog on screen hiding that anything was
+                        // wrong. A login being typed (`persist`) is not — the
+                        // user is right there to press the button again.
+                        if !persist && worth_retrying(&e) {
+                            session.schedule_reconnect(generation, url, username, password, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -184,8 +204,35 @@ impl Session {
         .detach();
     }
 
+    /// Try a failed saved connect again after `reconnect_delay`, unless
+    /// something has connected (or logged out) in the meantime.
+    fn schedule_reconnect(
+        &mut self,
+        generation: u64,
+        url: String,
+        username: String,
+        password: String,
+        cx: &mut Context<Self>,
+    ) {
+        let delay = reconnect_delay(self.reconnect_attempt);
+        self.reconnect_attempt += 1;
+        tracing::info!("server unreachable; reconnecting in {}s", delay.as_secs());
+        cx.spawn(async move |this, cx| {
+            // gpui's timer, not tokio's: this task has no reactor.
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |session, cx| {
+                if session.connect_generation == generation {
+                    session.connect(url, username, password, false, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Forget server, credentials and connection.
     pub fn logout(&mut self, cx: &mut Context<Self>) {
+        self.connect_generation += 1;
+        self.reconnect_attempt = 0;
         if let Some(server) = &self.settings.server {
             config::delete_password(&server.url, &server.username);
         }
@@ -269,10 +316,44 @@ impl Session {
     }
 }
 
+/// How long the automatic reconnect waits before its `attempt`th retry:
+/// quickly at first, since a server stalling for a moment is the common case,
+/// then once a minute for as long as it stays away.
+fn reconnect_delay(attempt: u32) -> std::time::Duration {
+    const STEPS: [u64; 4] = [2, 5, 15, 30];
+    std::time::Duration::from_secs(STEPS.get(attempt as usize).copied().unwrap_or(60))
+}
+
+/// Whether a failed connect could succeed if tried again. The ping timeout is
+/// the app's own error rather than the client's, and is always worth it;
+/// wrong credentials or a malformed URL fail the same way forever.
+fn worth_retrying(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<subsonic::Error>()
+        .is_none_or(subsonic::Error::is_transient)
+}
+
 fn friendly_error(e: &anyhow::Error) -> String {
     crate::errors::error_text(e)
 }
 
 pub fn init(cx: &mut gpui::App) -> Entity<Session> {
     cx.new(Session::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backs_off_then_holds_at_a_minute() {
+        let secs: Vec<u64> = (0..7).map(|n| reconnect_delay(n).as_secs()).collect();
+        assert_eq!(secs, [2, 5, 15, 30, 60, 60, 60]);
+    }
+
+    #[test]
+    fn a_timeout_is_retried() {
+        assert!(worth_retrying(&anyhow::anyhow!(
+            "The server took too long to respond."
+        )));
+    }
 }

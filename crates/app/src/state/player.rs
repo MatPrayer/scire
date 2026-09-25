@@ -147,10 +147,17 @@ pub struct PlayerState {
     current_art_key: Option<String>,
     /// OS output device name, known once the engine opens the audio output.
     pub output_device: Option<String>,
+    /// Format of a card opened directly (`44.1 kHz · 32-bit`); None on the
+    /// shared output. While set the engine plays at unity volume.
+    pub output_direct: Option<String>,
+    /// Why a direct card was asked for and the shared output used instead.
+    pub direct_error: Option<String>,
     /// Clear the queue + player bar when playback reaches the queue end.
     clear_on_end: bool,
     /// ReplayGain mode applied to the effective playback volume.
     replay_gain_mode: ReplayGainMode,
+    /// Pre-amp and clipping guard applied on top of the mode (from Settings).
+    replay_gain_tuning: RgTuning,
     /// Linear gain factor for the current track from ReplayGain (1.0 = none).
     current_gain: f32,
     /// The engine has a track loaded. False after startup with a restored
@@ -261,8 +268,11 @@ impl PlayerState {
             current_art_path: None,
             current_art_key: None,
             output_device: None,
+            output_direct: None,
+            direct_error: None,
             clear_on_end: false,
             replay_gain_mode: ReplayGainMode::Off,
+            replay_gain_tuning: RgTuning::default(),
             current_gain: 1.0,
             engine_has_track: false,
             waveform_enabled: false,
@@ -745,7 +755,7 @@ impl PlayerState {
         } else {
             self.current_song()
                 .and_then(|s| s.replay_gain.as_ref())
-                .map(|rg| replaygain_linear(rg, mode))
+                .map(|rg| replaygain_linear(rg, mode, self.replay_gain_tuning))
                 .unwrap_or(1.0)
         };
         self.push_volume();
@@ -764,9 +774,24 @@ impl PlayerState {
         cx.notify();
     }
 
+    /// Change the ReplayGain pre-amp / clipping guard (from Settings) and
+    /// reapply to the current track.
+    pub fn set_replay_gain_tuning(&mut self, tuning: RgTuning, cx: &mut Context<Self>) {
+        self.replay_gain_tuning = tuning;
+        self.recompute_gain();
+        cx.notify();
+    }
+
     /// Switch the audio output device (None = system default).
     pub fn set_output_device(&mut self, name: Option<String>, cx: &mut Context<Self>) {
         self.player.set_output_device(name);
+        cx.notify();
+    }
+
+    /// Open a card directly by its ALSA id, bypassing the sound server
+    /// (None = back to the shared output).
+    pub fn set_direct_output(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.player.set_direct_output(id);
         cx.notify();
     }
 
@@ -776,7 +801,9 @@ impl PlayerState {
     pub fn replay_gain_active(&self) -> Option<(String, Option<f32>)> {
         // Nothing loaded means nothing is being normalised — reporting a mode
         // here leaves a stray "RG · album" line under an empty player.
+        // A card opened directly plays at unity: nothing is being applied.
         if self.replay_gain_mode == ReplayGainMode::Off
+            || self.output_direct.is_some()
             || self.is_radio()
             || self.current_song().is_none()
         {
@@ -796,7 +823,7 @@ impl PlayerState {
         let db = self
             .current_song()
             .and_then(|s| s.replay_gain.as_ref())
-            .map(|rg| 20.0 * replaygain_linear(rg, mode).log10());
+            .map(|rg| 20.0 * replaygain_linear(rg, mode, self.replay_gain_tuning).log10());
         Some((label, db))
     }
 
@@ -1359,8 +1386,14 @@ impl PlayerState {
                     crate::errors::playback_error(&error, title.as_deref())
                 ));
             }
-            Event::OutputOpened { device } => {
+            Event::OutputOpened {
+                device,
+                direct,
+                direct_error,
+            } => {
                 self.output_device = device;
+                self.output_direct = direct;
+                self.direct_error = direct_error;
             }
             Event::StationInfo(info) => {
                 // Only a live stream produces this, but a library track that
@@ -1386,12 +1419,18 @@ pub fn init(settings: &Settings, cx: &mut gpui::App) -> Entity<PlayerState> {
     cx.new(|cx| {
         let mut state = PlayerState::new(settings.volume, cx);
         state.replay_gain_mode = settings.replay_gain;
+        state.replay_gain_tuning = RgTuning::from_settings(settings);
         state.clear_on_end = settings.queue_end == crate::config::QueueEndBehavior::Clear;
         state.waveform_enabled = settings.waveform_seekbar;
         if settings.output_device.is_some() {
             state
                 .player
                 .set_output_device(settings.output_device.clone());
+        }
+        if settings.output_direct.is_some() {
+            state
+                .player
+                .set_direct_output(settings.output_direct.clone());
         }
         match load_queue() {
             Some(queue) => {
@@ -1442,9 +1481,37 @@ fn scrobble_track(song: &Song) -> ScrobbleTrack {
     }
 }
 
+/// What the user adds on top of the tags: a pre-amp in dB and whether the
+/// peak may cap the result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RgTuning {
+    pub preamp_db: f32,
+    pub prevent_clipping: bool,
+}
+
+impl Default for RgTuning {
+    fn default() -> Self {
+        Self {
+            preamp_db: 0.0,
+            prevent_clipping: true,
+        }
+    }
+}
+
+impl RgTuning {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            preamp_db: settings.replay_gain_preamp,
+            prevent_clipping: settings.replay_gain_prevent_clipping,
+        }
+    }
+}
+
 /// Linear gain factor from a ReplayGain block for the given mode. Applies the
-/// base gain offset and clamps against the peak to avoid clipping.
-fn replaygain_linear(rg: &subsonic::ReplayGain, mode: ReplayGainMode) -> f32 {
+/// base gain offset and the pre-amp, and (with `prevent_clipping`) clamps
+/// against the peak. The pre-amp only applies where there is a gain to adjust:
+/// an untagged track stays at unity rather than being boosted blind.
+fn replaygain_linear(rg: &subsonic::ReplayGain, mode: ReplayGainMode, tuning: RgTuning) -> f32 {
     let (gain_db, peak) = match mode {
         // Auto is resolved to Track/Album before this call; treat as Track.
         ReplayGainMode::Off => return 1.0,
@@ -1458,8 +1525,10 @@ fn replaygain_linear(rg: &subsonic::ReplayGain, mode: ReplayGainMode) -> f32 {
     };
     let Some(db) = gain_db else { return 1.0 };
     let base = rg.base_gain.unwrap_or(0.0);
-    let mut g = 10f32.powf((db + base) / 20.0);
-    if let Some(pk) = peak.filter(|&p| p > 0.0) {
+    let mut g = 10f32.powf((db + base + tuning.preamp_db) / 20.0);
+    if tuning.prevent_clipping
+        && let Some(pk) = peak.filter(|&p| p > 0.0)
+    {
         g = g.min(1.0 / pk); // clipping prevention
     }
     g.clamp(0.0, playback::MAX_VOLUME)
@@ -1569,13 +1638,61 @@ mod tests {
     use subsonic::{Song, StreamOptions};
 
     use super::{
-        FALLBACK_BITRATE, FALLBACK_FORMAT, ReplayGainMode, ResumeState, SMOOTH_MAX, read_resume_at,
-        replaygain_linear, resume_for, smoothed, stream_opts_for, write_resume_at,
+        FALLBACK_BITRATE, FALLBACK_FORMAT, ReplayGainMode, ResumeState, RgTuning, SMOOTH_MAX,
+        read_resume_at, replaygain_linear, resume_for, smoothed, stream_opts_for, write_resume_at,
     };
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
 
     // ---- ReplayGain ----
+
+    fn lin(rg: &subsonic::ReplayGain, mode: ReplayGainMode) -> f32 {
+        replaygain_linear(rg, mode, RgTuning::default())
+    }
+
+    /// The pre-amp is added in dB on top of the tag, before the peak cap.
+    #[test]
+    fn the_preamp_is_added_to_the_tagged_gain() {
+        let tuning = RgTuning {
+            preamp_db: 6.0,
+            prevent_clipping: true,
+        };
+        let g = replaygain_linear(
+            &rg(Some(-12.0), None, None, None),
+            ReplayGainMode::Track,
+            tuning,
+        );
+        assert!((g - 10f32.powf(-6.0 / 20.0)).abs() < 0.001, "{g}");
+        // Still held under the peak.
+        let g = replaygain_linear(
+            &rg(Some(0.0), None, Some(0.8), None),
+            ReplayGainMode::Track,
+            tuning,
+        );
+        assert!((g - 1.0 / 0.8).abs() < 0.001, "{g}");
+        // Nothing tagged: no gain to adjust, so no blind boost either.
+        let g = replaygain_linear(
+            &subsonic::ReplayGain::default(),
+            ReplayGainMode::Track,
+            tuning,
+        );
+        assert_eq!(g, 1.0);
+    }
+
+    /// With the guard off the peak no longer caps a boost.
+    #[test]
+    fn clipping_prevention_can_be_turned_off() {
+        let tuning = RgTuning {
+            preamp_db: 0.0,
+            prevent_clipping: false,
+        };
+        let g = replaygain_linear(
+            &rg(Some(12.0), None, Some(0.5), None),
+            ReplayGainMode::Track,
+            tuning,
+        );
+        assert!((g - 10f32.powf(12.0 / 20.0)).abs() < 0.001, "{g}");
+    }
 
     fn rg(
         track_gain: Option<f32>,
@@ -1595,9 +1712,9 @@ mod tests {
     /// dB → linear is `10^(dB/20)`: -6 dB halves the amplitude, +6 doubles it.
     #[test]
     fn a_gain_in_db_becomes_a_linear_multiplier() {
-        let g = replaygain_linear(&rg(Some(-6.02), None, None, None), ReplayGainMode::Track);
+        let g = lin(&rg(Some(-6.02), None, None, None), ReplayGainMode::Track);
         assert!((g - 0.5).abs() < 0.001, "{g}");
-        let g = replaygain_linear(&rg(Some(6.02), None, None, None), ReplayGainMode::Track);
+        let g = lin(&rg(Some(6.02), None, None, None), ReplayGainMode::Track);
         assert!((g - 2.0).abs() < 0.005, "{g}");
     }
 
@@ -1606,8 +1723,8 @@ mod tests {
     #[test]
     fn album_mode_takes_the_album_gain_and_peak() {
         let block = rg(Some(-3.0), Some(-9.0), Some(0.9), Some(0.99));
-        let album = replaygain_linear(&block, ReplayGainMode::Album);
-        let track = replaygain_linear(&block, ReplayGainMode::Track);
+        let album = lin(&block, ReplayGainMode::Album);
+        let track = lin(&block, ReplayGainMode::Track);
         assert!((album - 10f32.powf(-9.0 / 20.0)).abs() < 0.001, "{album}");
         assert!((track - 10f32.powf(-3.0 / 20.0)).abs() < 0.001, "{track}");
     }
@@ -1616,7 +1733,7 @@ mod tests {
     /// than falling back to unity, which would leave it unnormalized.
     #[test]
     fn album_mode_falls_back_to_the_track_tags() {
-        let g = replaygain_linear(
+        let g = lin(
             &rg(Some(-4.0), None, Some(0.8), None),
             ReplayGainMode::Album,
         );
@@ -1628,7 +1745,7 @@ mod tests {
     #[test]
     fn a_boost_is_held_under_the_peak() {
         // +12 dB is ~3.98x, but a 0.5 peak only has 2x of headroom.
-        let g = replaygain_linear(
+        let g = lin(
             &rg(Some(12.0), None, Some(0.5), None),
             ReplayGainMode::Track,
         );
@@ -1643,7 +1760,7 @@ mod tests {
             base_gain: Some(-1.0),
             ..Default::default()
         };
-        let g = replaygain_linear(&block, ReplayGainMode::Track);
+        let g = lin(&block, ReplayGainMode::Track);
         assert!((g - 10f32.powf(-5.0 / 20.0)).abs() < 0.001, "{g}");
     }
 
@@ -1655,14 +1772,14 @@ mod tests {
             fallback_gain: Some(-8.0),
             ..Default::default()
         };
-        let g = replaygain_linear(&block, ReplayGainMode::Track);
+        let g = lin(&block, ReplayGainMode::Track);
         assert!((g - 10f32.powf(-8.0 / 20.0)).abs() < 0.001, "{g}");
         assert_eq!(
-            replaygain_linear(&subsonic::ReplayGain::default(), ReplayGainMode::Track),
+            lin(&subsonic::ReplayGain::default(), ReplayGainMode::Track),
             1.0
         );
         assert_eq!(
-            replaygain_linear(&rg(Some(-8.0), None, None, None), ReplayGainMode::Off),
+            lin(&rg(Some(-8.0), None, None, None), ReplayGainMode::Off),
             1.0
         );
     }
@@ -1671,7 +1788,7 @@ mod tests {
     /// the engine's own — a gain the engine would clamp away is not applied.
     #[test]
     fn the_gain_is_capped_at_the_engines_ceiling() {
-        let g = replaygain_linear(&rg(Some(60.0), None, None, None), ReplayGainMode::Track);
+        let g = lin(&rg(Some(60.0), None, None, None), ReplayGainMode::Track);
         assert_eq!(g, playback::MAX_VOLUME);
     }
 

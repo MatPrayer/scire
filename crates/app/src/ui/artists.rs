@@ -4,22 +4,30 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     App, Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor, ScrollHandle,
     SharedString, UniformListScrollHandle, Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::link::Link;
 use gpui_component::spinner::Spinner;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt, h_flex, v_flex,
+};
 use subsonic::{Album, ArtistIndex, ArtistInfo2, ArtistWithAlbums, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
+use crate::services::album_info::{self, looks_truncated};
+use crate::services::artist_info::{self, ArtistInfo};
 use crate::services::library_db::{LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
+use crate::ui::album_detail::{
+    ABOUT_PROSE_MAX_W, AboutSource, ONLINE_WAIT, about_sources, ext_links, link_icon,
+    waiting_online,
+};
 use crate::ui::albums::album_from_row;
 use crate::ui::{
     card_inset, card_padding, strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor,
@@ -698,6 +706,19 @@ pub struct ArtistDetailView {
     image_requested: bool,
     /// Long bios render clamped to a few lines until expanded.
     bio_expanded: bool,
+    /// What `services::artist_info` found outside the server (Wikipedia,
+    /// MusicBrainz), once it has answered.
+    online: Option<ArtistInfo>,
+    /// Which services the online lookup for this page asked, once it has
+    /// started — a service switched on later asks again.
+    online_asked: Option<album_info::Sources>,
+    /// The online lookup is in flight, since when (the bio holds for it up
+    /// to `ONLINE_WAIT`).
+    online_since: Option<Instant>,
+    /// The bio source the user picked with the pills.
+    about_pick: Option<AboutSource>,
+    /// This frame's content width, for the bio column's explicit width.
+    live_width: crate::ui::LiveWidth,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
     /// Album id per flattened discography card (album cards then singles/EPs),
@@ -751,6 +772,11 @@ impl ArtistDetailView {
             info: None,
             image_requested: false,
             bio_expanded: false,
+            online: None,
+            online_asked: None,
+            online_since: None,
+            about_pick: None,
+            live_width: crate::ui::LiveWidth::default(),
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             discography_ids: Vec::new(),
@@ -1063,10 +1089,85 @@ impl ArtistDetailView {
                     view.fetch_artist_image(image, cx);
                 }
                 view.info = Some(info);
+                view.maybe_load_online(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Ask MusicBrainz / Wikipedia about the artist, once per page, behind
+    /// `Settings::artist_info_wikipedia`/`artist_info_musicbrainz`.
+    ///
+    /// Waits for `getArtistInfo2`, since its MusicBrainz id is the one lookup
+    /// that cannot pick the wrong artist, and for `getArtist`'s album titles,
+    /// which tell two artists of one name apart.
+    fn maybe_load_online(&mut self, cx: &mut Context<Self>) {
+        let sources = artist_sources(&self.session.read(cx).settings);
+        if self.info.is_none()
+            || !sources.any()
+            || self.online_asked.is_some_and(|asked| asked.covers(sources))
+        {
+            return;
+        }
+        let Some(artist) = self.artist.as_ref() else {
+            return;
+        };
+        // Full albums first: a single's title is the song's, and a search by
+        // it finds every cover version.
+        let (albums, singles): (Vec<&Album>, Vec<&Album>) =
+            artist.album.iter().partition(|a| !is_single_or_ep(a));
+        let query = artist_info::Query {
+            name: artist.artist.name.clone(),
+            mbid: self
+                .info
+                .as_ref()
+                .and_then(|i| i.music_brainz_id.as_deref())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            albums: albums
+                .into_iter()
+                .chain(singles)
+                .map(|a| a.name.clone())
+                .collect(),
+            sources,
+        };
+        self.online_asked = Some(sources);
+        self.online_since = Some(Instant::now());
+        // The clock running out has to repaint, or the server's bio only
+        // appears at the next unrelated notify.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ONLINE_WAIT).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(artist_info::fetch(query)).await;
+            let _ = this.update(cx, |view, cx| {
+                // Past the wait the server's bio is already up; swapping it
+                // for Wikipedia's under somebody reading it is worse than the
+                // pill that offers the switch.
+                if !waiting_online(view.online_since) && view.about_pick.is_none() {
+                    view.about_pick = view.server_bio().map(|_| AboutSource::Server);
+                }
+                view.online_since = None;
+                match result {
+                    Ok(info) => view.online = info,
+                    Err(e) => tracing::warn!("artist info lookup failed: {e:#}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The server's biography, cleaned (see [`clean_server_bio`]).
+    fn server_bio(&self) -> Option<(String, bool)> {
+        self.info
+            .as_ref()
+            .and_then(|i| i.biography.as_deref())
+            .and_then(clean_server_bio)
     }
 
     pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1269,23 +1370,81 @@ impl Render for ArtistDetailView {
             .as_ref()
             .map(|a| a.artist.name.clone())
             .unwrap_or_else(|| "…".into());
-        let bio = self
-            .info
-            .as_ref()
-            .and_then(|i| i.biography.as_deref())
-            .map(strip_html)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "No biography is available for this artist yet.".into());
-        // Collapse long bios by truncating the string itself: gpui's
+        // Bio + external links: the server's `getArtistInfo2` and whatever
+        // `services::artist_info` found online, picked between like the album
+        // page's About card. Collapsed by truncating the string itself: gpui's
         // line_clamp lets the last line run past the container and its text
         // measurement cache ignores clamp changes, so it can't do this job.
-        let bio_long = bio.chars().count() > BIO_PREVIEW_CHARS;
-        let bio_text = if self.bio_expanded || !bio_long {
-            bio
+        let settings = &self.session.read(cx).settings;
+        let bios_on = settings.server_artist_bios;
+        let want = artist_sources(settings);
+        let online_on = want.any();
+        if online_on {
+            self.maybe_load_online(cx);
+        }
+        let server_bio = self.server_bio().filter(|_| bios_on);
+        let online = self.online.as_ref().filter(|_| online_on);
+        let wikipedia = online
+            .and_then(|o| o.wikipedia.as_ref())
+            .filter(|_| want.wikipedia);
+        let annotation = online
+            .and_then(|o| o.annotation.as_ref())
+            .filter(|_| want.musicbrainz);
+        let waiting = waiting_online(self.online_since);
+        let (sources, shown) = about_sources(
+            wikipedia.is_some(),
+            server_bio.is_some(),
+            annotation.is_some(),
+            self.about_pick,
+        );
+        let lastfm_url = self
+            .info
+            .as_ref()
+            .and_then(|i| i.last_fm_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty() && bios_on)
+            .map(str::to_string);
+        let server_label = if lastfm_url.is_some() {
+            "Last.fm"
         } else {
-            truncate_at_word(&bio, BIO_PREVIEW_CHARS)
+            "Server"
         };
-        // External links from getArtistInfo2 (same sources as Navidrome's UI).
+        // The rest of a cut summary lives on Last.fm's own page.
+        let read_more = match (shown, &server_bio) {
+            (Some(AboutSource::Server), Some((_, true))) => lastfm_url.clone(),
+            _ => None,
+        };
+        let bio: Option<String> = match shown {
+            Some(AboutSource::Wikipedia) => wikipedia.map(|d| d.text.clone()),
+            Some(AboutSource::MusicBrainz) => annotation.map(|d| d.text.clone()),
+            Some(AboutSource::Server) => {
+                server_bio.map(|(text, cut)| if cut { format!("{text} …") } else { text })
+            }
+            None => None,
+        };
+        // Still coming: `getArtistInfo2`, or the online lookup inside its wait
+        // (or not started yet, since it needs both server answers first).
+        let bio_loading = (bios_on || online_on)
+            && (self.info.is_none()
+                || waiting
+                || (online_on && self.online.is_none() && self.online_asked.is_none()));
+        let bio = bio.filter(|_| !bio_loading);
+        let bio_long = bio
+            .as_ref()
+            .is_some_and(|b| b.chars().count() > BIO_PREVIEW_CHARS);
+        let read_more = read_more.filter(|_| self.bio_expanded || !bio_long);
+        let bio_text: Option<String> = bio.map(|b| {
+            if self.bio_expanded || !bio_long {
+                b
+            } else {
+                truncate_at_word(&b, BIO_PREVIEW_CHARS)
+            }
+        });
+        let bio_placeholder = (bios_on || online_on).then_some(if bio_loading {
+            "Looking up a biography…"
+        } else {
+            "No biography is available for this artist yet."
+        });
         let musicbrainz_url = self
             .info
             .as_ref()
@@ -1293,13 +1452,14 @@ impl Render for ArtistDetailView {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(|id| format!("https://musicbrainz.org/artist/{id}"));
-        let lastfm_url = self
-            .info
-            .as_ref()
-            .and_then(|i| i.last_fm_url.as_deref())
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(str::to_string);
+        let online_links: Vec<album_info::Link> = online
+            .map(|o| o.links.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter(|l| want.allows(l.kind))
+            .cloned()
+            .collect();
+        let links = ext_links(musicbrainz_url, lastfm_url, &online_links);
         let genres = self.artist.as_ref().map(|a| {
             let mut seen = std::collections::HashSet::new();
             a.album
@@ -1315,6 +1475,16 @@ impl Render for ArtistDetailView {
             .filter(|g| !g.is_empty())
             .map(|g| format!("Genres: {g}"));
         let hero_art = self.artist_image_path.clone();
+        // The bio column carries an explicit width: left to flex, taffy
+        // measures its height at a different width than it lays the prose out
+        // at, and a Wikipedia intro spilled out over the rows under it.
+        let content_w = self
+            .live_width
+            .resolve(f32::from(self.scroll.bounds().size.width), window);
+        if content_w <= 0. {
+            window.request_animation_frame();
+        }
+        let bio_w = bio_column_width(content_w);
 
         // Cover size for this page's cards, and a refetch when it moved. The
         // rung is what matters: two settings landing on the same one name the
@@ -1408,14 +1578,22 @@ impl Render for ArtistDetailView {
                     .gap_4()
                     .bg(cx.theme().sidebar)
                     .child(
-                        h_flex()
-                            .items_start()
+                        // Beside or under the photo, decided here rather
+                        // than by `flex_wrap`: a wrapping row is measured as
+                        // if it did not wrap, so once it did the bio ran out
+                        // through the bottom of the card.
+                        div()
+                            .flex()
                             .gap_4()
-                            .flex_wrap()
+                            .map(|row| match bio_w {
+                                Some(BioColumn { beside: false, .. }) => row.flex_col(),
+                                _ => row.flex_row().items_start(),
+                            })
                             .child(
                                 div()
                                     .id("artist-hero")
-                                    .size(px(220.))
+                                    .flex_none()
+                                    .size(px(HERO_W))
                                     .rounded_2xl()
                                     .overflow_hidden()
                                     .bg(cx.theme().muted)
@@ -1428,22 +1606,64 @@ impl Render for ArtistDetailView {
                                                     this.open_full_art(cx)
                                                 }),
                                             )
-                                            .child(img(path).size(px(220.)).rounded_2xl())
+                                            .child(img(path).size(px(HERO_W)).rounded_2xl())
                                     }),
                             )
                             .child(
                                 v_flex()
-                                    .flex_1()
-                                    .min_w(px(260.))
+                                    .map(|col| match bio_w {
+                                        Some(b) => col.w(px(b.width)),
+                                        None => col.flex_1().min_w(px(BIO_MIN_W)),
+                                    })
                                     .gap_2()
                                     .child(div().text_2xl().font_medium().child(name))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Bio"),
-                                    )
-                                    .child(div().text_sm().child(bio_text))
+                                    .when(bio_text.is_some() || bio_placeholder.is_some(), |this| {
+                                        let pills =
+                                            (bio_text.is_some() && sources.len() > 1).then(|| {
+                                                h_flex().gap_1().children(sources.iter().map(
+                                                    |&source| {
+                                                        let label = match source {
+                                                            AboutSource::Wikipedia => "Wikipedia",
+                                                            AboutSource::Server => server_label,
+                                                            AboutSource::MusicBrainz => {
+                                                                "MusicBrainz"
+                                                            }
+                                                        };
+                                                        Button::new(SharedString::from(format!(
+                                                            "bio-src-{label}"
+                                                        )))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label(label)
+                                                        .selected(shown == Some(source))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.about_pick = Some(source);
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                    },
+                                                ))
+                                            });
+                                        this.child(
+                                            h_flex()
+                                                .gap_2()
+                                                .flex_wrap()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child("Bio"),
+                                                )
+                                                .children(pills),
+                                        )
+                                        .child(bio_body(
+                                            bio_text,
+                                            read_more,
+                                            bio_placeholder,
+                                            cx,
+                                        ))
+                                    })
                                     .when(bio_long, |this| {
                                         let expanded = self.bio_expanded;
                                         let focused = bio_focused;
@@ -1478,30 +1698,20 @@ impl Render for ArtistDetailView {
                                                 .child(desc),
                                         )
                                     })
-                                    .when(
-                                        musicbrainz_url.is_some() || lastfm_url.is_some(),
-                                        |this| {
-                                            this.child(
-                                                h_flex()
-                                                    .gap_3()
-                                                    .text_sm()
-                                                    .when_some(musicbrainz_url, |this, url| {
-                                                        this.child(
-                                                            Link::new("mb-link")
-                                                                .href(url)
-                                                                .child("MusicBrainz"),
-                                                        )
-                                                    })
-                                                    .when_some(lastfm_url, |this, url| {
-                                                        this.child(
-                                                            Link::new("lastfm-link")
-                                                                .href(url)
-                                                                .child("Last.fm"),
-                                                        )
-                                                    }),
-                                            )
-                                        },
-                                    ),
+                                    .when(!links.is_empty(), |this| {
+                                        this.child(h_flex().gap_1().children(
+                                            links.into_iter().map(|(label, url)| {
+                                                Button::new(SharedString::from(format!(
+                                                    "ar-link-{label}"
+                                                )))
+                                                .ghost()
+                                                .small()
+                                                .icon(link_icon(label))
+                                                .tooltip(label)
+                                                .on_click(move |_, _, cx| cx.open_url(&url))
+                                            }),
+                                        ))
+                                    }),
                             ),
                     ),
             )
@@ -1606,6 +1816,118 @@ fn in_libraries(library: Option<&str>, selected: &[String]) -> bool {
 /// Collapsed-bio length; roughly four lines at typical window widths.
 const BIO_PREVIEW_CHARS: usize = 400;
 
+/// The artist photo's edge.
+const HERO_W: f32 = 220.;
+/// Narrowest the bio column goes beside the photo before dropping under it.
+const BIO_MIN_W: f32 = 260.;
+
+/// Where the bio column goes and how wide it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BioColumn {
+    width: f32,
+    /// Beside the photo; under it otherwise.
+    beside: bool,
+}
+
+/// The bio column for a content area `content_w` wide: beside the photo where
+/// it fits, under it otherwise. `None` before anything has been measured. The
+/// page and the header card each pad by `p_4` either side, and the photo and
+/// column sit `gap_4` apart. A couple of px are left spare, since a row filled
+/// to the exact pixel is at the mercy of rounding.
+fn bio_column_width(content_w: f32) -> Option<BioColumn> {
+    const SLACK: f32 = 2.;
+    if content_w <= 0. {
+        return None;
+    }
+    let inner = (content_w - 64. - SLACK).max(0.);
+    let beside = inner - HERO_W - 16.;
+    // Floored to a whole pixel: gpui rounds bounds, and a fractional width
+    // measured back through the scroll handle oscillates.
+    Some(if beside >= BIO_MIN_W {
+        BioColumn {
+            width: beside.floor(),
+            beside: true,
+        }
+    } else {
+        BioColumn {
+            width: inner.floor(),
+            beside: false,
+        }
+    })
+}
+
+/// The bio's prose, one element per paragraph (a Wikipedia intro is several),
+/// ending in the Last.fm link for a cut summary; or the muted line standing in
+/// for it.
+fn bio_body(
+    text: Option<String>,
+    read_more: Option<String>,
+    placeholder: Option<&'static str>,
+    cx: &App,
+) -> gpui::AnyElement {
+    let Some(text) = text else {
+        return div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .children(placeholder)
+            .into_any_element();
+    };
+    v_flex()
+        .max_w(px(ABOUT_PROSE_MAX_W))
+        .gap_2()
+        .text_sm()
+        .children(
+            text.split('\n')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| div().child(p.to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .children(read_more.map(|url| {
+            h_flex().child(
+                Button::new("bio-read-more")
+                    .link()
+                    .xsmall()
+                    .label("Read more on Last.fm")
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            )
+        }))
+        .into_any_element()
+}
+
+/// The online services the artist page may ask, per the settings.
+fn artist_sources(settings: &crate::config::Settings) -> album_info::Sources {
+    album_info::Sources {
+        wikipedia: settings.artist_info_wikipedia,
+        musicbrainz: settings.artist_info_musicbrainz,
+    }
+}
+
+/// The server's biography as text, and whether it was cut short.
+///
+/// Navidrome forwards Last.fm's *summary*, which stops at a fixed length and
+/// ends in a "Read more on Last.fm" anchor; with the tags stripped, the
+/// anchor's words are left dangling after the cut as if they were part of the
+/// sentence. They are dropped here and the cut reported instead, so the page
+/// can mark the text as cut and offer the link as a link.
+fn clean_server_bio(raw: &str) -> Option<(String, bool)> {
+    const READ_MORE: &str = "read more on last.fm";
+    let text = strip_html(raw);
+    let trimmed = text.trim_end();
+    let cut_at = trimmed.len().checked_sub(READ_MORE.len());
+    let (body, anchored) = match cut_at {
+        Some(at)
+            if trimmed.is_char_boundary(at) && trimmed[at..].eq_ignore_ascii_case(READ_MORE) =>
+        {
+            (&trimmed[..at], true)
+        }
+        _ => (trimmed, false),
+    };
+    let body = body.trim();
+    (!body.is_empty()).then(|| (body.to_string(), anchored || looks_truncated(body)))
+}
+
 /// Whether an album belongs under "Singles / EPs" rather than "Albums".
 ///
 /// The server's own `releaseTypes` decide it when present: they come from the
@@ -1670,6 +1992,51 @@ async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
 mod tests {
     use super::is_single_or_ep;
     use subsonic::Album;
+
+    #[test]
+    fn the_bio_goes_under_the_photo_only_when_it_must() {
+        use super::{BioColumn, bio_column_width};
+        assert_eq!(bio_column_width(0.), None);
+        assert_eq!(
+            bio_column_width(1748.),
+            Some(BioColumn {
+                width: 1446.,
+                beside: true
+            })
+        );
+        // 64 of padding, 220 of photo and 16 of gap leave under 260.
+        assert_eq!(
+            bio_column_width(500.),
+            Some(BioColumn {
+                width: 434.,
+                beside: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_last_fm_anchor_is_dropped_and_read_as_a_cut() {
+        use super::clean_server_bio;
+        let raw = "Radiohead are an English rock band formed in Abingdon in \
+                   <a href=\"https://www.last.fm/music/Radiohead\">Read more on Last.fm</a>";
+        assert_eq!(
+            clean_server_bio(raw),
+            Some((
+                "Radiohead are an English rock band formed in Abingdon in".into(),
+                true
+            ))
+        );
+        assert_eq!(
+            clean_server_bio("They formed in 1985."),
+            Some(("They formed in 1985.".into(), false))
+        );
+        // A summary cut without the anchor is still a cut.
+        assert_eq!(
+            clean_server_bio("formed over more"),
+            Some(("formed over more".into(), true))
+        );
+        assert_eq!(clean_server_bio(" <a>Read more on Last.fm</a>"), None);
+    }
 
     fn release(name: &str, songs: Option<u32>, secs: Option<u32>, types: &[&str]) -> Album {
         Album {

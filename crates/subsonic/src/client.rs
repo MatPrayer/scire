@@ -62,7 +62,7 @@ struct ApiError {
 /// URL it failed on — so the app rendering an error into a view, or writing
 /// one to a log, published the credentials with it. `without_url` is reqwest's
 /// own way to drop it; the endpoint is named by the caller's context anyway.
-fn http_error(e: reqwest::Error) -> Error {
+pub(crate) fn http_error(e: reqwest::Error) -> Error {
     Error::Http(e.without_url())
 }
 

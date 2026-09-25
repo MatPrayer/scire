@@ -497,9 +497,19 @@ impl Render for PlayerBar {
             .read(cx)
             .settings
             .stream_info_bar
-            .then(|| self.player.read(cx).output_device.clone())
+            .then(|| {
+                let p = self.player.read(cx);
+                // A card opened directly carries the format it runs at, which
+                // is the thing worth checking there.
+                p.output_device.clone().map(|d| match &p.output_direct {
+                    Some(format) => format!("{d} · {format}"),
+                    None => d,
+                })
+            })
             .flatten()
             .filter(|d| !d.trim().is_empty());
+        // Volume is fixed at unity on a card opened directly.
+        let direct_output = self.player.read(cx).output_direct.is_some();
         let reduced_motion = self.session.read(cx).settings.reduced_motion;
 
         let seek_fraction = match duration {
@@ -1097,7 +1107,10 @@ impl Render for PlayerBar {
                                                 .child(div().flex_1())
                                             } else {
                                                 this.child(
-                                                    div().flex_1().child(Slider::new(&self.volume)),
+                                                    div().flex_1().child(
+                                                        Slider::new(&self.volume)
+                                                            .disabled(direct_output),
+                                                    ),
                                                 )
                                             }
                                         }),
@@ -1115,7 +1128,12 @@ impl Render for PlayerBar {
                                 }),
                         )
                         .when_some(device_line, |this, device| {
-                            let selected = self.session.read(cx).settings.output_device.clone();
+                            // Nothing here is the choice while a card is open
+                            // directly (that one is picked in Settings).
+                            let selected = {
+                                let s = &self.session.read(cx).settings;
+                                s.output_direct.is_none().then(|| s.output_device.clone())
+                            };
                             let player = self.player.clone();
                             let session = self.session.clone();
                             this.child(
@@ -1150,8 +1168,9 @@ impl Render for PlayerBar {
                                                 .overflow_y_scroll();
                                             for (i, (label, value)) in opts.into_iter().enumerate()
                                             {
-                                                let is_sel =
-                                                    selected.as_deref() == value.as_deref();
+                                                let is_sel = selected.as_ref().is_some_and(|s| {
+                                                    s.as_deref() == value.as_deref()
+                                                });
                                                 let player = player.clone();
                                                 let session = session.clone();
                                                 menu = menu.child(
@@ -1170,13 +1189,17 @@ impl Render for PlayerBar {
                                                         .on_click(cx.listener(
                                                             move |state, _, window, cx| {
                                                                 let v = value.clone();
+                                                                // Picking a shared device leaves
+                                                                // direct output.
                                                                 player.update(cx, |p, cx| {
+                                                                    p.set_direct_output(None, cx);
                                                                     p.set_output_device(
                                                                         v.clone(),
                                                                         cx,
                                                                     )
                                                                 });
                                                                 session.update(cx, |s, _| {
+                                                                    s.settings.output_direct = None;
                                                                     s.settings.output_device =
                                                                         v.clone();
                                                                     s.persist_settings();

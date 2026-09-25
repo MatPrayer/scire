@@ -6,6 +6,112 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-26
+
+### Added
+
+- The album page's About card looks the album up on MusicBrainz and Wikipedia
+  (Settings → Connections → Album descriptions, each on by default and
+  switchable on its own): the full Wikipedia intro, the MusicBrainz annotation,
+  and links to Wikipedia, MusicBrainz, Discogs, AllMusic and Bandcamp. When more
+  than one description is on offer, pills in the card's header switch between
+  them.
+- The card's links are site icons with tooltips instead of text.
+- The artist page's bio does the same (Settings → Connections → Artist bios,
+  Wikipedia and MusicBrainz each on by default and switchable on their own):
+  the full Wikipedia intro, the MusicBrainz annotation, pills to switch between
+  them and Last.fm's bio, and icon links to Wikipedia, MusicBrainz, Last.fm,
+  Discogs, AllMusic, Bandcamp and the artist's official site. An artist is
+  found by the MusicBrainz id in your tags, else through one of their albums,
+  so two artists sharing a name are not mixed up. A cut Last.fm bio is marked
+  with "…" and ends in a *Read more on Last.fm* link, rather than trailing the
+  link's words after the cut. Its answers have their own Clear cache button.
+- Settings → Connections gathers every outside service the app relies on,
+  grouped by what it is for — album descriptions, lyrics, scrobbling, artist
+  bios — with each feature listing its services: whether your server reaches
+  them or Scirè contacts them itself (and which host), a switch for each one the
+  app decides about — Wikipedia, MusicBrainz, LRCLIB, the library's own lyrics,
+  ListenBrainz for local files, and whether to show the Last.fm notes and bios
+  the server forwards — and a Clear cache button where answers are kept on disk.
+  The lyrics *Source* menu became two switches and *Ask LRCLIB first*. The
+  switches that used to live under Album pages, Library → Lyrics and Playback →
+  ListenBrainz have moved there.
+- Connections also says whether your Navidrome server forwards your plays to
+  ListenBrainz and Last.fm (linked, not linked, or not enabled on the server),
+  read from Navidrome's own API. The check sends your password to the
+  server's login, so it is skipped over plain HTTP unless the server is on
+  your machine or local network.
+- Settings → About links to the GitHub repository, its releases, the
+  changelog and the issue tracker, and names the license.
+- Settings → Audio: the output device is a dropdown, listing the system's
+  devices and, on Linux, the sound cards themselves under *Direct
+  (bit-perfect)*. A direct card is opened on its own, bypassing
+  PipeWire/PulseAudio, at each track's own sample rate, so 16- and 24-bit files
+  reach the DAC unchanged. Volume and ReplayGain are off while it is in use (set
+  the level on the DAC or amp), gapless holds only between tracks of the same
+  rate, and nothing else can play through that card meanwhile — if it is busy,
+  the system output is used and the page says why. The player bar's device line
+  shows the format the card runs at.
+- ReplayGain gains a pre-amp (−6 to +6 dB) and a *Prevent clipping* switch
+  (on by default, as before).
+
+### Changed
+
+- ReplayGain moved from Playback to the new Audio section, next to the output
+  device.
+- Settings that only apply once another one is on are hidden until it is,
+  instead of shown greyed out — the minimal title bar, the album-colour glow,
+  the album panel side, the album page tint and wash, the floating bar's
+  see-through switch, the cover tint and the lyrics order switches. The
+  ListenBrainz token field sits inside the ListenBrainz row and appears when
+  it is switched on.
+- In the wide settings grid, which has no room for the Connections page's
+  explanations, they are behind an info icon beside each heading.
+- Captions that only restated their setting are gone: the in-app title bar,
+  Reduce motion, the local music folders and About.
+
+### Fixed
+
+- Text no longer wraps a closing bracket, semicolon, question mark or ellipsis
+  onto a line of its own — a settings caption could end with `).` alone on its
+  last line.
+- Album art replaced on the server now shows up in Scirè. A library refresh
+  picks up albums whose cover changed and swaps the cached pictures in place,
+  and Settings → Library → Rebuild local cache rechecks every cached cover.
+  Before, the old art stayed until it was evicted from the cache.
+- Two albums by one artist sharing a title (a self-titled debut and a
+  self-titled follow-up) no longer both get the same album's description: the
+  lookup prefers the one first released in the album's year. Clear the album
+  descriptions cache to re-ask for one already looked up.
+- A long artist bio no longer runs out through the bottom of the header card,
+  in a window wide enough to set it beside the photo or narrow enough to put it
+  under.
+- A saved server that does not answer at startup is retried (after 2s, 5s,
+  15s, 30s, then every minute) instead of leaving the session offline until a
+  restart while the cached library made everything look fine.
+- The About card no longer ends mid-sentence after More. The text Navidrome
+  forwards is Last.fm's summary, cut at a fixed length with its "Read more" link
+  stripped; a cut-off summary is now marked with "…" and ends in a *Read more on
+  Last.fm* link to the full text, and the Wikipedia intro — complete, and split
+  into paragraphs — is shown in its place where there is one.
+
+## [1.0.2] — 2026-09-24
+
+### Fixed
+
+- Portrait windows: the album page header (server and local) becomes one
+  centred column with a bigger cover once the window is clearly taller than
+  wide, instead of a stack hugging the left edge. The side-panel layout now
+  takes any landscape window a little wider than square rather than only
+  widescreen ones, so the header-over-tracks layout is left to near-square
+  windows.
+- Track titles keep a share of the row in narrow windows instead of being
+  squeezed to nothing by the artist column, and the grid headers wrap their
+  summary under the tabs rather than pushing it off the edge. A narrow pane
+  keeps two grid columns at a slightly smaller tile.
+
+## [1.0.1] — 2026-09-24
+
 ### Fixed
 
 - The artist page's Albums / Singles / EPs split follows the release type the
@@ -17,16 +123,9 @@ follows [Semantic Versioning](https://semver.org/).
 - A year below 1000 is treated as missing. A date written day-first into a
   year-first tag (`0003-09-2026`) used to show as "3" under the album's cover
   and sort as the oldest record in the library.
-- Portrait windows: the album page header (server and local) becomes one
-  centred column with a bigger cover once the window is clearly taller than
-  wide, instead of a stack hugging the left edge. The side-panel layout now
-  takes any landscape window a little wider than square rather than only
-  widescreen ones, so the header-over-tracks layout is left to near-square
-  windows.
-- Track titles keep a share of the row in narrow windows instead of being
-  squeezed to nothing by the artist column, and the grid headers wrap their
-  summary under the tabs rather than pushing it off the edge. A narrow pane
-  keeps two grid columns at a slightly smaller tile.
+- The Recent page draws covers already in the cache, including art the player
+  bar or the album grid stored at another size, and offline. Local tracks'
+  covers are read from disk instead of being asked of the server.
 
 ## [1.0.0] — 2026-09-24
 
@@ -114,5 +213,8 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/MatPrayer/scire/compare/d6706f2...v1.1.0
+[1.0.2]: https://github.com/MatPrayer/scire/compare/a7c8c36...d6706f2
+[1.0.1]: https://github.com/MatPrayer/scire/compare/v1.0.0...a7c8c36
 [1.0.0]: https://github.com/MatPrayer/scire/releases/tag/v1.0.0

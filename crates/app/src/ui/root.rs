@@ -58,6 +58,8 @@ const REFRESH_POLL: Duration = Duration::from_millis(400);
 /// disk. Long enough that a resize drag costs one write rather than one per
 /// frame; short enough that a window moved and then quit is still remembered.
 const GEOMETRY_FLUSH: Duration = Duration::from_millis(700);
+/// How often the root view checks for cover art a sync replaced on disk.
+const REPLACED_ART_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, PartialEq)]
 enum FocusRegion {
@@ -660,6 +662,32 @@ impl RootView {
             // until the user touched playback.
             this.maybe_update_adaptive_accent(cx);
         });
+
+        // Covers a sync found replaced on the server are rewritten in place,
+        // and gpui caches decoded images by path — so each one is evicted
+        // here, or the old picture would stay on screen until a restart.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REPLACED_ART_POLL).await;
+                let replaced = artwork::take_replaced();
+                if replaced.is_empty() {
+                    continue;
+                }
+                let alive = this.update(cx, |this, cx| {
+                    for path in replaced {
+                        gpui::ImageSource::from(path).remove_asset(cx);
+                    }
+                    // The accent was derived from the old art.
+                    this.adaptive_cover = None;
+                    this.maybe_update_adaptive_accent(cx);
+                    cx.refresh_windows();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
 
         // Sidebar fold state is persisted, so restore it instead of reopening
         // every section on each start.

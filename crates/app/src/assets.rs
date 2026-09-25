@@ -80,4 +80,13 @@ pub mod icons {
     pub const REFRESH: &str = "icons/refresh-cw.svg";
     /// Outline star from the gpui-component bundle (same artwork, no fill).
     pub const STAR_OUTLINE: &str = "icons/star.svg";
+    pub const SERVER: &str = "icons/server.svg";
+    /// Stands in for ListenBrainz, which Simple Icons has no mark for.
+    pub const HEADPHONES: &str = "icons/headphones.svg";
+    // Site marks for the album page's link row, from Simple Icons (CC0).
+    pub const BRAND_WIKIPEDIA: &str = "icons/brand-wikipedia.svg";
+    pub const BRAND_MUSICBRAINZ: &str = "icons/brand-musicbrainz.svg";
+    pub const BRAND_LASTFM: &str = "icons/brand-lastdotfm.svg";
+    pub const BRAND_DISCOGS: &str = "icons/brand-discogs.svg";
+    pub const BRAND_BANDCAMP: &str = "icons/brand-bandcamp.svg";
 }
