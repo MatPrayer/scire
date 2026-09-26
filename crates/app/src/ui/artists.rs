@@ -704,8 +704,16 @@ pub struct ArtistDetailView {
     /// An artist-image fetch has started; stops info2's fallback from
     /// racing/overwriting the primary coverArt fetch.
     image_requested: bool,
-    /// Long bios render clamped to a few lines until expanded.
-    bio_expanded: bool,
+    /// A long bio shows a preview on the page; the whole text opens in a
+    /// popup rather than growing the header card down the page.
+    bio_open: bool,
+    /// The bio popup's open/close travel.
+    bio_reveal: crate::ui::Reveal,
+    /// The bio popup's own scroll, reset each time it opens.
+    bio_scroll: ScrollHandle,
+    /// Content-area height the bio popup was last capped at: the area is
+    /// measured a frame late, so a change asks for one more frame.
+    bio_popup_area_h: f32,
     /// What `services::artist_info` found outside the server (Wikipedia,
     /// MusicBrainz), once it has answered.
     online: Option<ArtistInfo>,
@@ -724,7 +732,7 @@ pub struct ArtistDetailView {
     /// Album id per flattened discography card (album cards then singles/EPs),
     /// rebuilt each render to map the vi cursor index onto a card.
     discography_ids: Vec<String>,
-    /// Whether the bio "More/Less" toggle is present and can take the cursor.
+    /// Whether the bio "Read more" button is present and can take the cursor.
     bio_toggle_focusable: bool,
     /// Discography card / bio toggle index under the vi-mode cursor.
     vi_cursor: Option<usize>,
@@ -771,7 +779,10 @@ impl ArtistDetailView {
             error: None,
             info: None,
             image_requested: false,
-            bio_expanded: false,
+            bio_open: false,
+            bio_reveal: crate::ui::Reveal::new(170, 120),
+            bio_scroll: ScrollHandle::new(),
+            bio_popup_area_h: 0.,
             online: None,
             online_asked: None,
             online_since: None,
@@ -1171,6 +1182,16 @@ impl ArtistDetailView {
     }
 
     pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
+        // With the popup up, j/k read through the bio instead of walking the
+        // cards hidden behind it.
+        if self.bio_open {
+            let offset = self.bio_scroll.offset();
+            let max = self.bio_scroll.max_offset().height;
+            let y = (offset.y - px(BIO_POPUP_STEP * delta as f32)).clamp(-max, px(0.));
+            self.bio_scroll.set_offset(gpui::point(offset.x, y));
+            cx.notify();
+            return;
+        }
         let bio = self.bio_toggle_focusable as usize;
         let count = self.discography_ids.len() + bio;
         if count == 0 {
@@ -1192,18 +1213,163 @@ impl ArtistDetailView {
         }
     }
 
-    /// Enter on a focused discography card opens the album; on the bio toggle
-    /// it expands/collapses the biography.
+    /// Enter on a focused discography card opens the album; on the bio's
+    /// "Read more" it opens the whole biography, and closes it again.
     pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
+        if self.bio_open {
+            self.close_bio(cx);
+            return;
+        }
         let Some(i) = self.vi_cursor else {
             return;
         };
         if let Some(id) = self.discography_ids.get(i) {
             cx.emit(ArtistDetailEvent::OpenAlbum(id.clone()));
         } else if self.bio_toggle_focusable {
-            self.bio_expanded = !self.bio_expanded;
+            self.open_bio(cx);
+        }
+    }
+
+    fn open_bio(&mut self, cx: &mut Context<Self>) {
+        self.bio_open = true;
+        self.bio_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Close the bio popup; whether it was open (Escape asks, and only stops
+    /// there when it was).
+    pub fn close_bio(&mut self, cx: &mut Context<Self>) -> bool {
+        let was = std::mem::take(&mut self.bio_open);
+        if was {
             cx.notify();
         }
+        was
+    }
+
+    /// The whole biography over the page: a card sized to the content area
+    /// with its own scroll, dismissed by the close button, a click on the
+    /// backdrop, Escape, or Enter in vi mode. On its way out the popup no
+    /// longer takes clicks.
+    fn render_bio_popup(
+        &mut self,
+        text: String,
+        source: Option<&'static str>,
+        read_more: Option<String>,
+        content_w: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let active = self.bio_open;
+        let t = self
+            .bio_reveal
+            .openness(self.session.read(cx).settings.reduced_motion);
+        // Width from this frame's viewport (`LiveWidth`); the height only
+        // exists as last paint's bounds, so when it moves the next frame is
+        // asked for, or a window shrunk once kept the old cap.
+        let measured_h = f32::from(self.scroll.bounds().size.height);
+        let area_h = if measured_h > 0. {
+            measured_h
+        } else {
+            f32::from(window.viewport_size().height)
+        };
+        if area_h != self.bio_popup_area_h {
+            self.bio_popup_area_h = area_h;
+            window.request_animation_frame();
+        }
+        let width = bio_popup_width(content_w);
+        let max_h = (area_h - 2. * BIO_POPUP_MARGIN).max(0.).floor();
+        let name = self
+            .artist
+            .as_ref()
+            .map(|a| a.artist.name.clone())
+            .unwrap_or_default();
+        div()
+            .id("artist-bio-popup")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            // Half of it, the container being centred: the card rises into
+            // place while the backdrop dims behind it.
+            .pt(px(28. * (1. - t)))
+            .occlude()
+            .bg(gpui::hsla(0., 0., 0., 0.6 * t))
+            .when(active, |this| {
+                this.on_click(cx.listener(|this, _, _, cx| {
+                    this.close_bio(cx);
+                }))
+            })
+            .child(
+                v_flex()
+                    .id("artist-bio-card")
+                    .w(px(width))
+                    .max_h(px(max_h))
+                    .overflow_hidden()
+                    // Its own hitbox over the backdrop's, so a click on the
+                    // text does not count as one outside it.
+                    .occlude()
+                    .opacity(t)
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .shadow_xl()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_start()
+                            .justify_between()
+                            .gap_2()
+                            .px_5()
+                            .pt_4()
+                            .pb_2()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .child(div().text_lg().font_semibold().child(name))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(match source {
+                                                Some(source) => format!("Bio · {source}"),
+                                                None => "Bio".to_string(),
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                Button::new("artist-bio-close")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(IconName::Close))
+                                    .tooltip("Close")
+                                    .when(active, |b| {
+                                        b.on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_bio(cx);
+                                        }))
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("artist-bio-text")
+                            // Grows to the text and gives way to the card's
+                            // cap: `flex_1`'s zero basis would measure the
+                            // prose at min-content width.
+                            .flex_grow()
+                            .flex_shrink()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.bio_scroll)
+                            .px_5()
+                            .pb_5()
+                            .child(bio_body(Some(text), read_more, None, cx)),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// One discography card, focus-ringed and scroll-anchored when the vi
@@ -1432,13 +1598,22 @@ impl Render for ArtistDetailView {
         let bio_long = bio
             .as_ref()
             .is_some_and(|b| b.chars().count() > BIO_PREVIEW_CHARS);
-        let read_more = read_more.filter(|_| self.bio_expanded || !bio_long);
+        // A long bio is previewed here and read whole in the popup, which is
+        // also where a cut summary's Last.fm link goes.
+        let popup_read_more = read_more.clone().filter(|_| bio_long);
+        let read_more = read_more.filter(|_| !bio_long);
+        let full_bio = bio.clone().filter(|_| bio_long);
         let bio_text: Option<String> = bio.map(|b| {
-            if self.bio_expanded || !bio_long {
-                b
-            } else {
+            if bio_long {
                 truncate_at_word(&b, BIO_PREVIEW_CHARS)
+            } else {
+                b
             }
+        });
+        let shown_label = shown.map(|source| match source {
+            AboutSource::Wikipedia => "Wikipedia",
+            AboutSource::Server => server_label,
+            AboutSource::MusicBrainz => "MusicBrainz",
         });
         let bio_placeholder = (bios_on || online_on).then_some(if bio_loading {
             "Looking up a biography…"
@@ -1572,7 +1747,13 @@ impl Render for ArtistDetailView {
             .p_4()
             .gap_4()
             .child(
+                // An explicit width and no shrinking, like the album page's
+                // header card: left to the scrolling column, the card was
+                // squeezed to the photo's height while the bio ran on through
+                // its bottom and over the discography.
                 v_flex()
+                    .when_some(hero_card_width(content_w), |this, w| this.w(px(w)))
+                    .flex_none()
                     .rounded_2xl()
                     .p_4()
                     .gap_4()
@@ -1665,21 +1846,15 @@ impl Render for ArtistDetailView {
                                         ))
                                     })
                                     .when(bio_long, |this| {
-                                        let expanded = self.bio_expanded;
                                         let focused = bio_focused;
                                         let glow = self.session.read(cx).settings.selection_glow_vi;
                                         let btn = Button::new("bio-toggle")
                                             .ghost()
                                             .xsmall()
-                                            .label(if expanded { "Less" } else { "More" })
-                                            .icon(Icon::new(if expanded {
-                                                IconName::ChevronUp
-                                            } else {
-                                                IconName::ChevronDown
-                                            }))
+                                            .label("Read more")
+                                            .icon(Icon::new(IconName::Maximize))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.bio_expanded = !this.bio_expanded;
-                                                cx.notify();
+                                                this.open_bio(cx);
                                             }));
                                         this.child(h_flex().child(with_focus_cursor(
                                             "vi-bio-toggle",
@@ -1734,10 +1909,27 @@ impl Render for ArtistDetailView {
                 this.child(make_section("Appears on".to_string(), appears_cards))
             });
 
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        // Nothing to read any more (a source switched off, the page reloaded):
+        // the popup goes with it.
+        if full_bio.is_none() {
+            self.bio_open = false;
+        }
+        self.bio_reveal.set(self.bio_open, reduced_motion);
+        if self.bio_reveal.settling(reduced_motion) {
+            window.request_animation_frame();
+        }
+        let bio_popup = full_bio
+            .filter(|_| self.bio_reveal.visible(reduced_motion))
+            .map(|text| {
+                self.render_bio_popup(text, shown_label, popup_read_more, content_w, window, cx)
+            });
+
         div()
             .relative()
             .size_full()
             .child(page)
+            .children(bio_popup)
             // Full-resolution artist photo; click anywhere to dismiss, same as
             // the album page's cover.
             .when(self.show_full_art, |this| {
@@ -1820,6 +2012,27 @@ const BIO_PREVIEW_CHARS: usize = 400;
 const HERO_W: f32 = 220.;
 /// Narrowest the bio column goes beside the photo before dropping under it.
 const BIO_MIN_W: f32 = 260.;
+
+/// How far one vi j/k moves the bio popup's text.
+const BIO_POPUP_STEP: f32 = 64.;
+/// The bio popup's widest; prose past this is a strain to read.
+const BIO_POPUP_MAX_W: f32 = 680.;
+/// Room the bio popup leaves around itself inside the content area.
+const BIO_POPUP_MARGIN: f32 = 24.;
+
+/// The bio popup's width in a content area `content_w` wide, a whole pixel so
+/// the prose inside measures at the width it is laid out at.
+fn bio_popup_width(content_w: f32) -> f32 {
+    (content_w - 2. * BIO_POPUP_MARGIN)
+        .clamp(0., BIO_POPUP_MAX_W)
+        .floor()
+}
+
+/// The header card's width: the content area less the page's `p_4` either
+/// side. `None` before anything has been measured.
+fn hero_card_width(content_w: f32) -> Option<f32> {
+    (content_w > 0.).then(|| (content_w - 32.).max(0.).floor())
+}
 
 /// Where the bio column goes and how wide it is.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1992,6 +2205,16 @@ async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
 mod tests {
     use super::is_single_or_ep;
     use subsonic::Album;
+
+    #[test]
+    fn the_header_card_and_bio_popup_fit_the_content_area() {
+        use super::{BIO_POPUP_MAX_W, bio_popup_width, hero_card_width};
+        assert_eq!(hero_card_width(0.), None);
+        assert_eq!(hero_card_width(1200.5), Some(1168.));
+        assert_eq!(bio_popup_width(2400.), BIO_POPUP_MAX_W);
+        assert_eq!(bio_popup_width(500.5), 452.);
+        assert_eq!(bio_popup_width(10.), 0.);
+    }
 
     #[test]
     fn the_bio_goes_under_the_photo_only_when_it_must() {

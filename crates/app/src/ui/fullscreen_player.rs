@@ -13,6 +13,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::popover::Popover;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
+use gpui_component::spinner::Spinner;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
@@ -832,8 +833,16 @@ impl LyricsSource {
 
     fn tooltip(self) -> &'static str {
         match self {
-            Self::Library => "From your library — the file's tags or a sidecar .lrc",
-            Self::Online => "Fetched from LRCLIB; your library has none for this track",
+            Self::Library => "From your library (the file's tags or a sidecar .lrc)",
+            Self::Online => "Fetched from LRCLIB",
+        }
+    }
+
+    /// How the badge's tooltip names this source as the one a click shows.
+    fn offer(self) -> &'static str {
+        match self {
+            Self::Library => "Click to show your library's lyrics instead",
+            Self::Online => "Click to show LRCLIB's lyrics instead",
         }
     }
 }
@@ -2105,14 +2114,33 @@ impl FullscreenPlayer {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let reduced_motion = self.session.read(cx).settings.reduced_motion;
-        let body: Vec<gpui::AnyElement> = if self.lyrics_loading {
-            vec![
+        // Loading and "No lyrics found" sit in the middle of the panel rather
+        // than under its title: the panel keeps its full size throughout, so
+        // it does not collapse to a strip and spring back as each song loads.
+        let placeholder: Option<gpui::AnyElement> = if self.lyrics_loading {
+            Some(
+                v_flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(Spinner::new().color(cx.theme().muted_foreground))
+                    .child("Loading lyrics…")
+                    .into_any_element(),
+            )
+        } else if self.lyrics.is_none() {
+            Some(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Loading…")
+                    .child("No lyrics found")
                     .into_any_element(),
-            ]
+            )
+        } else {
+            None
+        };
+        let body: Vec<gpui::AnyElement> = if placeholder.is_some() {
+            Vec::new()
         } else {
             match &self.lyrics {
                 Some(doc) => doc
@@ -2258,13 +2286,7 @@ impl FullscreenPlayer {
                         }
                     })
                     .collect(),
-                None => vec![
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("No lyrics found")
-                        .into_any_element(),
-                ],
+                None => Vec::new(),
             }
         };
         v_flex()
@@ -2272,8 +2294,9 @@ impl FullscreenPlayer {
             .flex_none()
             // Same card as the info column and the mini player, so an open
             // panel reads as part of the player rather than as a list dropped
-            // onto the backdrop.
-            .max_h(px(max_h))
+            // onto the backdrop. A fixed height, not a cap: a sheet shorter
+            // than the panel, or none yet, must not shrink it.
+            .h(px(max_h))
             .p_4()
             .gap_2()
             .rounded_2xl()
@@ -2303,15 +2326,19 @@ impl FullscreenPlayer {
                         // wherever it is there to be had.
                         let switch = self.lyrics_switch(cx);
                         let switching = self.lyrics_switching;
-                        let tip = match switch {
-                            Some(alt) => {
+                        // "Your library has none" only when the library was
+                        // asked and came back empty: online-first shows
+                        // LRCLIB while the library may well have its own.
+                        let library_empty = matches!(self.lyrics_library, Some(None));
+                        let tip = match (switch, source) {
+                            (Some(alt), _) => format!("{}. {}", source.tooltip(), alt.offer()),
+                            (None, LyricsSource::Online) if library_empty => {
                                 format!(
-                                    "{} — click to show {} instead",
-                                    source.tooltip(),
-                                    alt.badge()
+                                    "{}; your library has none for this track",
+                                    source.tooltip()
                                 )
                             }
-                            None => source.tooltip().to_string(),
+                            (None, _) => source.tooltip().to_string(),
                         };
                         this.child(
                             div()
@@ -2342,8 +2369,15 @@ impl FullscreenPlayer {
                         )
                     }),
             )
-            .child(
-                v_flex()
+            .child(match placeholder {
+                Some(placeholder) => v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .child(placeholder)
+                    .into_any_element(),
+                None => v_flex()
                     .id("fs-lyrics-scroll")
                     .track_scroll(&self.lyrics_scroll)
                     .flex_1()
@@ -2352,8 +2386,9 @@ impl FullscreenPlayer {
                     // to read as separate lines rather than as a paragraph.
                     .gap_3()
                     .overflow_y_scroll()
-                    .children(body),
-            )
+                    .children(body)
+                    .into_any_element(),
+            })
             .into_any_element()
     }
 

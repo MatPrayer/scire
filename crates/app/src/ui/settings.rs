@@ -553,8 +553,8 @@ enum SettingsButton {
 const DIRECT_OUTPUT_NOTE: &str = "Direct devices bypass the sound server: the \
      card is opened on its own at each track's sample rate and gets the file's \
      samples unchanged (bit-perfect for 16- and 24-bit files). Volume and \
-     ReplayGain are off — set the level on your DAC or amp — and nothing else \
-     can play through that card meanwhile. If the card is busy, the system \
+     ReplayGain are off (set the level on your DAC or amp), and nothing \
+     else can play through that card meanwhile. If the card is busy, the system \
      output is used instead.";
 
 /// The output dropdown's value: a sound-server device (None = the system
@@ -3110,7 +3110,7 @@ impl Render for SettingsView {
             )
             .child(self.note(
                 "Font size sets the interface's text; UI scale sets the space \
-                 around it — gutters, card padding, row and bar heights. They \
+                 around it: gutters, card padding, row and bar heights. They \
                  are separate knobs, so text can grow without the layout \
                  loosening and the layout can loosen without the text growing.",
                 cx,
@@ -3160,7 +3160,7 @@ impl Render for SettingsView {
             .child(self.note(
                 "Stacked puts the cover and details above the track list. Side \
                  panel moves them into a tall panel on the right, with a much \
-                 bigger cover — on any landscape window wide enough for it; anything \
+                 bigger cover, on any landscape window wide enough for it. Anything \
                  narrower or squarer stays stacked.",
                 cx,
             ))
@@ -3390,7 +3390,7 @@ impl Render for SettingsView {
             .child(self.note_if(
                 !tint_disabled,
                 "The Adaptive theme washes the player bar with the playing \
-                 track's colour. Turn it off for the plain panel background — \
+                 track's colour. Turn it off for the plain panel background; \
                  the accent stays on the buttons, sliders and seek bar.",
                 cx,
             ))
@@ -3512,17 +3512,68 @@ impl Render for SettingsView {
                 cx,
             )
             .into_any_element();
-        let status = {
+        // A dot and a short label say at a glance whether the card is really
+        // open directly; the muted detail carries the format or the reason.
+        let (dot, label, detail) = {
             let p = self.player.read(cx);
+            let theme = cx.theme();
             match (&p.output_direct, &p.direct_error, &p.output_device) {
-                (Some(format), _, _) => format!("Direct: {format}"),
-                (None, Some(err), Some(d)) if direct_chosen => {
-                    format!("Direct output unavailable ({err}); playing through {d}")
+                (Some(format), _, _) if format.contains("resampled") => {
+                    (theme.warning, "Direct, resampled", format.clone())
                 }
-                (_, _, Some(d)) => format!("Output open on {d}"),
-                _ => "No output open yet".to_string(),
+                (Some(format), _, _) => (theme.success, "Bit-perfect", format.clone()),
+                (None, Some(err), Some(d)) if direct_chosen => (
+                    theme.danger,
+                    "Direct unavailable",
+                    format!("{err}. Playing through {d}"),
+                ),
+                (_, _, Some(d)) => (theme.info, "System output", d.clone()),
+                _ if direct_chosen => (
+                    theme.muted_foreground.opacity(0.5),
+                    "Direct",
+                    "The card opens with the next track".to_string(),
+                ),
+                _ => (
+                    theme.muted_foreground.opacity(0.5),
+                    "No output",
+                    "Opens with the next track".to_string(),
+                ),
             }
         };
+        let status = h_flex()
+            .id("output-status")
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .items_center()
+            .text_xs()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1p5()
+                    .items_center()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(dot.opacity(0.5))
+                    .bg(dot.opacity(0.12))
+                    .child(div().size(px(7.)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .child(label),
+                    ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(detail.clone()),
+            )
+            .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx));
         let rg_on = replay_gain != ReplayGainMode::Off && !direct_chosen;
         let mut audio_section = audio_section
             .child(
@@ -3532,12 +3583,7 @@ impl Render for SettingsView {
                     .child(div().flex_1().min_w_0().child(output_dropdown))
                     .child(refresh),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(status),
-            )
+            .child(status)
             .child(self.note(
                 "System default follows the desktop's choice. A chosen device \
                  that disconnects pauses playback until it comes back.",
@@ -3766,7 +3812,7 @@ impl Render for SettingsView {
             )
             .child(self.subheading("Cover size", cx))
             .child(self.note(
-                "Roughly how big album covers are — the exact size and the number \
+                "Roughly how big album covers are. The exact size and the number \
                  per row adapt to the window so the grid fills its width.",
                 cx,
             ))
@@ -4136,7 +4182,7 @@ impl Render for SettingsView {
                 "Download every album and artist cover in the background, so the \
                  grids draw from disk instead of fetching as you scroll. Runs \
                  after each library sync and only fetches what is missing. Large \
-                 libraries will fill the cache above — raise it if covers start \
+                 libraries will fill the cache above, so raise it if covers start \
                  reappearing.",
                 cx,
             ))

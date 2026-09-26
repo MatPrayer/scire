@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-09-26
+
+### Fixed
+
+- A long artist bio no longer runs out of the header card and over the
+  discography: the card grows with its contents in every window shape.
+- The lyrics source badge no longer claims your library has no lyrics while
+  LRCLIB's are showing and your library does have some.
+- The lyrics panel keeps its size while lyrics load, with the loading
+  indicator in its centre, instead of collapsing to a strip and springing back.
+
+### Changed
+
+- A long artist bio shows a preview on the page; *Read more* opens the whole
+  text in a popup (close button, a click outside, or Escape) instead of
+  stretching the header down the page.
+- The audio output status in Settings is a coloured indicator: bit-perfect,
+  resampled, direct unavailable, or system output, with the details beside it.
+- Settings descriptions reworded without long dashes.
+
 ## [1.1.0] — 2026-09-26
 
 ### Added
@@ -213,7 +233,8 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/MatPrayer/scire/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/MatPrayer/scire/compare/d6706f2...v1.1.0
 [1.0.2]: https://github.com/MatPrayer/scire/compare/a7c8c36...d6706f2
 [1.0.1]: https://github.com/MatPrayer/scire/compare/v1.0.0...a7c8c36

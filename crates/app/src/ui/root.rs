@@ -2108,6 +2108,8 @@ impl RootView {
                 {
                     self.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
                     cx.stop_propagation();
+                } else if self.close_artist_bio(cx) {
+                    cx.stop_propagation();
                 }
             }
             _ => {}
@@ -3083,6 +3085,14 @@ impl RootView {
     /// `t` is the open/close travel, `active` whether the dialog is still open:
     /// its buttons keep working for the length of the exit otherwise, and a
     /// click landing on "Create" after Cancel would create the playlist anyway.
+    /// Close the artist page's bio popup, if that is what is on screen.
+    fn close_artist_bio(&mut self, cx: &mut Context<Self>) -> bool {
+        match &self.content {
+            Some(Content::ArtistDetail(view)) => view.update(cx, |v, cx| v.close_bio(cx)),
+            _ => false,
+        }
+    }
+
     fn render_new_playlist_modal(
         &self,
         t: f32,
@@ -3417,6 +3427,8 @@ impl Render for RootView {
                                 || this.search_bar.read(cx).is_open()
                             {
                                 this.search_bar.update(cx, |sb, cx| sb.dismiss(window, cx));
+                                cx.stop_propagation();
+                            } else if this.close_artist_bio(cx) {
                                 cx.stop_propagation();
                             }
                         }
