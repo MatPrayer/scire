@@ -101,6 +101,8 @@ fn bits(format: SampleFormat) -> &'static str {
 }
 
 /// One of a card's supported configurations, reduced to what planning reads.
+/// Planning runs on Linux only; macOS lists no direct devices.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Range {
     pub channels: u16,
@@ -112,6 +114,7 @@ pub(crate) struct Range {
 /// How much a sample format is worth to us. Wide integers first: 16- and
 /// 24-bit samples both land in them unchanged. `f32` is exact too, but few
 /// cards take it. 16-bit last, since it truncates a 24-bit source.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn format_rank(format: SampleFormat) -> Option<u8> {
     match format {
         SampleFormat::I32 => Some(5),
@@ -132,6 +135,7 @@ fn format_rank(format: SampleFormat) -> Option<u8> {
 /// count, then the sample format. A card that cannot take the rate at all
 /// gets the nearest one it can, above rather than below where there is a
 /// choice, so the result is still something that plays.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn plan(ranges: &[Range], want: Want) -> Option<DirectFormat> {
     ranges
         .iter()
@@ -167,6 +171,7 @@ pub(crate) fn plan(ranges: &[Range], want: Want) -> Option<DirectFormat> {
 pub(crate) enum OpenError {
     /// Something else has the card — worth waiting a moment and retrying,
     /// since the likeliest something is the sound server letting go.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Busy(String),
     Other(String),
 }
