@@ -1057,13 +1057,26 @@ impl Render for PlayerBar {
                                         .flex_1()
                                         .gap_2()
                                         .items_center()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(app_icon(icons::VOLUME_HIGH)),
-                                        )
                                         .map(|this| {
+                                            if direct_output {
+                                                // Unity on a card opened directly:
+                                                // say so rather than grey a slider.
+                                                this.child(crate::ui::direct_badge(
+                                                    "np-direct",
+                                                    false,
+                                                    cx,
+                                                ))
+                                                .child(div().flex_1())
+                                            } else {
+                                                this.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(app_icon(icons::VOLUME_HIGH)),
+                                                )
+                                            }
+                                        })
+                                        .when(!direct_output, |this| {
                                             if detailed_volume {
                                                 // [−] [editable dB] [+] — no slider.
                                                 this.child(
@@ -1107,10 +1120,7 @@ impl Render for PlayerBar {
                                                 .child(div().flex_1())
                                             } else {
                                                 this.child(
-                                                    div().flex_1().child(
-                                                        Slider::new(&self.volume)
-                                                            .disabled(direct_output),
-                                                    ),
+                                                    div().flex_1().child(Slider::new(&self.volume)),
                                                 )
                                             }
                                         }),
@@ -1140,14 +1150,10 @@ impl Render for PlayerBar {
                                 // Click the device name to switch outputs.
                                 h_flex().w_full().child(
                                     Popover::new("output-device")
-                                        .trigger(
-                                            Button::new("output-device-trigger")
-                                                .ghost()
-                                                .xsmall()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .icon(Icon::new(IconName::ChevronDown).xsmall())
-                                                .label(device),
-                                        )
+                                        .trigger(DeviceTrigger::new(
+                                            "output-device-trigger",
+                                            device,
+                                        ))
                                         .content(move |_state, _window, cx| {
                                             let opts: Vec<(String, Option<String>)> =
                                                 std::iter::once((
@@ -1164,6 +1170,9 @@ impl Render for PlayerBar {
                                                 .id("output-device-menu")
                                                 .gap_0p5()
                                                 .min_w(px(220.))
+                                                // Long sink names wrap instead of
+                                                // running off the popover.
+                                                .max_w(px(360.))
                                                 .max_h(px(280.))
                                                 .overflow_y_scroll();
                                             for (i, (label, value)) in opts.into_iter().enumerate()
@@ -1217,6 +1226,67 @@ impl Render for PlayerBar {
                         }),
                 ),
             )
+    }
+}
+
+/// The output-device line under the volume row, and the trigger of the
+/// device picker. A plain element rather than a `Button`: a button's label is
+/// `flex_none`, so a long sink name (Bluetooth and USB ones often are) pushed
+/// the line past the bar instead of ending in an ellipsis. The full name is in
+/// the tooltip.
+#[derive(IntoElement)]
+struct DeviceTrigger {
+    id: &'static str,
+    label: String,
+    selected: bool,
+}
+
+impl DeviceTrigger {
+    fn new(id: &'static str, label: String) -> Self {
+        Self {
+            id,
+            label,
+            selected: false,
+        }
+    }
+}
+
+impl gpui_component::Selectable for DeviceTrigger {
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.selected
+    }
+}
+
+impl RenderOnce for DeviceTrigger {
+    fn render(self, _: &mut Window, cx: &mut gpui::App) -> impl IntoElement {
+        let tip = self.label.clone();
+        h_flex()
+            .id(self.id)
+            .min_w_0()
+            .max_w_full()
+            .gap_1()
+            .px_1p5()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .hover(|s| s.bg(cx.theme().muted))
+            .when(self.selected, |s| s.bg(cx.theme().muted))
+            .child(div().min_w_0().truncate().child(self.label))
+            .child(
+                div()
+                    .flex_none()
+                    .child(Icon::new(IconName::ChevronDown).xsmall()),
+            )
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
     }
 }
 

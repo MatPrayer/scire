@@ -470,20 +470,31 @@ impl RootView {
                 }
                 PlayerBarEvent::OpenAlbum(id) => {
                     this.show_fullscreen = false;
-                    this.open_album(id.clone(), cx);
+                    this.open_any_album(id.clone(), cx);
                 }
                 PlayerBarEvent::OpenArtist(id) => {
                     this.show_fullscreen = false;
-                    this.open_artist(id.clone(), cx);
+                    this.open_any_artist(id.clone(), cx);
                 }
             }
             cx.notify();
         })
         .detach();
 
-        cx.subscribe(&fullscreen, |this: &mut Self, _, event, cx| {
-            let FullscreenEvent::Close = event;
-            this.show_fullscreen = false;
+        cx.subscribe(&fullscreen, |this: &mut Self, fullscreen, event, cx| {
+            match event {
+                FullscreenEvent::Close => this.show_fullscreen = false,
+                // Navigate underneath, then animate the overlay away so the
+                // page is what it uncovers.
+                FullscreenEvent::OpenAlbum(id) => {
+                    this.open_any_album(id.clone(), cx);
+                    fullscreen.update(cx, |f, cx| f.begin_close(cx));
+                }
+                FullscreenEvent::OpenArtist(id) => {
+                    this.open_any_artist(id.clone(), cx);
+                    fullscreen.update(cx, |f, cx| f.begin_close(cx));
+                }
+            }
             cx.notify();
         })
         .detach();
@@ -1485,6 +1496,25 @@ impl RootView {
         .detach();
         self.content = Some(Content::AlbumDetail(view));
         cx.notify();
+    }
+
+    /// Open an album from a song's `album_id`, which for a local track is a
+    /// local album key (`local:album:…`) rather than a server id.
+    fn open_any_album(&mut self, id: String, cx: &mut Context<Self>) {
+        if id.starts_with("local:") {
+            self.open_local_album(id, cx);
+        } else {
+            self.open_album(id, cx);
+        }
+    }
+
+    /// [`Self::open_any_album`] for artists (`local:artist:…`).
+    fn open_any_artist(&mut self, id: String, cx: &mut Context<Self>) {
+        if id.starts_with("local:") {
+            self.open_local_artist(id, cx);
+        } else {
+            self.open_artist(id, cx);
+        }
     }
 
     fn open_local_album(&mut self, id: String, cx: &mut Context<Self>) {

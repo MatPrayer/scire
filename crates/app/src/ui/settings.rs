@@ -3467,7 +3467,12 @@ impl Render for SettingsView {
         let output_dropdown = self.vi_control(
             SettingsAction::OutputDevice,
             Button::new("output-device")
-                .label(trigger_label)
+                // A child rather than `.label`: the label is `flex_none`, so
+                // a long sink name ran past the card instead of ellipsizing.
+                .child(div().min_w_0().truncate().child(trigger_label))
+                .flex_shrink()
+                .min_w_0()
+                .max_w_full()
                 .dropdown_caret(true)
                 .outline()
                 .small()

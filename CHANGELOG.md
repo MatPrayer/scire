@@ -6,6 +6,30 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.2] — 2026-09-27
+
+### Added
+
+- In the fullscreen player the artist and album names are links: a click
+  closes the fullscreen view and opens that page. The visualizer's mini
+  player links its artist too.
+
+### Changed
+
+- With a direct (bit-perfect) output the volume control is replaced by a
+  *Direct · bit-perfect* indicator, instead of a greyed-out slider; its tooltip
+  says to set the level on the device.
+
+### Fixed
+
+- Long output device names end in an ellipsis (full name in a tooltip) instead
+  of running out of the player bar and the Settings dropdown; they wrap in the
+  player bar's device list.
+- Clicking the album or artist of a local track in the player bar opens its
+  local page instead of an empty server one.
+- With the lyrics panel open, the next song's lyrics start at the top instead
+  of showing from their last lines.
+
 ## [1.1.1] — 2026-09-26
 
 ### Fixed
@@ -233,7 +257,8 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/MatPrayer/scire/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/MatPrayer/scire/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/MatPrayer/scire/compare/d6706f2...v1.1.0
 [1.0.2]: https://github.com/MatPrayer/scire/compare/a7c8c36...d6706f2

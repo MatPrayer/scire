@@ -83,6 +83,7 @@ pub mod icons {
     pub const SERVER: &str = "icons/server.svg";
     /// Stands in for ListenBrainz, which Simple Icons has no mark for.
     pub const HEADPHONES: &str = "icons/headphones.svg";
+    pub const AUDIO_LINES: &str = "icons/audio-lines.svg";
     // Site marks for the album page's link row, from Simple Icons (CC0).
     pub const BRAND_WIKIPEDIA: &str = "icons/brand-wikipedia.svg";
     pub const BRAND_MUSICBRAINZ: &str = "icons/brand-musicbrainz.svg";

@@ -1026,6 +1026,10 @@ fn lyric_color(rest: gpui::Hsla, lit: gpui::Hsla, t: f32) -> gpui::Hsla {
 
 pub enum FullscreenEvent {
     Close,
+    /// The album line was clicked: collapse and open that album's page.
+    OpenAlbum(String),
+    /// An artist credit was clicked: collapse and open that artist's page.
+    OpenArtist(String),
 }
 
 /// Optional side panel next to the controls.
@@ -1104,6 +1108,11 @@ pub struct FullscreenPlayer {
     waveform_for: Option<String>,
     /// Fraction of the seek bar under the cursor, for the hover indicator.
     seek_hover: Option<f32>,
+    /// Hover state of the track-info links (gpui's `hover` can't style text,
+    /// so the underline is drawn from state): the album line, and which artist
+    /// credit.
+    album_hovered: bool,
+    artist_hovered: Option<usize>,
     /// Spectrum analysis + scene state for the 3D visualizer. Ticked once per
     /// frame while a scene is running; idle (and unread) when it is off.
     visualizer: Visualizer,
@@ -1259,6 +1268,8 @@ impl FullscreenPlayer {
             waveform: None,
             waveform_for: None,
             seek_hover: None,
+            album_hovered: false,
+            artist_hovered: None,
             visualizer,
             viz_knobs,
             viz_tuning_open: false,
@@ -1268,6 +1279,56 @@ impl FullscreenPlayer {
             opened_at: Instant::now(),
             closing_at: None,
         }
+    }
+
+    /// The artist line: one clickable span per credit with an id, comma-joined
+    /// (as in the player bar); plain text for radio or a song with no credits.
+    /// Text size and colour come from the caller's wrapper.
+    fn artist_line(
+        &self,
+        id_prefix: &'static str,
+        text: Option<String>,
+        artists: &[(String, Option<String>)],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if artists.iter().all(|(_, id)| id.is_none()) {
+            return div()
+                .truncate()
+                .child(text.unwrap_or_default())
+                .into_any_element();
+        }
+        let mut row = h_flex().min_w_0().overflow_hidden();
+        let last = artists.len() - 1;
+        for (i, (name, id)) in artists.iter().cloned().enumerate() {
+            let span = match id {
+                Some(id) => div()
+                    .id((id_prefix, i))
+                    .flex_none()
+                    .cursor_pointer()
+                    .when(self.artist_hovered == Some(i), |s| s.underline())
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        let now = hovered.then_some(i);
+                        if this.artist_hovered != now
+                            && (this.artist_hovered == Some(i) || *hovered)
+                        {
+                            this.artist_hovered = now;
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.artist_hovered = None;
+                        cx.emit(FullscreenEvent::OpenArtist(id.clone()));
+                    }))
+                    .child(name)
+                    .into_any_element(),
+                None => div().flex_none().child(name).into_any_element(),
+            };
+            row = row.child(span);
+            if i != last {
+                row = row.child(div().flex_none().child(", "));
+            }
+        }
+        row.into_any_element()
     }
 
     /// Start the exit animation, then emit Close so the overlay unmounts.
@@ -1860,9 +1921,17 @@ impl FullscreenPlayer {
                     for (source, doc) in tried {
                         view.cache_lyrics(source, doc);
                     }
-                    let (doc, source) = found.unzip();
-                    view.lyrics = doc;
-                    view.lyrics_source = source;
+                    // Through `apply_lyrics`, which also puts the list back at
+                    // its top: the offset otherwise still holds wherever the
+                    // last song ended, and a new song's intro lights no line to
+                    // scroll it back — its words showed from the end.
+                    match found {
+                        Some((doc, source)) => view.apply_lyrics(doc, source, cx),
+                        None => {
+                            view.lyrics = None;
+                            view.lyrics_source = None;
+                        }
+                    }
                     view.settle_lyrics_panel(cx);
                     cx.notify();
                 }
@@ -2819,6 +2888,8 @@ impl Render for FullscreenPlayer {
             title,
             artist,
             album,
+            album_id,
+            artists,
             position,
             duration,
             playing,
@@ -2831,10 +2902,24 @@ impl Render for FullscreenPlayer {
             let p = self.player.read(cx);
             let np = p.now_playing();
             let album = p.current_song().and_then(|s| s.album.clone());
+            // Navigation targets, as the player bar has them; radio has none.
+            let (album_id, artists) = match p.current_song().filter(|_| !p.is_radio()) {
+                Some(s) => (
+                    s.album_id.clone(),
+                    crate::ui::artist_credits(
+                        &s.artists,
+                        s.artist.as_deref(),
+                        s.artist_id.as_deref(),
+                    ),
+                ),
+                None => (None, Vec::new()),
+            };
             (
                 np.as_ref().map(|(t, _)| t.clone()),
                 np.as_ref().map(|(_, a)| a.clone()),
                 album,
+                album_id,
+                artists,
                 p.position,
                 p.duration,
                 p.playing,
@@ -2911,8 +2996,11 @@ impl Render for FullscreenPlayer {
         // per-mode scrim (tuned for album-art backdrops) would only mute it.
         // Keep a thin one — enough to seat the text over moving geometry.
         let viz_mode = self.session.read(cx).settings.visualizer;
+        let direct_output = self.player.read(cx).output_direct.is_some();
         let scrim = if viz_mode.is_on() { 0.15 } else { scrim };
-        let (mini_title, mini_artist) = (title.clone(), artist.clone());
+        let mini_title = title.clone();
+        // Built up front: the mini player's closures hold `cx` borrowed.
+        let mini_artist_el = self.artist_line("fs-mini-artist", artist.clone(), &artists, cx);
         let (mini_time_now, mini_time_total) = (time_now.clone(), time_total.clone());
         // Everything below sizes itself off the window: the overlay has no
         // scrollbar of its own beyond the fallback wrapper, so a fixed layout
@@ -3199,7 +3287,7 @@ impl Render for FullscreenPlayer {
                                                         .text_sm()
                                                         .text_color(cx.theme().muted_foreground)
                                                         .truncate()
-                                                        .child(mini_artist.unwrap_or_default()),
+                                                        .child(mini_artist_el),
                                                 ),
                                         )
                                         .child(
@@ -3521,7 +3609,7 @@ impl Render for FullscreenPlayer {
                                         .text_lg()
                                         .text_color(cx.theme().muted_foreground)
                                         .truncate()
-                                        .child(artist.unwrap_or_default()),
+                                        .child(self.artist_line("fs-artist", artist, &artists, cx)),
                                 )
                                 // Album line and the stream-info line
                                 // below are what a short window sheds
@@ -3536,7 +3624,34 @@ impl Render for FullscreenPlayer {
                                                 .text_sm()
                                                 .text_color(cx.theme().muted_foreground)
                                                 .truncate()
-                                                .child(alb),
+                                                .child(match album_id.clone() {
+                                                    Some(id) => div()
+                                                        .id("fs-album")
+                                                        .truncate()
+                                                        .cursor_pointer()
+                                                        .when(self.album_hovered, |s| s.underline())
+                                                        .on_hover(cx.listener(
+                                                            |this, hovered: &bool, _, cx| {
+                                                                if this.album_hovered != *hovered {
+                                                                    this.album_hovered = *hovered;
+                                                                    cx.notify();
+                                                                }
+                                                            },
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.album_hovered = false;
+                                                                cx.emit(
+                                                                    FullscreenEvent::OpenAlbum(
+                                                                        id.clone(),
+                                                                    ),
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child(alb)
+                                                        .into_any_element(),
+                                                    None => alb.into_any_element(),
+                                                }),
                                         )
                                     },
                                 ),
@@ -3830,48 +3945,53 @@ impl Render for FullscreenPlayer {
                                         .border_1()
                                         .border_color(cx.theme().border.opacity(0.5))
                                         .shadow_xl()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(app_icon(icons::VOLUME_HIGH)),
-                                        )
-                                        .child(
-                                            // gpui-component's vertical slider is a fixed
-                                            // 120px tall; match it so the high/low icons sit
-                                            // symmetrically at each end (no dead space).
-                                            div()
-                                                .h(px(120.))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(
-                                                    Slider::new(&self.volume)
-                                                        .vertical()
-                                                        // Unity on a card opened directly.
-                                                        .disabled(
-                                                            self.player
-                                                                .read(cx)
-                                                                .output_direct
-                                                                .is_some(),
-                                                        ),
+                                        // Unity on a card opened directly:
+                                        // say so rather than grey a slider.
+                                        .when(direct_output, |this| {
+                                            this.child(
+                                                div().h(px(120.)).flex().items_center().child(
+                                                    crate::ui::direct_badge("fs-direct", true, cx),
                                                 ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(app_icon(icons::VOLUME_LOW)),
-                                        )
-                                        .when(detailed_volume, |this| {
+                                            )
+                                        })
+                                        .when(!direct_output, |this| {
                                             this.child(
                                                 div()
                                                     .text_xs()
                                                     .text_color(cx.theme().muted_foreground)
-                                                    .child(format!(
-                                                        "{}%",
-                                                        (volume_level * 100.).round() as u32
-                                                    )),
+                                                    .child(app_icon(icons::VOLUME_HIGH)),
+                                            )
+                                            .child(
+                                                // gpui-component's vertical slider is a fixed
+                                                // 120px tall; match it so the high/low icons sit
+                                                // symmetrically at each end (no dead space).
+                                                div()
+                                                    .h(px(120.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(Slider::new(&self.volume).vertical()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(app_icon(icons::VOLUME_LOW)),
+                                            )
+                                            .when(
+                                                detailed_volume,
+                                                |this| {
+                                                    this.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(format!(
+                                                                "{}%",
+                                                                (volume_level * 100.).round()
+                                                                    as u32
+                                                            )),
+                                                    )
+                                                },
                                             )
                                         }),
                                 )

@@ -1049,6 +1049,50 @@ pub fn scrolling_line(
 /// `id` must differ per call site — `with_animation` keys its state on the
 /// element-id path, so two badges sharing an id share a phase and, worse,
 /// restart each other whenever one of them is rebuilt.
+/// Stands in for the volume control while a card is opened directly: the
+/// engine plays at exactly unity there, so a greyed slider would only read as
+/// broken. `vertical` is the fullscreen player's upright volume column.
+pub fn direct_badge(id: &'static str, vertical: bool, cx: &App) -> gpui::AnyElement {
+    use gpui_component::tooltip::Tooltip;
+    use gpui_component::{StyledExt as _, h_flex, v_flex};
+
+    let accent = cx.theme().primary;
+    let icon = crate::assets::app_icon(crate::assets::icons::AUDIO_LINES);
+    let tip = "Bit-perfect output: volume is fixed at 100%. Set the level on the device.";
+    let badge = if vertical {
+        v_flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(div().text_lg().child(icon))
+            .child(div().text_xs().font_medium().child("Direct"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("bit-perfect"),
+            )
+    } else {
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .flex_none()
+            .child(div().text_xs().child(icon))
+            .child(div().text_xs().font_medium().child("Direct"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("· bit-perfect"),
+            )
+    };
+    badge
+        .id(id)
+        .text_color(accent)
+        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .into_any_element()
+}
+
 pub fn live_badge(
     id: &'static str,
     accent: Hsla,

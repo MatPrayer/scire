@@ -563,6 +563,9 @@ impl RenderOnce for Button {
             .child({
                 h_flex()
                     .id("label")
+                    // Scirè: lets a caller-constrained button shrink so a
+                    // truncating child can ellipsize (long device names).
+                    .min_w_0()
                     .items_center()
                     .justify_center()
                     .button_text_size(self.size)
