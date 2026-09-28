@@ -18,6 +18,7 @@ use gpui_component::{
 use subsonic::{Album, ArtistIndex, ArtistInfo2, ArtistWithAlbums, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
+use crate::config::AlbumCardStyle;
 use crate::services::album_info::{self, looks_truncated};
 use crate::services::artist_info::{self, ArtistInfo};
 use crate::services::library_db::{LibraryDb, LibraryStats};
@@ -241,7 +242,7 @@ impl ArtistsView {
     /// where `load` had nothing to fetch with and bailed — without this it
     /// would keep showing the seeded cache for the rest of the session.
     /// Re-read the header totals from the cache; see `AlbumsView::refresh_stats`.
-    fn refresh_stats(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_stats(&mut self, cx: &mut Context<Self>) {
         let libraries = self.session.read(cx).library_ids.clone();
         if let Ok(stats) = self.library_db.library_stats("navidrome", &libraries) {
             self.stats = stats;
@@ -533,7 +534,7 @@ impl Render for ArtistsView {
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
         let (cols, tile) =
             self.live_width
-                .grid(measured, min_tile, max_tile, window, FALLBACK_COLS);
+                .grid(measured, min_tile, max_tile, window, FALLBACK_COLS, false);
         let row_count = self.cards.len().div_ceil(cols);
         self.ensure_art_for_viewport(row_count, cols, cx);
 
@@ -604,8 +605,12 @@ impl Render for ArtistsView {
                     // zeros next to a grid full of live cards read as a bug.
                     .when(self.stats.albums > 0, |this| {
                         this.child(
-                            div()
-                                .ml_auto()
+                            // Fills the rest of the line and right-aligns, rather
+                            // than `ml_auto`: taffy left the auto-margin text ~2rem
+                            // short of the row's padding in this wrapping row.
+                            h_flex()
+                                .flex_1()
+                                .justify_end()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(crate::ui::library_summary(
@@ -636,7 +641,7 @@ impl ArtistsView {
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
         let (min_tile, max_tile) = self.session.read(cx).settings.cover_size.range();
         self.live_width
-            .grid(measured, min_tile, max_tile, window, FALLBACK_COLS)
+            .grid(measured, min_tile, max_tile, window, FALLBACK_COLS, false)
             .0
     }
 
@@ -850,9 +855,10 @@ impl ArtistDetailView {
         }
     }
 
-    /// Albums the artist plays on without being credited with them. Cache-only:
-    /// no Subsonic endpoint answers this, and reading it here means the section
-    /// is up on the first frame rather than after `getArtist` lands.
+    /// Albums the artist plays on, or wrote a song on, without being credited
+    /// with them. Cache-only: no Subsonic endpoint answers this, and reading it
+    /// here means the section is up on the first frame rather than after
+    /// `getArtist` lands.
     fn load_appears_on(&mut self, cx: &mut Context<Self>) {
         let libraries = self.session.read(cx).library_ids.clone();
         let Ok(rows) = self
@@ -1405,6 +1411,37 @@ impl ArtistDetailView {
         } else {
             None
         };
+        if self.session.read(cx).settings.album_card_style == AlbumCardStyle::Gallery {
+            let play = Button::new(("artist-album-play", flat))
+                .primary()
+                .xsmall()
+                .icon(app_icon(icons::PLAY))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.play_album(play_id.clone(), cx);
+                    cx.stop_propagation();
+                }));
+            let tile_el = crate::ui::gallery_tile(
+                gpui::SharedString::from(format!("aalbum-{}", album.id)),
+                tile,
+                art,
+                album.name.clone(),
+                year,
+                Some(play.into_any_element()),
+                cx,
+            )
+            .when(focused, |s| s.anchor_scroll(Some(anchor)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(ArtistDetailEvent::OpenAlbum(id.clone()));
+            }));
+            return with_focus_cursor(
+                format!("vi-artist-card-{flat}"),
+                tile_el,
+                focused,
+                glow,
+                accent,
+                cx,
+            );
+        }
         // The album grid's setting, applied to the album cards here too —
         // these are the same card at a different size.
         let flush = !self.session.read(cx).settings.classic_album_cards;
@@ -1666,6 +1703,7 @@ impl Render for ArtistDetailView {
         // same cache entry.
         let cover = album_cover(&self.session, cx);
         let tile = cover.wrap_tile();
+        let gallery = self.session.read(cx).settings.album_card_style == AlbumCardStyle::Gallery;
         if artwork::bucket(cover.wrap_art_px()) != artwork::bucket(self.album_art_px) {
             self.refetch_art(cover.wrap_art_px(), cx);
         }
@@ -1723,7 +1761,12 @@ impl Render for ArtistDetailView {
 
         let make_section = |title: String, cards: Vec<gpui::AnyElement>| {
             let title_text = title.clone();
+            // Same as the header card: left stretch-sized, the wrapping card
+            // row was measured at a narrower width, so each section claimed
+            // the height of more rows than it drew and left a gap under it.
             let mut section = v_flex()
+                .when_some(hero_card_width(content_w), |this, w| this.w(px(w)))
+                .flex_none()
                 .gap_2()
                 .child(div().text_sm().font_medium().child(title_text.clone()));
             if cards.is_empty() {
@@ -1734,7 +1777,12 @@ impl Render for ArtistDetailView {
                         .child(format!("No {} yet.", title_text.to_lowercase())),
                 );
             } else {
-                section = section.child(h_flex().flex_wrap().gap_4().children(cards));
+                section = section.child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap(px(crate::ui::grid_item_gap(gallery)))
+                        .children(cards),
+                );
             }
             section.into_any_element()
         };
@@ -2663,5 +2711,82 @@ mod detail_tests {
         )
         .unwrap();
         assert!(db.appears_on("navidrome", me).unwrap().is_empty());
+    }
+
+    /// A cover of the artist's song on someone else's record is an appearance
+    /// too: found by the composer id when the server sent one, by the
+    /// artist's name when only `displayComposer` came back.
+    #[test]
+    fn appears_on_lists_covers_of_the_artists_songs() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let me = "navidrome:artist:me";
+        db.upsert_artist(me, "navidrome", "Trent Reznor", None, None)
+            .unwrap();
+        for (album, by) in [
+            ("navidrome:album:cash", "navidrome:artist:cash"),
+            ("navidrome:album:vanilla", "navidrome:artist:other"),
+            ("navidrome:album:unrelated", "navidrome:artist:other"),
+        ] {
+            let mut row = AlbumRow::new(album, "navidrome", "Record");
+            row.artist_id = Some(by.into());
+            db.upsert_album(&row).unwrap();
+        }
+        let track = |id: &str, album: &str, composers: &[(Option<&str>, &str)]| {
+            db.upsert_track(
+                id,
+                "navidrome",
+                "Hurt",
+                None,
+                Some("navidrome:artist:cash"),
+                None,
+                Some(album),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let composers: Vec<_> = composers
+                .iter()
+                .map(|(id, name)| (id.map(str::to_string), (*name).to_string()))
+                .collect();
+            db.set_track_composers(id, &composers).unwrap();
+        };
+        track(
+            "navidrome:track:1",
+            "navidrome:album:cash",
+            &[(Some(me), "Trent Reznor")],
+        );
+        track(
+            "navidrome:track:2",
+            "navidrome:album:vanilla",
+            &[(None, "trent reznor")],
+        );
+        // A namesake with an id of their own is somebody else.
+        track(
+            "navidrome:track:3",
+            "navidrome:album:unrelated",
+            &[(Some("navidrome:artist:namesake"), "Trent Reznor")],
+        );
+
+        let mut found: Vec<_> = db
+            .appears_on("navidrome", me)
+            .unwrap()
+            .into_iter()
+            .map(|(row, tracks)| (row.id, tracks))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("navidrome:album:cash".to_string(), 1),
+                ("navidrome:album:vanilla".to_string(), 1),
+            ]
+        );
     }
 }

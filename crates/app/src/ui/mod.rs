@@ -16,6 +16,7 @@ pub mod root;
 pub mod search_bar;
 pub mod settings;
 pub mod sidebar;
+pub mod song_info;
 pub mod visualizer;
 
 use std::future::Future;
@@ -278,12 +279,18 @@ pub fn library_summary(primary: (i64, &str), stats: &LibraryStats) -> String {
         format!("{}s", primary.1)
     };
     let tracks = if stats.tracks == 1 { "track" } else { "tracks" };
-    format!(
+    let mut line = format!(
         "{} {noun} · {} {tracks} · {}",
         format_count(primary.0),
         format_count(stats.tracks),
         format_playtime(stats.duration_secs),
-    )
+    );
+    // No size known (vanilla servers, nothing synced yet): leave it off
+    // rather than claim "0.0 MB".
+    if stats.size_bytes > 0 {
+        line.push_str(&format!(" · {}", format_bytes(stats.size_bytes as u64)));
+    }
+    line
 }
 
 /// Gap between grid cards, and the chrome a card adds around its cover.
@@ -313,6 +320,32 @@ const CARD_BORDER: f32 = 1.;
 /// tests below assert.
 pub fn grid_gap() -> f32 {
     scaled(GRID_GAP_BASE)
+}
+
+/// Gutter between gallery tiles (`AlbumCardStyle::Gallery` and the Timeline
+/// tab) — tighter than the card grid's, the way a photo gallery packs its
+/// thumbnails.
+pub fn tile_gap() -> f32 {
+    scaled(TILE_GAP_BASE)
+}
+
+const TILE_GAP_BASE: f32 = 4.;
+
+/// Space under one row of a grid: the cards' `pb_3`, or a gallery's gutter so
+/// rows sit as close as columns do.
+pub fn grid_row_gap(gallery: bool) -> f32 {
+    match gallery {
+        true => tile_gap(),
+        false => 12.,
+    }
+}
+
+/// Gutter between the items of a row, for either style.
+pub fn grid_item_gap(gallery: bool) -> f32 {
+    match gallery {
+        true => tile_gap(),
+        false => grid_gap(),
+    }
 }
 
 /// A card's inset, per side — what a card puts between its edge and its cover.
@@ -483,6 +516,23 @@ pub fn grid_fit(width: f32, min_tile: f32, max_tile: f32) -> Option<(usize, f32)
         }
     }
     Some((cols, fill(cols).clamp(min_tile, max_tile)))
+}
+
+/// Columns and tile edge for a gallery grid in `width`: as many `min_tile`
+/// squares as fit `gap` apart, then grown to fill the row up to `max_tile`.
+/// Tiles carry no chrome, so this is [`grid_fit`] without the card padding.
+/// Never fewer than two columns while two can be drawn at half the minimum.
+/// Floored to a whole pixel: rows are sized off it.
+pub fn tile_fit(width: f32, min_tile: f32, max_tile: f32, gap: f32) -> Option<(usize, f32)> {
+    if width <= 0. {
+        return None;
+    }
+    let fill = |cols: usize| (width + gap) / cols as f32 - gap;
+    let mut cols = (((width + gap) / (min_tile + gap)).floor() as usize).max(1);
+    if cols == 1 && fill(2) >= min_tile / 2. {
+        cols = 2;
+    }
+    Some((cols, fill(cols).min(max_tile).floor().max(1.)))
 }
 
 /// How far under its size setting's minimum [`grid_fit`] will draw a tile to
@@ -670,14 +720,89 @@ impl LiveWidth {
         max_tile: f32,
         window: &Window,
         fallback: usize,
+        gallery: bool,
     ) -> (usize, f32) {
         let viewport = f32::from(window.viewport_size().width);
         let width = self.resolve_at(measured, viewport);
+        if gallery {
+            let gap = tile_gap();
+            return tile_fit(width - grid_padding_x(), min_tile, max_tile, gap).unwrap_or_else(
+                || {
+                    let cols = tile_fit(viewport - grid_padding_x(), min_tile, min_tile, gap)
+                        .map_or(fallback, |(c, _)| c);
+                    (fallback.min(cols), min_tile)
+                },
+            );
+        }
         grid_fit_padded(width, min_tile, max_tile).unwrap_or_else(|| {
             let cols = grid_columns_padded(viewport, min_tile).unwrap_or(fallback);
             (fallback.min(cols), min_tile)
         })
     }
+}
+
+/// A gallery tile (`AlbumCardStyle::Gallery`): the cover alone, `tile`
+/// square, with `title` and `subtitle` fading in over its foot on hover beside
+/// an optional `play` button. The caller adds
+/// the click, context menu and focus cursor, as it does for its cards.
+pub fn gallery_tile(
+    id: impl Into<ElementId>,
+    tile: f32,
+    art: Option<PathBuf>,
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    play: Option<AnyElement>,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    let group: SharedString = "gallery-tile".into();
+    div()
+        .id(id)
+        .group(group.clone())
+        .relative()
+        .flex_none()
+        .size(px(tile))
+        .rounded_md()
+        .overflow_hidden()
+        .bg(cx.theme().muted)
+        .cursor_pointer()
+        .active(|s| s.opacity(0.8))
+        .when_some(art, |this, path| {
+            this.child(gpui::img(path).size(px(tile)).rounded_md())
+        })
+        .child(
+            gpui_component::h_flex()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1p5()
+                .bg(hsla(0., 0., 0., 0.6))
+                .opacity(0.)
+                .group_hover(group, |s| s.opacity(1.))
+                .child(
+                    gpui_component::v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(gpui::white())
+                                .truncate()
+                                .child(title.into()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(hsla(0., 0., 1., 0.75))
+                                .truncate()
+                                .child(subtitle.into()),
+                        ),
+                )
+                .children(play),
+        )
 }
 
 /// Cut `text` down to at most `max_chars`, backing up to the last word
@@ -919,7 +1044,7 @@ pub fn format_release_date(album: &subsonic::Album, detailed: bool) -> Option<St
     Some(format!("{year}-{month:02}-{day:02}"))
 }
 
-fn format_khz(hz: u32) -> String {
+pub(crate) fn format_khz(hz: u32) -> String {
     let khz = hz as f32 / 1000.0;
     if (khz - khz.round()).abs() < 0.05 {
         format!("{} kHz", khz.round() as u32)
@@ -928,11 +1053,18 @@ fn format_khz(hz: u32) -> String {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     let mb = bytes as f64 / MB;
-    if mb >= 1024.0 {
-        format!("{:.2} GB", mb / 1024.0)
+    let gb = mb / 1024.0;
+    // Whole libraries land here too (the catalog header), where "412.00 GB"
+    // is two digits of noise.
+    if gb >= 1024.0 {
+        format!("{:.2} TB", gb / 1024.0)
+    } else if gb >= 100.0 {
+        format!("{gb:.0} GB")
+    } else if mb >= 1024.0 {
+        format!("{gb:.2} GB")
     } else if mb >= 10.0 {
         format!("{mb:.0} MB")
     } else {
@@ -2585,6 +2717,18 @@ mod tests {
         assert!(UiScale::Large.factor() > UiScale::Roomy.factor());
     }
 
+    #[test]
+    fn tile_fit_fills_the_row_up_to_the_cap() {
+        use super::tile_fit;
+        // 3 × 100 + 2 × 4 = 308 fits; the leftover grows the tiles.
+        assert_eq!(tile_fit(320., 100., 200., 4.), Some((3, 104.)));
+        // Capped: the tiles stop growing, the columns don't multiply.
+        assert_eq!(tile_fit(400., 50., 52., 4.), Some((7, 52.)));
+        // Too narrow for two at the minimum, wide enough for two at half.
+        assert_eq!(tile_fit(150., 100., 200., 4.), Some((2, 73.)));
+        assert_eq!(tile_fit(0., 100., 200., 4.), None);
+    }
+
     /// Flush hands the card's inset to the cover but keeps the border, so the
     /// cover fills the card's content box exactly. The card's width is
     /// untouched either way, which is what keeps the column count fixed.
@@ -2722,6 +2866,26 @@ mod tests {
         assert_eq!(format_playtime(90.0), "1m");
         assert_eq!(format_playtime(3600.0 * 5.5), "5h 30m");
         assert_eq!(format_playtime(86_400.0 * 34.0 + 3600.0 * 5.0), "34d 5h");
+    }
+
+    #[test]
+    fn summary_adds_the_size_only_when_known() {
+        let mut stats = super::LibraryStats {
+            tracks: 15_000,
+            duration_secs: 86_400.0 * 34.0 + 3600.0 * 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::library_summary((1_234, "album"), &stats),
+            "1,234 albums · 15,000 tracks · 34d 5h"
+        );
+        stats.size_bytes = 412 * 1024 * 1024 * 1024;
+        assert_eq!(
+            super::library_summary((1_234, "album"), &stats),
+            "1,234 albums · 15,000 tracks · 34d 5h · 412 GB"
+        );
+        stats.size_bytes = 3 * 1024 * 1024 * 1024 * 1024 / 2;
+        assert!(super::library_summary((1_234, "album"), &stats).ends_with(" · 1.50 TB"));
     }
 
     /// A `w`×1 PNG of one solid colour, in the encoded form the cache holds.

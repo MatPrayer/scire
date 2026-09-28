@@ -213,6 +213,29 @@ ALTER TABLE tracks ADD COLUMN replay_peak_album REAL;
 UPDATE tracks SET file_modified = NULL WHERE source = 'local';
 ";
 
+/// Who wrote each track, so an artist's page can list the covers other people
+/// recorded of their songs under *Appears on*.
+///
+/// `artist_id` is the server's composer id (OpenSubsonic `contributors`),
+/// NULL when only a `displayComposer` name came back; `appears_on` then
+/// matches on the artist's name instead.
+///
+/// Synced tracks are dropped for the same reason as [`SCHEMA_V6`]: the credits
+/// only arrive with `getAlbum`, and nothing unchanged would be fetched again.
+const SCHEMA_V9: &str = "
+CREATE TABLE IF NOT EXISTS track_composers (
+    track_id  TEXT NOT NULL,
+    artist_id TEXT,
+    name      TEXT NOT NULL,
+    PRIMARY KEY (track_id, name)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_track_composers_artist ON track_composers(artist_id);
+CREATE INDEX IF NOT EXISTS idx_track_composers_name ON track_composers(name COLLATE NOCASE);
+DELETE FROM track_artists;
+DELETE FROM tracks WHERE source = 'navidrome';
+";
+
 /// One migration step, applied atomically with the version it records.
 ///
 /// SQLite makes DDL transactional, and the two halves of a step have to travel
@@ -394,6 +417,7 @@ impl LibraryDb {
             (6, SCHEMA_V6),
             (7, SCHEMA_V7),
             (8, SCHEMA_V8),
+            (9, SCHEMA_V9),
         ] {
             if version < target {
                 migration_step(&conn, sql, Some(target))?;
@@ -711,6 +735,10 @@ impl LibraryDb {
             "DELETE FROM track_artists WHERE track_id = ?1",
             rusqlite::params![id],
         )?;
+        conn.execute(
+            "DELETE FROM track_composers WHERE track_id = ?1",
+            rusqlite::params![id],
+        )?;
         conn.execute("DELETE FROM tracks WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
@@ -734,6 +762,28 @@ impl LibraryDb {
             conn.execute(
                 "INSERT OR IGNORE INTO track_artists (track_id, artist_id) VALUES (?1, ?2)",
                 rusqlite::params![track_id, artist_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record who wrote a track as `(artist id if known, name)`, replacing
+    /// what was there.
+    pub fn set_track_composers(
+        &self,
+        track_id: &str,
+        composers: &[(Option<String>, String)],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM track_composers WHERE track_id = ?1",
+            rusqlite::params![track_id],
+        )?;
+        for (artist_id, name) in composers {
+            conn.execute(
+                "INSERT OR IGNORE INTO track_composers (track_id, artist_id, name)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![track_id, artist_id, name],
             )?;
         }
         Ok(())
@@ -970,6 +1020,11 @@ impl LibraryDb {
     /// into the display string, so "credited to someone else" is asked of
     /// `album_artists` — without it the second artist's own record came back as
     /// an appearance on it.
+    ///
+    /// A track the artist *wrote* counts too (`track_composers`), which is
+    /// how covers of their songs on other people's records show up. The
+    /// composer id is matched when the server sent one, the artist's name
+    /// otherwise.
     pub fn appears_on(
         &self,
         source: &str,
@@ -982,8 +1037,22 @@ impl LibraryDb {
                     COUNT(DISTINCT t.id)
              FROM albums a
              JOIN tracks t ON t.album_id = a.id
-             JOIN track_artists ta ON ta.track_id = t.id AND ta.artist_id = ?2
              WHERE a.source = ?1
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM track_artists ta
+                       WHERE ta.track_id = t.id AND ta.artist_id = ?2
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM track_composers tc
+                       WHERE tc.track_id = t.id
+                         AND (tc.artist_id = ?2
+                              OR (tc.artist_id IS NULL
+                                  AND tc.name = (SELECT name FROM artists
+                                                 WHERE id = ?2 AND source = ?1)
+                                                COLLATE NOCASE))
+                   )
+               )
                AND (a.artist_id IS NULL OR a.artist_id <> ?2)
                AND NOT EXISTS (
                    SELECT 1 FROM album_artists aa
@@ -1066,6 +1135,11 @@ impl LibraryDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM track_artists
+             WHERE track_id IN (SELECT id FROM tracks WHERE album_id = ?1)",
+            rusqlite::params![album_id],
+        )?;
+        conn.execute(
+            "DELETE FROM track_composers
              WHERE track_id IN (SELECT id FROM tracks WHERE album_id = ?1)",
             rusqlite::params![album_id],
         )?;
@@ -1238,11 +1312,23 @@ impl LibraryDb {
             params.as_slice(),
             |row| row.get::<_, i64>(0),
         )?;
+        // Joined, so the library column needs its table named.
+        let album_filter = filter.replace("library_id", "a.library_id");
+        let size_bytes = conn.query_row(
+            &format!(
+                "SELECT COALESCE(SUM(t.file_size), 0) FROM tracks t
+                 JOIN albums a ON a.id = t.album_id AND a.source = t.source
+                 WHERE a.source = ?1{album_filter}"
+            ),
+            params.as_slice(),
+            |row| row.get::<_, i64>(0),
+        )?;
         Ok(LibraryStats {
             albums,
             artists,
             tracks,
             duration_secs,
+            size_bytes,
         })
     }
 
@@ -1452,6 +1538,7 @@ impl TrackRow {
             ),
             artists: Vec::new(),
             local_path: self.local_path,
+            details: Default::default(),
         }
     }
 }
@@ -1567,6 +1654,9 @@ pub struct LibraryStats {
     pub tracks: i64,
     /// Total playtime of every album counted, in seconds.
     pub duration_secs: f64,
+    /// Sum of `tracks.file_size` under the counted albums; tracks with no size
+    /// (vanilla servers, unsynced albums) count 0.
+    pub size_bytes: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1742,7 +1832,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]

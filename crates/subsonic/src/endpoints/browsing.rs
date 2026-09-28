@@ -2,7 +2,9 @@ use serde::Deserialize;
 
 use crate::client::SubsonicClient;
 use crate::error::Error;
-use crate::models::{AlbumWithSongs, ArtistIndex, ArtistWithAlbums, LibraryId, SearchResult3};
+use crate::models::{
+    AlbumWithSongs, ArtistIndex, ArtistWithAlbums, LibraryId, SearchResult3, Song,
+};
 
 #[derive(Debug, Deserialize)]
 struct ArtistsWrapper {
@@ -23,6 +25,11 @@ struct ArtistWrapper {
 #[derive(Debug, Deserialize)]
 struct AlbumWrapper {
     album: AlbumWithSongs,
+}
+
+#[derive(Debug, Deserialize)]
+struct SongWrapper {
+    song: Song,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +118,12 @@ impl SubsonicClient {
     pub async fn get_album(&self, id: &str) -> Result<AlbumWithSongs, Error> {
         let w: AlbumWrapper = self.get("getAlbum", &[("id", id)]).await?;
         Ok(w.album)
+    }
+
+    /// One track with every field the server knows (ID3, getSong).
+    pub async fn get_song(&self, id: &str) -> Result<Song, Error> {
+        let w: SongWrapper = self.get("getSong", &[("id", id)]).await?;
+        Ok(w.song)
     }
 
     /// Artist biography and image URLs (ID3, OpenSubsonic getArtistInfo2).

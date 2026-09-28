@@ -151,8 +151,17 @@ async fn control_loop(
     let mut seek_gen: u64 = 0;
     let mut seek_announced = false;
     let (seek_done_tx, mut seek_done_rx) = mpsc::unbounded_channel::<(u64, SeekOutcome)>();
+    // Set when a sink was opened paused to seek before it is heard (a restored
+    // position, or a reopen on another device): the seek landing is what
+    // starts it, provided nobody paused in the meantime.
+    let mut play_after_seek = false;
     let mut serials: u64 = 0;
     let mut ticker = tokio::time::interval(TICK);
+    // `start_track` is awaited inline and can take seconds over HTTP. The
+    // default `Burst` would then fire the missed ticks back to back the moment
+    // it returns, reporting a position before any follow-up command (a seek)
+    // has had the chance to arrive.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Ticks since the output route was last checked. Asking the OS costs a
     // device enumeration (a `pactl` subprocess on Linux), so it is throttled to
     // ~2s while playing (or while waiting for a device to come back), ~8s while
@@ -169,9 +178,16 @@ async fn control_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break }; // all Player handles dropped
                 match cmd {
-                    Command::Play(track) => {
+                    Command::Play(mut track) => {
                         drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
-                        cancel_seek(&mut seek_target, &mut seek_gen);
+                        cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
+                        // Taken out so a later reopen of this track (device
+                        // switch, route change) seeks to where playback is, not
+                        // back to where it was first started.
+                        let start_at = track.start_at.take().filter(|p| !p.is_zero());
+                        // A new track is an explicit request for audio: whatever
+                        // device playback was being held for no longer matters.
+                        lost_device = None;
                         queued = None;
                         current = None;
                         if let Some(s) = sink.take() {
@@ -201,6 +217,7 @@ async fn control_loop(
                             &end_tx,
                             &tap,
                             &event_tx,
+                            start_at.is_some(),
                         )
                         .await
                         {
@@ -215,7 +232,22 @@ async fn control_loop(
                                     let _ = event_tx.send(Event::StationInfo(station));
                                 }
                                 current = Some(loaded);
-                                sink = Some(Arc::new(new_sink));
+                                let new_sink = Arc::new(new_sink);
+                                // Opened paused: the seek landing starts it, so
+                                // the track is first heard at `start_at`.
+                                if let Some(p) = start_at {
+                                    spawn_seek(
+                                        &new_sink,
+                                        p,
+                                        &mut seek_target,
+                                        &mut seek_gen,
+                                        &mut seek_announced,
+                                        &seek_done_tx,
+                                        &event_tx,
+                                    );
+                                    play_after_seek = true;
+                                }
+                                sink = Some(new_sink);
                                 playing = true;
                                 let _ = event_tx.send(Event::Playing);
                             }
@@ -226,6 +258,9 @@ async fn control_loop(
                         }
                     }
                     Command::Pause => {
+                        // Paused by hand: a device coming back later must not
+                        // start the music again behind the user's back.
+                        lost_device = None;
                         if let Some(s) = &sink {
                             s.pause();
                             playing = false;
@@ -233,8 +268,15 @@ async fn control_loop(
                         }
                     }
                     Command::Resume => {
+                        // Resumed on whatever is connected now: the hold for
+                        // the vanished device is over.
+                        lost_device = None;
                         if let Some(s) = &sink {
-                            s.play();
+                            // Still seeking into position: the landing starts
+                            // it, playing now would sound the old spot.
+                            if !play_after_seek {
+                                s.play();
+                            }
                             playing = true;
                             // Resuming onto a route that moved while paused
                             // would play the first seconds on the old device;
@@ -246,8 +288,9 @@ async fn control_loop(
                         }
                     }
                     Command::Stop => {
+                        lost_device = None;
                         drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
-                        cancel_seek(&mut seek_target, &mut seek_gen);
+                        cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
                         queued = None;
                         if let Some(s) = sink.take() {
                             s.stop();
@@ -265,6 +308,7 @@ async fn control_loop(
                         if wanted != target {
                             target = wanted;
                             lost_device = None;
+                            route_grace = false;
                             direct_error = None;
                             // Reopen on the new device, resuming the current
                             // track at its position (paused stays paused).
@@ -273,7 +317,7 @@ async fn control_loop(
                             // going, so that is the position to reopen at —
                             // the player itself still reports the old one.
                             let pos = seek_target.or_else(|| sink.as_ref().map(|s| s.get_pos()));
-                            cancel_seek(&mut seek_target, &mut seek_gen);
+                            cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
                             // An already-appended next track dies with the old
                             // player; re-prepare it so gapless survives.
                             let requeue = queued.take().map(|l| l.track);
@@ -293,13 +337,14 @@ async fn control_loop(
                                     &end_tx,
                                     &tap,
                                     &event_tx,
+                                    // Opened paused whenever a seek follows: the reopened
+                                    // track starts at zero, and resuming before the seek
+                                    // lands would replay its opening seconds.
+                                    !resume || pos.is_some(),
                                 )
                                 .await
                                 {
                                     Ok((new_sink, loaded, _)) => {
-                                        if !resume {
-                                            new_sink.pause();
-                                        }
                                         current = Some(loaded);
                                         let new_sink = Arc::new(new_sink);
                                         // The reopened track starts at zero, so
@@ -315,6 +360,7 @@ async fn control_loop(
                                                 &seek_done_tx,
                                                 &event_tx,
                                             );
+                                            play_after_seek = resume;
                                         }
                                         sink = Some(new_sink);
                                         playing = resume;
@@ -425,6 +471,14 @@ async fn control_loop(
                     if let Err(e) = result {
                         tracing::warn!("seek failed: {e}");
                     }
+                    // A failed seek still plays, from wherever the decoder is:
+                    // better than a track that never starts.
+                    if std::mem::take(&mut play_after_seek)
+                        && playing
+                        && let Some(s) = &sink
+                    {
+                        s.play();
+                    }
                     // Only undo a stall that was announced; a seek quick enough
                     // to finish inside one tick never showed the consumer
                     // anything to take back.
@@ -491,6 +545,11 @@ async fn control_loop(
                 // A card opened directly is not routed by anyone: there is no
                 // default to follow, and asking the sound server is moot.
                 let check_route = target.direct.is_none() && output.is_some() && route_ticks >= due;
+                // The grace covers the window up to the first check after a
+                // Play/Resume, not every check until the route next moves: left
+                // set, a Bluetooth drop hours later would read as the user
+                // asking for the speakers and keep playing through them.
+                let grace = check_route && std::mem::take(&mut route_grace);
                 if check_route {
                     route_ticks = 0;
                 }
@@ -499,8 +558,7 @@ async fn control_loop(
                     // event as a new one taking the route over, and only the
                     // first should stop the music.
                     let vanished = open_device.as_deref().is_none_or(|name| !device_present(name));
-                    let action = route_action(playing, vanished, route_grace);
-                    route_grace = false;
+                    let action = route_action(playing, vanished, grace);
                     if action == RouteAction::HoldForDevice {
                         lost_device = open_device.clone();
                     }
@@ -524,13 +582,14 @@ async fn control_loop(
                             &end_tx,
                             &tap,
                             &event_tx,
+                            // Opened paused whenever a seek follows: the reopened
+                            // track starts at zero, and resuming before the seek
+                            // lands would replay its opening seconds.
+                            !resume || pos.is_some(),
                         )
                         .await
                         {
                             Ok((new_sink, loaded, _)) => {
-                                if !resume {
-                                    new_sink.pause();
-                                }
                                 current = Some(loaded);
                                 let new_sink = Arc::new(new_sink);
                                 if let Some(p) = pos {
@@ -543,6 +602,7 @@ async fn control_loop(
                                         &seek_done_tx,
                                         &event_tx,
                                     );
+                                    play_after_seek = resume;
                                 }
                                 sink = Some(new_sink);
                                 playing = resume;
@@ -564,7 +624,13 @@ async fn control_loop(
                     if lost_device.is_some() && lost_device == open_device {
                         lost_device = None;
                         if let Some(s) = &sink {
-                            s.play();
+                            // Reopened at zero and seeking back: let the seek
+                            // landing start it rather than replay the opening.
+                            if seek_target.is_some() {
+                                play_after_seek = true;
+                            } else {
+                                s.play();
+                            }
                             playing = true;
                             let _ = event_tx.send(Event::Playing);
                         }
@@ -652,9 +718,10 @@ fn spawn_seek(
 
 /// Forget a seek in flight: its result belongs to a sink that is on its way out,
 /// and bumping the generation is what makes the late answer harmless.
-fn cancel_seek(seek_target: &mut Option<Duration>, seek_gen: &mut u64) {
+fn cancel_seek(seek_target: &mut Option<Duration>, seek_gen: &mut u64, play_after_seek: &mut bool) {
     *seek_gen += 1;
     *seek_target = None;
+    *play_after_seek = false;
 }
 
 /// Has the output route moved out from under an open sink?
@@ -1003,6 +1070,7 @@ async fn start_track(
     end_tx: &mpsc::UnboundedSender<u64>,
     tap: &Arc<SpectrumTap>,
     event_tx: &mpsc::UnboundedSender<Event>,
+    paused: bool,
 ) -> Result<(rodio::Player, Loaded, bool), PlaybackError> {
     let prepared = prepare(track, event_tx).await?;
 
@@ -1054,8 +1122,15 @@ async fn start_track(
 
     let player = rodio::Player::connect_new(out.sink.mixer());
     player.set_volume(applied_volume(volume, output));
+    // Paused before the append, not after: rodio reads the flag on the first
+    // sample, so pausing afterwards lets the head of the track slip out.
+    if paused {
+        player.pause();
+    }
     let loaded = append(&player, prepared, serials, end_tx, tap);
-    player.play();
+    if !paused {
+        player.play();
+    }
     Ok((player, loaded, opened))
 }
 

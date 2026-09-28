@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 use crate::assets::{app_icon, icons};
 use crate::config::{
-    AlbumPageLayout, ArtistAlbumSize, CoverSize, DefaultPage, FullscreenBackground,
+    AlbumCardStyle, AlbumPageLayout, ArtistAlbumSize, CoverSize, DefaultPage, FullscreenBackground,
     FullscreenCoverSize, LyricsProvider, PlayerBarStyle, QueueEndBehavior, ReplayGainMode,
-    ThemePref, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize, UiScale,
+    ThemePref, TimelineGrouping, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN, UiFontSize, UiScale,
 };
 use crate::services::library_db::LibraryDb;
 use crate::services::local_library::LocalScanner;
@@ -144,7 +144,7 @@ const COMPACT_SECTIONS: [(&str, u16); 13] = [
     ("Player bar", 11),
     ("Audio", 9),
     ("Playback", 8),
-    ("Browsing", 16),
+    ("Browsing", 18),
     ("Streaming", 5),
     ("Library", 12),
     ("Connections", 30),
@@ -534,6 +534,8 @@ enum SettingsButton {
     Repeat(RepeatMode),
     DefaultPage(DefaultPage),
     CoverSize(CoverSize),
+    AlbumCardStyle(AlbumCardStyle),
+    TimelineGrouping(TimelineGrouping),
     ArtistAlbumSize(ArtistAlbumSize),
     TrackInfo(TrackInfoField),
     Format(Option<&'static str>),
@@ -1544,6 +1546,20 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_album_card_style(&mut self, style: AlbumCardStyle, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.album_card_style = style);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn set_timeline_grouping(&mut self, grouping: TimelineGrouping, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.timeline_grouping = grouping);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_artist_album_size(&mut self, size: ArtistAlbumSize, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.artist_album_size = size);
@@ -1803,7 +1819,7 @@ impl SettingsView {
         }
     }
 
-    /// A switch waiting on another setting. `vi_switch` hides it (and so the
+    /// A switch waiting on another setting. `switch_row` hides it (and so the
     /// vi cursor never lands on it); Enter/Space refusing it is the backstop.
     fn switch_disabled(&self, which: SettingsSwitch, cx: &Context<Self>) -> bool {
         let s = &self.session.read(cx).settings;
@@ -1932,6 +1948,8 @@ impl SettingsView {
             SettingsButton::DefaultPage(p) => self.set_default_page(p, cx),
             SettingsButton::CoverSize(s) => self.set_cover_size(s, cx),
             SettingsButton::ArtistAlbumSize(s) => self.set_artist_album_size(s, cx),
+            SettingsButton::AlbumCardStyle(s) => self.set_album_card_style(s, cx),
+            SettingsButton::TimelineGrouping(g) => self.set_timeline_grouping(g, cx),
             SettingsButton::TrackInfo(f) => self.toggle_track_info(f.toggle(), cx),
             SettingsButton::Format(f) => self.set_format(f, cx),
             SettingsButton::Bitrate(r) => self.set_bitrate(r, cx),
@@ -2088,6 +2106,7 @@ impl SettingsView {
         let action = button;
         let dispatch = action.clone();
         let control = Button::new(id)
+            .small()
             .label(label)
             .when(active, |b| b.primary())
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2096,29 +2115,9 @@ impl SettingsView {
         self.vi_control(SettingsAction::Button(action), control, cx)
     }
 
-    /// A labelled switch that dispatches back through `dispatch_switch`.
-    fn vi_switch(
-        &mut self,
-        which: SettingsSwitch,
-        id: &'static str,
-        checked: bool,
-        disabled: bool,
-        label: &'static str,
-        cx: &Context<Self>,
-    ) -> gpui::AnyElement {
-        // A switch waiting on another setting is hidden rather than greyed
-        // out, and registers nothing for the vi cursor — it comes back once
-        // the setting it depends on is turned on. `hidden()` rather than no
-        // element, so the card's gap goes with it (see `note`).
-        if disabled {
-            return div().hidden().into_any_element();
-        }
-        self.vi_switch_with(which, id, checked, false, Some(label), cx)
-            .into_any_element()
-    }
-
     /// A switch with no label of its own, for a row that names what it
-    /// switches elsewhere (a service in a Connections list).
+    /// switches beside it (a `switch_row`, a service in a Connections list),
+    /// dispatching back through `dispatch_switch`.
     fn vi_toggle(
         &mut self,
         which: SettingsSwitch,
@@ -2127,40 +2126,29 @@ impl SettingsView {
         disabled: bool,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        self.vi_switch_with(which, id, checked, disabled, None, cx)
-            .into_any_element()
-    }
-
-    fn vi_switch_with(
-        &mut self,
-        which: SettingsSwitch,
-        id: &'static str,
-        checked: bool,
-        disabled: bool,
-        label: Option<&'static str>,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
         let control = Switch::new(id)
             .checked(checked)
             .disabled(disabled)
-            .when_some(label, |this, label| this.label(label))
             .on_click(cx.listener(move |this, &checked, window, cx| {
                 this.dispatch_switch(which, checked, window, cx)
             }));
         self.vi_control(SettingsAction::Switch(which), control, cx)
     }
 
-    /// One maintenance task row (Library section), with its button registered
-    /// for the vi cursor.
+    /// One maintenance task as a row of a `setting_list` (Library section):
+    /// its name and button, what it does under them, and how the last run
+    /// went.
+    #[allow(clippy::too_many_arguments)]
     fn vi_library_task(
         &mut self,
         button: SettingsButton,
         id: &'static str,
+        name: &'static str,
         label: &'static str,
         description: &'static str,
         state: &TaskState,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Option<gpui::AnyElement> {
         let running = state.is_running();
         let message = state.message().map(|m| m.to_string());
         let failed = matches!(state, TaskState::Failed(_));
@@ -2174,32 +2162,36 @@ impl SettingsView {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.dispatch_button(dispatch.clone(), window, cx)
             }));
-        v_flex()
-            .gap_1p5()
-            .items_start()
-            // The description is a caption like `note`'s, and goes the same way
-            // in compact mode.
-            .when(!self.compact, |row| {
-                row.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(description),
-                )
-            })
-            .child(h_flex().child(self.vi_control(SettingsAction::Button(action), control, cx)))
-            .when_some(message, |this, message| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(if failed {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(message),
-                )
-            })
+        let control = self.vi_control(SettingsAction::Button(action), control, cx);
+        Some(
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(setting_row(name, None, control, cx))
+                // The description is a caption like `note`'s, and goes the
+                // same way in compact mode.
+                .when(!self.compact, |row| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(description),
+                    )
+                })
+                .when_some(message, |this, message| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(if failed {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(message),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     /// Move the vi cursor by `delta` controls, clamping and revealing the
@@ -2429,7 +2421,7 @@ impl SettingsView {
     }
 
     /// A caption belonging to a control that is only drawn while `shown` —
-    /// see `vi_switch`, which hides a switch waiting on another setting.
+    /// see `switch_row`, which hides a switch waiting on another setting.
     fn note_if(&self, shown: bool, text: &str, cx: &Context<Self>) -> gpui::AnyElement {
         if !shown {
             return div().hidden().into_any_element();
@@ -2530,16 +2522,61 @@ impl SettingsView {
                 .children(s.switch);
             v_flex().w_full().gap_2().child(head).children(s.extra)
         };
-        v_flex()
-            .w_full()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .children(services.into_iter().map(row))
-            .into_any_element()
+        setting_list(
+            services
+                .into_iter()
+                .map(|s| Some(row(s).into_any_element())),
+            cx,
+        )
+    }
+
+    /// A switch as a row of a `setting_list`, its label on the left like a
+    /// service's name. A switch waiting on another setting is hidden rather
+    /// than greyed out: `None` — no row, nothing for the vi cursor — until
+    /// the setting it depends on is turned on.
+    #[allow(clippy::too_many_arguments)]
+    fn switch_row(
+        &mut self,
+        which: SettingsSwitch,
+        id: &'static str,
+        checked: bool,
+        hidden: bool,
+        name: &'static str,
+        detail: Option<&'static str>,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if hidden {
+            return None;
+        }
+        let toggle = self.vi_toggle(which, id, checked, false, cx);
+        Some(setting_row(name, detail, toggle, cx))
+    }
+
+    /// A pick-one (or, for track info, pick-several) row of a `setting_list`:
+    /// the name, then its buttons on a line of their own, since a group of
+    /// them does not fit beside the name in a column.
+    fn choice_row(
+        &mut self,
+        name: &'static str,
+        detail: Option<&'static str>,
+        choices: Vec<Choice>,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let buttons: Vec<_> = choices
+            .into_iter()
+            .map(|(button, id, label, active)| {
+                self.label_btn(button, id, label, active, cx)
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            v_flex()
+                .w_full()
+                .gap_1p5()
+                .child(setting_label(name, detail, cx))
+                .child(h_flex().gap_1p5().flex_wrap().children(buttons))
+                .into_any_element(),
+        )
     }
 
     /// A service's cached answers and the button that forgets them.
@@ -2649,6 +2686,82 @@ impl SettingsView {
                     }),
             )
     }
+}
+
+/// One button of a `choice_row`: what it dispatches, its element id, its label
+/// and whether it is the active choice.
+type Choice = (SettingsButton, gpui::ElementId, gpui::SharedString, bool);
+
+/// A `Choice` whose element id is its label — fine wherever the label is
+/// unique on the page.
+fn choice(button: SettingsButton, label: &'static str, active: bool) -> Choice {
+    (button, label.into(), label.into(), active)
+}
+
+/// The boxed list the settings cards group their rows in — the Connections
+/// card's service lists and every other group of controls. `None` rows are
+/// controls waiting on another setting; a list with none left is not drawn,
+/// rather than leaving an empty box behind.
+fn setting_list(
+    rows: impl IntoIterator<Item = Option<gpui::AnyElement>>,
+    cx: &Context<SettingsView>,
+) -> gpui::AnyElement {
+    let rows: Vec<_> = rows.into_iter().flatten().collect();
+    if rows.is_empty() {
+        return div().hidden().into_any_element();
+    }
+    v_flex()
+        .w_full()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(cx.theme().border)
+        .children(rows)
+        .into_any_element()
+}
+
+/// A row's name and, under it, a short muted detail — truncated in a narrow
+/// column, with the whole of it in a hover card, like a service's host line.
+fn setting_label(
+    name: &'static str,
+    detail: Option<&'static str>,
+    cx: &Context<SettingsView>,
+) -> gpui::Div {
+    v_flex()
+        .min_w_0()
+        .child(div().text_sm().child(name))
+        .when_some(detail, |this, detail| {
+            this.child(
+                div()
+                    .id(gpui::SharedString::from(format!("detail-{name}")))
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(detail)
+                    .tooltip(move |window, cx| Tooltip::new(detail).build(window, cx)),
+            )
+        })
+}
+
+/// A row of a `setting_list`: name and detail on the left, its control on the
+/// right.
+fn setting_row(
+    name: &'static str,
+    detail: Option<&'static str>,
+    control: impl IntoElement,
+    cx: &Context<SettingsView>,
+) -> gpui::AnyElement {
+    h_flex()
+        .w_full()
+        .gap_3()
+        .items_center()
+        .justify_between()
+        .child(setting_label(name, detail, cx).flex_1())
+        .child(div().flex_none().child(control))
+        .into_any_element()
 }
 
 /// A muted info icon whose hover card holds `notes`, one paragraph each —
@@ -2763,6 +2876,8 @@ impl Render for SettingsView {
             )
         };
         let classic_album_cards = self.session.read(cx).settings.classic_album_cards;
+        let album_card_style = self.session.read(cx).settings.album_card_style;
+        let timeline_grouping = self.session.read(cx).settings.timeline_grouping;
         let show_queue_button = self.session.read(cx).settings.show_queue_button;
         let hide_idle_player_bar = self.session.read(cx).settings.hide_idle_player_bar;
         let player_bar_style = self.session.read(cx).settings.player_bar_style;
@@ -2944,505 +3059,500 @@ impl Render for SettingsView {
             }
         }
 
+        // Every card below is laid out like Connections: a feature's controls
+        // in one boxed list, name on the left and control on the right, the
+        // longer captions under the list, and a divider before the next
+        // group. Each caption is a const so the compact grid, which hides the
+        // captions, can move the same text behind its heading's info icon.
+
         // Window
-        let window_section = self
-            .section("Window", cx)
-            .child(self.vi_switch(
+        const MINIMAL_TITLEBAR_NOTE: &str = "Minimal drops the app name and the separator \
+             and paints the bar in the window background, leaving only the window controls.";
+        const NAV_BUTTONS_NOTE: &str = "Hiding the back / forward buttons keeps history \
+             navigation on the mouse's side buttons and the keyboard ([ / ] normally, h / l \
+             in vi mode).";
+        let window_section =
+            self.section_with_notes("Window", &[MINIMAL_TITLEBAR_NOTE, NAV_BUTTONS_NOTE], cx);
+        let window_rows = [
+            self.switch_row(
                 SettingsSwitch::ClientTitlebar,
                 "client-titlebar",
                 client_titlebar,
                 false,
                 "Use in-app title bar",
+                None,
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::MinimalTitlebar,
                 "minimal-titlebar",
                 minimal_titlebar,
                 !client_titlebar,
                 "Minimal title bar",
+                Some("Only the window controls"),
                 cx,
-            ))
-            .child(self.note_if(
-                client_titlebar,
-                "Drops the app name and the separator and paints the bar \
-                 in the window background, leaving only the window \
-                 controls.",
-                cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::ShowNavButtons,
                 "show-nav-buttons",
                 show_nav_buttons,
                 false,
                 "Back / forward buttons",
+                None,
                 cx,
-            ))
-            .child(self.note(
-                "Hiding them keeps history navigation on the mouse's \
-                 side buttons and the keyboard ([ / ] normally, h / l \
-                 in vi mode).",
-                cx,
-            ));
+            ),
+        ];
+        let window_section = window_section
+            .child(setting_list(window_rows, cx))
+            .child(self.note_if(client_titlebar, MINIMAL_TITLEBAR_NOTE, cx))
+            .child(self.note(NAV_BUTTONS_NOTE, cx));
 
         // Appearance
+        const SCALE_NOTE: &str = "Font size sets the interface's text; UI scale sets the \
+             space around it: gutters, card padding, row and bar heights. They are separate \
+             knobs, so text can grow without the layout loosening and the layout can loosen \
+             without the text growing.";
+        const GLOW_NOTE: &str =
+            "Off is just a primary border; on adds a filled background and glow.";
         let font_menu_view = cx.entity();
         let scale_menu_view = cx.entity();
-        let appearance_section = self
-            .section("Appearance", cx)
-            .child(self.subheading("Theme", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
-                        SettingsButton::Theme(ThemePref::System),
-                        "System",
-                        "System",
-                        theme == ThemePref::System,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Theme(ThemePref::Light),
-                        "Light",
-                        "Light",
-                        theme == ThemePref::Light,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Theme(ThemePref::Dark),
-                        "Dark",
-                        "Dark",
-                        theme == ThemePref::Dark,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Theme(ThemePref::Adaptive),
-                        "Adaptive (from cover)",
-                        "Adaptive (from cover)",
-                        theme == ThemePref::Adaptive,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Theme(ThemePref::Custom),
-                        "Custom (theme.json)",
-                        "Custom (theme.json)",
-                        theme == ThemePref::Custom,
-                        cx,
-                    )),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .child(self.subheading("Font size", cx))
-                    .child(
-                        self.vi_control(
-                            SettingsAction::FontSize,
-                            Button::new("font-size")
-                                .label(format!("{} px", font_size.value()))
-                                .dropdown_caret(true)
-                                .outline()
-                                .small()
-                                .w(px(112.))
-                                .h(px(32.))
-                                .text_size(px(14.))
-                                .dropdown_menu(move |menu, _window, _cx| {
-                                    font_size_options().into_iter().fold(
-                                        menu.max_h(px(FONT_SIZE_MENU_MAX_H)).scrollable(true),
-                                        |menu, value| {
-                                            let view = font_menu_view.clone();
-                                            let selected = value == font_size.value();
-                                            menu.item(
-                                                PopupMenuItem::new(format!("{value} px"))
-                                                    .checked(selected)
-                                                    .on_click(move |_, _, cx: &mut gpui::App| {
-                                                        view.update(cx, |settings, cx| {
-                                                            settings.set_font_size(
-                                                                UiFontSize::new(value),
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                            )
-                                        },
-                                    )
+        let appearance_section = self.section_with_notes("Appearance", &[SCALE_NOTE], cx);
+        let theme_row = self.choice_row(
+            "Theme",
+            None,
+            vec![
+                choice(
+                    SettingsButton::Theme(ThemePref::System),
+                    "System",
+                    theme == ThemePref::System,
+                ),
+                choice(
+                    SettingsButton::Theme(ThemePref::Light),
+                    "Light",
+                    theme == ThemePref::Light,
+                ),
+                choice(
+                    SettingsButton::Theme(ThemePref::Dark),
+                    "Dark",
+                    theme == ThemePref::Dark,
+                ),
+                choice(
+                    SettingsButton::Theme(ThemePref::Adaptive),
+                    "Adaptive (from cover)",
+                    theme == ThemePref::Adaptive,
+                ),
+                choice(
+                    SettingsButton::Theme(ThemePref::Custom),
+                    "Custom (theme.json)",
+                    theme == ThemePref::Custom,
+                ),
+            ],
+            cx,
+        );
+        let font_size_control = self.vi_control(
+            SettingsAction::FontSize,
+            Button::new("font-size")
+                .label(format!("{} px", font_size.value()))
+                .dropdown_caret(true)
+                .outline()
+                .small()
+                .w(px(112.))
+                .dropdown_menu(move |menu, _window, _cx| {
+                    font_size_options().into_iter().fold(
+                        menu.max_h(px(FONT_SIZE_MENU_MAX_H)).scrollable(true),
+                        |menu, value| {
+                            let view = font_menu_view.clone();
+                            let selected = value == font_size.value();
+                            menu.item(
+                                PopupMenuItem::new(format!("{value} px"))
+                                    .checked(selected)
+                                    .on_click(move |_, _, cx: &mut gpui::App| {
+                                        view.update(cx, |settings, cx| {
+                                            settings.set_font_size(UiFontSize::new(value), cx);
+                                        });
+                                    }),
+                            )
+                        },
+                    )
+                }),
+            cx,
+        );
+        let ui_scale_control = self.vi_control(
+            SettingsAction::UiScale,
+            Button::new("ui-scale")
+                .label(ui_scale.label())
+                .dropdown_caret(true)
+                .outline()
+                .small()
+                .w(px(112.))
+                .dropdown_menu(move |menu, _window, _cx| {
+                    UiScale::ALL.into_iter().fold(menu, |menu, scale| {
+                        let view = scale_menu_view.clone();
+                        menu.item(
+                            PopupMenuItem::new(scale.label())
+                                .checked(scale == ui_scale)
+                                .on_click(move |_, _, cx: &mut gpui::App| {
+                                    view.update(cx, |settings, cx| {
+                                        settings.set_ui_scale(scale, cx);
+                                    });
                                 }),
-                            cx,
-                        ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .child(self.subheading("UI scale", cx))
-                    .child(
-                        self.vi_control(
-                            SettingsAction::UiScale,
-                            Button::new("ui-scale")
-                                .label(ui_scale.label())
-                                .dropdown_caret(true)
-                                .outline()
-                                .small()
-                                .w(px(112.))
-                                .h(px(32.))
-                                .text_size(px(14.))
-                                .dropdown_menu(move |menu, _window, _cx| {
-                                    UiScale::ALL.into_iter().fold(menu, |menu, scale| {
-                                        let view = scale_menu_view.clone();
-                                        menu.item(
-                                            PopupMenuItem::new(scale.label())
-                                                .checked(scale == ui_scale)
-                                                .on_click(move |_, _, cx: &mut gpui::App| {
-                                                    view.update(cx, |settings, cx| {
-                                                        settings.set_ui_scale(scale, cx);
-                                                    });
-                                                }),
-                                        )
-                                    })
-                                }),
-                            cx,
-                        ),
-                    ),
-            )
-            .child(self.note(
-                "Font size sets the interface's text; UI scale sets the space \
-                 around it: gutters, card padding, row and bar heights. They \
-                 are separate knobs, so text can grow without the layout \
-                 loosening and the layout can loosen without the text growing.",
-                cx,
-            ))
-            .child(self.vi_switch(
+                        )
+                    })
+                }),
+            cx,
+        );
+        let appearance_rows = [
+            theme_row,
+            Some(setting_row("Font size", None, font_size_control, cx)),
+            Some(setting_row("UI scale", None, ui_scale_control, cx)),
+            self.switch_row(
                 SettingsSwitch::ReducedMotion,
                 "reduced-motion",
                 reduced_motion,
                 false,
                 "Reduce motion",
+                None,
                 cx,
-            ))
-            .child(self.subheading("Selection", cx))
-            .child(self.vi_switch(
+            ),
+        ];
+        let appearance_section = appearance_section
+            .child(setting_list(appearance_rows, cx))
+            .child(self.note(SCALE_NOTE, cx))
+            .child(crate::ui::divider())
+            .child(self.subheading_with_notes("Selection", &[GLOW_NOTE], cx));
+        let selection_rows = [
+            self.switch_row(
                 SettingsSwitch::SelectionGlowVi,
                 "selection-glow-vi",
                 selection_glow_vi,
                 false,
                 "Glow the vi cursor's card",
+                None,
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::SelectionGlowHover,
                 "selection-glow-hover",
                 selection_glow_hover,
                 false,
                 "Glow the hovered card",
+                None,
                 cx,
-            ))
-            .child(self.note(
-                "Off is just a primary border; on adds a filled background and glow.",
-                cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::SelectionGlowAlbumColor,
                 "selection-glow-album-color",
                 selection_glow_album_color,
                 !(selection_glow_vi || selection_glow_hover),
-                "Colour the glow from the album's own cover",
+                "Colour the glow from the album's cover",
+                None,
                 cx,
-            ));
+            ),
+        ];
+        let appearance_section = appearance_section
+            .child(setting_list(selection_rows, cx))
+            .child(self.note(GLOW_NOTE, cx));
 
-        // Album pages: the layout of the page itself and what it draws on it.
-        let album_pages_section = self
-            .section("Album pages", cx)
-            .child(self.subheading("Layout", cx))
-            .child(self.note(
-                "Stacked puts the cover and details above the track list. Side \
-                 panel moves them into a tall panel on the right, with a much \
-                 bigger cover, on any landscape window wide enough for it. Anything \
-                 narrower or squarer stays stacked.",
-                cx,
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
-                        SettingsButton::AlbumLayout(AlbumPageLayout::Stacked),
-                        "Stacked",
-                        AlbumPageLayout::Stacked.label(),
-                        album_layout == AlbumPageLayout::Stacked,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::AlbumLayout(AlbumPageLayout::SidePanel),
-                        "Side panel",
-                        AlbumPageLayout::SidePanel.label(),
-                        album_layout == AlbumPageLayout::SidePanel,
-                        cx,
-                    )),
-            )
-            .child(self.vi_switch(
+        // Album pages: the layout of the page itself and what it draws on it,
+        // then — under the Adaptive theme only — where its colour comes from.
+        const LAYOUT_NOTE: &str = "Stacked puts the cover and details above the track \
+             list. Side panel moves them into a tall panel on the right, with a much bigger \
+             cover, on any landscape window wide enough for it. Anything narrower or squarer \
+             stays stacked.";
+        const DATES_NOTE: &str = "Detailed dates spell the dates out: the time of day \
+             beside the Added date, and the full release date where the server publishes the \
+             month and day instead of the year alone.";
+        const PAGE_TINT_NOTE: &str = "An album page takes its colour from the album you're \
+             looking at. The sidebar, player and fullscreen keep the playing track's.";
+        let album_pages_section =
+            self.section_with_notes("Album pages", &[LAYOUT_NOTE, DATES_NOTE], cx);
+        let album_layout_row = self.choice_row(
+            "Layout",
+            None,
+            vec![
+                (
+                    SettingsButton::AlbumLayout(AlbumPageLayout::Stacked),
+                    "Stacked".into(),
+                    AlbumPageLayout::Stacked.label().into(),
+                    album_layout == AlbumPageLayout::Stacked,
+                ),
+                (
+                    SettingsButton::AlbumLayout(AlbumPageLayout::SidePanel),
+                    "Side panel".into(),
+                    AlbumPageLayout::SidePanel.label().into(),
+                    album_layout == AlbumPageLayout::SidePanel,
+                ),
+            ],
+            cx,
+        );
+        let album_rows = [
+            album_layout_row,
+            self.switch_row(
                 SettingsSwitch::AlbumPanelRight,
                 "album-panel-right",
                 album_panel_right,
                 !album_layout.wants_side_panel(),
                 "Cover panel on the right",
+                None,
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::HideAlbumStars,
                 "hide-album-stars",
                 hide_album_stars,
                 false,
-                "Hide star buttons on album pages",
+                "Hide star buttons",
+                Some("On the title and each track row; the context menu still stars"),
                 cx,
-            ))
-            .child(self.note(
-                "Drops the star beside the album title and the one on each \
-                 track row. A track's context menu still stars it.",
-                cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::DetailedAlbumDates,
                 "detailed-album-dates",
                 detailed_album_dates,
                 false,
                 "Detailed dates",
+                Some("Time of day and full release dates"),
                 cx,
-            ))
-            .child(self.note(
-                "Spells the dates out: the time of day beside the Added date, \
-                 and the full release date where the server publishes the \
-                 month and day instead of the year alone.",
-                cx,
-            ))
-            .child(self.vi_switch(
-                SettingsSwitch::AdaptiveFromPage,
-                "adaptive-from-page",
-                adaptive_from_page,
-                theme != ThemePref::Adaptive,
-                "Album pages tint from their own cover",
-                cx,
-            ))
-            .child(self.note_if(
-                theme == ThemePref::Adaptive,
-                "An album page takes its colour from the album \
-                 you're looking at. The sidebar, player and \
-                 fullscreen keep the playing track's.",
-                cx,
-            ))
-            .child(self.vi_switch(
-                SettingsSwitch::AdaptivePageGradient,
-                "adaptive-page-gradient",
-                adaptive_page_gradient,
-                theme != ThemePref::Adaptive || !adaptive_from_page,
-                "Wash the album header in that colour",
-                cx,
-            ));
+            ),
+        ];
+        let mut album_pages_section = album_pages_section
+            .child(setting_list(album_rows, cx))
+            .child(self.note(LAYOUT_NOTE, cx))
+            .child(self.note(DATES_NOTE, cx));
+        if theme == ThemePref::Adaptive {
+            album_pages_section = album_pages_section
+                .child(crate::ui::divider())
+                .child(self.subheading_with_notes("Colour", &[PAGE_TINT_NOTE], cx));
+            let tint_rows = [
+                self.switch_row(
+                    SettingsSwitch::AdaptiveFromPage,
+                    "adaptive-from-page",
+                    adaptive_from_page,
+                    false,
+                    "Tint from the album's own cover",
+                    None,
+                    cx,
+                ),
+                self.switch_row(
+                    SettingsSwitch::AdaptivePageGradient,
+                    "adaptive-page-gradient",
+                    adaptive_page_gradient,
+                    !adaptive_from_page,
+                    "Wash the album header in that colour",
+                    None,
+                    cx,
+                ),
+            ];
+            album_pages_section = album_pages_section
+                .child(setting_list(tint_rows, cx))
+                .child(self.note(PAGE_TINT_NOTE, cx));
+        }
 
         // Fullscreen: the now-playing overlay.
-        let fullscreen_section = self
-            .section("Fullscreen", cx)
-            .child(self.subheading("Background", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
+        const COVER_GROWTH_NOTE: &str = "Cover size is how far the cover grows on a big \
+             window. Fixed keeps it at the size a small window draws; the controls beside it \
+             keep their room whichever you pick.";
+        let fullscreen_section = self.section_with_notes("Fullscreen", &[COVER_GROWTH_NOTE], cx);
+        let fullscreen_rows = [
+            self.choice_row(
+                "Background",
+                None,
+                vec![
+                    choice(
                         SettingsButton::FullscreenBg(FullscreenBackground::Gradient),
                         "Gradient",
-                        "Gradient",
                         fullscreen_bg == FullscreenBackground::Gradient,
-                        cx,
-                    ))
-                    .child(self.label_btn(
+                    ),
+                    choice(
                         SettingsButton::FullscreenBg(FullscreenBackground::Vibrant),
                         "Vibrant",
-                        "Vibrant",
                         fullscreen_bg == FullscreenBackground::Vibrant,
-                        cx,
-                    ))
-                    .child(self.label_btn(
+                    ),
+                    choice(
                         SettingsButton::FullscreenBg(FullscreenBackground::BlurredArt),
                         "Blurred art",
-                        "Blurred art",
                         fullscreen_bg == FullscreenBackground::BlurredArt,
-                        cx,
-                    ))
-                    .child(self.label_btn(
+                    ),
+                    choice(
                         SettingsButton::FullscreenBg(FullscreenBackground::Animated),
                         "Animated",
-                        "Animated",
                         fullscreen_bg == FullscreenBackground::Animated,
-                        cx,
-                    ))
-                    .child(self.label_btn(
+                    ),
+                    choice(
                         SettingsButton::FullscreenBg(FullscreenBackground::Solid),
                         "Solid",
-                        "Solid",
                         fullscreen_bg == FullscreenBackground::Solid,
-                        cx,
-                    )),
-            )
-            .child(self.vi_switch(
+                    ),
+                ],
+                cx,
+            ),
+            self.choice_row(
+                "Cover size",
+                None,
+                [
+                    FullscreenCoverSize::Fixed,
+                    FullscreenCoverSize::Medium,
+                    FullscreenCoverSize::Large,
+                    FullscreenCoverSize::Huge,
+                ]
+                .into_iter()
+                .map(|size| {
+                    (
+                        SettingsButton::FullscreenCover(size),
+                        gpui::ElementId::from(gpui::SharedString::from(format!(
+                            "fullscreen-cover-{}",
+                            size.label()
+                        ))),
+                        size.label().into(),
+                        fullscreen_cover == size,
+                    )
+                })
+                .collect(),
+                cx,
+            ),
+            self.switch_row(
                 SettingsSwitch::FullscreenVolume,
                 "fullscreen-volume",
                 fullscreen_volume,
                 false,
-                "Volume slider in fullscreen player",
+                "Volume slider",
+                None,
                 cx,
-            ))
-            .child(self.subheading("Cover size", cx))
-            .child(self.note(
-                "How far the cover grows on a big window. Fixed keeps it at the \
-                 size a small window draws; the controls beside it keep their \
-                 room whichever you pick.",
-                cx,
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
-                        SettingsButton::FullscreenCover(FullscreenCoverSize::Fixed),
-                        "Fixed",
-                        FullscreenCoverSize::Fixed.label(),
-                        fullscreen_cover == FullscreenCoverSize::Fixed,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::FullscreenCover(FullscreenCoverSize::Medium),
-                        "Medium",
-                        FullscreenCoverSize::Medium.label(),
-                        fullscreen_cover == FullscreenCoverSize::Medium,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::FullscreenCover(FullscreenCoverSize::Large),
-                        "Large",
-                        FullscreenCoverSize::Large.label(),
-                        fullscreen_cover == FullscreenCoverSize::Large,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::FullscreenCover(FullscreenCoverSize::Huge),
-                        "Huge",
-                        FullscreenCoverSize::Huge.label(),
-                        fullscreen_cover == FullscreenCoverSize::Huge,
-                        cx,
-                    )),
-            );
+            ),
+        ];
+        let fullscreen_section = fullscreen_section
+            .child(setting_list(fullscreen_rows, cx))
+            .child(self.note(COVER_GROWTH_NOTE, cx));
 
         // Player bar: how the bar looks, then what it carries. The two
         // switches that only apply to one style follow the style itself, so
-        // one appearing turns up right under the button that brought it.
-        let player_bar_section = self
-            .section("Player bar", cx)
-            .child(self.subheading("Style", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.label_btn(
+        // one appearing turns up right under the buttons that brought it.
+        const FLOATING_NOTE: &str = "Floating draws the player bar as a rounded card \
+             hovering over the content instead of a docked strip, matching the fullscreen \
+             overlay's panels.";
+        const TRANSLUCENT_NOTE: &str = "See-through lets the page show through the floating \
+             card. Off is the solid card, which stays readable over cover art.";
+        const TINT_NOTE: &str = "The Adaptive theme washes the player bar with the playing \
+             track's colour. Turn the tint off for the plain panel background; the accent \
+             stays on the buttons, sliders and seek bar.";
+        const WAVEFORM_NOTE: &str = "The waveform seek bar reads each local track or \
+             downloads each remote track a second time to decode it, so remote music uses \
+             extra bandwidth.";
+        let player_bar_section = self.section_with_notes(
+            "Player bar",
+            &[FLOATING_NOTE, TRANSLUCENT_NOTE, TINT_NOTE],
+            cx,
+        );
+        let style_rows = [
+            self.choice_row(
+                "Style",
+                None,
+                vec![
+                    (
                         SettingsButton::PlayerBarStyle(PlayerBarStyle::Docked),
-                        "Docked",
-                        PlayerBarStyle::Docked.label(),
+                        "Docked".into(),
+                        PlayerBarStyle::Docked.label().into(),
                         player_bar_style == PlayerBarStyle::Docked,
-                        cx,
-                    ))
-                    .child(self.label_btn(
+                    ),
+                    (
                         SettingsButton::PlayerBarStyle(PlayerBarStyle::Floating),
-                        "Floating",
-                        PlayerBarStyle::Floating.label(),
+                        "Floating".into(),
+                        PlayerBarStyle::Floating.label().into(),
                         player_bar_style == PlayerBarStyle::Floating,
-                        cx,
-                    )),
-            )
-            .child(self.note(
-                "Floating draws the player bar as a rounded card hovering \
-                 over the content instead of a docked strip, matching the \
-                 fullscreen overlay's panels.",
+                    ),
+                ],
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::PlayerBarTranslucent,
                 "player-bar-translucent",
                 player_bar_translucent,
                 translucent_disabled,
-                "See-through floating player bar",
+                "See-through",
+                None,
                 cx,
-            ))
-            .child(self.note_if(
-                !translucent_disabled,
-                "Lets the page show through the floating card. Off is the \
-                 solid card, which stays readable over cover art.",
-                cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::PlayerBarTint,
                 "player-bar-tint",
                 player_bar_tint,
                 tint_disabled,
-                "Cover tint behind player bar",
+                "Cover tint",
+                None,
                 cx,
-            ))
-            .child(self.note_if(
-                !tint_disabled,
-                "The Adaptive theme washes the player bar with the playing \
-                 track's colour. Turn it off for the plain panel background; \
-                 the accent stays on the buttons, sliders and seek bar.",
-                cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::HideIdlePlayerBar,
                 "hide-idle-player-bar",
                 hide_idle_player_bar,
                 false,
-                "Hide player bar when idle",
+                "Hide when idle",
+                Some("Nothing playing and the queue empty"),
                 cx,
-            ))
-            .child(self.subheading("Contents", cx))
-            .child(self.vi_switch(
+            ),
+        ];
+        let player_bar_section = player_bar_section
+            .child(setting_list(style_rows, cx))
+            .child(self.note(FLOATING_NOTE, cx))
+            .child(self.note_if(!translucent_disabled, TRANSLUCENT_NOTE, cx))
+            .child(self.note_if(!tint_disabled, TINT_NOTE, cx))
+            .child(crate::ui::divider())
+            .child(self.subheading_with_notes("Contents", &[WAVEFORM_NOTE], cx));
+        let contents_rows = [
+            self.switch_row(
                 SettingsSwitch::WaveformSeekbar,
                 "waveform-seekbar",
                 waveform,
                 false,
                 "Waveform progress bar",
+                None,
                 cx,
-            ))
-            .child(self.note(
-                "The waveform seek bar reads each local track or downloads each \
-                 remote track a second time to decode it, so remote music uses \
-                 extra bandwidth.",
-                cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::StreamInfoBar,
                 "stream-info-bar",
                 stream_info,
                 false,
-                "Stream info in player bar",
+                "Stream info",
+                None,
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::DetailedVolume,
                 "detailed-volume",
                 detailed_volume,
                 false,
                 "Detailed volume control",
+                None,
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::ShowQueueButton,
                 "show-queue-button",
                 show_queue_button,
                 false,
-                "Queue button in player bar",
+                "Queue button",
+                None,
                 cx,
-            ));
+            ),
+        ];
+        let player_bar_section = player_bar_section
+            .child(setting_list(contents_rows, cx))
+            .child(self.note(WAVEFORM_NOTE, cx));
 
         // Audio: where the sound goes and how loud it is.
+        const SYSTEM_DEFAULT_NOTE: &str = "System default follows the desktop's choice. A \
+             chosen device that disconnects pauses playback until it comes back.";
+        const REPLAYGAIN_NOTE: &str = "ReplayGain evens out perceived volume using each \
+             file's tags. Track normalizes every song; Album keeps an album's relative \
+             loudness; Auto uses album gain when playing a whole album and track gain \
+             otherwise. The player bar shows the applied gain (and the auto-chosen mode).";
+        const PREAMP_NOTE: &str = "The pre-amp is added to every ReplayGain adjustment. \
+             Tags aim for a fairly quiet reference level; a few dB brings normalised tracks \
+             closer to everything else. Untagged tracks are left alone.";
+        const CLIP_GUARD_NOTE: &str = "Prevent clipping holds each boost under the track's \
+             peak so it never distorts. Off lets quiet tracks with loud peaks reach the full \
+             target.";
         let chosen = self.output_choice(cx);
         let direct_chosen = matches!(chosen, OutputChoice::Direct(_));
         let (preamp, clip_guard) = {
@@ -3458,9 +3568,11 @@ impl Render for SettingsView {
             .unwrap_or_else(|| "System default".to_string());
         // Opened before its controls: `section` records where its first vi
         // control lands.
-        let audio_section = self
-            .section("Audio", cx)
-            .child(self.subheading("Output device", cx));
+        let audio_section = self.section("Audio", cx).child(self.subheading_with_notes(
+            "Output device",
+            &[SYSTEM_DEFAULT_NOTE, DIRECT_OUTPUT_NOTE],
+            cx,
+        ));
         let output_menu_view = cx.entity();
         let menu_options = options.clone();
         let listing = self.devices.is_none();
@@ -3476,8 +3588,6 @@ impl Render for SettingsView {
                 .dropdown_caret(true)
                 .outline()
                 .small()
-                .h(px(32.))
-                .text_size(px(14.))
                 .dropdown_menu(move |menu, _window, _cx| {
                     let mut menu = menu.max_h(px(FONT_SIZE_MENU_MAX_H)).scrollable(true);
                     let mut group = None;
@@ -3580,489 +3690,477 @@ impl Render for SettingsView {
             )
             .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx));
         let rg_on = replay_gain != ReplayGainMode::Off && !direct_chosen;
-        let mut audio_section = audio_section
-            .child(
+        let output_rows = [
+            Some(
                 h_flex()
+                    .w_full()
                     .gap_2()
                     .items_center()
                     .child(div().flex_1().min_w_0().child(output_dropdown))
-                    .child(refresh),
-            )
-            .child(status)
-            .child(self.note(
-                "System default follows the desktop's choice. A chosen device \
-                 that disconnects pauses playback until it comes back.",
-                cx,
-            ))
+                    .child(refresh)
+                    .into_any_element(),
+            ),
+            Some(status.into_any_element()),
+        ];
+        let mut audio_section = audio_section
+            .child(setting_list(output_rows, cx))
+            .child(self.note(SYSTEM_DEFAULT_NOTE, cx))
             .child(self.note(DIRECT_OUTPUT_NOTE, cx));
         // ReplayGain is a volume change, and a card opened directly takes the
         // samples untouched — the whole group stands down until it is left.
+        // The pre-amp and the clip guard only matter while something is being
+        // normalised — hidden rather than greyed out, like a dependent switch.
         if !direct_chosen {
-            audio_section = audio_section
-                .child(self.subheading("ReplayGain", cx))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(self.label_btn(
-                            SettingsButton::ReplayGain(ReplayGainMode::Off),
-                            "Off",
-                            "Off",
-                            replay_gain == ReplayGainMode::Off,
-                            cx,
-                        ))
-                        .child(self.label_btn(
-                            SettingsButton::ReplayGain(ReplayGainMode::Track),
-                            "Track",
-                            "Track",
-                            replay_gain == ReplayGainMode::Track,
-                            cx,
-                        ))
-                        .child(self.label_btn(
-                            SettingsButton::ReplayGain(ReplayGainMode::Album),
-                            "Album",
-                            "Album",
-                            replay_gain == ReplayGainMode::Album,
-                            cx,
-                        ))
-                        .child(self.label_btn(
-                            SettingsButton::ReplayGain(ReplayGainMode::Auto),
-                            "Auto",
-                            "Auto",
-                            replay_gain == ReplayGainMode::Auto,
-                            cx,
-                        )),
-                )
-                .child(self.note(
-                    "Evens out perceived volume using each file's ReplayGain tags. \
-                     Track normalizes every song; Album keeps an album's relative \
-                     loudness; Auto uses album gain when playing a whole album and \
-                     track gain otherwise. The player bar shows the applied gain \
-                     (and the auto-chosen mode).",
-                    cx,
-                ));
-        }
-        // The pre-amp only matters while something is being normalised —
-        // hidden rather than greyed out, like a dependent switch.
-        if rg_on {
-            let mut preamp_row = h_flex().gap_2().flex_wrap();
-            for db in [-6i8, -3, 0, 3, 6] {
-                let label = if db > 0 {
-                    format!("+{db} dB")
-                } else {
-                    format!("{db} dB")
-                };
-                preamp_row = preamp_row.child(self.label_btn(
-                    SettingsButton::Preamp(db),
-                    ("rg-preamp", (db + 6) as usize),
-                    label,
-                    (preamp - f32::from(db)).abs() < 0.05,
-                    cx,
-                ));
-            }
-            audio_section = audio_section
-                .child(self.subheading("Pre-amp", cx))
-                .child(preamp_row)
-                .child(self.note(
-                    "Added to every ReplayGain adjustment. Tags aim for a \
-                     fairly quiet reference level; a few dB brings normalised \
-                     tracks closer to everything else. Untagged tracks are \
-                     left alone.",
-                    cx,
-                ));
-        }
-        let audio_section = audio_section
-            .child(self.vi_switch(
+            audio_section =
+                audio_section
+                    .child(crate::ui::divider())
+                    .child(self.subheading_with_notes(
+                        "ReplayGain",
+                        &[REPLAYGAIN_NOTE, PREAMP_NOTE, CLIP_GUARD_NOTE],
+                        cx,
+                    ));
+            let mode_row = self.choice_row(
+                "Mode",
+                None,
+                [
+                    (ReplayGainMode::Off, "Off"),
+                    (ReplayGainMode::Track, "Track"),
+                    (ReplayGainMode::Album, "Album"),
+                    (ReplayGainMode::Auto, "Auto"),
+                ]
+                .into_iter()
+                .map(|(mode, label)| {
+                    (
+                        SettingsButton::ReplayGain(mode),
+                        gpui::ElementId::from(gpui::SharedString::from(format!("rg-{label}"))),
+                        label.into(),
+                        replay_gain == mode,
+                    )
+                })
+                .collect(),
+                cx,
+            );
+            let preamp_row = rg_on
+                .then(|| {
+                    let choices = [-6i8, -3, 0, 3, 6]
+                        .into_iter()
+                        .map(|db| {
+                            let label = if db > 0 {
+                                format!("+{db} dB")
+                            } else {
+                                format!("{db} dB")
+                            };
+                            (
+                                SettingsButton::Preamp(db),
+                                gpui::ElementId::from(("rg-preamp", (db + 6) as usize)),
+                                label.into(),
+                                (preamp - f32::from(db)).abs() < 0.05,
+                            )
+                        })
+                        .collect();
+                    self.choice_row("Pre-amp", None, choices, cx)
+                })
+                .flatten();
+            let clip_row = self.switch_row(
                 SettingsSwitch::ReplayGainClipGuard,
                 "rg-clip-guard",
                 clip_guard,
                 clip_guard_disabled,
                 "Prevent clipping",
+                None,
                 cx,
-            ))
-            .child(self.note_if(
-                !clip_guard_disabled,
-                "Holds each boost under the track's peak so it never \
-                 distorts. Off lets quiet tracks with loud peaks reach the \
-                 full target.",
-                cx,
-            ));
+            );
+            audio_section = audio_section
+                .child(setting_list([mode_row, preamp_row, clip_row], cx))
+                .child(self.note(REPLAYGAIN_NOTE, cx))
+                .child(self.note_if(rg_on, PREAMP_NOTE, cx))
+                .child(self.note_if(!clip_guard_disabled, CLIP_GUARD_NOTE, cx));
+        }
 
         // Playback: what happens to the queue.
-        let playback_section = self
-            .section("Playback", cx)
-            .child(self.vi_switch(
+        const SCROBBLE_TO_SERVER_NOTE: &str = "Server tracks are scrobbled to Navidrome, \
+             which forwards them to Last.fm or ListenBrainz if it is set up to. Local plays \
+             are under Connections.";
+        const QUEUE_END_NOTE: &str = "When the queue ends, Keep leaves the finished queue and \
+             last track in the player bar; Clear empties the queue and resets the player bar.";
+        let playback_section =
+            self.section_with_notes("Playback", &[SCROBBLE_TO_SERVER_NOTE, QUEUE_END_NOTE], cx);
+        let playback_rows = [
+            self.switch_row(
                 SettingsSwitch::ResumePlayback,
                 "resume-playback",
                 resume_playback,
                 false,
                 "Resume where you left off",
+                None,
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::DefaultShuffle,
                 "default-shuffle",
                 default_shuffle,
                 false,
                 "Shuffle on by default",
+                None,
                 cx,
-            ))
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::Scrobble,
                 "scrobble",
                 scrobble_enabled,
                 false,
                 "Scrobble plays to server",
+                None,
                 cx,
-            ))
-            .child(self.note(
-                "Server tracks are scrobbled to Navidrome, which forwards them to \
-                 Last.fm or ListenBrainz if it is set up to. Local plays are \
-                 under Connections.",
-                cx,
-            ))
-            .child(self.subheading("When the queue ends", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.label_btn(
+            ),
+            self.choice_row(
+                "When the queue ends",
+                None,
+                vec![
+                    choice(
                         SettingsButton::QueueEnd(QueueEndBehavior::Keep),
                         "Keep queue",
-                        "Keep queue",
                         queue_end == QueueEndBehavior::Keep,
-                        cx,
-                    ))
-                    .child(self.label_btn(
+                    ),
+                    choice(
                         SettingsButton::QueueEnd(QueueEndBehavior::Clear),
                         "Clear queue",
-                        "Clear queue",
                         queue_end == QueueEndBehavior::Clear,
-                        cx,
-                    )),
-            )
-            .child(self.note(
-                "Keep leaves the finished queue and last track in the player \
-                 bar; Clear empties the queue and resets the player bar.",
+                    ),
+                ],
                 cx,
-            ))
-            .child(self.subheading("Default repeat", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.label_btn(
-                        SettingsButton::Repeat(RepeatMode::Off),
-                        "Off",
-                        "Off",
-                        default_repeat == RepeatMode::Off,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Repeat(RepeatMode::All),
-                        "All",
-                        "All",
-                        default_repeat == RepeatMode::All,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Repeat(RepeatMode::One),
-                        "One",
-                        "One",
-                        default_repeat == RepeatMode::One,
-                        cx,
-                    )),
-            );
+            ),
+            self.choice_row(
+                "Default repeat",
+                None,
+                [
+                    (RepeatMode::Off, "Off"),
+                    (RepeatMode::All, "All"),
+                    (RepeatMode::One, "One"),
+                ]
+                .into_iter()
+                .map(|(mode, label)| {
+                    (
+                        SettingsButton::Repeat(mode),
+                        gpui::ElementId::from(gpui::SharedString::from(format!("repeat-{label}"))),
+                        label.into(),
+                        default_repeat == mode,
+                    )
+                })
+                .collect(),
+                cx,
+            ),
+        ];
+        let playback_section = playback_section
+            .child(setting_list(playback_rows, cx))
+            .child(self.note(SCROBBLE_TO_SERVER_NOTE, cx))
+            .child(self.note(QUEUE_END_NOTE, cx));
 
         // Browsing
-        let browsing_section = self
-            .section("Browsing", cx)
-            .child(self.subheading("Open at startup", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
-                        SettingsButton::DefaultPage(DefaultPage::Albums),
-                        "Albums",
-                        "Albums",
-                        default_page == DefaultPage::Albums,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::DefaultPage(DefaultPage::Artists),
-                        "Artists",
-                        "Artists",
-                        default_page == DefaultPage::Artists,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::DefaultPage(DefaultPage::Favorites),
-                        "Favorites",
-                        "Favorites",
-                        default_page == DefaultPage::Favorites,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::DefaultPage(DefaultPage::Recent),
-                        "Recent",
-                        "Recent",
-                        default_page == DefaultPage::Recent,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::DefaultPage(DefaultPage::Radio),
-                        "Radio",
-                        "Radio",
-                        default_page == DefaultPage::Radio,
-                        cx,
-                    )),
-            )
-            .child(self.subheading("Cover size", cx))
-            .child(self.note(
-                "Roughly how big album covers are. The exact size and the number \
-                 per row adapt to the window so the grid fills its width.",
+        const COVER_SIZE_NOTE: &str = "Cover size is roughly how big album covers are. The \
+             exact size and the number per row adapt to the window so the grid fills its \
+             width.";
+        const CLASSIC_CARDS_NOTE: &str = "Classic album cards put the padding back around the \
+             cover and round all four of its corners. By default the cover fills the card \
+             instead, edge to edge inside the border, and runs flat into the title below. The \
+             cards keep the width they had either way, so the grid's columns do not move.";
+        const CARD_STYLE_NOTE: &str = "Album cards draw every album grid as cards with the \
+             title underneath, or as a gallery: the covers alone, packed tight, with title \
+             and artist shown on hover. The Timeline tab follows it too.";
+        const TIMELINE_NOTE: &str = "Timeline groups sets how finely the Albums page's \
+             Timeline tab heads its albums by the date they were added.";
+        const ARTIST_COVERS_NOTE: &str = "Artist page covers size the album cards on an \
+             artist's page. Match follows the cover size above; the rest size that page on \
+             its own.";
+        const VI_NOTE: &str = "j/k sidebar+grid, h/l history, : commands, / search, ? help";
+        let browsing_section = self.section_with_notes(
+            "Browsing",
+            &[
+                COVER_SIZE_NOTE,
+                CARD_STYLE_NOTE,
+                CLASSIC_CARDS_NOTE,
+                TIMELINE_NOTE,
+                ARTIST_COVERS_NOTE,
+            ],
+            cx,
+        );
+        let browsing_rows = [
+            self.choice_row(
+                "Open at startup",
+                None,
+                [
+                    (DefaultPage::Albums, "Albums"),
+                    (DefaultPage::Artists, "Artists"),
+                    (DefaultPage::Favorites, "Favorites"),
+                    (DefaultPage::Recent, "Recent"),
+                    (DefaultPage::Radio, "Radio"),
+                ]
+                .into_iter()
+                .map(|(page, label)| {
+                    (
+                        SettingsButton::DefaultPage(page),
+                        gpui::ElementId::from(gpui::SharedString::from(format!(
+                            "default-page-{label}"
+                        ))),
+                        label.into(),
+                        default_page == page,
+                    )
+                })
+                .collect(),
                 cx,
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
-                        SettingsButton::CoverSize(CoverSize::Small),
-                        "Small",
-                        "Small",
-                        cover_size == CoverSize::Small,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::CoverSize(CoverSize::Medium),
-                        "Medium",
-                        "Medium",
-                        cover_size == CoverSize::Medium,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::CoverSize(CoverSize::Large),
-                        "Large",
-                        "Large",
-                        cover_size == CoverSize::Large,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::CoverSize(CoverSize::ExtraLarge),
-                        "Extra large",
-                        "Extra large",
-                        cover_size == CoverSize::ExtraLarge,
-                        cx,
-                    )),
-            )
-            .child(self.vi_switch(
+            ),
+            self.choice_row(
+                "Cover size",
+                None,
+                [
+                    (CoverSize::Small, "Small"),
+                    (CoverSize::Medium, "Medium"),
+                    (CoverSize::Large, "Large"),
+                    (CoverSize::ExtraLarge, "Extra large"),
+                ]
+                .into_iter()
+                .map(|(size, label)| {
+                    (
+                        SettingsButton::CoverSize(size),
+                        gpui::ElementId::from(gpui::SharedString::from(format!(
+                            "cover-size-{label}"
+                        ))),
+                        label.into(),
+                        cover_size == size,
+                    )
+                })
+                .collect(),
+                cx,
+            ),
+            self.choice_row(
+                "Album cards",
+                None,
+                [
+                    (AlbumCardStyle::Cards, "Cards"),
+                    (AlbumCardStyle::Gallery, "Gallery"),
+                ]
+                .into_iter()
+                .map(|(style, label)| {
+                    (
+                        SettingsButton::AlbumCardStyle(style),
+                        gpui::ElementId::from(gpui::SharedString::from(format!(
+                            "album-card-style-{label}"
+                        ))),
+                        label.into(),
+                        album_card_style == style,
+                    )
+                })
+                .collect(),
+                cx,
+            ),
+            // Gallery tiles have no card chrome to put back.
+            self.switch_row(
                 SettingsSwitch::ClassicAlbumCards,
                 "classic-album-cards",
                 classic_album_cards,
-                false,
+                album_card_style == AlbumCardStyle::Gallery,
                 "Classic album cards",
+                None,
+                cx,
+            ),
+            self.choice_row(
+                "Timeline groups",
+                None,
+                [
+                    (TimelineGrouping::Day, "Day"),
+                    (TimelineGrouping::Week, "Week"),
+                    (TimelineGrouping::Month, "Month"),
+                    (TimelineGrouping::Year, "Year"),
+                ]
+                .into_iter()
+                .map(|(grouping, label)| {
+                    (
+                        SettingsButton::TimelineGrouping(grouping),
+                        gpui::ElementId::from(gpui::SharedString::from(format!(
+                            "timeline-grouping-{label}"
+                        ))),
+                        label.into(),
+                        timeline_grouping == grouping,
+                    )
+                })
+                .collect(),
+                cx,
+            ),
+            self.choice_row(
+                "Artist page covers",
+                None,
+                [
+                    ArtistAlbumSize::Match,
+                    ArtistAlbumSize::Small,
+                    ArtistAlbumSize::Medium,
+                    ArtistAlbumSize::Large,
+                    ArtistAlbumSize::ExtraLarge,
+                ]
+                .into_iter()
+                .map(|size| {
+                    // Prefixed: the cover sizes above carry the same labels,
+                    // and an element id is page-wide.
+                    (
+                        SettingsButton::ArtistAlbumSize(size),
+                        gpui::ElementId::from(gpui::SharedString::from(format!(
+                            "artist-album-size-{}",
+                            size.label()
+                        ))),
+                        size.label().into(),
+                        artist_album_size == size,
+                    )
+                })
+                .collect(),
+                cx,
+            ),
+            self.choice_row(
+                "Track info",
+                Some("Shown next to song titles in album and playlist views"),
+                [
+                    (TrackInfoField::Artist, "Artist", track_info.artist),
+                    (TrackInfoField::Album, "Album", track_info.album),
+                    (TrackInfoField::Year, "Year", track_info.year),
+                    (TrackInfoField::Genre, "Genre", track_info.genre),
+                    (TrackInfoField::Bitrate, "Bitrate", track_info.bitrate),
+                    (TrackInfoField::Plays, "Play count", track_info.plays),
+                ]
+                .into_iter()
+                .map(|(field, label, on)| {
+                    (
+                        SettingsButton::TrackInfo(field),
+                        gpui::ElementId::from(gpui::SharedString::from(format!(
+                            "track-info-{label}"
+                        ))),
+                        label.into(),
+                        on,
+                    )
+                })
+                .collect(),
+                cx,
+            ),
+        ];
+        let browsing_section = browsing_section
+            .child(setting_list(browsing_rows, cx))
+            .child(self.note(COVER_SIZE_NOTE, cx))
+            .child(self.note(CARD_STYLE_NOTE, cx))
+            .child(self.note_if(
+                album_card_style == AlbumCardStyle::Cards,
+                CLASSIC_CARDS_NOTE,
                 cx,
             ))
-            .child(self.note(
-                "Puts the padding back around the cover and rounds all four of \
-                 its corners. By default the cover fills the card instead, edge \
-                 to edge inside the border, and runs flat into the title below. \
-                 The cards keep the width they had either way, so the grid's \
-                 columns do not move.",
-                cx,
-            ))
-            .child(self.subheading("Artist page covers", cx))
-            .child(self.note(
-                "Size of the album cards on an artist's page. Match follows the \
-                 setting above; the rest size that page on its own.",
-                cx,
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    // Ids are prefixed: the cover sizes above carry the same
-                    // labels, and an element id is page-wide.
-                    .child(self.label_btn(
-                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Match),
-                        "artist-album-size-match",
-                        ArtistAlbumSize::Match.label(),
-                        artist_album_size == ArtistAlbumSize::Match,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Small),
-                        "artist-album-size-small",
-                        ArtistAlbumSize::Small.label(),
-                        artist_album_size == ArtistAlbumSize::Small,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Medium),
-                        "artist-album-size-medium",
-                        ArtistAlbumSize::Medium.label(),
-                        artist_album_size == ArtistAlbumSize::Medium,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::Large),
-                        "artist-album-size-large",
-                        ArtistAlbumSize::Large.label(),
-                        artist_album_size == ArtistAlbumSize::Large,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::ArtistAlbumSize(ArtistAlbumSize::ExtraLarge),
-                        "artist-album-size-xl",
-                        ArtistAlbumSize::ExtraLarge.label(),
-                        artist_album_size == ArtistAlbumSize::ExtraLarge,
-                        cx,
-                    )),
-            )
-            .child(self.subheading("Track info", cx))
-            .child(self.note("Shown next to song titles in album and playlist views.", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
-                        SettingsButton::TrackInfo(TrackInfoField::Artist),
-                        "Artist",
-                        "Artist",
-                        track_info.artist,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::TrackInfo(TrackInfoField::Album),
-                        "Album",
-                        "Album",
-                        track_info.album,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::TrackInfo(TrackInfoField::Year),
-                        "Year",
-                        "Year",
-                        track_info.year,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::TrackInfo(TrackInfoField::Genre),
-                        "Genre",
-                        "Genre",
-                        track_info.genre,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::TrackInfo(TrackInfoField::Bitrate),
-                        "Bitrate",
-                        "Bitrate",
-                        track_info.bitrate,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::TrackInfo(TrackInfoField::Plays),
-                        "Play count",
-                        "Play count",
-                        track_info.plays,
-                        cx,
-                    )),
-            )
-            .child(self.subheading("Keyboard", cx))
-            .child(self.vi_switch(
-                SettingsSwitch::ViMode,
-                "vi-mode",
-                vi_mode,
-                false,
-                "Vi-style keyboard navigation",
-                cx,
-            ))
-            .child(self.note(
-                "j/k sidebar+grid, h/l history, : commands, / search, ? help",
-                cx,
-            ));
+            .child(self.note(TIMELINE_NOTE, cx))
+            .child(self.note(ARTIST_COVERS_NOTE, cx))
+            .child(crate::ui::divider())
+            .child(self.subheading("Keyboard", cx));
+        let keyboard_rows = [self.switch_row(
+            SettingsSwitch::ViMode,
+            "vi-mode",
+            vi_mode,
+            false,
+            "Vi-style keyboard navigation",
+            Some(VI_NOTE),
+            cx,
+        )];
+        let browsing_section = browsing_section.child(setting_list(keyboard_rows, cx));
 
         // Streaming
-        let streaming_section = self
-            .section("Streaming", cx)
-            .child(self.subheading("Format", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.label_btn(
-                        SettingsButton::Format(None),
-                        "Original",
-                        "Original",
-                        format.is_none(),
-                        cx,
-                    ))
-                    .child(self.label_btn(
+        const TRANSCODE_NOTE: &str = "Transcoding helps low-bandwidth connections but \
+             disables accurate seeking. Original streams the source file.";
+        let streaming_section = self.section_with_notes("Streaming", &[TRANSCODE_NOTE], cx);
+        let streaming_rows = [
+            self.choice_row(
+                "Format",
+                None,
+                vec![
+                    choice(SettingsButton::Format(None), "Original", format.is_none()),
+                    choice(
                         SettingsButton::Format(Some("mp3")),
                         "MP3",
-                        "MP3",
                         format.as_deref() == Some("mp3"),
-                        cx,
-                    ))
-                    .child(self.label_btn(
+                    ),
+                    choice(
                         SettingsButton::Format(Some("opus")),
                         "Opus",
-                        "Opus",
                         format.as_deref() == Some("opus"),
-                        cx,
-                    )),
-            )
-            .child(self.note(
-                "Transcoding helps low-bandwidth connections but disables accurate \
-                 seeking. Original streams the source file.",
+                    ),
+                ],
                 cx,
-            ))
-            .child(self.subheading("Max bitrate", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.label_btn(
-                        SettingsButton::Bitrate(None),
-                        "No limit",
-                        "No limit",
-                        bitrate.is_none(),
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Bitrate(Some(128)),
-                        "128k",
-                        "128k",
-                        bitrate == Some(128),
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Bitrate(Some(192)),
-                        "192k",
-                        "192k",
-                        bitrate == Some(192),
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Bitrate(Some(320)),
-                        "320k",
-                        "320k",
-                        bitrate == Some(320),
-                        cx,
-                    )),
-            );
+            ),
+            self.choice_row(
+                "Max bitrate",
+                None,
+                [None, Some(128), Some(192), Some(320)]
+                    .into_iter()
+                    .map(|rate: Option<u32>| {
+                        let label =
+                            rate.map_or_else(|| "No limit".to_string(), |r| format!("{r}k"));
+                        (
+                            SettingsButton::Bitrate(rate),
+                            gpui::ElementId::from(gpui::SharedString::from(format!(
+                                "bitrate-{label}"
+                            ))),
+                            label.into(),
+                            bitrate == rate,
+                        )
+                    })
+                    .collect(),
+                cx,
+            ),
+        ];
+        let streaming_section = streaming_section
+            .child(setting_list(streaming_rows, cx))
+            .child(self.note(TRANSCODE_NOTE, cx));
 
         // Library: the two maintenance jobs, the local music folders, and the
         // artwork cache.
-        let library_card = self.section("Library", cx);
+        const MAINTENANCE_NOTE: &str = "Refresh in the sidebar picks up albums the server \
+             already knows about. These maintenance jobs are slower and rarely needed.";
+        const PRECACHE_NOTE: &str = "Preloading downloads every album and artist cover in \
+             the background, so the grids draw from disk instead of fetching as you scroll. \
+             Runs after each library sync and only fetches what is missing. Large libraries \
+             will fill the cache above, so raise it if covers start reappearing.";
+        let library_section = self
+            .section("Library", cx)
+            .child(self.subheading_with_notes("Maintenance", &[MAINTENANCE_NOTE], cx));
+        let maintenance_rows = [
+            self.vi_library_task(
+                SettingsButton::ScanServer,
+                "scan-server",
+                "Scan server library",
+                "Scan",
+                "Have the server re-read its music folders. Needed after adding \
+                 files to the server itself. Requires an admin account.",
+                &server_scan_state,
+                cx,
+            ),
+            self.vi_library_task(
+                SettingsButton::RebuildCache,
+                "rebuild-cache",
+                "Rebuild local cache",
+                "Rebuild",
+                "Re-read local metadata and covers, then re-import every album \
+                 from the server when connected. Never changes music files.",
+                &rebuild_state,
+                cx,
+            ),
+        ];
+        let library_section = library_section
+            .child(setting_list(maintenance_rows, cx))
+            .child(self.note(MAINTENANCE_NOTE, cx))
+            .child(crate::ui::divider())
+            .child(self.subheading("Local music", cx));
 
-        // Local-directory rows live in document order now, so their remove
-        // buttons land in the right place for j/k navigation.
-        let mut dir_rows: Vec<gpui::AnyElement> = Vec::new();
+        // Built after the maintenance rows, so the remove buttons come in
+        // document order for j/k navigation.
+        let mut local_rows: Vec<Option<gpui::AnyElement>> = Vec::new();
         for (i, p) in local_music_dirs.iter().enumerate() {
             let p_str = p.to_string_lossy().to_string();
-            dir_rows.push(
+            local_rows.push(Some(
                 h_flex()
+                    .w_full()
                     .gap_2()
                     .items_center()
-                    .child(div().flex_1().text_sm().truncate().child(p_str))
+                    .child(div().flex_1().min_w_0().text_sm().truncate().child(p_str))
                     .child(
                         self.vi_control(
                             SettingsAction::Button(SettingsButton::RemoveLocalDir(i)),
@@ -4077,132 +4175,79 @@ impl Render for SettingsView {
                         ),
                     )
                     .into_any_element(),
-            );
+            ));
         }
-
-        let library_section = library_card
-            .child(self.subheading("Maintenance", cx))
-            .child(self.note(
-                "Refresh in the sidebar picks up albums the server already knows \
-                 about. These maintenance jobs are slower and rarely needed.",
-                cx,
-            ))
-            .child(self.vi_library_task(
-                SettingsButton::ScanServer,
-                "scan-server",
-                "Scan server library",
-                "Have the server re-read its music folders. Needed after adding \
-                 files to the server itself. Requires an admin account.",
-                &server_scan_state,
-                cx,
-            ))
-            // Two description-then-button blocks in a row read as one
-            // paragraph without something between them.
+        let dir_input = self.vi_control(
+            SettingsAction::DirInput,
+            div().w_full().child(Input::new(&self.dir_input).small()),
+            cx,
+        );
+        let add_dir = self.vi_control(
+            SettingsAction::Button(SettingsButton::AddLocalDir),
+            Button::new("add-local-dir")
+                .small()
+                .label("Add")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.add_local_dir(window, cx);
+                })),
+            cx,
+        );
+        local_rows.push(Some(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_center()
+                .child(div().flex_1().min_w_0().child(dir_input))
+                .child(add_dir)
+                .into_any_element(),
+        ));
+        let library_section = library_section
+            .child(setting_list(local_rows, cx))
             .child(crate::ui::divider())
-            .child(self.vi_library_task(
-                SettingsButton::RebuildCache,
-                "rebuild-cache",
-                "Rebuild local cache",
-                "Re-read local metadata and covers, then re-import every album \
-                 from the server when connected. Never changes music files.",
-                &rebuild_state,
+            .child(self.subheading_with_notes("Artwork cache", &[PRECACHE_NOTE], cx));
+        let precache_message = precache_state.message().map(|msg| {
+            div()
+                .text_xs()
+                .text_color(if matches!(precache_state, TaskState::Failed(_)) {
+                    cx.theme().danger
+                } else {
+                    cx.theme().muted_foreground
+                })
+                .child(msg.to_string())
+                .into_any_element()
+        });
+        // One list: preloading fills the cache sized right above it.
+        let artwork_rows = [
+            self.choice_row(
+                "Cache size",
+                None,
+                [64_u32, 128, 256, 512, 1024]
+                    .into_iter()
+                    .map(|mb| {
+                        (
+                            SettingsButton::Cache(mb),
+                            gpui::ElementId::from(("cache-mb", mb as usize)),
+                            format!("{mb} MB").into(),
+                            artwork_cache_mb == mb,
+                        )
+                    })
+                    .collect(),
                 cx,
-            ))
-            .child(crate::ui::divider())
-            .child(self.subheading("Local music", cx))
-            .child(v_flex().gap_1().children(dir_rows))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.vi_control(
-                        SettingsAction::DirInput,
-                        div().w(px(300.)).child(Input::new(&self.dir_input)),
-                        cx,
-                    ))
-                    .child(
-                        self.vi_control(
-                            SettingsAction::Button(SettingsButton::AddLocalDir),
-                            Button::new("add-local-dir")
-                                .label("Add")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_local_dir(window, cx);
-                                })),
-                            cx,
-                        ),
-                    ),
-            )
-            .child(crate::ui::divider())
-            .child(self.subheading("Artwork cache", cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(self.label_btn(
-                        SettingsButton::Cache(64),
-                        ("cache-mb", 64_u32),
-                        "64 MB",
-                        artwork_cache_mb == 64,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Cache(128),
-                        ("cache-mb", 128_u32),
-                        "128 MB",
-                        artwork_cache_mb == 128,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Cache(256),
-                        ("cache-mb", 256_u32),
-                        "256 MB",
-                        artwork_cache_mb == 256,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Cache(512),
-                        ("cache-mb", 512_u32),
-                        "512 MB",
-                        artwork_cache_mb == 512,
-                        cx,
-                    ))
-                    .child(self.label_btn(
-                        SettingsButton::Cache(1024),
-                        ("cache-mb", 1024_u32),
-                        "1024 MB",
-                        artwork_cache_mb == 1024,
-                        cx,
-                    )),
-            )
-            // No divider: preloading fills the cache sized right above it, so
-            // the two are one block rather than two.
-            .child(self.vi_switch(
+            ),
+            self.switch_row(
                 SettingsSwitch::PrecacheArt,
                 "precache-art",
                 precache_art,
                 false,
                 "Preload all cover art",
+                None,
                 cx,
-            ))
-            .child(self.note(
-                "Download every album and artist cover in the background, so the \
-                 grids draw from disk instead of fetching as you scroll. Runs \
-                 after each library sync and only fetches what is missing. Large \
-                 libraries will fill the cache above, so raise it if covers start \
-                 reappearing.",
-                cx,
-            ))
-            .when_some(precache_state.message().map(str::to_string), |this, msg| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(if matches!(precache_state, TaskState::Failed(_)) {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(msg),
-                )
-            });
+            ),
+            precache_message,
+        ];
+        let library_section = library_section
+            .child(setting_list(artwork_rows, cx))
+            .child(self.note(PRECACHE_NOTE, cx));
 
         // Connections: every outside service the app's features rely on,
         // grouped by the feature — what a service is *for* is the question a
@@ -4332,26 +4377,25 @@ impl Render for SettingsView {
             },
         ];
         let lyrics_list = self.service_list(lyrics_services, cx);
-        let lyrics_first = self
-            .vi_switch(
-                SettingsSwitch::LyricsOnlineFirst,
-                "lyrics-online-first",
-                lyrics_provider == LyricsProvider::OnlineFirst,
-                !lyrics_provider.has_fallback(),
-                "Ask LRCLIB first",
-                cx,
-            )
-            .into_any_element();
-        let prefer_synced = self
-            .vi_switch(
-                SettingsSwitch::PreferSyncedLyrics,
-                "prefer-synced-lyrics",
-                prefer_synced_lyrics,
-                !lyrics_provider.has_fallback(),
-                "Prefer synced lyrics",
-                cx,
-            )
-            .into_any_element();
+        let lyrics_first = self.switch_row(
+            SettingsSwitch::LyricsOnlineFirst,
+            "lyrics-online-first",
+            lyrics_provider == LyricsProvider::OnlineFirst,
+            !lyrics_provider.has_fallback(),
+            "Ask LRCLIB first",
+            None,
+            cx,
+        );
+        let prefer_synced = self.switch_row(
+            SettingsSwitch::PreferSyncedLyrics,
+            "prefer-synced-lyrics",
+            prefer_synced_lyrics,
+            !lyrics_provider.has_fallback(),
+            "Prefer synced lyrics",
+            None,
+            cx,
+        );
+        let lyrics_order = setting_list([lyrics_first, prefer_synced], cx);
         let lyrics_cache = self.cache_row(OnlineCache::Lyrics, lyrics_cached, cx);
 
         let lb_switch = self.vi_toggle(
@@ -4494,8 +4538,7 @@ impl Render for SettingsView {
             .child(crate::ui::divider())
             .child(self.subheading_with_notes("Lyrics", LYRICS_NOTES, cx))
             .child(lyrics_list)
-            .child(lyrics_first)
-            .child(prefer_synced)
+            .child(lyrics_order)
             .child(self.note(LYRICS_NOTES[0], cx))
             .child(lyrics_cache)
             .child(crate::ui::divider())
@@ -4511,38 +4554,40 @@ impl Render for SettingsView {
 
         // Account (only when connected).
         let account_section = account.map(|(url, user)| {
-            self.section("Account", cx)
+            let sign_out = self.vi_control(
+                SettingsAction::Button(SettingsButton::SignOut),
+                Button::new("sign-out")
+                    .outline()
+                    .small()
+                    .danger()
+                    .label("Sign out")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sign_out(cx);
+                    })),
+                cx,
+            );
+            let row = h_flex()
+                .w_full()
+                .gap_3()
+                .justify_between()
+                .items_center()
                 .child(
-                    h_flex()
-                        .justify_between()
-                        .items_start()
+                    v_flex()
+                        .gap_1()
+                        .min_w_0()
+                        .child(div().text_sm().child(user))
                         .child(
-                            v_flex()
-                                .gap_1()
-                                .min_w_0()
-                                .child(div().text_sm().child(user))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .truncate()
-                                        .child(url),
-                                ),
-                        )
-                        .child(
-                            self.vi_control(
-                                SettingsAction::Button(SettingsButton::SignOut),
-                                Button::new("sign-out")
-                                    .outline()
-                                    .danger()
-                                    .label("Sign out")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.sign_out(cx);
-                                    })),
-                                cx,
-                            ),
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .truncate()
+                                .child(url),
                         ),
                 )
+                .child(sign_out)
+                .into_any_element();
+            self.section("Account", cx)
+                .child(setting_list([Some(row)], cx))
                 .into_any_element()
         });
 
@@ -4550,47 +4595,52 @@ impl Render for SettingsView {
         let copied = self.version_copied;
         let about_section = self
             .section("About", cx)
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_start()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child(format!("Scirè {}", env!("CARGO_PKG_VERSION"))),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .truncate()
-                                    .child(format!(
-                                        "{} · {} · {} License",
-                                        std::env::consts::OS,
-                                        std::env::consts::ARCH,
-                                        env!("CARGO_PKG_LICENSE"),
-                                    )),
+            .child(setting_list(
+                [Some(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .child(format!("Scirè {}", env!("CARGO_PKG_VERSION"))),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .truncate()
+                                        .child(format!(
+                                            "{} · {} · {} License",
+                                            std::env::consts::OS,
+                                            std::env::consts::ARCH,
+                                            env!("CARGO_PKG_LICENSE"),
+                                        )),
+                                ),
+                        )
+                        .child(
+                            self.vi_control(
+                                SettingsAction::Button(SettingsButton::CopyVersion),
+                                Button::new("copy-version")
+                                    .outline()
+                                    .small()
+                                    .label(if copied { "Copied" } else { "Copy" })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.copy_version(cx);
+                                    })),
+                                cx,
                             ),
-                    )
-                    .child(
-                        self.vi_control(
-                            SettingsAction::Button(SettingsButton::CopyVersion),
-                            Button::new("copy-version")
-                                .outline()
-                                .small()
-                                .label(if copied { "Copied" } else { "Copy" })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.copy_version(cx);
-                                })),
-                            cx,
-                        ),
-                    ),
-            )
+                        )
+                        .into_any_element(),
+                )],
+                cx,
+            ))
             .child(self.note(
                 "A desktop music client for Navidrome and the music on \
                          your disk. Built with GPUI and gpui-component.",

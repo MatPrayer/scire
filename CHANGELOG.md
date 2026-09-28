@@ -6,6 +6,56 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-27
+
+### Added
+
+- **Timeline** tab on the Albums page: the library laid out like a phone's
+  photo gallery. Albums newest-added first, grouped under date headings with
+  their counts, and a year column down the right edge that jumps straight to a
+  year. Drawn as cards or gallery tiles, following the Album cards setting.
+- **Settings → Browsing → Timeline groups**: head the Timeline by day, week
+  (Monday to Sunday), month or year.
+- **Settings → Browsing → Album cards → Gallery**: draw every album grid — the
+  Albums and Local pages, the Timeline and artist discographies — as
+  cover-only tiles packed tight, with title, artist and a play button showing
+  on hover. Cards stay the default.
+- **Song details**: an info button on album track rows (and *Song details* in
+  their right-click menu) opens every field the server has on the track —
+  credits by role, composer, audio format, ReplayGain, path, dates, ISRC,
+  MusicBrainz id — with a *Copy* button. Local tracks list every tag in the
+  file as well.
+- An artist's *Appears on* section includes covers: albums by other artists
+  holding a song this artist wrote (the composer credit). The first sync after
+  updating re-reads every album's tracks to pick the credits up.
+- The library size sits beside the album, track and playtime totals at the
+  top right of the Albums and Local Music pages.
+- Long instrumental breaks in synced lyrics show three dots, the way Apple
+  Music does: they light one by one as the break runs, then fade just before
+  the singing comes back. Covers the intro, gaps the lyrics mark with a blank
+  line, and long gaps between two sung lines. The dots
+  grow and shrink smoothly about their own centres.
+
+### Changed
+
+- More room between the *Albums* caption and the sort pills.
+- Every Settings card is laid out like Connections: each group's controls in
+  one boxed list, name on the left and control on the right.
+
+### Fixed
+
+- The fullscreen player no longer scrolls with the mouse wheel at some window
+  shapes; the page only scrolls in a window too short for its controls.
+- The library totals at the top right of the Albums, Artists and Local Music
+  pages sit as far from the right edge as the page title does from the left.
+- Bluetooth earbuds dropping mid-track pause playback until they come back,
+  instead of carrying on through the speakers after any earlier press of play.
+- A device reconnecting no longer restarts music you paused yourself.
+- Resuming the last session starts the track at the saved position straight
+  away: no more hearing its opening seconds first, and the saved position is
+  no longer lost when the app quits during that first seek. Switching output
+  device or following a route change resumes the same way.
+
 ## [1.1.2] — 2026-09-27
 
 ### Added
@@ -257,7 +307,8 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/MatPrayer/scire/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/MatPrayer/scire/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/MatPrayer/scire/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/MatPrayer/scire/compare/d6706f2...v1.1.0

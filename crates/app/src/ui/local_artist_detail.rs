@@ -9,9 +9,10 @@ use gpui::{
     Window, div, img, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 
 use crate::assets::{app_icon, icons};
+use crate::config::AlbumCardStyle;
 use crate::services::library_db::{AlbumRow, ArtistRow, LibraryDb};
 use crate::services::local_library::local_art_path;
 use crate::state::player::PlayerState;
@@ -204,6 +205,42 @@ impl LocalArtistDetailView {
         let anchor = self.focus_anchor.clone();
         let glow = self.session.read(cx).settings.selection_glow_vi;
 
+        if self.session.read(cx).settings.album_card_style == AlbumCardStyle::Gallery {
+            let play = Button::new(("local-artist-play", index))
+                .primary()
+                .xsmall()
+                .icon(app_icon(icons::PLAY))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.play_album(play_id.clone(), false, cx);
+                    cx.stop_propagation();
+                }));
+            let subtitle = album
+                .year
+                .map(|year| year.to_string())
+                .unwrap_or_else(|| format!("{} tracks", album.song_count));
+            let tile_el = crate::ui::gallery_tile(
+                SharedString::from(format!("local-artist-album-{}", album.id)),
+                tile,
+                art,
+                album.title.clone(),
+                subtitle,
+                Some(play.into_any_element()),
+                cx,
+            )
+            .when(focused, |style| style.anchor_scroll(Some(anchor)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(LocalArtistEvent::OpenAlbum(id.clone()));
+            }));
+            return with_focus_cursor(
+                format!("vi-local-artist-album-{index}"),
+                tile_el,
+                focused,
+                glow,
+                None,
+                cx,
+            );
+        }
+
         // Same trade as the album grid's cards: the cover takes the card's
         // inset for itself, the border and the card's width are unchanged.
         let flush = !self.session.read(cx).settings.classic_album_cards;
@@ -317,6 +354,7 @@ impl Render for LocalArtistDetailView {
             .artist_album_size
             .resolve(self.session.read(cx).settings.cover_size);
         let tile = cover.wrap_tile();
+        let gallery = self.session.read(cx).settings.album_card_style == AlbumCardStyle::Gallery;
         let cards: Vec<_> = self
             .albums
             .iter()
@@ -386,6 +424,12 @@ impl Render for LocalArtistDetailView {
                     ),
             )
             .child(div().text_lg().child("Albums"))
-            .child(h_flex().w_full().gap_4().flex_wrap().children(cards))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap(px(crate::ui::grid_item_gap(gallery)))
+                    .flex_wrap()
+                    .children(cards),
+            )
     }
 }

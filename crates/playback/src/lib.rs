@@ -46,6 +46,11 @@ pub struct TrackSource {
     /// file answers without a `Content-Length`, which costs the decoder the
     /// ability to seek — fatal for an m4a whose index sits at the end.
     pub live: bool,
+    /// Begin playback here instead of at zero (a restored position). The
+    /// engine opens the track paused, seeks, and only then lets it play, so the
+    /// first seconds of the track are never heard on the way to this point.
+    /// Only `Command::Play` honours it; a prefetched track always starts at 0.
+    pub start_at: Option<Duration>,
 }
 
 /// Commands accepted by the engine.

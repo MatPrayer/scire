@@ -293,6 +293,11 @@ pub struct RootView {
     new_playlist_reveal: crate::ui::Reveal,
     /// Open/close travel of the vi-mode help overlay.
     vi_help_reveal: crate::ui::Reveal,
+    /// Song details dialog: what it shows (kept through the exit), whether
+    /// it is open, and its open/close travel.
+    song_info: Option<crate::ui::song_info::SongInfo>,
+    song_info_open: bool,
+    song_info_reveal: crate::ui::Reveal,
     /// Open/close travel of the `:` command bar.
     command_reveal: crate::ui::Reveal,
     show_fullscreen: bool,
@@ -502,6 +507,28 @@ impl RootView {
         // Re-render the sidebar's playlist list when playlists change.
         cx.observe(&playlists, |_, _, cx| cx.notify()).detach();
 
+        // Any view asks for the song details dialog through this global.
+        cx.set_global(crate::ui::song_info::SongInfoRequest::default());
+        cx.observe_global::<crate::ui::song_info::SongInfoRequest>(|this: &mut Self, cx| {
+            // `global_mut` notifies this observer again, so only take when
+            // there is something to take — otherwise the effect loop spins.
+            if cx
+                .global::<crate::ui::song_info::SongInfoRequest>()
+                .0
+                .is_none()
+            {
+                return;
+            }
+            if let Some(song) = cx
+                .global_mut::<crate::ui::song_info::SongInfoRequest>()
+                .0
+                .take()
+            {
+                this.open_song_info(song, cx);
+            }
+        })
+        .detach();
+
         // -- First-time setup inputs --
         let setup_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://music.example.com"));
@@ -646,9 +673,27 @@ impl RootView {
                         .await
                     })
                     .await;
-                    // The catalog is as fresh as it gets this session; warm its
-                    // art if the user asked for that.
-                    let _ = this.update(cx, |this, cx| this.maybe_precache_art(cx));
+                    let _ = this.update(cx, |this, cx| {
+                        // The retained grids computed their header totals
+                        // from the cache at construction; the sync may have
+                        // filled what was empty then (track sizes after a
+                        // migration wipe), so re-read them in place.
+                        if let Some(view) = &this.albums_view {
+                            view.update(cx, |v, cx| {
+                                v.refresh_stats(cx);
+                                cx.notify();
+                            });
+                        }
+                        if let Some(view) = &this.artists_view {
+                            view.update(cx, |v, cx| {
+                                v.refresh_stats(cx);
+                                cx.notify();
+                            });
+                        }
+                        // The catalog is as fresh as it gets this session;
+                        // warm its art if the user asked for that.
+                        this.maybe_precache_art(cx);
+                    });
                 })
                 .detach();
             }
@@ -740,6 +785,9 @@ impl RootView {
             // A dialog is read the moment it lands, so it is given a little
             // less time than a panel that slides in beside the content.
             new_playlist_reveal: crate::ui::Reveal::new(170, 120),
+            song_info: None,
+            song_info_open: false,
+            song_info_reveal: crate::ui::Reveal::new(170, 120),
             vi_help_reveal: crate::ui::Reveal::new(170, 120),
             command_reveal: crate::ui::Reveal::new(150, 110),
             show_fullscreen: false,
@@ -1627,6 +1675,72 @@ impl RootView {
         cx.notify();
     }
 
+    /// Show the details dialog for `song` straight away from what the caller
+    /// holds, then fill in what it lacks: the whole `getSong` record for a
+    /// server track (a cached or queued copy may be thin), every tag in the
+    /// file for a local one.
+    fn open_song_info(&mut self, song: subsonic::Song, cx: &mut Context<Self>) {
+        let generation = self.song_info.as_ref().map_or(0, |i| i.generation) + 1;
+        let local_path = song.local_path.clone();
+        let client = self.session.read(cx).client.clone();
+        let id = song.id.clone();
+        let loading = local_path.is_some() || client.is_some();
+        self.song_info = Some(crate::ui::song_info::SongInfo {
+            song,
+            file_tags: None,
+            loading,
+            generation,
+        });
+        self.song_info_open = true;
+        cx.notify();
+
+        if let Some(path) = local_path {
+            cx.spawn(async move |this, cx| {
+                let tags =
+                    runtime::spawn_blocking_io(move || crate::ui::song_info::read_file_tags(&path))
+                        .await;
+                if let Err(e) = &tags {
+                    tracing::warn!("song details: reading tags failed: {e:#}");
+                }
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(info) = this.song_info.as_mut()
+                        && info.generation == generation
+                    {
+                        info.file_tags = tags.ok();
+                        info.loading = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        } else if let Some(client) = client {
+            cx.spawn(async move |this, cx| {
+                let fresh = runtime::spawn_io(async move {
+                    client.get_song(&id).await.map_err(anyhow::Error::from)
+                })
+                .await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(info) = this.song_info.as_mut()
+                        && info.generation == generation
+                    {
+                        // A failure keeps what was already shown.
+                        if let Ok(song) = fresh {
+                            info.song = song;
+                        }
+                        info.loading = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn close_song_info(&mut self, cx: &mut Context<Self>) {
+        self.song_info_open = false;
+        cx.notify();
+    }
+
     // ------------------------------------------------------------------
     // Vi-mode handling
     // ------------------------------------------------------------------
@@ -2123,7 +2237,10 @@ impl RootView {
                 cx.stop_propagation();
             }
             (false, "escape") => {
-                if self.show_vi_help {
+                if self.song_info_open {
+                    self.close_song_info(cx);
+                    cx.stop_propagation();
+                } else if self.show_vi_help {
                     self.show_vi_help = false;
                     cx.notify();
                     cx.stop_propagation();
@@ -3214,6 +3331,7 @@ impl Render for RootView {
             window.request_animation_frame();
         }
         let modal_open = self.new_playlist_open
+            || self.song_info_open
             || self.show_fullscreen
             || palette_open
             || self.mode == KeyboardMode::Command
@@ -3363,16 +3481,21 @@ impl Render for RootView {
         self.new_playlist_reveal
             .set(self.new_playlist_open, reduced_motion);
         self.vi_help_reveal.set(self.show_vi_help, reduced_motion);
+        self.song_info_reveal
+            .set(self.song_info_open, reduced_motion);
         self.command_reveal
             .set(self.mode == KeyboardMode::Command, reduced_motion);
         let new_playlist_t = self.new_playlist_reveal.openness(reduced_motion);
         let new_playlist_visible = self.new_playlist_reveal.visible(reduced_motion);
         let vi_help_t = self.vi_help_reveal.openness(reduced_motion);
+        let song_info_t = self.song_info_reveal.openness(reduced_motion);
+        let song_info_visible = self.song_info_reveal.visible(reduced_motion);
         let vi_help_visible = self.vi_help_reveal.visible(reduced_motion);
         let command_t = self.command_reveal.openness(reduced_motion);
         let command_visible = self.command_reveal.visible(reduced_motion);
         if self.new_playlist_reveal.settling(reduced_motion)
             || self.vi_help_reveal.settling(reduced_motion)
+            || self.song_info_reveal.settling(reduced_motion)
             || self.command_reveal.settling(reduced_motion)
         {
             window.request_animation_frame();
@@ -3447,7 +3570,10 @@ impl Render for RootView {
                             cx.stop_propagation();
                         }
                         "escape" => {
-                            if this.new_playlist_open {
+                            if this.song_info_open {
+                                this.close_song_info(cx);
+                                cx.stop_propagation();
+                            } else if this.new_playlist_open {
                                 this.cancel_new_playlist(cx);
                                 cx.stop_propagation();
                             } else if this.show_fullscreen {
@@ -3670,6 +3796,20 @@ impl Render for RootView {
                     cx,
                 ))
             })
+            // Song details dialog.
+            .when_some(
+                self.song_info.as_ref().filter(|_| song_info_visible),
+                |this, info| {
+                    this.child(crate::ui::song_info::render(
+                        info,
+                        song_info_t,
+                        self.song_info_open,
+                        |this: &mut Self, cx| this.close_song_info(cx),
+                        window,
+                        cx,
+                    ))
+                },
+            )
             // Command-mode input bar at bottom.
             .when(command_visible, |this| {
                 this.child(self.render_command_bar(

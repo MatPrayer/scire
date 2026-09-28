@@ -68,6 +68,7 @@ async fn plays_wav_stream_to_completion() {
         path: None,
         id: None,
         live: false,
+        start_at: None,
     });
 
     let mut saw_playing = false;
@@ -119,6 +120,7 @@ async fn plays_alac_m4a_stream() {
         path: None,
         id: None,
         live: false,
+        start_at: None,
     });
 
     let deadline = tokio::time::sleep(Duration::from_secs(15));
@@ -163,6 +165,7 @@ async fn prefetched_track_auto_advances() {
         path: None,
         id: None,
         live: false,
+        start_at: None,
     });
     player.prefetch_next(TrackSource {
         url: format!("{}/rest/stream?id=2", server.uri()),
@@ -170,6 +173,7 @@ async fn prefetched_track_auto_advances() {
         path: None,
         id: Some("2".into()),
         live: false,
+        start_at: None,
     });
 
     let mut ends = Vec::new();
@@ -229,6 +233,7 @@ async fn plays_local_wav_to_completion() {
         path: Some(wav_path.clone()),
         id: None,
         live: false,
+        start_at: None,
     });
 
     let mut saw_playing = false;
@@ -265,6 +270,7 @@ async fn local_file_missing_errors() {
         path: Some(PathBuf::from("/nonexistent/test.wav")),
         id: None,
         live: false,
+        start_at: None,
     });
 
     let deadline = tokio::time::sleep(Duration::from_secs(10));
@@ -309,9 +315,8 @@ fn wav_bytes_secs(secs: u32) -> Vec<u8> {
     buf
 }
 
-/// Resuming a saved position seeks the instant the track reports `Playing` —
-/// which is what the app does on the first press of play after a restart. The
-/// track must actually arrive there.
+/// A seek sent the instant the track reports `Playing` — before the source has
+/// played a single tick — must still land.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seek_at_playing_moves_the_track() {
     if no_audio_output() {
@@ -332,6 +337,7 @@ async fn seek_at_playing_moves_the_track() {
         path: Some(wav_path.clone()),
         id: Some("resume-song".into()),
         live: false,
+        start_at: None,
     });
 
     let target = Duration::from_secs(8);
@@ -365,6 +371,72 @@ async fn seek_at_playing_moves_the_track() {
         "never reported a position at or past the seek target"
     );
     let _ = std::fs::remove_file(&wav_path);
+}
+
+/// A restored position goes in with the track (`start_at`): the engine opens it
+/// paused, seeks, and only then plays. No position from the head of the track is
+/// ever reported — the app writes each one to its resume file, and a stray
+/// `0:00` there deletes the position it was about to restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_at_begins_at_the_restored_position() {
+    if no_audio_output() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("scire-test-start-at");
+    let _ = std::fs::create_dir_all(&dir);
+    let wav_path = dir.join("start-at.wav");
+    let mut f = std::fs::File::create(&wav_path).unwrap();
+    f.write_all(&wav_bytes_secs(10)).unwrap();
+    drop(f);
+
+    let target = Duration::from_secs(8);
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    player.play(TrackSource {
+        url: String::new(),
+        duration_hint: Some(Duration::from_secs(10)),
+        path: Some(wav_path.clone()),
+        id: Some("start-at-song".into()),
+        live: false,
+        start_at: Some(target),
+    });
+
+    let mut positions = Vec::new();
+    let mut playing_at = None;
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Playing => {
+                        playing_at.get_or_insert_with(std::time::Instant::now);
+                    }
+                    Event::Position(p) => positions.push(p),
+                    Event::TrackEnded { .. } => break,
+                    Event::Failed(msg) => panic!("playback failed: {msg}"),
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("engine never finished a track started at 8s"),
+        }
+    }
+    let _ = std::fs::remove_file(&wav_path);
+
+    let playing_at = playing_at.expect("never saw Playing event");
+    assert!(!positions.is_empty(), "no position was ever reported");
+    let floor = target - Duration::from_millis(50);
+    assert!(
+        positions.iter().all(|p| *p >= floor),
+        "reported a position before the start point: {positions:?}"
+    );
+    // Two seconds were left to play; the whole ten would mean it began at zero.
+    assert!(
+        playing_at.elapsed() < Duration::from_secs(6),
+        "took {:?} to finish, so it did not start at {target:?}",
+        playing_at.elapsed()
+    );
 }
 
 /// An HTTP server that trickles the body after the first `fast_bytes` and
@@ -476,6 +548,7 @@ async fn a_slow_seek_does_not_stop_the_engine_answering() {
         path: None,
         id: Some("slow-seek".into()),
         live: false,
+        start_at: None,
     });
 
     let target = Duration::from_secs(250);
@@ -595,6 +668,7 @@ async fn a_trailing_index_is_read_without_the_whole_download() {
         path: None,
         id: None,
         live: false,
+        start_at: None,
     });
 
     let deadline = tokio::time::sleep(Duration::from_secs(30));
@@ -703,6 +777,7 @@ async fn m4a_without_content_length_reports_the_container() {
         path: None,
         id: None,
         live: false,
+        start_at: None,
     });
 
     let deadline = tokio::time::sleep(Duration::from_secs(20));
@@ -741,6 +816,7 @@ async fn library_tracks_do_not_request_icy_metadata() {
         path: None,
         id: None,
         live: false,
+        start_at: None,
     });
 
     let seen = headers

@@ -464,6 +464,7 @@ impl PlayerState {
             path: None,
             id: None,
             live: true,
+            start_at: None,
         });
         // Radio has no queue song behind it: drop the last track's cover.
         self.refresh_current_art(cx);
@@ -1156,6 +1157,9 @@ impl PlayerState {
             path,
             id: Some(song_id.clone()),
             live: false,
+            // The engine seeks before the track is heard; kept pending until
+            // `Playing` so a transcode retry of the same track still resumes.
+            start_at: resume,
         });
         self.engine_has_track = true;
         push_recent(&mut self.recently_played, song_clone);
@@ -1191,6 +1195,7 @@ impl PlayerState {
                 path,
                 id: Some(song.id.clone()),
                 live: false,
+                start_at: None,
             })
         });
         match next {
@@ -1241,14 +1246,14 @@ impl PlayerState {
                 self.playing = true;
                 self.buffering = false;
                 self.failed_streak = 0;
-                // The restored position is applied here, not in `start_current`:
-                // the engine can only seek a source it has actually opened.
-                if let Some((id, pos)) = self.pending_resume.clone()
-                    && self.current_song().is_some_and(|s| s.id == id)
+                // The restored position went to the engine with the track
+                // (`TrackSource::start_at`); once it has opened, it is spent.
+                if self
+                    .pending_resume
+                    .as_ref()
+                    .is_some_and(|(id, _)| self.current_song().is_some_and(|s| &s.id == id))
                 {
                     self.pending_resume = None;
-                    self.set_position(pos);
-                    self.player.seek(pos);
                 }
                 if let Some(c) = &mut self.media_controls {
                     let _ = c.set_playback(MediaPlayback::Playing {
@@ -1281,6 +1286,10 @@ impl PlayerState {
                         self.queue.advance_to(pos);
                         persist_queue(&self.queue);
                     }
+                    // A gapless track starts at zero; a resume still pending
+                    // for another song must not fire if the queue comes back
+                    // round to it.
+                    self.pending_resume = None;
                     self.set_position(Duration::ZERO);
                     self.duration = self
                         .queue

@@ -426,6 +426,7 @@ async fn fetch_album_tracks(
             &metadata,
         );
         let _ = db.set_track_artists(&track_id, &song_credits(song, artist_id.as_deref()));
+        let _ = db.set_track_composers(&track_id, &composer_credits(song));
     }
 }
 
@@ -466,6 +467,15 @@ fn song_credits(song: &subsonic::Song, primary: Option<&str>) -> Vec<String> {
             .collect();
     }
     primary.map(str::to_string).into_iter().collect()
+}
+
+/// Who wrote a song, as `(namespaced artist id if known, name)`.
+fn composer_credits(song: &subsonic::Song) -> Vec<(Option<String>, String)> {
+    song.details
+        .composers()
+        .into_iter()
+        .map(|(id, name)| (id.map(|id| format!("navidrome:artist:{id}")), name))
+        .collect()
 }
 
 /// How often the server scan is polled while it runs.
@@ -538,6 +548,12 @@ pub async fn run_server_scan(client: &SubsonicClient, files: Arc<AtomicU64>) -> 
 /// Remove all navidrome-sourced tracks, albums, and artists from the DB.
 fn remove_navidrome(db: &LibraryDb) -> Result<i64> {
     let count = db.track_count_by_source("navidrome")?;
+    db.execute(
+        "DELETE FROM track_artists WHERE track_id IN (SELECT id FROM tracks WHERE source = 'navidrome')",
+    )?;
+    db.execute(
+        "DELETE FROM track_composers WHERE track_id IN (SELECT id FROM tracks WHERE source = 'navidrome')",
+    )?;
     db.execute("DELETE FROM tracks WHERE source = 'navidrome'")?;
     db.execute("DELETE FROM albums WHERE source = 'navidrome'")?;
     db.execute("DELETE FROM artists WHERE source = 'navidrome'")?;

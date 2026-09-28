@@ -11,7 +11,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 
 use crate::assets::{app_icon, icons};
@@ -479,6 +479,7 @@ impl Render for LocalAlbumDetailView {
                     .unwrap_or_default();
                 let song_next = track.clone().into_song();
                 let song_enq = track.clone().into_song();
+                let song_info = track.clone().into_song();
 
                 let row = h_flex()
                     .id(("local-track", i))
@@ -552,6 +553,17 @@ impl Render for LocalAlbumDetailView {
                                         });
                                         cx.stop_propagation();
                                     })),
+                            )
+                            .child(
+                                Button::new(("lt-info", i))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Info)
+                                    .tooltip("Song details")
+                                    .on_click(move |_, _, cx| {
+                                        crate::ui::song_info::show(song_info.clone(), cx);
+                                        cx.stop_propagation();
+                                    }),
                             ),
                     )
                     .child(
@@ -583,16 +595,22 @@ impl Render for LocalAlbumDetailView {
                                     });
                                 }
                             }))
+                            .item(PopupMenuItem::new("Add to queue").on_click({
+                                let v = view.clone();
+                                let song = track_song.clone();
+                                move |_, _, cx: &mut gpui::App| {
+                                    v.update(cx, |v, cx| {
+                                        v.player
+                                            .update(cx, |p, cx| p.enqueue(vec![song.clone()], cx))
+                                    });
+                                }
+                            }))
+                            .separator()
                             .item(
-                                PopupMenuItem::new("Add to queue").on_click({
-                                    let v = view.clone();
+                                PopupMenuItem::new("Song details").on_click({
                                     let song = track_song.clone();
                                     move |_, _, cx: &mut gpui::App| {
-                                        v.update(cx, |v, cx| {
-                                            v.player.update(cx, |p, cx| {
-                                                p.enqueue(vec![song.clone()], cx)
-                                            })
-                                        });
+                                        crate::ui::song_info::show(song.clone(), cx);
                                     }
                                 }),
                             )

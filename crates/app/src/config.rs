@@ -197,6 +197,15 @@ pub struct Settings {
     /// grid's rhythm are identical, and toggling this cannot reflow the page.
     #[serde(default)]
     pub classic_album_cards: bool,
+    /// How every album grid draws an album: a card with its title under the
+    /// cover, or the timeline's gallery tile — the cover alone, packed
+    /// tight, with title and artist over its foot on hover.
+    #[serde(default)]
+    pub album_card_style: AlbumCardStyle,
+    /// How finely the Albums page's Timeline tab groups albums by the date
+    /// they were added.
+    #[serde(default)]
+    pub timeline_grouping: TimelineGrouping,
     /// Cover size of the album cards on an artist's page. `Match` follows
     /// `cover_size`; the rest pick a size for that page alone.
     #[serde(default)]
@@ -988,6 +997,32 @@ pub enum AlbumSort {
     Frequent,
     Random,
     Starred,
+    /// Newest-first, grouped under date headings (`Settings::timeline_grouping`)
+    /// like a photo gallery.
+    Timeline,
+}
+
+/// How the album grids draw an album. See `Settings::album_card_style`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlbumCardStyle {
+    /// Cover over title, artist and year, inside a bordered card.
+    #[default]
+    Cards,
+    /// Cover-only tiles with a tight gutter; title and artist on hover.
+    Gallery,
+}
+
+/// Date buckets the Timeline tab draws a heading for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimelineGrouping {
+    Day,
+    /// Monday-to-Sunday weeks.
+    Week,
+    #[default]
+    Month,
+    Year,
 }
 
 /// Which extra fields to show next to song titles in album/playlist views.
@@ -1029,6 +1064,8 @@ impl Default for Settings {
             album_sort: AlbumSort::default(),
             cover_size: CoverSize::default(),
             classic_album_cards: false,
+            album_card_style: AlbumCardStyle::default(),
+            timeline_grouping: TimelineGrouping::default(),
             artist_album_size: ArtistAlbumSize::default(),
             track_info: TrackInfo {
                 artist: true,

@@ -12,10 +12,11 @@ use gpui::{
     Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 
 use crate::assets::{app_icon, icons};
+use crate::config::AlbumCardStyle;
 use crate::services::artwork;
 use crate::services::library_db::{AlbumRow, LibraryDb, LibraryStats};
 use crate::services::local_library::local_art_path;
@@ -157,9 +158,11 @@ impl LocalMusicView {
 
     fn grid_cols(&mut self, window: &Window, cx: &gpui::App) -> usize {
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
-        let (min_tile, max_tile) = self.session.read(cx).settings.cover_size.range();
+        let settings = &self.session.read(cx).settings;
+        let (min_tile, max_tile) = settings.cover_size.range();
+        let gallery = settings.album_card_style == AlbumCardStyle::Gallery;
         self.live_width
-            .grid(measured, min_tile, max_tile, window, FALLBACK_COLS)
+            .grid(measured, min_tile, max_tile, window, FALLBACK_COLS, gallery)
             .0
     }
 
@@ -371,6 +374,58 @@ impl LocalMusicView {
             None
         };
 
+        let menu_view = view.clone();
+        let menu_id = id.clone();
+        let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            let act = |mode: QueueMode| {
+                let view = menu_view.clone();
+                let aid = menu_id.clone();
+                move |_: &_, _: &mut Window, cx: &mut gpui::App| {
+                    view.update(cx, |v, cx| v.queue_album(aid.clone(), mode, cx));
+                }
+            };
+            menu.item(PopupMenuItem::new("Play").on_click(act(QueueMode::Play)))
+                .item(PopupMenuItem::new("Shuffle").on_click(act(QueueMode::Shuffle)))
+                .item(PopupMenuItem::new("Play next").on_click(act(QueueMode::PlayNext)))
+                .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
+        };
+
+        if self.session.read(cx).settings.album_card_style == AlbumCardStyle::Gallery {
+            let play = Button::new(("lcard-play", index))
+                .primary()
+                .xsmall()
+                .icon(app_icon(icons::PLAY))
+                .on_click(move |_, _, cx: &mut gpui::App| {
+                    play_view.update(cx, |this, cx| {
+                        this.queue_album(play_id.clone(), QueueMode::Play, cx);
+                    });
+                    cx.stop_propagation();
+                });
+            let tile_el = crate::ui::gallery_tile(
+                SharedString::from(format!("local-album-{}", album.id)),
+                tile,
+                art,
+                name,
+                artist,
+                Some(play.into_any_element()),
+                cx,
+            )
+            .on_click(move |_, _, cx: &mut gpui::App| {
+                open_view.update(cx, |_, cx| {
+                    cx.emit(LocalMusicEvent::OpenAlbum(open_id.clone()))
+                });
+            })
+            .context_menu(menu);
+            return with_focus_cursor(
+                format!("vi-focus-{index}"),
+                tile_el,
+                focused,
+                glow,
+                accent,
+                cx,
+            );
+        }
+
         // Same trade as the album grid's cards: the cover takes the card's
         // inset for itself, the border and the card's width are unchanged.
         let flush = !self.session.read(cx).settings.classic_album_cards;
@@ -478,19 +533,7 @@ impl LocalMusicView {
                         )
                     }),
             )
-            .context_menu(move |menu, _window, _cx| {
-                let act = |mode: QueueMode| {
-                    let view = view.clone();
-                    let aid = id.clone();
-                    move |_: &_, _: &mut Window, cx: &mut gpui::App| {
-                        view.update(cx, |v, cx| v.queue_album(aid.clone(), mode, cx));
-                    }
-                };
-                menu.item(PopupMenuItem::new("Play").on_click(act(QueueMode::Play)))
-                    .item(PopupMenuItem::new("Shuffle").on_click(act(QueueMode::Shuffle)))
-                    .item(PopupMenuItem::new("Play next").on_click(act(QueueMode::PlayNext)))
-                    .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
-            });
+            .context_menu(menu);
         with_focus_cursor(format!("vi-focus-{index}"), card, focused, glow, accent, cx)
     }
 }
@@ -525,9 +568,10 @@ impl Render for LocalMusicView {
 
         let (min_tile, max_tile) = cover.range();
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
+        let gallery = self.session.read(cx).settings.album_card_style == AlbumCardStyle::Gallery;
         let (cols, tile) =
             self.live_width
-                .grid(measured, min_tile, max_tile, window, FALLBACK_COLS);
+                .grid(measured, min_tile, max_tile, window, FALLBACK_COLS, gallery);
         let row_count = self.albums.len().div_ceil(cols);
         self.ensure_art_for_viewport(row_count, cols, cx);
 
@@ -555,9 +599,9 @@ impl Render for LocalMusicView {
                         .collect::<Vec<_>>();
                     h_flex()
                         .w_full()
-                        .gap_4()
+                        .gap(px(crate::ui::grid_item_gap(gallery)))
                         .justify_center()
-                        .pb_3()
+                        .pb(px(crate::ui::grid_row_gap(gallery)))
                         .children(cards)
                         .into_any_element()
                 })
@@ -584,8 +628,12 @@ impl Render for LocalMusicView {
                     // zeros next to a grid full of live cards read as a bug.
                     .when(self.stats.albums > 0, |this| {
                         this.child(
-                            div()
-                                .ml_auto()
+                            // Fills the rest of the line and right-aligns, rather
+                            // than `ml_auto`: taffy left the auto-margin text ~2rem
+                            // short of the row's padding in this wrapping row.
+                            h_flex()
+                                .flex_1()
+                                .justify_end()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(crate::ui::library_summary(

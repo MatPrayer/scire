@@ -8,17 +8,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, IntoElement, Render, UniformListScrollHandle, Window, div,
-    img, prelude::*, px, uniform_list,
+    App, Context, Entity, EventEmitter, IntoElement, ListAlignment, ListOffset, ListState, Render,
+    UniformListScrollHandle, Window, div, img, list, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
-use gpui_component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use subsonic::{Album, AlbumListType, SubsonicClient};
 
 use crate::assets::{app_icon, icons};
-use crate::config::AlbumSort;
+use crate::config::{AlbumCardStyle, AlbumSort, TimelineGrouping};
 use crate::services::library_db::{AlbumRow, LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
@@ -55,6 +55,7 @@ const TABS: &[AlbumSort] = &[
     AlbumSort::Frequent,
     AlbumSort::Random,
     AlbumSort::Starred,
+    AlbumSort::Timeline,
 ];
 
 fn tab_label(sort: AlbumSort) -> &'static str {
@@ -65,13 +66,14 @@ fn tab_label(sort: AlbumSort) -> &'static str {
         AlbumSort::Frequent => "Frequent",
         AlbumSort::Random => "Random",
         AlbumSort::Starred => "Starred",
+        AlbumSort::Timeline => "Timeline",
     }
 }
 
 fn tab_list_type(sort: AlbumSort) -> AlbumListType {
     match sort {
         AlbumSort::All => AlbumListType::AlphabeticalByName,
-        AlbumSort::New => AlbumListType::Newest,
+        AlbumSort::New | AlbumSort::Timeline => AlbumListType::Newest,
         AlbumSort::Recent => AlbumListType::Recent,
         AlbumSort::Frequent => AlbumListType::Frequent,
         AlbumSort::Random => AlbumListType::Random,
@@ -102,6 +104,8 @@ struct TabState {
     /// How many entries of `albums` came from the server (only meaningful
     /// while `cached` — it's the write cursor for the overwrite).
     live_len: usize,
+    /// Bumped whenever `albums` changes, so the timeline knows to regroup.
+    version: u64,
 }
 
 /// Display order between two albums for a tab (mirrors the server's order
@@ -110,7 +114,7 @@ struct TabState {
 fn album_cmp(tab: AlbumSort, a: &Album, b: &Album) -> Ordering {
     match tab {
         AlbumSort::All => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        AlbumSort::New => b.created.cmp(&a.created),
+        AlbumSort::New | AlbumSort::Timeline => b.created.cmp(&a.created),
         AlbumSort::Frequent => b.play_count.cmp(&a.play_count),
         AlbumSort::Starred => b.starred.cmp(&a.starred),
         // No client-visible key; keep each library's order and let the
@@ -200,6 +204,7 @@ pub(crate) fn album_from_row(row: AlbumRow) -> Album {
 ///
 /// `state.exhausted` must already be set for this page.
 fn apply_live_page(state: &mut TabState, page: &[Album]) {
+    state.version += 1;
     if !state.cached {
         state.albums.extend_from_slice(page);
         return;
@@ -212,6 +217,165 @@ fn apply_live_page(state: &mut TabState, page: &[Album]) {
         state.albums.truncate(state.live_len);
         state.cached = false;
     }
+}
+
+/// Width of the year scrubber beside the timeline.
+const TIMELINE_RAIL_W: f32 = 56.;
+/// Rows of the timeline left below the viewport before the next page is asked
+/// for.
+const TIMELINE_LOAD_AHEAD_ROWS: usize = 12;
+/// Pixels the timeline lays out past each edge of the viewport.
+const TIMELINE_OVERDRAW: f32 = 600.;
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+const WEEKDAYS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+
+/// A calendar date, `(year, 1..=12, 1..=31)`.
+type Date = (i32, u32, u32);
+
+/// One row of the timeline: a date bucket's heading, or a line of its covers.
+#[derive(Debug, Clone, PartialEq)]
+enum TimelineRow {
+    /// `bucket` is the first day of the heading's day, week, month or year;
+    /// `None` groups albums with no added date.
+    Header { bucket: Option<Date>, count: usize },
+    /// Albums `start..end` of the tab's list.
+    Covers { start: usize, end: usize },
+}
+
+/// The date an album was added, from its ISO-8601 `created` stamp. Read as
+/// written — no time zone is applied, like the album page's Added chip.
+fn added_date(created: Option<&str>) -> Option<Date> {
+    let s = created?;
+    let year = s.get(0..4)?.parse().ok()?;
+    if s.get(4..5)? != "-" || s.get(7..8)? != "-" {
+        return None;
+    }
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some((year, month, day))
+}
+
+/// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
+fn days_from_civil((y, m, d): Date) -> i64 {
+    let y = i64::from(y) - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = i64::from((m + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of [`days_from_civil`].
+fn civil_from_days(days: i64) -> Date {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = ((mp + 2) % 12 + 1) as u32;
+    ((yoe + era * 400 + i64::from(m <= 2)) as i32, m, d)
+}
+
+/// 0 = Monday. 1970-01-01 was a Thursday.
+fn weekday(date: Date) -> usize {
+    (days_from_civil(date) + 3).rem_euclid(7) as usize
+}
+
+/// First day of the bucket `date` falls in.
+fn bucket_of(date: Date, grouping: TimelineGrouping) -> Date {
+    let (y, m, _) = date;
+    match grouping {
+        TimelineGrouping::Day => date,
+        TimelineGrouping::Week => civil_from_days(days_from_civil(date) - weekday(date) as i64),
+        TimelineGrouping::Month => (y, m, 1),
+        TimelineGrouping::Year => (y, 1, 1),
+    }
+}
+
+fn bucket_label(bucket: Option<Date>, grouping: TimelineGrouping) -> String {
+    let Some(date @ (y, m, d)) = bucket else {
+        return "Date unknown".into();
+    };
+    let month = MONTHS[m as usize - 1];
+    match grouping {
+        TimelineGrouping::Day => format!("{}, {d} {month} {y}", WEEKDAYS[weekday(date)]),
+        TimelineGrouping::Week => format!("Week of {d} {month} {y}"),
+        TimelineGrouping::Month => format!("{month} {y}"),
+        TimelineGrouping::Year => y.to_string(),
+    }
+}
+
+/// Group a newest-first album list into date headings and rows of `cols`
+/// covers. Grouping is by runs, so it relies on the list already being sorted
+/// by date — which is the order the timeline's `getAlbumList2` type returns.
+fn timeline_rows(albums: &[Album], cols: usize, grouping: TimelineGrouping) -> Vec<TimelineRow> {
+    let cols = cols.max(1);
+    let bucket = |a: &Album| added_date(a.created.as_deref()).map(|d| bucket_of(d, grouping));
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < albums.len() {
+        let key = bucket(&albums[start]);
+        let end = albums[start..]
+            .iter()
+            .position(|a| bucket(a) != key)
+            .map_or(albums.len(), |n| start + n);
+        rows.push(TimelineRow::Header {
+            bucket: key,
+            count: end - start,
+        });
+        let mut row = start;
+        while row < end {
+            let next = (row + cols).min(end);
+            rows.push(TimelineRow::Covers {
+                start: row,
+                end: next,
+            });
+            row = next;
+        }
+        start = end;
+    }
+    rows
+}
+
+/// The covers row holding album `index`.
+fn timeline_row_of(rows: &[TimelineRow], index: usize) -> Option<usize> {
+    rows.iter().position(
+        |r| matches!(r, TimelineRow::Covers { start, end } if (*start..*end).contains(&index)),
+    )
+}
+
+/// The first album drawn at or after row `row` — what a regroup keeps on
+/// screen.
+fn timeline_album_at(rows: &[TimelineRow], row: usize) -> Option<usize> {
+    rows.get(row..)?.iter().find_map(|r| match r {
+        TimelineRow::Covers { start, .. } => Some(*start),
+        TimelineRow::Header { .. } => None,
+    })
 }
 
 pub enum AlbumsEvent {
@@ -269,6 +433,15 @@ pub struct AlbumsView {
     /// from `uniform_list`'s item closure, which reads the entity rather than
     /// updating it) — the cache is filled in lazily behind that shared ref.
     glow_accents: RefCell<HashMap<String, gpui::Hsla>>,
+    /// Variable-height list behind the Timeline tab: month headings and
+    /// cover rows differ in height, which `uniform_list` can't hold.
+    timeline_list: ListState,
+    timeline_rows: Rc<Vec<TimelineRow>>,
+    /// `(tab version, album count, columns)` the rows were grouped for.
+    timeline_sig: Option<(u64, usize, usize, TimelineGrouping, bool)>,
+    /// The timeline's own width tracker: its list sits beside the year rail,
+    /// so it measures differently from the card grid.
+    timeline_width: crate::ui::LiveWidth,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
@@ -302,6 +475,10 @@ impl AlbumsView {
             live_width: crate::ui::LiveWidth::default(),
             menu_playlists: Rc::new(Vec::new()),
             glow_accents: RefCell::new(HashMap::new()),
+            timeline_list: ListState::new(0, ListAlignment::Top, px(TIMELINE_OVERDRAW)),
+            timeline_rows: Rc::new(Vec::new()),
+            timeline_sig: None,
+            timeline_width: crate::ui::LiveWidth::default(),
         };
         this.refresh_stats(cx);
         this.seed_from_cache(active_tab, cx);
@@ -365,6 +542,7 @@ impl AlbumsView {
         let state = self.tabs.entry(tab).or_default();
         state.cached = true;
         state.live_len = 0;
+        state.version += 1;
         state.albums = albums.clone();
         for album in albums.iter().take(CACHE_ART_PREFETCH) {
             self.fetch_art(album, cx);
@@ -381,7 +559,7 @@ impl AlbumsView {
     /// Re-read the header totals from the cache. Cheap — two aggregates over
     /// the album/artist tables — so it runs wherever the cache may have moved
     /// under the view, rather than being recomputed per frame.
-    fn refresh_stats(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_stats(&mut self, cx: &mut Context<Self>) {
         let libraries = self.session.read(cx).library_ids.clone();
         if let Ok(stats) = self.library_db.library_stats("navidrome", &libraries) {
             self.stats = stats;
@@ -538,9 +716,11 @@ impl AlbumsView {
     /// Number of grid columns at the current window width.
     fn grid_cols(&mut self, window: &Window, cx: &App) -> usize {
         let measured = f32::from(self.scroll.0.borrow().base_handle.bounds().size.width);
-        let (min_tile, max_tile) = self.session.read(cx).settings.cover_size.range();
+        let settings = &self.session.read(cx).settings;
+        let (min_tile, max_tile) = settings.cover_size.range();
+        let gallery = settings.album_card_style == AlbumCardStyle::Gallery;
         self.live_width
-            .grid(measured, min_tile, max_tile, window, FALLBACK_COLS)
+            .grid(measured, min_tile, max_tile, window, FALLBACK_COLS, gallery)
             .0
     }
 
@@ -562,9 +742,22 @@ impl AlbumsView {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        let cols = self.grid_cols(window, cx).max(1);
-        self.scroll
-            .scroll_to_item(next / cols, gpui::ScrollStrategy::Top);
+        if self.active_tab == AlbumSort::Timeline {
+            if let Some(mut row) = timeline_row_of(&self.timeline_rows, next) {
+                // Going up into a month, bring its heading along.
+                if delta < 0
+                    && row > 0
+                    && matches!(self.timeline_rows[row - 1], TimelineRow::Header { .. })
+                {
+                    row -= 1;
+                }
+                self.timeline_list.scroll_to_reveal_item(row);
+            }
+        } else {
+            let cols = self.grid_cols(window, cx).max(1);
+            self.scroll
+                .scroll_to_item(next / cols, gpui::ScrollStrategy::Top);
+        }
         cx.notify();
     }
 
@@ -819,6 +1012,452 @@ impl AlbumsView {
         }
     }
 
+    /// Regroup the timeline when its albums or column count moved, keeping
+    /// the album at the top of the viewport where it was.
+    fn sync_timeline(&mut self, cols: usize, grouping: TimelineGrouping, gallery: bool) {
+        let (version, len) = self
+            .tabs
+            .get(&AlbumSort::Timeline)
+            .map(|t| (t.version, t.albums.len()))
+            .unwrap_or((0, 0));
+        let sig = (version, len, cols, grouping, gallery);
+        if self.timeline_sig == Some(sig) {
+            return;
+        }
+        // Row heights only hold while the column count and card style do.
+        let same_cols = self
+            .timeline_sig
+            .is_some_and(|(_, _, c, _, g)| c == cols && g == gallery);
+        self.timeline_sig = Some(sig);
+
+        let top = self.timeline_list.logical_scroll_top();
+        let anchor = timeline_album_at(&self.timeline_rows, top.item_ix);
+        let on_header = matches!(
+            self.timeline_rows.get(top.item_ix),
+            Some(TimelineRow::Header { .. })
+        );
+        let rows = self
+            .tabs
+            .get(&AlbumSort::Timeline)
+            .map(|t| timeline_rows(&t.albums, cols, grouping))
+            .unwrap_or_default();
+        // `reset` forgets the scroll position; put it back by album rather
+        // than by row, since a regroup moves every row index after a change.
+        self.timeline_list.reset(rows.len());
+        let scrolled = top.item_ix > 0 || top.offset_in_item > px(0.);
+        if scrolled
+            && let Some(album) = anchor
+            && let Some(mut row) = timeline_row_of(&rows, album)
+        {
+            if on_header && row > 0 && matches!(rows[row - 1], TimelineRow::Header { .. }) {
+                row -= 1;
+            }
+            self.timeline_list.scroll_to(ListOffset {
+                item_ix: row,
+                // Row heights only hold while the tile size does.
+                offset_in_item: if same_cols {
+                    top.offset_in_item
+                } else {
+                    px(0.)
+                },
+            });
+        }
+        self.timeline_rows = Rc::new(rows);
+        self.art_range = None;
+    }
+
+    /// Timeline rows on screen (plus lookahead), as a row range, estimated
+    /// from the scroll top and the height of a covers row — headings are
+    /// shorter, so this errs towards too many.
+    fn timeline_visible_rows(&self, row_h: f32) -> (usize, usize) {
+        let top = self.timeline_list.logical_scroll_top().item_ix;
+        let viewport = f32::from(self.timeline_list.viewport_bounds().size.height);
+        let visible = if viewport > 0. && row_h > 0. {
+            (viewport / row_h).ceil() as usize + 1
+        } else {
+            ART_LOOKAHEAD_ROWS * 2
+        };
+        (
+            top.saturating_sub(ART_LOOKAHEAD_ROWS),
+            (top + visible + ART_LOOKAHEAD_ROWS).min(self.timeline_rows.len()),
+        )
+    }
+
+    fn ensure_timeline_art(&mut self, row_h: f32, cx: &mut Context<Self>) {
+        let (first, last) = self.timeline_visible_rows(row_h);
+        let rows = self.timeline_rows.clone();
+        let mut covers = rows
+            .get(first..last)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| match r {
+                TimelineRow::Covers { start, end } => Some((*start, *end)),
+                TimelineRow::Header { .. } => None,
+            });
+        let Some((start, mut end)) = covers.next() else {
+            return;
+        };
+        if let Some((_, e)) = covers.next_back() {
+            end = e;
+        }
+        if self.art_range == Some((start, end)) {
+            return;
+        }
+        self.art_range = Some((start, end));
+        let window: Vec<Album> = self
+            .tabs
+            .get(&AlbumSort::Timeline)
+            .and_then(|t| t.albums.get(start..end))
+            .map(<[Album]>::to_vec)
+            .unwrap_or_default();
+        for album in &window {
+            self.fetch_art(album, cx);
+        }
+    }
+
+    /// One gallery tile — the Timeline tab's, and every album in the grid
+    /// under `AlbumCardStyle::Gallery`.
+    fn render_tile(
+        &self,
+        entity: &Entity<Self>,
+        index: usize,
+        album: &Album,
+        tile: f32,
+        focused: bool,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let id = album.id.clone();
+        let play_id = album.id.clone();
+        let art = self.art_paths.get(&album.id).cloned();
+        let settings = &self.session.read(cx).settings;
+        let glow = settings.selection_glow_vi;
+        let accent = if settings.selection_glow_album_color {
+            art.as_ref().and_then(|p| {
+                crate::ui::album_glow_accent(&mut self.glow_accents.borrow_mut(), &album.id, p)
+            })
+        } else {
+            None
+        };
+        let open_view = entity.clone();
+        let play_view = entity.clone();
+        let play = Button::new(("tile-play", index))
+            .primary()
+            .xsmall()
+            .icon(app_icon(icons::PLAY))
+            .on_click(move |_, _, cx: &mut App| {
+                play_view.update(cx, |this, cx| {
+                    this.queue_album(play_id.clone(), QueueMode::Play, cx);
+                });
+                cx.stop_propagation();
+            });
+        let tile_el = crate::ui::gallery_tile(
+            gpui::SharedString::from(format!("tile-album-{}", album.id)),
+            tile,
+            art,
+            album.name.clone(),
+            album.artist.clone().unwrap_or_default(),
+            Some(play.into_any_element()),
+            cx,
+        )
+        .on_click(move |_, _, cx: &mut App| {
+            open_view.update(cx, |_, cx| cx.emit(AlbumsEvent::OpenAlbum(id.clone())));
+        })
+        .context_menu(self.album_menu(entity, album));
+        with_focus_cursor(
+            format!("vi-focus-{index}"),
+            tile_el,
+            focused,
+            glow,
+            accent,
+            cx,
+        )
+    }
+
+    /// The Timeline tab: date headings (`Settings::timeline_grouping`) over
+    /// dense cover rows, newest first, with a year scrubber down the right
+    /// edge.
+    fn render_timeline(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let settings = &self.session.read(cx).settings;
+        let (min_tile, max_tile) = settings.cover_size.range();
+        let grouping = settings.timeline_grouping;
+        // Follows `album_card_style` like every other album grid.
+        let gallery = settings.album_card_style == AlbumCardStyle::Gallery;
+        let gap = crate::ui::grid_item_gap(gallery);
+        let row_gap = crate::ui::grid_row_gap(gallery);
+        let pad = crate::ui::grid_padding_x();
+        let measured = f32::from(self.timeline_list.viewport_bounds().size.width);
+        let width = self.timeline_width.resolve(measured, window) - pad;
+        let fit = |width: f32, max_tile: f32| match gallery {
+            true => crate::ui::tile_fit(width, min_tile, max_tile, gap),
+            false => crate::ui::grid_fit(width, min_tile, max_tile),
+        };
+        let (cols, tile) = fit(width, max_tile).unwrap_or_else(|| {
+            // First frame: guess low, like the card grid's fallback.
+            let viewport = f32::from(window.viewport_size().width) - pad - TIMELINE_RAIL_W;
+            let cols = fit(viewport, min_tile).map_or(1, |(c, _)| c);
+            (cols.min(FALLBACK_COLS), min_tile)
+        });
+        self.sync_timeline(cols, grouping, gallery);
+        // A card is its tile plus padding, the gap over its text and the text
+        // block; only an estimate for how many rows are on screen.
+        let item_w = match gallery {
+            true => tile,
+            false => tile + crate::ui::card_padding(),
+        };
+        let item_h = match gallery {
+            true => tile,
+            false => tile + crate::ui::card_padding() + 6. + TEXT_BLOCK_H,
+        };
+        let row_h = item_h + row_gap;
+        self.ensure_timeline_art(row_h, cx);
+
+        // Near the end of what's loaded: ask for more. Also what fills a
+        // viewport the first page doesn't reach the bottom of.
+        let (_, last_visible) = self.timeline_visible_rows(row_h);
+        if self.error.is_none()
+            && self.timeline_rows.len().saturating_sub(last_visible) < TIMELINE_LOAD_AHEAD_ROWS
+        {
+            self.load_more(AlbumSort::Timeline, cx);
+        }
+
+        let rows = self.timeline_rows.clone();
+        let row_w = cols as f32 * item_w + cols.saturating_sub(1) as f32 * gap;
+        let entity = cx.entity();
+        let list_rows = rows.clone();
+        let timeline = list(self.timeline_list.clone(), move |ix, _window, cx| {
+            let view = entity.read(cx);
+            match list_rows.get(ix) {
+                Some(TimelineRow::Header { bucket, count }) => h_flex()
+                    .w_full()
+                    .justify_center()
+                    .pt_4()
+                    .pb_2()
+                    .child(
+                        h_flex()
+                            .w(px(row_w))
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_semibold()
+                                    .child(bucket_label(*bucket, grouping)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!(
+                                        "{count} album{}",
+                                        if *count == 1 { "" } else { "s" }
+                                    )),
+                            ),
+                    )
+                    .into_any_element(),
+                Some(TimelineRow::Covers { start, end }) => {
+                    let tiles: Vec<_> = view
+                        .tabs
+                        .get(&AlbumSort::Timeline)
+                        .and_then(|t| t.albums.get(*start..*end))
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .map(|(j, album)| {
+                            let index = start + j;
+                            let focused = view.vi_cursor == Some(index);
+                            match gallery {
+                                true => view.render_tile(&entity, index, album, tile, focused, cx),
+                                false => view.render_card(&entity, index, album, tile, focused, cx),
+                            }
+                        })
+                        .collect();
+                    // Left-aligned inside a centred block, so a month's short
+                    // last row lines up under the one above like a gallery's.
+                    h_flex()
+                        .w_full()
+                        .justify_center()
+                        .pb(px(row_gap))
+                        .child(h_flex().w(px(row_w)).gap(px(gap)).children(tiles))
+                        .into_any_element()
+                }
+                None => div().into_any_element(),
+            }
+        })
+        .flex_1()
+        .h_full()
+        .px(px(pad / 2.));
+
+        // Year scrubber: the first heading of each year, marking the one the
+        // viewport is in.
+        let top = self.timeline_list.logical_scroll_top().item_ix;
+        let current_year = rows
+            .get(..=top.min(rows.len().saturating_sub(1)))
+            .into_iter()
+            .flatten()
+            .rev()
+            .find_map(|r| match r {
+                TimelineRow::Header {
+                    bucket: Some((y, _, _)),
+                    ..
+                } => Some(*y),
+                _ => None,
+            });
+        let mut years: Vec<(i32, usize)> = Vec::new();
+        for (ix, row) in rows.iter().enumerate() {
+            if let TimelineRow::Header {
+                bucket: Some((y, _, _)),
+                ..
+            } = row
+                && years.last().is_none_or(|(last, _)| last != y)
+            {
+                years.push((*y, ix));
+            }
+        }
+        let rail = (years.len() > 1).then(|| {
+            v_flex()
+                .id("timeline-years")
+                .flex_none()
+                .w(px(TIMELINE_RAIL_W))
+                .h_full()
+                .overflow_y_scroll()
+                .items_end()
+                .pr_3()
+                .pt_4()
+                .gap_0p5()
+                .children(years.into_iter().map(|(year, row)| {
+                    let current = current_year == Some(year);
+                    div()
+                        .id(("timeline-year", row))
+                        .px_1p5()
+                        .rounded_sm()
+                        .text_xs()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().muted))
+                        .map(|d| match current {
+                            true => d.font_semibold().text_color(cx.theme().foreground),
+                            false => d.text_color(cx.theme().muted_foreground),
+                        })
+                        .child(year.to_string())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.timeline_list.scroll_to(ListOffset {
+                                item_ix: row,
+                                offset_in_item: px(0.),
+                            });
+                            cx.notify();
+                        }))
+                }))
+        });
+
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(timeline)
+            .children(rail)
+            .into_any_element()
+    }
+
+    /// Right-click menu for one album, shared by the grid cards and the
+    /// timeline tiles.
+    fn album_menu(
+        &self,
+        entity: &Entity<Self>,
+        album: &Album,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = entity.clone();
+        let menu_id = album.id.clone();
+        let menu_artists = crate::ui::artist_links(
+            &album.artists,
+            album.artist.as_deref(),
+            album.artist_id.as_deref(),
+        );
+        // Shared, not rebuilt per card: the "Save to playlist" submenu needs the
+        // whole list, and cloning every name into every visible card on every
+        // frame is a resize's worth of allocations for a menu that is usually
+        // closed.
+        let menu_pl_list = self.menu_playlists.clone();
+        move |menu, window, cx| {
+            let act = |mode: QueueMode| {
+                let view = view.clone();
+                let id = menu_id.clone();
+                move |_: &_, _: &mut Window, cx: &mut gpui::App| {
+                    view.update(cx, |v, cx| v.queue_album(id.clone(), mode, cx));
+                }
+            };
+            let pl_list = menu_pl_list.clone();
+            let pl_view = view.clone();
+            let pl_album = menu_id.clone();
+            let mut menu = menu
+                .item(PopupMenuItem::new("Play").on_click(act(QueueMode::Play)))
+                .item(PopupMenuItem::new("Shuffle").on_click(act(QueueMode::Shuffle)))
+                .item(PopupMenuItem::new("Play next").on_click(act(QueueMode::PlayNext)))
+                .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
+                .submenu("Save to playlist", window, cx, move |sub, _w, _c| {
+                    if pl_list.is_empty() {
+                        return sub.item(PopupMenuItem::new("No playlists yet").disabled(true));
+                    }
+                    let mut sub = sub;
+                    for (pid, pname) in pl_list.iter() {
+                        let view = pl_view.clone();
+                        let pid = pid.clone();
+                        let album = pl_album.clone();
+                        sub = sub.item(PopupMenuItem::new(pname.clone()).on_click(
+                            move |_, _, cx: &mut gpui::App| {
+                                view.update(cx, |v, cx| {
+                                    v.add_album_to_playlist(album.clone(), pid.clone(), cx)
+                                });
+                            },
+                        ));
+                    }
+                    sub
+                });
+            // One credit goes straight to that artist; a collaboration asks
+            // which one, since `artistId` names only the primary credit and
+            // silently sending every name there is the bug this replaces.
+            match menu_artists.as_slice() {
+                [] => {}
+                [(_, aid)] => {
+                    let view = view.clone();
+                    let aid = aid.clone();
+                    menu = menu.item(PopupMenuItem::separator()).item(
+                        PopupMenuItem::new("Go to artist").on_click(
+                            move |_, _, cx: &mut gpui::App| {
+                                view.update(cx, |_, cx| {
+                                    cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
+                                });
+                            },
+                        ),
+                    );
+                }
+                _ => {
+                    let artists = menu_artists.clone();
+                    let art_view = view.clone();
+                    menu = menu.item(PopupMenuItem::separator()).submenu(
+                        "Go to artist",
+                        window,
+                        cx,
+                        move |sub, _w, _c| {
+                            let mut sub = sub;
+                            for (name, aid) in artists.iter() {
+                                let view = art_view.clone();
+                                let aid = aid.clone();
+                                sub = sub.item(PopupMenuItem::new(name.clone()).on_click(
+                                    move |_, _, cx: &mut gpui::App| {
+                                        view.update(cx, |_, cx| {
+                                            cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
+                                        });
+                                    },
+                                ));
+                            }
+                            sub
+                        },
+                    );
+                }
+            }
+            menu
+        }
+    }
+
     fn render_card(
         &self,
         entity: &Entity<Self>,
@@ -834,21 +1473,8 @@ impl AlbumsView {
         let name = album.name.clone();
         let artist = album.artist.clone().unwrap_or_default();
         let year = album.year.map(|y| y.to_string()).unwrap_or_default();
-        // Right-click context menu data.
-        let menu_id = album.id.clone();
-        let menu_artists = crate::ui::artist_links(
-            &album.artists,
-            album.artist.as_deref(),
-            album.artist_id.as_deref(),
-        );
-        let view = entity.clone();
         let open_view = entity.clone();
         let play_view = entity.clone();
-        // Shared, not rebuilt per card: the "Save to playlist" submenu needs the
-        // whole list, and cloning every name into every visible card on every
-        // frame is a resize's worth of allocations for a menu that is usually
-        // closed.
-        let menu_pl_list = self.menu_playlists.clone();
         let glow = self.session.read(cx).settings.selection_glow_vi;
         let hover_glow = self.session.read(cx).settings.selection_glow_hover;
         let accent = if self.session.read(cx).settings.selection_glow_album_color {
@@ -971,86 +1597,7 @@ impl AlbumsView {
                         )
                     }),
             )
-            .context_menu(move |menu, window, cx| {
-                let act = |mode: QueueMode| {
-                    let view = view.clone();
-                    let id = menu_id.clone();
-                    move |_: &_, _: &mut Window, cx: &mut gpui::App| {
-                        view.update(cx, |v, cx| v.queue_album(id.clone(), mode, cx));
-                    }
-                };
-                let pl_list = menu_pl_list.clone();
-                let pl_view = view.clone();
-                let pl_album = menu_id.clone();
-                let mut menu = menu
-                    .item(PopupMenuItem::new("Play").on_click(act(QueueMode::Play)))
-                    .item(PopupMenuItem::new("Shuffle").on_click(act(QueueMode::Shuffle)))
-                    .item(PopupMenuItem::new("Play next").on_click(act(QueueMode::PlayNext)))
-                    .item(PopupMenuItem::new("Add to queue").on_click(act(QueueMode::Enqueue)))
-                    .submenu("Save to playlist", window, cx, move |sub, _w, _c| {
-                        if pl_list.is_empty() {
-                            return sub.item(PopupMenuItem::new("No playlists yet").disabled(true));
-                        }
-                        let mut sub = sub;
-                        for (pid, pname) in pl_list.iter() {
-                            let view = pl_view.clone();
-                            let pid = pid.clone();
-                            let album = pl_album.clone();
-                            sub = sub.item(PopupMenuItem::new(pname.clone()).on_click(
-                                move |_, _, cx: &mut gpui::App| {
-                                    view.update(cx, |v, cx| {
-                                        v.add_album_to_playlist(album.clone(), pid.clone(), cx)
-                                    });
-                                },
-                            ));
-                        }
-                        sub
-                    });
-                // One credit goes straight to that artist; a collaboration asks
-                // which one, since `artistId` names only the primary credit and
-                // silently sending every name there is the bug this replaces.
-                match menu_artists.as_slice() {
-                    [] => {}
-                    [(_, aid)] => {
-                        let view = view.clone();
-                        let aid = aid.clone();
-                        menu = menu.item(PopupMenuItem::separator()).item(
-                            PopupMenuItem::new("Go to artist").on_click(
-                                move |_, _, cx: &mut gpui::App| {
-                                    view.update(cx, |_, cx| {
-                                        cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
-                                    });
-                                },
-                            ),
-                        );
-                    }
-                    _ => {
-                        let artists = menu_artists.clone();
-                        let art_view = view.clone();
-                        menu = menu.item(PopupMenuItem::separator()).submenu(
-                            "Go to artist",
-                            window,
-                            cx,
-                            move |sub, _w, _c| {
-                                let mut sub = sub;
-                                for (name, aid) in artists.iter() {
-                                    let view = art_view.clone();
-                                    let aid = aid.clone();
-                                    sub = sub.item(PopupMenuItem::new(name.clone()).on_click(
-                                        move |_, _, cx: &mut gpui::App| {
-                                            view.update(cx, |_, cx| {
-                                                cx.emit(AlbumsEvent::OpenArtist(aid.clone()))
-                                            });
-                                        },
-                                    ));
-                                }
-                                sub
-                            },
-                        );
-                    }
-                }
-                menu
-            });
+            .context_menu(self.album_menu(entity, album));
         with_focus_cursor(format!("vi-focus-{index}"), card, focused, glow, accent, cx)
     }
 }
@@ -1090,10 +1637,11 @@ impl Render for AlbumsView {
         // If the loaded content doesn't fill the viewport (no scrollbar yet),
         // keep fetching until it does or the list is exhausted.
         let base = self.scroll.0.borrow().base_handle.clone();
-        let needs_fill = self
-            .tabs
-            .get(&active)
-            .is_some_and(|t| !t.loading && !t.exhausted && !t.albums.is_empty())
+        let needs_fill = active != AlbumSort::Timeline
+            && self
+                .tabs
+                .get(&active)
+                .is_some_and(|t| !t.loading && !t.exhausted && !t.albums.is_empty())
             && base.max_offset().height <= px(0.);
         if needs_fill {
             self.load_more(active, cx);
@@ -1119,59 +1667,72 @@ impl Render for AlbumsView {
         let paginating = loading && !showing_cache && album_count > 0;
         let header_loading = loading && !paginating;
 
-        // Columns *and* the tile they're drawn at, from this frame's window
-        // width: the covers grow inside the setting's range to spend what would
-        // otherwise be left as gutters. Falls back to a guess on the very first
-        // frame (before anything is laid out), then self-corrects.
-        let (cols, tile) = self.live_width.grid(
-            f32::from(base.bounds().size.width),
-            min_tile,
-            max_tile,
-            window,
-            FALLBACK_COLS,
-        );
-        let row_count = album_count.div_ceil(cols);
-        self.ensure_art_for_viewport(row_count, cols, cx);
+        let body = if active == AlbumSort::Timeline {
+            self.render_timeline(window, cx)
+        } else {
+            // Columns *and* the tile they're drawn at, from this frame's window
+            // width: the covers grow inside the setting's range to spend what would
+            // otherwise be left as gutters. Falls back to a guess on the very first
+            // frame (before anything is laid out), then self-corrects.
+            let gallery =
+                self.session.read(cx).settings.album_card_style == AlbumCardStyle::Gallery;
+            let (cols, tile) = self.live_width.grid(
+                f32::from(base.bounds().size.width),
+                min_tile,
+                max_tile,
+                window,
+                FALLBACK_COLS,
+                gallery,
+            );
+            let row_count = album_count.div_ceil(cols);
+            self.ensure_art_for_viewport(row_count, cols, cx);
 
-        let entity = cx.entity();
-        let grid = uniform_list("albums-grid", row_count, move |range, _window, cx| {
-            let view = entity.read(cx);
-            let Some(tab) = view.tabs.get(&active) else {
-                return Vec::new();
-            };
-            range
-                .map(|row| {
-                    let start = row * cols;
-                    let end = ((row + 1) * cols).min(tab.albums.len());
-                    let cards: Vec<_> = tab.albums[start..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(j, album)| {
-                            let card_index = start + j;
-                            let focused = view.vi_cursor == Some(card_index);
-                            view.render_card(&entity, start + j, album, tile, focused, cx)
-                        })
-                        .collect();
-                    // Centered so the ragged last row's leftover space splits
-                    // evenly — left/right gutters stay equal at any width.
-                    h_flex()
-                        .w_full()
-                        .gap(px(crate::ui::grid_gap()))
-                        .justify_center()
-                        .pb_3()
-                        .children(cards)
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>()
-        })
-        .flex_1()
-        // Half of `grid_padding_x`, which is the pair; `grid_columns_padded`
-        // takes the whole of it back off the element's own bounds.
-        .px(px(crate::ui::grid_padding_x() / 2.))
-        .track_scroll(self.scroll.clone())
-        .on_scroll_wheel(cx.listener(|this, _, _, cx| {
-            this.maybe_load_more_on_scroll(cx);
-        }));
+            let entity = cx.entity();
+            uniform_list("albums-grid", row_count, move |range, _window, cx| {
+                let view = entity.read(cx);
+                let Some(tab) = view.tabs.get(&active) else {
+                    return Vec::new();
+                };
+                range
+                    .map(|row| {
+                        let start = row * cols;
+                        let end = ((row + 1) * cols).min(tab.albums.len());
+                        let cards: Vec<_> = tab.albums[start..end]
+                            .iter()
+                            .enumerate()
+                            .map(|(j, album)| {
+                                let card_index = start + j;
+                                let focused = view.vi_cursor == Some(card_index);
+                                match gallery {
+                                    true => view
+                                        .render_tile(&entity, card_index, album, tile, focused, cx),
+                                    false => view
+                                        .render_card(&entity, card_index, album, tile, focused, cx),
+                                }
+                            })
+                            .collect();
+                        // Centered so the ragged last row's leftover space splits
+                        // evenly — left/right gutters stay equal at any width.
+                        h_flex()
+                            .w_full()
+                            .gap(px(crate::ui::grid_item_gap(gallery)))
+                            .justify_center()
+                            .pb(px(crate::ui::grid_row_gap(gallery)))
+                            .children(cards)
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flex_1()
+            // Half of `grid_padding_x`, which is the pair; `grid_columns_padded`
+            // takes the whole of it back off the element's own bounds.
+            .px(px(crate::ui::grid_padding_x() / 2.))
+            .track_scroll(self.scroll.clone())
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.maybe_load_more_on_scroll(cx);
+            }))
+            .into_any_element()
+        };
 
         // No bottom padding: the grid runs to the window edge so rows slide
         // under the player bar instead of stopping short of it with a gap.
@@ -1185,10 +1746,11 @@ impl Render for AlbumsView {
                 h_flex()
                     .items_center()
                     .flex_wrap()
-                    .gap_4()
-                    .gap_y_1()
+                    .gap_x_4()
+                    .gap_y_2()
                     .px_4()
-                    .child(div().text_lg().child("Albums"))
+                    // Extra margin sets the caption apart from the sort pills.
+                    .child(div().text_lg().mr_4().child("Albums"))
                     .child(tabs)
                     // Spinner sits in the header rather than over the grid so
                     // it's visible while cached cards are already filling the
@@ -1217,8 +1779,12 @@ impl Render for AlbumsView {
                     // zeros next to a grid full of live cards read as a bug.
                     .when(self.stats.albums > 0, |this| {
                         this.child(
-                            div()
-                                .ml_auto()
+                            // Fills the rest of the line and right-aligns, rather
+                            // than `ml_auto`: taffy left the auto-margin text ~2rem
+                            // short of the row's padding in this wrapping row.
+                            h_flex()
+                                .flex_1()
+                                .justify_end()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(crate::ui::library_summary(
@@ -1235,7 +1801,7 @@ impl Render for AlbumsView {
                     cx,
                 ))
             })
-            .child(grid)
+            .child(body)
             // Pagination indicator, floated over the grid's bottom edge so it
             // doesn't shorten the scroll area. Only for further pages: on the
             // first load and while cached cards are showing, the header spinner
@@ -1295,6 +1861,142 @@ mod tests {
             cached: true,
             ..Default::default()
         }
+    }
+
+    fn added(id: &str, created: Option<&str>) -> Album {
+        Album {
+            created: created.map(Into::into),
+            ..album(id)
+        }
+    }
+
+    #[test]
+    fn added_date_reads_iso_stamps() {
+        assert_eq!(added_date(Some("2024-03-09T12:00:00Z")), Some((2024, 3, 9)));
+        assert_eq!(added_date(Some("2024-13-01")), None);
+        assert_eq!(added_date(Some("2024-03")), None);
+        assert_eq!(added_date(Some("20240309")), None);
+        assert_eq!(added_date(Some("")), None);
+        assert_eq!(added_date(None), None);
+    }
+
+    #[test]
+    fn civil_days_round_trip() {
+        assert_eq!(days_from_civil((1970, 1, 1)), 0);
+        assert_eq!(days_from_civil((2000, 3, 1)), 11_017);
+        for days in [-800_000, -1, 0, 59, 11_016, 20_724, 400_000] {
+            assert_eq!(days_from_civil(civil_from_days(days)), days);
+        }
+        assert_eq!(
+            civil_from_days(days_from_civil((2024, 2, 29))),
+            (2024, 2, 29)
+        );
+        // 2026-09-28 is a Monday, 1970-01-01 a Thursday.
+        assert_eq!(weekday((2026, 9, 28)), 0);
+        assert_eq!(weekday((1970, 1, 1)), 3);
+    }
+
+    #[test]
+    fn buckets_start_their_day_week_month_or_year() {
+        let d = (2026, 1, 3); // a Saturday
+        assert_eq!(bucket_of(d, TimelineGrouping::Day), d);
+        // Weeks start on Monday, across the year boundary.
+        assert_eq!(bucket_of(d, TimelineGrouping::Week), (2025, 12, 29));
+        assert_eq!(
+            bucket_of((2025, 12, 29), TimelineGrouping::Week),
+            (2025, 12, 29)
+        );
+        assert_eq!(bucket_of(d, TimelineGrouping::Month), (2026, 1, 1));
+        assert_eq!(bucket_of(d, TimelineGrouping::Year), (2026, 1, 1));
+    }
+
+    #[test]
+    fn bucket_labels() {
+        let b = Some((2026, 9, 28));
+        assert_eq!(
+            bucket_label(b, TimelineGrouping::Day),
+            "Monday, 28 September 2026"
+        );
+        assert_eq!(
+            bucket_label(b, TimelineGrouping::Week),
+            "Week of 28 September 2026"
+        );
+        assert_eq!(
+            bucket_label(Some((2026, 9, 1)), TimelineGrouping::Month),
+            "September 2026"
+        );
+        assert_eq!(
+            bucket_label(Some((2026, 1, 1)), TimelineGrouping::Year),
+            "2026"
+        );
+        assert_eq!(bucket_label(None, TimelineGrouping::Month), "Date unknown");
+    }
+
+    #[test]
+    fn timeline_groups_months_and_splits_rows() {
+        let albums = [
+            added("a", Some("2026-09-20T00:00:00Z")),
+            added("b", Some("2026-09-01T00:00:00Z")),
+            added("c", Some("2026-09-01T00:00:00Z")),
+            added("d", Some("2026-08-31T00:00:00Z")),
+            added("e", None),
+        ];
+        let rows = timeline_rows(&albums, 2, TimelineGrouping::Month);
+        assert_eq!(
+            rows,
+            [
+                TimelineRow::Header {
+                    bucket: Some((2026, 9, 1)),
+                    count: 3
+                },
+                TimelineRow::Covers { start: 0, end: 2 },
+                TimelineRow::Covers { start: 2, end: 3 },
+                TimelineRow::Header {
+                    bucket: Some((2026, 8, 1)),
+                    count: 1
+                },
+                TimelineRow::Covers { start: 3, end: 4 },
+                TimelineRow::Header {
+                    bucket: None,
+                    count: 1
+                },
+                TimelineRow::Covers { start: 4, end: 5 },
+            ]
+        );
+        assert_eq!(timeline_row_of(&rows, 2), Some(2));
+        assert_eq!(timeline_row_of(&rows, 4), Some(6));
+        assert_eq!(timeline_row_of(&rows, 9), None);
+        // A heading anchors on the first album under it.
+        assert_eq!(timeline_album_at(&rows, 3), Some(3));
+        assert_eq!(timeline_album_at(&rows, 7), None);
+        assert!(timeline_rows(&[], 4, TimelineGrouping::Month).is_empty());
+    }
+
+    #[test]
+    fn timeline_grouping_changes_the_headings() {
+        let albums = [
+            added("a", Some("2026-09-02T00:00:00Z")),
+            added("b", Some("2026-09-01T00:00:00Z")),
+            added("c", Some("2026-08-31T00:00:00Z")),
+            added("d", Some("2026-08-30T00:00:00Z")),
+        ];
+        let headings = |g| {
+            timeline_rows(&albums, 4, g)
+                .into_iter()
+                .filter_map(|r| match r {
+                    TimelineRow::Header { bucket, count } => Some((bucket, count)),
+                    TimelineRow::Covers { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(headings(TimelineGrouping::Day).len(), 4);
+        // Mon 31 Aug – Sun 6 Sep holds three; Sun 30 Aug is the week before.
+        assert_eq!(
+            headings(TimelineGrouping::Week),
+            [(Some((2026, 8, 31)), 3), (Some((2026, 8, 24)), 1)]
+        );
+        assert_eq!(headings(TimelineGrouping::Month).len(), 2);
+        assert_eq!(headings(TimelineGrouping::Year), [(Some((2026, 1, 1)), 4)]);
     }
 
     #[test]

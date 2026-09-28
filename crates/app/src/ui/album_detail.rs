@@ -1574,6 +1574,7 @@ impl Render for AlbumDetailView {
                     .unwrap_or_default();
                 let song_next = song.clone();
                 let song_enq = song.clone();
+                let song_info = song.clone();
                 // Right-click context menu data.
                 let menu_song = song.clone();
                 let menu_artists = crate::ui::artist_links(
@@ -1636,7 +1637,7 @@ impl Render for AlbumDetailView {
                     .when(!extras.is_empty(), |this| {
                         this.child(crate::ui::extras_column(extras, 320., cx))
                     })
-                    // Hover actions: play-next, enqueue, star, add-to-playlist.
+                    // Hover actions: play-next, enqueue, star, add-to-playlist, details.
                     .child(
                         h_flex()
                             .gap_0p5()
@@ -1682,7 +1683,18 @@ impl Render for AlbumDetailView {
                                         })),
                                 )
                             })
-                            .child(self.playlist_popover(i, song, cx)),
+                            .child(self.playlist_popover(i, song, cx))
+                            .child(
+                                Button::new(("t-info", i))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Info)
+                                    .tooltip("Song details")
+                                    .on_click(move |_, _, cx| {
+                                        crate::ui::song_info::show(song_info.clone(), cx);
+                                        cx.stop_propagation();
+                                    }),
+                            ),
                     )
                     // Play count and duration: fixed right-aligned columns,
                     // same text size, extra margin between them.
@@ -1712,6 +1724,7 @@ impl Render for AlbumDetailView {
                         let enq_view = menu_view.clone();
                         let enq_song = menu_song.clone();
                         let star_view = menu_view.clone();
+                        let details_song = menu_song.clone();
                         // Clone per open: the outer builder is called repeatedly.
                         let pl_list = menu_pl_list.clone();
                         let playlists = menu_playlists.clone();
@@ -1764,7 +1777,12 @@ impl Render for AlbumDetailView {
                                     .on_click(move |_, _, cx: &mut gpui::App| {
                                         star_view.update(cx, |v, cx| v.toggle_song_star(i, cx));
                                     }),
-                            );
+                            )
+                            .item(PopupMenuItem::new("Song details").on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    crate::ui::song_info::show(details_song.clone(), cx)
+                                },
+                            ));
                         // A track credited to several artists asks which one:
                         // `artistId` is the primary credit alone, so a single
                         // row sent the guest's name to somebody else's page.

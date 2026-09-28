@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt as _, Context, ElementId, Entity, EventEmitter, IntoElement, ObjectFit,
-    Render, StyledImage as _, Window, div, img, linear_color_stop, linear_gradient, prelude::*, px,
-    relative, rems,
+    Render, StyledImage as _, Window, canvas, div, img, linear_color_stop, linear_gradient,
+    prelude::*, px, relative, rems,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::popover::Popover;
@@ -601,6 +601,33 @@ impl Layout {
         let body = self.density.card_height(self.card).max(self.art);
         self.pad_top + body + self.pad_bottom <= height
     }
+
+    /// Total height the content asks for, by the same estimates the layout was
+    /// sized with.
+    fn content_height(&self) -> f32 {
+        let card_h = self.density.card_height(self.card);
+        let body = if self.stacked {
+            // The panel either sits under the card or shares its row, in which
+            // case the row is as tall as the taller of the two.
+            if self.panel_beside {
+                self.art + GAP + card_h.max(self.panel_max_h)
+            } else {
+                let gaps = GAP * if self.panel > 0. { 2. } else { 1. };
+                self.art + gaps + card_h + self.panel_max_h
+            }
+        } else {
+            self.art.max(card_h)
+        };
+        self.pad_top + body + self.pad_bottom
+    }
+
+    /// The content is taller than the window even at its smallest, so the
+    /// page has to scroll. Anywhere else the page is fixed to the window: the
+    /// estimates above are close but not exact, and a few pixels of error
+    /// made the whole page wheel-scrollable at some aspect ratios.
+    fn overruns(&self, height: f32) -> bool {
+        self.content_height() > height + 0.5
+    }
 }
 
 /// Entrance duration. Long enough for the zoom to read, short enough that the
@@ -943,12 +970,12 @@ const LYRICS_LEAD: f32 = 0.35;
 /// A scan rather than a binary search: the list is a few dozen lines, it is
 /// consulted twice a second, and a server-supplied document is not guaranteed
 /// to be in order.
-fn active_line(lines: &[LyricLine], offset: i64, position: Duration) -> Option<usize> {
+fn active_line(lines: &[impl Timed], offset: i64, position: Duration) -> Option<usize> {
     let pos = position.as_millis() as i64;
     lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.start.is_some_and(|start| start + offset <= pos))
+        .filter(|(_, l)| l.start().is_some_and(|start| start + offset <= pos))
         .map(|(ix, _)| ix)
         .next_back()
 }
@@ -1022,6 +1049,130 @@ fn lyric_wrap(size_rem: f32) -> f32 {
 /// element's `opacity`, and folding it in here would apply it twice.
 fn lyric_color(rest: gpui::Hsla, lit: gpui::Hsla, t: f32) -> gpui::Hsla {
     rest.blend(lit.opacity(t))
+}
+
+/// Shortest silence a document marks itself (a blank timed line, or the intro
+/// before the first line) that is drawn as an interlude. Anything shorter is a
+/// breath, and dots that appear and pop inside a second read as a glitch.
+const INTERLUDE_MIN_MS: i64 = 4_000;
+/// Shortest silence *inferred* from a gap between two sung lines. LRC has no
+/// end times, so where the singing stops is a guess ([`LINE_HOLD_MS`]), and a
+/// guess wants a wider margin before it puts dots over what may be a held note.
+const INFERRED_INTERLUDE_MIN_MS: i64 = 8_000;
+/// How long a sung line is taken to last when the document does not say, per
+/// character and clamped: long lines take longer to sing, but no line is
+/// assumed to run past a few seconds.
+const LINE_HOLD_PER_CHAR_MS: i64 = 90;
+const LINE_HOLD_MS: (i64, i64) = (3_000, 6_000);
+/// Last stretch of an interlude, in which the dots swell and fade ahead of the
+/// words — the cue that the next line is about to arrive.
+const INTERLUDE_OUTRO_MS: f32 = 700.;
+/// One breath of the dots while they wait.
+const INTERLUDE_BREATH_MS: f32 = 2_400.;
+
+/// A lyric line as the panel draws it: something the document says, or a
+/// silence long enough to be drawn as a row of dots (the way Apple Music marks
+/// instrumental breaks) between `start` and `end`.
+#[derive(Debug, Clone)]
+enum LyricRow {
+    Line(LyricLine),
+    Interlude { start: i64, end: i64 },
+}
+
+/// Anything with a start time [`active_line`] can light.
+trait Timed {
+    fn start(&self) -> Option<i64>;
+}
+
+impl Timed for LyricLine {
+    fn start(&self) -> Option<i64> {
+        self.start
+    }
+}
+
+impl Timed for LyricRow {
+    fn start(&self) -> Option<i64> {
+        match self {
+            LyricRow::Line(line) => line.start,
+            LyricRow::Interlude { start, .. } => Some(*start),
+        }
+    }
+}
+
+/// The document's lines with its long silences turned into interludes.
+///
+/// Three kinds: the intro before the first line; a blank timed line (how LRC
+/// marks the end of a verse) followed by a long wait, which *becomes* the
+/// interlude; and a sung line followed by a wait so long the singing must have
+/// stopped part-way through it, which gets one inserted after it at a guessed
+/// [`LINE_HOLD_MS`]. The last line never gets one — nothing says where the
+/// song ends. An untimed document has no silences to find and comes back as
+/// it is. Times stay in the document's own frame; `offset` is applied by
+/// whoever compares them against the playhead, the same as for lines.
+fn lyric_rows(doc: &StructuredLyrics) -> Vec<LyricRow> {
+    let lines = &doc.lines;
+    let mut rows = Vec::with_capacity(lines.len() + 2);
+    if !doc.synced {
+        rows.extend(lines.iter().cloned().map(LyricRow::Line));
+        return rows;
+    }
+    if let Some(first) = lines.first().and_then(|l| l.start)
+        && first >= INTERLUDE_MIN_MS
+    {
+        rows.push(LyricRow::Interlude {
+            start: 0,
+            end: first,
+        });
+    }
+    for (ix, line) in lines.iter().enumerate() {
+        // A document out of order has no gap to speak of here.
+        let gap = line
+            .start
+            .zip(lines.get(ix + 1).and_then(|n| n.start))
+            .filter(|(start, next)| next > start);
+        let Some((start, next)) = gap else {
+            rows.push(LyricRow::Line(line.clone()));
+            continue;
+        };
+        let chars = line.value.trim().chars().count() as i64;
+        if chars == 0 {
+            rows.push(match next - start >= INTERLUDE_MIN_MS {
+                true => LyricRow::Interlude { start, end: next },
+                false => LyricRow::Line(line.clone()),
+            });
+            continue;
+        }
+        rows.push(LyricRow::Line(line.clone()));
+        let hold = (chars * LINE_HOLD_PER_CHAR_MS).clamp(LINE_HOLD_MS.0, LINE_HOLD_MS.1);
+        if next - (start + hold) >= INFERRED_INTERLUDE_MIN_MS {
+            rows.push(LyricRow::Interlude {
+                start: start + hold,
+                end: next,
+            });
+        }
+    }
+    rows
+}
+
+/// How each of an interlude's three dots is drawn at `pos` ms (already in the
+/// document's frame): `(fill, scale)`, fill 0..1 toward lit.
+///
+/// The dots light one after another across the silence, so the row doubles as
+/// a countdown to the next line; the whole group breathes while it waits, and
+/// over the last [`INTERLUDE_OUTRO_MS`] swells and shrinks away so the words
+/// arrive into space the dots have already given up.
+fn interlude_dots(start: i64, end: i64, pos: i64) -> [(f32, f32); 3] {
+    let span = (end - start).max(1) as f32;
+    let elapsed = (pos - start).max(0) as f32;
+    let progress = (elapsed / span).clamp(0., 1.);
+    let breath = 1. + 0.08 * (elapsed / INTERLUDE_BREATH_MS * std::f32::consts::TAU).sin();
+    let remaining = (end - pos).max(0) as f32;
+    let outro = (1. - remaining / INTERLUDE_OUTRO_MS.min(span / 2.)).clamp(0., 1.);
+    let swell = (1. + 0.35 * (outro * std::f32::consts::PI).sin()) * (1. - outro * outro * outro);
+    std::array::from_fn(|i| {
+        let fill = (progress * 3. - i as f32).clamp(0., 1.);
+        (fill, breath * swell)
+    })
 }
 
 pub enum FullscreenEvent {
@@ -1561,7 +1712,9 @@ impl FullscreenPlayer {
         // line lit off it arrives up to that late against words being sung.
         // `lyrics_following` asks for the frames this resolution needs.
         let position = self.player.read(cx).smooth_position();
-        self.lyrics_active = active_line(&doc.lines, doc.offset, position);
+        // Rows, not lines: the panel's children include the interludes, and
+        // the index here is what `bounds_for_item` places.
+        self.lyrics_active = active_line(&lyric_rows(doc), doc.offset, position);
         // The handover: the line being left keeps a claim on the frame after
         // it, so it can shrink back rather than snap. This is recomputed every
         // frame and only a *change* touches it, so the outgoing line holds its
@@ -2168,6 +2321,108 @@ impl FullscreenPlayer {
             .into_any_element()
     }
 
+    /// One interlude row: three dots that light in turn across the silence and
+    /// swell away just before the next line (see [`interlude_dots`]).
+    ///
+    /// Only the lit interlude takes space. The rest are collapsed — no height,
+    /// and a negative margin cancelling the list's gap — so a sheet read ahead
+    /// or behind is just the words. Opening and closing run the same
+    /// [`LYRIC_GROW_MS`] handover as a line growing and shrinking, under the
+    /// same direction-in-the-id wrappers, and `sync_lyrics_scroll` follows the
+    /// live bounds while they do. The dots are painted inside the row, so
+    /// their breathing never moves the lines around them.
+    #[allow(clippy::too_many_arguments)]
+    fn render_interlude(
+        &self,
+        ix: usize,
+        start: i64,
+        end: i64,
+        pos: i64,
+        is_active: bool,
+        is_prev: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        // A resting line's height, so the dots take the room a line would.
+        const ROW_REM: f32 = LYRIC_REM * 1.3;
+        const DOT_REM: f32 = 0.6;
+        // Matches the scroller's `gap_3`.
+        const GAP_REM: f32 = 0.75;
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        let lit = cx.theme().primary;
+        let unlit = cx.theme().foreground;
+        let dots = interlude_dots(start, end, pos);
+        let el = div()
+            .id(("fs-lyric", ix))
+            .flex_none()
+            .overflow_hidden()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                this.player.update(cx, |p, cx| {
+                    p.seek(Duration::from_millis(start.max(0) as u64));
+                    cx.notify();
+                });
+            }))
+            .child(
+                // Painted rather than laid out: a div sized to a breathing
+                // scale is snapped to whole pixels, so each dot jittered and
+                // drifted off centre as it grew and shrank. Quads keep their
+                // fractional bounds, so the dots scale smoothly about fixed
+                // centres. They also scale with the row's own height, which
+                // the open/close handover animates, so they grow in from (and
+                // shrink back to) the middle of the row rather than being
+                // uncovered from its top edge.
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let rem = f32::from(window.rem_size());
+                        let openness = (f32::from(bounds.size.height) / (ROW_REM * rem)).min(1.);
+                        let cell = DOT_REM * 1.6 * rem;
+                        let cy = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.;
+                        for (i, (fill_t, scale)) in dots.into_iter().enumerate() {
+                            let d = DOT_REM * rem * scale * openness;
+                            if d <= 0. {
+                                continue;
+                            }
+                            let cx = f32::from(bounds.origin.x) + cell * (i as f32 + 0.5);
+                            let mut color = lyric_color(unlit, lit, fill_t);
+                            color.a *= LYRIC_DIM[0] + (1. - LYRIC_DIM[0]) * fill_t;
+                            let quad = gpui::Bounds {
+                                origin: gpui::point(px(cx - d / 2.), px(cy - d / 2.)),
+                                size: gpui::size(px(d), px(d)),
+                            };
+                            window.paint_quad(gpui::fill(quad, color).corner_radii(px(d / 2.)));
+                        }
+                    },
+                )
+                .w(rems(DOT_REM * 1.6 * 3.))
+                .h_full(),
+            );
+        let open = |el: gpui::Stateful<gpui::Div>, t: f32| {
+            el.h(rems(ROW_REM * t))
+                .mt(rems(-GAP_REM * (1. - t)))
+                .opacity(t)
+        };
+        let anim = Animation::new(crate::ui::transition(reduced_motion, LYRIC_GROW_MS))
+            .with_easing(gpui::ease_in_out);
+        if is_active {
+            el.with_animation(
+                ElementId::Name(format!("fs-lyric-in-{ix}").into()),
+                anim,
+                open,
+            )
+            .into_any_element()
+        } else if is_prev {
+            el.with_animation(
+                ElementId::Name(format!("fs-lyric-out-{ix}").into()),
+                anim,
+                move |el, t| open(el, 1. - t),
+            )
+            .into_any_element()
+        } else {
+            open(el, 0.).into_any_element()
+        }
+    }
+
     /// Right-hand lyrics panel. A timed document is followed line by line —
     /// the one being sung is lit and the rest step back; an untimed one is the
     /// same list drawn flat, since there is no line to be on.
@@ -2212,149 +2467,164 @@ impl FullscreenPlayer {
             Vec::new()
         } else {
             match &self.lyrics {
-                Some(doc) => doc
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, line)| {
-                        let text = line.value.trim_end();
-                        let is_active = self.lyrics_active == Some(ix);
-                        // The line the highlight has just left, which runs the
-                        // grow backwards. Without it the sheet only animates in
-                        // one direction: the incoming line eases up over
-                        // `LYRIC_GROW_MS` while the outgoing one is already back
-                        // at its resting size on the very first frame of it,
-                        // which is read as the new line shoving the old one
-                        // rather than as the two trading places.
-                        let is_prev = !is_active && self.lyrics_prev == Some(ix);
-                        let emphasis = line_emphasis(self.lyrics_active, ix, doc.synced);
-                        // Where each line comes to rest. The animated ones
-                        // override it every frame; it is what they are heading
-                        // for, and what they hold once they arrive.
-                        let rest = if is_active {
-                            LYRIC_REM_ACTIVE
-                        } else {
-                            LYRIC_REM
-                        };
-                        // Read out here rather than in the animators: those
-                        // closures outlive the borrow of `cx`, and an `Hsla` is
-                        // two words of `Copy`.
-                        let lit = cx.theme().primary;
-                        let unlit = cx.theme().foreground;
-                        // Where a click on this line moves the playhead. The
-                        // document's `offset` is applied here exactly as
-                        // `active_line` applies it, or a click would land at a
-                        // point that lights a *different* line — the correction
-                        // has to be in the same sense on both sides of the round
-                        // trip. A line with no start is inert: an untimed sheet
-                        // has no points to seek to, and a pointer cursor over one
-                        // promises something that cannot happen.
-                        let seek_to = line.start.map(|start| lyric_seek_target(start, doc.offset));
-                        let el = div()
-                            .id(("fs-lyric", ix))
-                            .when_some(seek_to, |this, to| {
-                                this.cursor_pointer().on_click(cx.listener(
-                                    move |this: &mut Self, _, _, cx| {
-                                        // Notify rather than lean on the
-                                        // per-frame repaint: that only runs while
-                                        // audio is moving, and clicking a line of
-                                        // a paused track has to light it too.
-                                        this.player.update(cx, |p, cx| {
-                                            p.seek(to);
-                                            cx.notify();
-                                        });
+                Some(doc) => {
+                    // The playhead in the document's own frame, for the
+                    // interludes' dots — `active_line` adds `offset` to the
+                    // rows' times, which is this taken off the position.
+                    let pos =
+                        self.player.read(cx).smooth_position().as_millis() as i64 - doc.offset;
+                    lyric_rows(doc)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, row)| {
+                            let is_active = self.lyrics_active == Some(ix);
+                            // The line the highlight has just left, which runs the
+                            // grow backwards. Without it the sheet only animates in
+                            // one direction: the incoming line eases up over
+                            // `LYRIC_GROW_MS` while the outgoing one is already back
+                            // at its resting size on the very first frame of it,
+                            // which is read as the new line shoving the old one
+                            // rather than as the two trading places.
+                            let is_prev = !is_active && self.lyrics_prev == Some(ix);
+                            let line = match row {
+                                LyricRow::Line(line) => line,
+                                LyricRow::Interlude { start, end } => {
+                                    return self.render_interlude(
+                                        ix, start, end, pos, is_active, is_prev, cx,
+                                    );
+                                }
+                            };
+                            let text = line.value.trim_end();
+                            let emphasis = line_emphasis(self.lyrics_active, ix, doc.synced);
+                            // Where each line comes to rest. The animated ones
+                            // override it every frame; it is what they are heading
+                            // for, and what they hold once they arrive.
+                            let rest = if is_active {
+                                LYRIC_REM_ACTIVE
+                            } else {
+                                LYRIC_REM
+                            };
+                            // Read out here rather than in the animators: those
+                            // closures outlive the borrow of `cx`, and an `Hsla` is
+                            // two words of `Copy`.
+                            let lit = cx.theme().primary;
+                            let unlit = cx.theme().foreground;
+                            // Where a click on this line moves the playhead. The
+                            // document's `offset` is applied here exactly as
+                            // `active_line` applies it, or a click would land at a
+                            // point that lights a *different* line — the correction
+                            // has to be in the same sense on both sides of the round
+                            // trip. A line with no start is inert: an untimed sheet
+                            // has no points to seek to, and a pointer cursor over one
+                            // promises something that cannot happen.
+                            let seek_to =
+                                line.start.map(|start| lyric_seek_target(start, doc.offset));
+                            let el = div()
+                                .id(("fs-lyric", ix))
+                                .when_some(seek_to, |this, to| {
+                                    this.cursor_pointer().on_click(cx.listener(
+                                        move |this: &mut Self, _, _, cx| {
+                                            // Notify rather than lean on the
+                                            // per-frame repaint: that only runs while
+                                            // audio is moving, and clicking a line of
+                                            // a paused track has to light it too.
+                                            this.player.update(cx, |p, cx| {
+                                                p.seek(to);
+                                                cx.notify();
+                                            });
+                                        },
+                                    ))
+                                })
+                                // Large and heavy throughout, the way a lyrics
+                                // sheet is set: these are words to be read from
+                                // across a room while something else plays, not a
+                                // list to be scanned. The panel is widened to
+                                // match — see `PANEL_LYRICS_MAX`. `BLACK` rather
+                                // than `BOLD` because a face that stops at 700 is
+                                // matched back to 700 anyway, so asking for the
+                                // heaviest weight costs nothing where there is none
+                                // and gets it wherever the font has one.
+                                .font_weight(gpui::FontWeight::BLACK)
+                                .line_height(relative(1.3))
+                                .text_size(rems(rest))
+                                // Laid out in the share of the panel that keeps the
+                                // words breaking where they will break at full size
+                                // — see `lyric_wrap`.
+                                .w(relative(lyric_wrap(rest)))
+                                // `primary` like every other playing-track mark —
+                                // it is playback this follows, and under the
+                                // Adaptive theme that is the cover's own colour.
+                                .text_color(if is_active { lit } else { unlit })
+                                .opacity(emphasis)
+                                // An empty line is a gap the timings asked for, so
+                                // it keeps its height instead of collapsing.
+                                .child(if text.is_empty() { " " } else { text }.to_string());
+                            // The two halves of the handover. Each animates under a
+                            // wrapper id of its own — the line's index *and* which
+                            // direction it is going — so the animation restarts as
+                            // the highlight steps, where one shared id would run
+                            // once per song and a single id per line would leave the
+                            // shrink holding the grow's finished state. gpui drops
+                            // the state behind an id that goes unrendered, so
+                            // changing it is what rewinds the clock.
+                            //
+                            // Both grow/shrink and brighten/fade together: the size
+                            // change costs the lines under it a few pixels of shift,
+                            // which `sync_lyrics_scroll` takes back out on the next
+                            // frame, and it is most of what makes the sheet read as
+                            // following the song rather than as a list with one row
+                            // coloured in.
+                            let anim = |ms| {
+                                Animation::new(crate::ui::transition(reduced_motion, ms))
+                                    .with_easing(gpui::ease_in_out)
+                            };
+                            if is_active {
+                                el.with_animation(
+                                    ElementId::Name(format!("fs-lyric-in-{ix}").into()),
+                                    anim(LYRIC_GROW_MS),
+                                    move |el, t| {
+                                        let size = LYRIC_REM + (LYRIC_REM_ACTIVE - LYRIC_REM) * t;
+                                        el.text_size(rems(size))
+                                            .w(relative(lyric_wrap(size)))
+                                            // Into the accent over the same curve as
+                                            // everything else, so the line is not
+                                            // already the colour of a line being sung
+                                            // while it is still on its way to being
+                                            // one.
+                                            .text_color(lyric_color(unlit, lit, t))
+                                            .opacity(LYRIC_DIM[0] + (1. - LYRIC_DIM[0]) * t)
                                     },
-                                ))
-                            })
-                            // Large and heavy throughout, the way a lyrics
-                            // sheet is set: these are words to be read from
-                            // across a room while something else plays, not a
-                            // list to be scanned. The panel is widened to
-                            // match — see `PANEL_LYRICS_MAX`. `BLACK` rather
-                            // than `BOLD` because a face that stops at 700 is
-                            // matched back to 700 anyway, so asking for the
-                            // heaviest weight costs nothing where there is none
-                            // and gets it wherever the font has one.
-                            .font_weight(gpui::FontWeight::BLACK)
-                            .line_height(relative(1.3))
-                            .text_size(rems(rest))
-                            // Laid out in the share of the panel that keeps the
-                            // words breaking where they will break at full size
-                            // — see `lyric_wrap`.
-                            .w(relative(lyric_wrap(rest)))
-                            // `primary` like every other playing-track mark —
-                            // it is playback this follows, and under the
-                            // Adaptive theme that is the cover's own colour.
-                            .text_color(if is_active { lit } else { unlit })
-                            .opacity(emphasis)
-                            // An empty line is a gap the timings asked for, so
-                            // it keeps its height instead of collapsing.
-                            .child(if text.is_empty() { " " } else { text }.to_string());
-                        // The two halves of the handover. Each animates under a
-                        // wrapper id of its own — the line's index *and* which
-                        // direction it is going — so the animation restarts as
-                        // the highlight steps, where one shared id would run
-                        // once per song and a single id per line would leave the
-                        // shrink holding the grow's finished state. gpui drops
-                        // the state behind an id that goes unrendered, so
-                        // changing it is what rewinds the clock.
-                        //
-                        // Both grow/shrink and brighten/fade together: the size
-                        // change costs the lines under it a few pixels of shift,
-                        // which `sync_lyrics_scroll` takes back out on the next
-                        // frame, and it is most of what makes the sheet read as
-                        // following the song rather than as a list with one row
-                        // coloured in.
-                        let anim = |ms| {
-                            Animation::new(crate::ui::transition(reduced_motion, ms))
-                                .with_easing(gpui::ease_in_out)
-                        };
-                        if is_active {
-                            el.with_animation(
-                                ElementId::Name(format!("fs-lyric-in-{ix}").into()),
-                                anim(LYRIC_GROW_MS),
-                                move |el, t| {
-                                    let size = LYRIC_REM + (LYRIC_REM_ACTIVE - LYRIC_REM) * t;
-                                    el.text_size(rems(size))
-                                        .w(relative(lyric_wrap(size)))
-                                        // Into the accent over the same curve as
-                                        // everything else, so the line is not
-                                        // already the colour of a line being sung
-                                        // while it is still on its way to being
-                                        // one.
-                                        .text_color(lyric_color(unlit, lit, t))
-                                        .opacity(LYRIC_DIM[0] + (1. - LYRIC_DIM[0]) * t)
-                                },
-                            )
-                            .into_any_element()
-                        } else if is_prev {
-                            el.with_animation(
-                                ElementId::Name(format!("fs-lyric-out-{ix}").into()),
-                                anim(LYRIC_GROW_MS),
-                                move |el, t| {
-                                    let size =
-                                        LYRIC_REM_ACTIVE + (LYRIC_REM - LYRIC_REM_ACTIVE) * t;
-                                    el.text_size(rems(size))
-                                        .w(relative(lyric_wrap(size)))
-                                        // And back out of it, so the two lines
-                                        // cross through each other's colour
-                                        // rather than swapping at a frame.
-                                        .text_color(lyric_color(lit, unlit, t))
-                                        // Down to whatever tier it has landed
-                                        // on, not to a fixed one: the highlight
-                                        // can step by more than a line after a
-                                        // seek, and fading to the wrong tier
-                                        // then snapping is the bug this whole
-                                        // branch exists to avoid.
-                                        .opacity(1. + (emphasis - 1.) * t)
-                                },
-                            )
-                            .into_any_element()
-                        } else {
-                            el.into_any_element()
-                        }
-                    })
-                    .collect(),
+                                )
+                                .into_any_element()
+                            } else if is_prev {
+                                el.with_animation(
+                                    ElementId::Name(format!("fs-lyric-out-{ix}").into()),
+                                    anim(LYRIC_GROW_MS),
+                                    move |el, t| {
+                                        let size =
+                                            LYRIC_REM_ACTIVE + (LYRIC_REM - LYRIC_REM_ACTIVE) * t;
+                                        el.text_size(rems(size))
+                                            .w(relative(lyric_wrap(size)))
+                                            // And back out of it, so the two lines
+                                            // cross through each other's colour
+                                            // rather than swapping at a frame.
+                                            .text_color(lyric_color(lit, unlit, t))
+                                            // Down to whatever tier it has landed
+                                            // on, not to a fixed one: the highlight
+                                            // can step by more than a line after a
+                                            // seek, and fading to the wrong tier
+                                            // then snapping is the bug this whole
+                                            // branch exists to avoid.
+                                            .opacity(1. + (emphasis - 1.) * t)
+                                    },
+                                )
+                                .into_any_element()
+                            } else {
+                                el.into_any_element()
+                            }
+                        })
+                        .collect()
+                }
                 None => Vec::new(),
             }
         };
@@ -3496,6 +3766,7 @@ impl Render for FullscreenPlayer {
             .when(!viz_mode.is_on(), |root| {
                 root.child({
                     let art_size = layout.art;
+                    let scrolls = layout.overruns(vh);
                     let content = div()
                         .flex()
                         .map(|this| {
@@ -3514,7 +3785,18 @@ impl Render for FullscreenPlayer {
                         // a percentage resolves against the scroll container's
                         // *content*, which is this element, so it collapses to
                         // the content height and the centring is lost.
-                        .min_h(px(vh))
+                        //
+                        // Where the layout fits, the box is the window's height
+                        // exactly and the wrapper does not scroll: a card a few
+                        // pixels taller than estimated eats into the padding,
+                        // centred, instead of making the page wheel-scrollable.
+                        .map(|this| {
+                            if scrolls {
+                                this.min_h(px(vh))
+                            } else {
+                                this.h(px(vh))
+                            }
+                        })
                         .items_center()
                         .justify_center()
                         .gap_8()
@@ -4012,7 +4294,13 @@ impl Render for FullscreenPlayer {
                     div()
                         .id("fs-content")
                         .size_full()
-                        .overflow_y_scroll()
+                        .map(|this| {
+                            if scrolls {
+                                this.overflow_y_scroll()
+                            } else {
+                                this.overflow_hidden()
+                            }
+                        })
                         .child(content)
                         .opacity(content_fade)
                         .top(px(content_rise))
@@ -4026,10 +4314,11 @@ impl Render for FullscreenPlayer {
 mod tests {
     use super::{
         ART_LEAD, ART_MAX, ART_MAX_STACKED, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity,
-        EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, LyricsSource, PANEL_LYRICS_MAX,
-        PANEL_MAX, PANEL_MIN, SidePanel, VOLUME_W, active_line, best_lyrics, blob_base, blob_field,
-        hash01, line_emphasis, lyric_color, lyric_seek_target, lyric_wrap, lyrics_switch_target,
-        plain_lyrics, queue_chrome_h, queue_row_h, queue_visible_rows, settled, takes_over,
+        EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, LyricRow, LyricsSource,
+        PANEL_LYRICS_MAX, PANEL_MAX, PANEL_MIN, SidePanel, VOLUME_W, active_line, best_lyrics,
+        blob_base, blob_field, hash01, interlude_dots, line_emphasis, lyric_color, lyric_rows,
+        lyric_seek_target, lyric_wrap, lyrics_switch_target, plain_lyrics, queue_chrome_h,
+        queue_row_h, queue_visible_rows, settled, takes_over,
     };
     use crate::config::{FullscreenCoverSize, LyricsProvider};
     use std::time::Duration;
@@ -4256,7 +4545,10 @@ mod tests {
     fn an_untimed_document_lights_nothing() {
         let d = doc(false, &["a", "b"]);
         assert_eq!(active_line(&d.lines, 0, Duration::from_secs(30)), None);
-        assert_eq!(active_line(&[], 0, Duration::from_secs(1)), None);
+        assert_eq!(
+            active_line(&[] as &[LyricLine], 0, Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]
@@ -4288,6 +4580,90 @@ mod tests {
                     Some(ix),
                     "line {ix} at offset {offset}"
                 );
+            }
+        }
+    }
+
+    fn timed(lines: &[(i64, &str)]) -> StructuredLyrics {
+        StructuredLyrics {
+            synced: true,
+            lines: lines
+                .iter()
+                .map(|(start, v)| LyricLine {
+                    start: Some(*start),
+                    value: (*v).to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn interludes(rows: &[LyricRow]) -> Vec<(usize, i64, i64)> {
+        rows.iter()
+            .enumerate()
+            .filter_map(|(ix, r)| match r {
+                LyricRow::Interlude { start, end } => Some((ix, *start, *end)),
+                LyricRow::Line(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_intro_is_an_interlude() {
+        let rows = lyric_rows(&timed(&[(12_000, "a"), (14_000, "b")]));
+        assert_eq!(interludes(&rows), vec![(0, 0, 12_000)]);
+        assert_eq!(active_line(&rows, 0, Duration::from_secs(3)), Some(0));
+        assert_eq!(active_line(&rows, 0, Duration::from_secs(13)), Some(1));
+        // A short one is a breath before the words, not a break.
+        let rows = lyric_rows(&timed(&[(2_000, "a"), (4_000, "b")]));
+        assert!(interludes(&rows).is_empty());
+    }
+
+    #[test]
+    fn a_blank_timed_line_before_a_long_wait_becomes_the_interlude() {
+        let rows = lyric_rows(&timed(&[(0, "a"), (2_000, ""), (20_000, "b")]));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(interludes(&rows), vec![(1, 2_000, 20_000)]);
+        // A short blank stays the gap it was.
+        let rows = lyric_rows(&timed(&[(0, "a"), (2_000, ""), (3_000, "b")]));
+        assert!(interludes(&rows).is_empty());
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn a_long_gap_after_a_sung_line_gets_an_interlude_after_it() {
+        let rows = lyric_rows(&timed(&[(0, "short"), (30_000, "b")]));
+        // Held for the minimum guess, then dots until the next line.
+        assert_eq!(interludes(&rows), vec![(1, 3_000, 30_000)]);
+        // Not where the gap could be one held note.
+        let rows = lyric_rows(&timed(&[(0, "short"), (9_000, "b")]));
+        assert!(interludes(&rows).is_empty());
+        // The last line never gets one.
+        let rows = lyric_rows(&timed(&[(0, "a"), (1_000, "b")]));
+        assert!(interludes(&rows).is_empty());
+    }
+
+    #[test]
+    fn untimed_and_out_of_order_documents_get_no_interludes() {
+        assert!(interludes(&lyric_rows(&doc(false, &["a", "", "b"]))).is_empty());
+        let rows = lyric_rows(&timed(&[(0, "a"), (1_000, ""), (500, "b")]));
+        assert!(interludes(&rows).is_empty());
+    }
+
+    #[test]
+    fn interlude_dots_light_in_turn_and_shrink_away_at_the_end() {
+        let dots = interlude_dots(0, 9_000, 0);
+        assert!(dots.iter().all(|(fill, _)| *fill == 0.));
+        let dots = interlude_dots(0, 9_000, 4_500);
+        assert_eq!(dots[0].0, 1.);
+        assert!(dots[1].0 > 0. && dots[1].0 < 1.);
+        assert_eq!(dots[2].0, 0.);
+        let dots = interlude_dots(0, 9_000, 9_000);
+        assert!(dots.iter().all(|(fill, scale)| *fill == 1. && *scale == 0.));
+        // Past the end or before the start stays in range.
+        for pos in [-5_000, 20_000] {
+            for (fill, scale) in interlude_dots(0, 9_000, pos) {
+                assert!((0. ..=1.).contains(&fill) && (0. ..=1.5).contains(&scale));
             }
         }
     }
@@ -4451,25 +4827,9 @@ mod tests {
 
     /// Height the card is expected to need in this layout's form, at the width
     /// this layout draws it.
-    fn card_height(l: &Layout) -> f32 {
-        l.density.card_height(l.card)
-    }
-
     /// Total height the content asks for.
     fn content_height(l: &Layout) -> f32 {
-        let body = if l.stacked {
-            // The panel either sits under the card or shares its row, in which
-            // case the row is as tall as the taller of the two.
-            if l.panel_beside {
-                l.art + GAP + card_height(l).max(l.panel_max_h)
-            } else {
-                let gaps = GAP * if l.panel > 0. { 2. } else { 1. };
-                l.art + gaps + card_height(l) + l.panel_max_h
-            }
-        } else {
-            l.art.max(card_height(l))
-        };
-        l.pad_top + body + l.pad_bottom
+        l.content_height()
     }
 
     #[test]

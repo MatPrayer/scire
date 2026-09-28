@@ -177,6 +177,214 @@ pub struct Song {
     /// Absolute path to a local file. `None` for Subsonic tracks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// Everything else a server says about the track, for the details dialog
+    /// and composer credits. Flattened: these are ordinary `Child` fields.
+    #[serde(flatten)]
+    pub details: SongDetails,
+}
+
+/// The rest of a Subsonic `Child`: fields nothing plays or sorts by, kept so
+/// the song details dialog can show them.
+///
+/// Every field is [`lenient`]: these are the extensions servers disagree on
+/// most (`isrc` as a string or an array, `bpm` as a string), and one odd
+/// value must not fail the whole `getAlbum` it arrived in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SongDetails {
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub path: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub created: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub played: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub comment: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bpm: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub music_brainz_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub isrc: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sort_name: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub media_type: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub explicit_status: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_artist: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_album_artist: Option<String>,
+    /// OpenSubsonic joined composer credit ("A, B & C").
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_composer: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub album_artists: Vec<ArtistRef>,
+    /// OpenSubsonic per-role credits: composer, lyricist, producer, …
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub contributors: Vec<Contributor>,
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub genres: Vec<ItemGenre>,
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub moods: Vec<String>,
+}
+
+impl SongDetails {
+    /// Composer credits, with the server's artist id where it has one.
+    ///
+    /// `contributors` wins (it carries ids); a server without it only has
+    /// `displayComposer`, split on the separators tags use between names.
+    pub fn composers(&self) -> Vec<(Option<String>, String)> {
+        let credited: Vec<_> = self
+            .contributors
+            .iter()
+            .filter(|c| c.role.eq_ignore_ascii_case("composer"))
+            .map(|c| {
+                let id = Some(c.artist.id.clone()).filter(|id| !id.is_empty());
+                (id, c.artist.name.clone())
+            })
+            .collect();
+        if !credited.is_empty() {
+            return credited;
+        }
+        self.display_composer
+            .as_deref()
+            .map(split_credit)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| (None, name))
+            .collect()
+    }
+}
+
+/// Split a joined credit ("A, B & C", "A; B", "A / B") into names.
+pub fn split_credit(joined: &str) -> Vec<String> {
+    joined
+        .split([',', ';', '&', '/'])
+        .flat_map(|part| part.split(" and "))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// One OpenSubsonic `contributors` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Contributor {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_role: Option<String>,
+    pub artist: ArtistRef,
+}
+
+/// One OpenSubsonic `genres` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemGenre {
+    pub name: String,
+}
+
+/// A field that reads as its default when the server sent something else
+/// (a string where a number belongs, an object where a string does).
+fn lenient<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(de)?;
+    if let serde_json::Value::String(s) = &value
+        && let Ok(n) = s.trim().parse::<u64>()
+        && let Ok(parsed) = T::deserialize(serde_json::Value::from(n))
+    {
+        return Ok(parsed);
+    }
+    Ok(T::deserialize(value).unwrap_or_default())
+}
+
+/// A list that some servers send as a single value; unreadable entries are
+/// dropped rather than failing the list.
+fn one_or_many<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(match serde_json::Value::deserialize(de)? {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| T::deserialize(item).ok())
+            .collect(),
+        serde_json::Value::Null => Vec::new(),
+        single => T::deserialize(single).into_iter().collect(),
+    })
 }
 
 /// A single artist credit as returned in OpenSubsonic `artists` arrays.

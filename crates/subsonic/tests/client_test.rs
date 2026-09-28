@@ -215,6 +215,67 @@ async fn get_album_without_artists_array_stays_empty() {
 }
 
 #[tokio::test]
+async fn get_song_parses_details_and_composer_credits() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getSong"))
+        .and(query_param("id", "s-9"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            // Realistic Navidrome 0.55 Child: contributors carry the composer
+            // with an artist id, `displayComposer` joins the names.
+            r#""song":{"id":"s-9","title":"Hurt","artist":"Johnny Cash","artistId":"ar-9",
+                "path":"Johnny Cash/American IV/02 - Hurt.flac","bpm":88,
+                "comment":"Nine Inch Nails cover","isrc":["USAM10300432"],
+                "genres":[{"name":"Country"},{"name":"Folk"}],"moods":[],
+                "displayComposer":"Trent Reznor",
+                "contributors":[
+                    {"role":"composer","artist":{"id":"ar-7","name":"Trent Reznor"}},
+                    {"role":"producer","artist":{"id":"ar-8","name":"Rick Rubin"}}
+                ]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let song = client(&server.uri()).get_song("s-9").await.unwrap();
+    let d = &song.details;
+    assert_eq!(
+        d.path.as_deref(),
+        Some("Johnny Cash/American IV/02 - Hurt.flac")
+    );
+    assert_eq!(d.bpm, Some(88));
+    assert_eq!(d.isrc, ["USAM10300432"]);
+    assert_eq!(d.genres.len(), 2);
+    assert_eq!(
+        d.composers(),
+        [(Some("ar-7".to_string()), "Trent Reznor".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn odd_extension_fields_do_not_fail_the_album() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getAlbum"))
+        .and(query_param("id", "al-4"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            // `isrc` as a bare string, `bpm` as a string, `comment` as an
+            // object: each reads as best it can instead of sinking the list.
+            r#""album":{"id":"al-4","name":"Odd","song":[
+                {"id":"s-1","title":"One","isrc":"GBAYE0601498","bpm":"120",
+                 "comment":{"text":"?"},"displayComposer":"A, B & C"}
+            ]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let album = client(&server.uri()).get_album("al-4").await.unwrap();
+    let d = &album.song[0].details;
+    assert_eq!(d.isrc, ["GBAYE0601498"]);
+    assert_eq!(d.bpm, Some(120));
+    assert_eq!(d.comment, None);
+    let names: Vec<_> = d.composers().into_iter().map(|(_, n)| n).collect();
+    assert_eq!(names, ["A", "B", "C"]);
+}
+
+#[tokio::test]
 async fn get_artists_flattens_index() {
     let server = MockServer::start().await;
     Mock::given(path("/rest/getArtists"))
