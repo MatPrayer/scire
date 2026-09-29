@@ -952,6 +952,45 @@ impl LibraryDb {
         rows.collect()
     }
 
+    /// An artist's own albums — primary credit or any album-level credit
+    /// (`album_artists`) — newest first. The complement of [`Self::appears_on`];
+    /// what the artist page paints before `getArtist` answers.
+    pub fn credited_albums(
+        &self,
+        source: &str,
+        artist_id: &str,
+    ) -> Result<Vec<AlbumRow>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
+                    created, play_count, starred_at, library_id
+             FROM albums a
+             WHERE source = ?1
+               AND (artist_id = ?2
+                    OR EXISTS (SELECT 1 FROM album_artists aa
+                               WHERE aa.album_id = a.id AND aa.artist_id = ?2))
+             ORDER BY year DESC, title COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source, artist_id], |row| {
+            Ok(AlbumRow {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                title: row.get(2)?,
+                artist: row.get(3)?,
+                artist_id: row.get(4)?,
+                year: row.get(5)?,
+                cover_art: row.get(6)?,
+                song_count: row.get(7)?,
+                duration: row.get(8)?,
+                created: row.get(9)?,
+                play_count: row.get(10)?,
+                starred: row.get(11)?,
+                library_id: row.get(12)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// One album row by id, or `None` when the cache has never seen it.
     ///
     /// `source` is matched as well as the id. Ids are the table's primary key

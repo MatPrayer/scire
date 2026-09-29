@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-09-29
+
+### Fixed
+
+- An artist page no longer waits on a slow server to show anything but
+  *Appears on*: the name, photo and discography paint from the last sync at
+  once and the server's answer replaces them, and the bio is asked for
+  alongside the discography instead of after it.
+
 ## [1.2.0] — 2026-09-27
 
 ### Added
@@ -307,7 +316,8 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/MatPrayer/scire/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/MatPrayer/scire/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/MatPrayer/scire/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/MatPrayer/scire/compare/v1.1.0...v1.1.1

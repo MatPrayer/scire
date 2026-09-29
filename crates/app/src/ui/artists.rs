@@ -803,7 +803,12 @@ impl ArtistDetailView {
             album_art_px,
         };
         this.load_appears_on(cx);
+        this.seed_from_cache(cx);
         this.load(cx);
+        // Independent of `getArtist`: asked at once so a lagging server
+        // answers both in parallel, not one after the other.
+        let info_id = this.artist_id.clone();
+        this.fetch_artist_info(&info_id, cx);
         this
     }
 
@@ -882,6 +887,44 @@ impl ArtistDetailView {
         }
     }
 
+    /// Paint the header and discography from the last sync, like "Appears
+    /// on", so a slow `getArtist` doesn't leave the page empty. The live answer
+    /// replaces it wholesale; release types and genres arrive only with it
+    /// (the cache stores neither), so a single can move section then.
+    fn seed_from_cache(&mut self, cx: &mut Context<Self>) {
+        let id = self.cache_artist_id();
+        let Ok(Some(row)) = self.library_db.artist_by_id("navidrome", &id) else {
+            return;
+        };
+        let Ok(rows) = self.library_db.credited_albums("navidrome", &id) else {
+            return;
+        };
+        let libraries = self.session.read(cx).library_ids.clone();
+        let mut albums: Vec<Album> = rows
+            .into_iter()
+            .filter(|row| in_libraries(row.library_id.as_deref(), &libraries))
+            .map(album_from_row)
+            .collect();
+        sort_discography(&mut albums);
+        for album in &albums {
+            self.fetch_art(album.id.clone(), album.cover_art.clone(), cx);
+        }
+        let cover = row.cover_art.clone();
+        self.artist = Some(ArtistWithAlbums {
+            artist: subsonic::Artist {
+                id: self.artist_id.clone(),
+                name: row.name,
+                cover_art: row.cover_art,
+                album_count: Some(albums.len() as u32),
+                artist_image_url: None,
+                biography: None,
+                starred: None,
+            },
+            album: albums,
+        });
+        self.fetch_artist_image(cover, cx);
+    }
+
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
@@ -897,14 +940,18 @@ impl ArtistDetailView {
                     Ok(mut artist) => {
                         view.keep_selected_libraries(&mut artist.album, cx);
                         sort_discography(&mut artist.album);
-                        let artist_id = artist.artist.id.clone();
                         for album in &artist.album {
                             view.fetch_art(album.id.clone(), album.cover_art.clone(), cx);
                         }
                         let cover = artist.artist.cover_art.clone();
+                        // info2 may have landed first and found no image; the
+                        // artist's own URL is the last fallback.
+                        let fallback = artist.artist.artist_image_url.clone();
                         view.artist = Some(artist);
                         view.fetch_artist_image(cover, cx);
-                        view.fetch_artist_info(&artist_id, cx);
+                        if !view.image_requested {
+                            view.fetch_artist_image(fallback, cx);
+                        }
                     }
                     Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
@@ -2711,6 +2758,40 @@ mod detail_tests {
         )
         .unwrap();
         assert!(db.appears_on("navidrome", me).unwrap().is_empty());
+    }
+
+    /// The cached discography the page paints before `getArtist`: albums led
+    /// by the artist and albums co-credited to them, never someone else's.
+    #[test]
+    fn credited_albums_cover_primary_and_co_credits() {
+        let db = LibraryDb::open_in_memory().unwrap();
+        let me = "navidrome:artist:me";
+        let them = "navidrome:artist:them";
+        let mut own = AlbumRow::new("navidrome:album:own", "navidrome", "Own Record");
+        own.artist_id = Some(me.into());
+        own.year = Some(2001);
+        let mut shared = AlbumRow::new("navidrome:album:shared", "navidrome", "Shared");
+        shared.artist_id = Some(them.into());
+        shared.year = Some(2010);
+        let mut theirs = AlbumRow::new("navidrome:album:theirs", "navidrome", "Theirs");
+        theirs.artist_id = Some(them.into());
+        db.upsert_catalog(
+            "navidrome",
+            &[own, shared, theirs],
+            &[],
+            &[(
+                "navidrome:album:shared".to_string(),
+                vec![them.to_string(), me.to_string()],
+            )],
+        )
+        .unwrap();
+        let ids: Vec<String> = db
+            .credited_albums("navidrome", me)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, ["navidrome:album:shared", "navidrome:album:own"]);
     }
 
     /// A cover of the artist's song on someone else's record is an appearance
