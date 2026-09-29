@@ -6,6 +6,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.2] — 2026-09-29
+
+### Fixed
+
+- The fullscreen player's queue panel is centred beside the card again
+  instead of sitting at the top of the window when the queue is short.
+
 ## [1.2.1] — 2026-09-29
 
 ### Fixed
@@ -316,7 +323,8 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/MatPrayer/scire/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/MatPrayer/scire/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/MatPrayer/scire/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/MatPrayer/scire/compare/v1.1.1...v1.1.2

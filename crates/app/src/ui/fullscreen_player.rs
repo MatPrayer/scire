@@ -4171,9 +4171,13 @@ impl Render for FullscreenPlayer {
                     // Margin + fade so the motion is visible (gpui 0.2.2 has no
                     // translate/transform), off the reveal's clock so it plays
                     // on the way out too.
+                    //
+                    // Sized by the panel itself (both set their own height), not
+                    // `h_full`: a full-height wrapper pinned a short queue to the
+                    // top of the window instead of centring it on the card.
                     let panel_el = drawn_panel.map(|panel| {
                         div()
-                            .h_full()
+                            .flex_none()
                             .opacity(panel_open)
                             .ml(px(28. * (1. - panel_open)))
                             .child(match panel {
