@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnimationExt as _, AnyElement, App, Context, Entity, EventEmitter, IntoElement, Render,
-    ScrollAnchor, ScrollHandle, SharedString, Window, div, img, linear_color_stop, linear_gradient,
-    prelude::*, px, relative,
+    AnyElement, App, Context, Entity, EventEmitter, IntoElement, Render, ScrollAnchor,
+    ScrollHandle, SharedString, Window, div, img, linear_color_stop, linear_gradient, prelude::*,
+    px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -30,8 +30,8 @@ use crate::state::session::Session;
 use crate::ui::albums::album_from_row;
 use crate::ui::{
     album_quality_chips, album_replaygain_line, format_added_date, format_duration,
-    format_release_date, strip_html, sync_focus_scroll, track_extras, truncate_at_word,
-    with_focus_cursor,
+    format_release_date, placeholding, skeleton_block, skeleton_text, strip_html,
+    sync_focus_scroll, track_extras, truncate_at_word, with_focus_cursor,
 };
 
 /// Resolution to request for the header cover.
@@ -115,24 +115,6 @@ fn cached_song_count(db: &LibraryDb, album_id: &str) -> Option<usize> {
         .ok()
         .flatten()?;
     (row.song_count > 0).then_some(row.song_count as usize)
-}
-
-/// How long a request runs before its placeholders become *visible*.
-///
-/// The space is reserved from the first frame either way — that is the whole
-/// point of the placeholders, and a gate on the space itself only moved the
-/// shift it exists to prevent back to wherever the gate opened. What the delay
-/// gates is the grey: the cache seeds the page instantly and a warm server
-/// answers in well under a tenth of a second, so bars *painted* the moment a
-/// request is issued are on screen for two frames and gone, which reads as a
-/// flash. Below the delay the placeholder is an empty hole of exactly the right
-/// size, so the words land in silence; past it the request is slow enough that
-/// the page should say so.
-const PLACEHOLDER_DELAY: Duration = Duration::from_millis(220);
-
-/// True once a request has been in flight long enough to be worth showing.
-fn placeholding(since: Option<Instant>) -> bool {
-    since.is_some_and(|t| t.elapsed() >= PLACEHOLDER_DELAY)
 }
 
 /// How long the About card waits for the online lookup before showing the
@@ -241,56 +223,6 @@ pub(crate) fn link_icon(label: &str) -> Icon {
     }
 }
 
-/// The pulse every placeholder here shares, over gpui-component's `Skeleton`
-/// colour. Not `Skeleton` itself: that is a bare `div` with no children, so a
-/// placeholder built from it can only be given a size in px, which is the one
-/// thing that must not be guessed.
-///
-/// `show` decides whether anything is painted, never whether anything is laid
-/// out: an unshown placeholder keeps its element, its sample text and so its
-/// exact size, and only loses the fill and the animation.
-fn skeleton_pulse(
-    id: impl Into<gpui::ElementId>,
-    show: bool,
-    el: gpui::Div,
-    cx: &App,
-) -> AnyElement {
-    // Whatever text is inside is there for its metrics alone.
-    let el = el.rounded_md().text_color(gpui::transparent_black());
-    if !show {
-        return el.into_any_element();
-    }
-    el.bg(cx.theme().skeleton)
-        .with_animation(
-            id,
-            gpui::Animation::new(Duration::from_secs(2))
-                .repeat()
-                .with_easing(gpui::bounce(gpui::ease_in_out)),
-            |this, delta| this.opacity(1. - delta * 0.5),
-        )
-        .into_any_element()
-}
-
-/// A placeholder standing in for a line of text the server has not answered for
-/// yet, shaped by a *sample string* laid out in the surrounding type styles.
-///
-/// The field it replaces is text, so the only height guaranteed to match the
-/// line that lands is the one the text engine produces for the same styles —
-/// hard-coded px were a few off in every place they were used, and the page
-/// still stepped when the words arrived.
-fn skeleton_text(id: impl Into<gpui::ElementId>, show: bool, sample: &str, cx: &App) -> AnyElement {
-    // Wrapped in a row because a column stretches its children: on its own the
-    // bar would be the width of the page rather than of its own sample.
-    h_flex()
-        .child(skeleton_pulse(
-            id,
-            show,
-            div().child(sample.to_string()),
-            cx,
-        ))
-        .into_any_element()
-}
-
 /// Same, at an explicit width: prose fills the column it sits in and so has no
 /// sample to take a width from. The non-breaking space is what gives it the
 /// line's height.
@@ -300,13 +232,13 @@ fn skeleton_line(
     w: gpui::DefiniteLength,
     cx: &App,
 ) -> AnyElement {
-    skeleton_pulse(id, show, div().w(w).child("\u{a0}"), cx)
+    crate::ui::skeleton_pulse(id, show, div().w(w).child("\u{a0}"), cx)
 }
 
 /// A placeholder chip: the real chip's padding and type, so the row it is in is
 /// exactly as tall as the one that replaces it.
 fn skeleton_chip(id: impl Into<gpui::ElementId>, show: bool, sample: &str, cx: &App) -> AnyElement {
-    skeleton_pulse(
+    crate::ui::skeleton_pulse(
         id,
         show,
         div().px_2().py_0p5().text_xs().child(sample.to_string()),
@@ -351,17 +283,6 @@ fn notes_sample() -> String {
                          the following spring by a band that had been touring it \
                          for the better part of a year ";
     WORDS.chars().cycle().take(NOTES_PREVIEW_CHARS).collect()
-}
-
-/// A placeholder for a block of prose: fills its column and takes its height
-/// from the wrapped sample, where `skeleton_line` is one line at a given width.
-fn skeleton_block(
-    id: impl Into<gpui::ElementId>,
-    show: bool,
-    sample: &str,
-    cx: &App,
-) -> AnyElement {
-    skeleton_pulse(id, show, div().w_full().child(sample.to_string()), cx)
 }
 
 pub enum AlbumDetailEvent {
@@ -595,7 +516,9 @@ impl AlbumDetailView {
     /// which for an album page nobody is touching is the response itself.
     fn wake_at_placeholder_delay(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(PLACEHOLDER_DELAY).await;
+            cx.background_executor()
+                .timer(crate::ui::PLACEHOLDER_DELAY)
+                .await;
             let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();

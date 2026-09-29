@@ -31,7 +31,8 @@ use crate::ui::album_detail::{
 };
 use crate::ui::albums::album_from_row;
 use crate::ui::{
-    card_inset, card_padding, strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor,
+    PLACEHOLDER_DELAY, card_inset, card_padding, placeholding, skeleton_block, skeleton_fill,
+    skeleton_text, strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor,
 };
 
 const ART_SIZE: u32 = 320;
@@ -696,13 +697,30 @@ pub struct ArtistDetailView {
     art_tasks: Vec<gpui::Task<()>>,
     /// A coalesced repaint is scheduled (batches cover arrivals).
     art_repaint_pending: bool,
+    /// Covers downloading, per album id, since when: their wells pulse once
+    /// the download has run `PLACEHOLDER_DELAY`.
+    art_pending: HashMap<String, Instant>,
+    /// A repaint at `PLACEHOLDER_DELAY` is scheduled for the covers.
+    art_wake_pending: bool,
+    /// When the page opened: the clock for a bio still waiting on a lookup
+    /// that has not started yet (the online one needs both server answers).
+    opened: Instant,
+    /// `getArtist` in flight, since when.
+    artist_since: Option<Instant>,
+    /// `getArtistInfo2` in flight, since when.
+    info_since: Option<Instant>,
+    /// The hero image's download in flight, since when.
+    image_since: Option<Instant>,
     artist_image_path: Option<PathBuf>,
     /// Cover id (or remote URL) the hero image came from, so the lightbox can
     /// ask for it again at full resolution.
     artist_image_source: Option<String>,
     /// The hero image is open full-window.
     show_full_art: bool,
-    full_art_path: Option<PathBuf>,
+    /// The lightbox's full-resolution image, with the source it was fetched
+    /// from: a hero that has since moved to another source must not open onto
+    /// the old picture.
+    full_art: Option<(String, PathBuf)>,
     error: Option<crate::errors::ErrorNote>,
     /// Biography + image URLs from getArtistInfo2 (Navidrome's agents).
     info: Option<ArtistInfo2>,
@@ -777,10 +795,16 @@ impl ArtistDetailView {
             art_paths: HashMap::new(),
             art_tasks: Vec::new(),
             art_repaint_pending: false,
+            art_pending: HashMap::new(),
+            art_wake_pending: false,
+            opened: Instant::now(),
+            artist_since: None,
+            info_since: None,
+            image_since: None,
             artist_image_path: None,
             artist_image_source: None,
             show_full_art: false,
-            full_art_path: None,
+            full_art: None,
             error: None,
             info: None,
             image_requested: false,
@@ -814,6 +838,16 @@ impl ArtistDetailView {
 
     fn client(&self, cx: &Context<Self>) -> Option<SubsonicClient> {
         self.session.read(cx).client.clone()
+    }
+
+    /// Repaint once `PLACEHOLDER_DELAY` has elapsed: the placeholders turn
+    /// grey on a deadline, and a clock running out dirties nothing.
+    fn wake_at_placeholder_delay(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PLACEHOLDER_DELAY).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
 
     /// Pick up a cover-size change: refetch the discography art at the new
@@ -930,12 +964,15 @@ impl ArtistDetailView {
             return;
         };
         let id = self.artist_id.clone();
+        self.artist_since = Some(Instant::now());
+        Self::wake_at_placeholder_delay(cx);
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 client.get_artist(&id).await.map_err(anyhow::Error::from)
             })
             .await;
             let _ = this.update(cx, |view, cx| {
+                view.artist_since = None;
                 match result {
                     Ok(mut artist) => {
                         view.keep_selected_libraries(&mut artist.album, cx);
@@ -948,6 +985,7 @@ impl ArtistDetailView {
                         // artist's own URL is the last fallback.
                         let fallback = artist.artist.artist_image_url.clone();
                         view.artist = Some(artist);
+                        view.revalidate_artist_image(cover.clone(), cx);
                         view.fetch_artist_image(cover, cx);
                         if !view.image_requested {
                             view.fetch_artist_image(fallback, cx);
@@ -1033,13 +1071,29 @@ impl ArtistDetailView {
         let Some(client) = self.client(cx) else {
             return;
         };
-        let task = cx.spawn(async move |this, cx| {
-            if let Ok(path) = artwork::fetch(client, cover_id, art_px).await {
+        self.art_pending
+            .entry(album_id.clone())
+            .or_insert_with(Instant::now);
+        if !self.art_wake_pending {
+            self.art_wake_pending = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(PLACEHOLDER_DELAY).await;
                 let _ = this.update(cx, |view, cx| {
-                    view.art_paths.insert(album_id, path);
-                    view.schedule_art_repaint(cx);
+                    view.art_wake_pending = false;
+                    cx.notify();
                 });
-            }
+            })
+            .detach();
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let result = artwork::fetch(client, cover_id, art_px).await;
+            let _ = this.update(cx, |view, cx| {
+                view.art_pending.remove(&album_id);
+                if let Ok(path) = result {
+                    view.art_paths.insert(album_id, path);
+                }
+                view.schedule_art_repaint(cx);
+            });
         });
         self.art_tasks.push(task);
     }
@@ -1072,12 +1126,16 @@ impl ArtistDetailView {
         self.image_requested = true;
         self.artist_image_source = Some(source.clone());
         let is_remote = source.starts_with("http://") || source.starts_with("https://");
+        let source_for_check = source.clone();
         // Synchronous cache hit: no empty-frame flash on revisit.
         if !is_remote && let Some(path) = artwork::cached(&source, ART_SIZE) {
             self.artist_image_path = Some(path);
+            self.image_since = None;
             cx.notify();
             return;
         }
+        self.image_since = Some(Instant::now());
+        Self::wake_at_placeholder_delay(cx);
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 if is_remote {
@@ -1087,14 +1145,37 @@ impl ArtistDetailView {
                 }
             })
             .await;
-            if let Ok(path) = result {
-                let _ = this.update(cx, |view, cx| {
-                    view.artist_image_path = Some(path);
+            let _ = this.update(cx, |view, cx| {
+                // A later source (getArtist's cover over the cache's or
+                // info2's) won while this was in flight: the hero and the
+                // lightbox both follow `artist_image_source`.
+                if view.artist_image_source.as_ref() == Some(&source_for_check) {
+                    view.image_since = None;
+                    if let Ok(path) = result {
+                        view.artist_image_path = Some(path);
+                    }
                     cx.notify();
-                });
-            }
+                }
+            });
         })
         .detach();
+    }
+
+    /// Recheck the server cover's cached rungs, since the cache ignores the
+    /// id's hash and Navidrome's artist image changes as its agents find a
+    /// photo: a hero cached before that and a lightbox fetched after would
+    /// show two different pictures. Rewritten files reach the screen through
+    /// `artwork::take_replaced`.
+    fn revalidate_artist_image(&self, cover: Option<String>, cx: &mut Context<Self>) {
+        let Some(cover) = cover else { return };
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        let job = runtime::spawn_io(async move {
+            artwork::revalidate_artist_cover(client, cover).await;
+            Ok(())
+        });
+        cx.background_spawn(job).detach();
     }
 
     /// Open the hero image full-window, fetching it at full resolution behind
@@ -1107,15 +1188,15 @@ impl ArtistDetailView {
             return;
         }
         self.show_full_art = true;
-        if self.full_art_path.is_none()
-            && let Some(source) = self.artist_image_source.clone()
+        if let Some(source) = self.artist_image_source.clone()
+            && self.full_art.as_ref().is_none_or(|(of, _)| *of != source)
             && !source.starts_with("http")
             && let Some(client) = self.client(cx)
         {
             cx.spawn(async move |this, cx| {
-                if let Ok(path) = artwork::fetch(client, source, FULL_ART_SIZE).await {
+                if let Ok(path) = artwork::fetch(client, source.clone(), FULL_ART_SIZE).await {
                     let _ = this.update(cx, |view, cx| {
-                        view.full_art_path = Some(path);
+                        view.full_art = Some((source, path));
                         cx.notify();
                     });
                 }
@@ -1127,11 +1208,13 @@ impl ArtistDetailView {
 
     /// Biography and artist image from Navidrome (getArtistInfo2). Falls back
     /// to the artist's own image fields when info2 has no usable image.
-    fn fetch_artist_info(&self, artist_id: &str, cx: &mut Context<Self>) {
+    fn fetch_artist_info(&mut self, artist_id: &str, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
         let artist_id = artist_id.to_string();
+        self.info_since = Some(Instant::now());
+        Self::wake_at_placeholder_delay(cx);
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
                 client
@@ -1141,6 +1224,7 @@ impl ArtistDetailView {
             })
             .await;
             let _ = this.update(cx, |view, cx| {
+                view.info_since = None;
                 let info = result.unwrap_or_default();
                 // The primary image (artist coverArt) started in load();
                 // info2 URLs are only a fallback for artists without one.
@@ -1443,6 +1527,7 @@ impl ArtistDetailView {
         let id = album.id.clone();
         let play_id = album.id.clone();
         let art = self.art_paths.get(&album.id).cloned();
+        let art_loading = art.is_none() && placeholding(self.art_pending.get(&album.id).copied());
         // The discography is sorted by year and says so under each cover; an
         // "Appears on" card is about someone else's album, so it names them
         // instead.
@@ -1474,6 +1559,7 @@ impl ArtistDetailView {
                 album.name.clone(),
                 year,
                 Some(play.into_any_element()),
+                art_loading,
                 cx,
             )
             .when(focused, |s| s.anchor_scroll(Some(anchor)))
@@ -1529,6 +1615,13 @@ impl ArtistDetailView {
                     .relative()
                     .when_some(art, |this, path| {
                         this.child(crate::ui::cover_rounding(img(path).size(px(cover)), flush))
+                    })
+                    .when(art_loading, |this| {
+                        this.child(skeleton_fill(
+                            "aacard-sk",
+                            crate::ui::cover_rounding(div(), flush),
+                            cx,
+                        ))
                     })
                     // Hover play button over the artwork, same as the
                     // album grid's cards.
@@ -1615,11 +1708,15 @@ impl Render for ArtistDetailView {
             window,
             cx,
         );
-        let name = self
-            .artist
-            .as_ref()
-            .map(|a| a.artist.name.clone())
-            .unwrap_or_else(|| "…".into());
+        // Nothing seeded from the cache and `getArtist` still out: the name
+        // and discography are placeheld, grey past `PLACEHOLDER_DELAY`.
+        let loading_artist = self.artist.is_none() && self.artist_since.is_some();
+        let show_artist = placeholding(self.artist_since);
+        let name: gpui::AnyElement = match self.artist.as_ref() {
+            Some(a) => a.artist.name.clone().into_any_element(),
+            None if loading_artist => skeleton_text("ar-name-sk", show_artist, NAME_SAMPLE, cx),
+            None => "…".into_any_element(),
+        };
         // Bio + external links: the server's `getArtistInfo2` and whatever
         // `services::artist_info` found online, picked between like the album
         // page's About card. Collapsed by truncating the string itself: gpui's
@@ -1679,6 +1776,14 @@ impl Render for ArtistDetailView {
                 || waiting
                 || (online_on && self.online.is_none() && self.online_asked.is_none()));
         let bio = bio.filter(|_| !bio_loading);
+        // Grey from `PLACEHOLDER_DELAY` after whichever lookup it is waiting
+        // on went out; the online one may not have yet.
+        let show_bio = placeholding(
+            self.info_since
+                .or(self.online_since)
+                .or(self.artist_since)
+                .or(Some(self.opened)),
+        );
         let bio_long = bio
             .as_ref()
             .is_some_and(|b| b.chars().count() > BIO_PREVIEW_CHARS);
@@ -1700,9 +1805,9 @@ impl Render for ArtistDetailView {
             AboutSource::MusicBrainz => "MusicBrainz",
         });
         let bio_placeholder = (bios_on || online_on).then_some(if bio_loading {
-            "Looking up a biography…"
+            BioPlaceholder::Loading { show: show_bio }
         } else {
-            "No biography is available for this artist yet."
+            BioPlaceholder::Missing
         });
         let musicbrainz_url = self
             .info
@@ -1733,7 +1838,17 @@ impl Render for ArtistDetailView {
         let genres_line = genres
             .filter(|g| !g.is_empty())
             .map(|g| format!("Genres: {g}"));
+        // Genres come only with `getArtist` (the cache stores none), so a
+        // seeded page still holds their line while it is out.
+        let genres_loading = genres_line.is_none() && self.artist_since.is_some();
         let hero_art = self.artist_image_path.clone();
+        // The photo is still coming while any of the three requests that can
+        // name or deliver it is out.
+        let hero_since = [self.artist_since, self.info_since, self.image_since]
+            .into_iter()
+            .flatten()
+            .min();
+        let hero_loading = hero_art.is_none() && placeholding(hero_since);
         // The bio column carries an explicit width: left to flex, taffy
         // measures its height at a different width than it lays the prose out
         // at, and a Wikipedia intro spilled out over the rows under it.
@@ -1802,6 +1917,17 @@ impl Render for ArtistDetailView {
                 cx,
             ));
         }
+        // Nothing to draw yet: cards of the real shape stand in, so the page
+        // fills in rather than jumping from "No albums yet." to a grid.
+        if loading_artist {
+            let flush = !self.session.read(cx).settings.classic_album_cards;
+            album_cards = (0..ALBUM_SKELETONS)
+                .map(|i| skeleton_card(("ar-album-sk", i), show_artist, tile, gallery, flush, cx))
+                .collect();
+            single_cards = (0..SINGLE_SKELETONS)
+                .map(|i| skeleton_card(("ar-single-sk", i), show_artist, tile, gallery, flush, cx))
+                .collect();
+        }
         // The bio More/Less toggle is the last target when it exists.
         self.bio_toggle_focusable = bio_long;
         let bio_focused = bio_long && self.vi_cursor == Some(self.discography_ids.len());
@@ -1868,11 +1994,19 @@ impl Render for ArtistDetailView {
                             .child(
                                 div()
                                     .id("artist-hero")
+                                    .relative()
                                     .flex_none()
                                     .size(px(HERO_W))
                                     .rounded_2xl()
                                     .overflow_hidden()
                                     .bg(cx.theme().muted)
+                                    .when(hero_loading, |this| {
+                                        this.child(skeleton_fill(
+                                            "artist-hero-sk",
+                                            div().rounded_2xl(),
+                                            cx,
+                                        ))
+                                    })
                                     // Only an image is worth enlarging; the
                                     // empty placeholder stays inert.
                                     .when_some(hero_art, |this, path| {
@@ -1968,6 +2102,14 @@ impl Render for ArtistDetailView {
                                                 .child(desc),
                                         )
                                     })
+                                    .when(genres_loading, |this| {
+                                        this.child(div().text_xs().child(skeleton_text(
+                                            "ar-genres-sk",
+                                            show_artist,
+                                            GENRES_SAMPLE,
+                                            cx,
+                                        )))
+                                    })
                                     .when(!links.is_empty(), |this| {
                                         this.child(h_flex().gap_1().children(
                                             links.into_iter().map(|(label, url)| {
@@ -2047,8 +2189,10 @@ impl Render for ArtistDetailView {
                             cx.notify();
                         }))
                         .when_some(
-                            self.full_art_path
-                                .clone()
+                            self.full_art
+                                .as_ref()
+                                .filter(|(of, _)| self.artist_image_source.as_ref() == Some(of))
+                                .map(|(_, path)| path.clone())
                                 .or_else(|| self.artist_image_path.clone()),
                             |this, path| {
                                 this.child(img(path).max_w(px(820.)).max_h(px(820.)).rounded_lg())
@@ -2098,6 +2242,91 @@ fn own_album_ids(discography: Option<&[Album]>) -> HashSet<String> {
 /// foreign, and dropping it would empty an artist page until the next sync.
 fn in_libraries(library: Option<&str>, selected: &[String]) -> bool {
     selected.is_empty() || library.is_none_or(|id| selected.iter().any(|s| s == id))
+}
+
+/// What stands where the bio goes before there is one.
+#[derive(Clone, Copy)]
+enum BioPlaceholder {
+    /// A lookup is out; `show` once it has run `PLACEHOLDER_DELAY`.
+    Loading { show: bool },
+    /// Every lookup answered and none had a bio.
+    Missing,
+}
+
+/// `BIO_PREVIEW_CHARS` of sample prose, for the bio's placeholder.
+fn bio_sample() -> String {
+    const WORDS: &str = "the band formed in the late nineties and released its \
+                         first record on a small label before touring for most \
+                         of the following two years ";
+    WORDS.chars().cycle().take(BIO_PREVIEW_CHARS).collect()
+}
+
+/// Samples shaping the name and genres placeholders.
+const NAME_SAMPLE: &str = "Artist Name";
+const GENRES_SAMPLE: &str = "Genres: Alternative, Indie Rock";
+/// Placeholder cards per section while the discography is unknown.
+const ALBUM_SKELETONS: usize = 6;
+const SINGLE_SKELETONS: usize = 3;
+
+/// A placeholder discography card: the real card's (or gallery tile's)
+/// geometry with its cover well and two text lines pulsing. Unshown, it is an
+/// empty hole of the same size — border included, in a transparent colour.
+fn skeleton_card(
+    id: (&'static str, usize),
+    show: bool,
+    tile: f32,
+    gallery: bool,
+    flush: bool,
+    cx: &App,
+) -> gpui::AnyElement {
+    let (name, ix) = id;
+    // `shape` carries the well's corners: gpui clips children to a rectangle.
+    let fill = |el: gpui::Div, shape: gpui::Div| {
+        el.relative().when(show, |this| {
+            this.child(skeleton_fill(
+                SharedString::from(format!("{name}-{ix}")),
+                shape,
+                cx,
+            ))
+        })
+    };
+    if gallery {
+        return fill(div().flex_none().size(px(tile)), div().rounded_md()).into_any_element();
+    }
+    let cover = crate::ui::card_cover_edge(tile, flush);
+    v_flex()
+        .w(px(tile + card_padding()))
+        .border_1()
+        .border_color(if show {
+            gpui::hsla(0., 0., 0.5, 0.15)
+        } else {
+            gpui::transparent_black()
+        })
+        .when(!flush, |c| c.p(px(card_inset())))
+        .gap_1p5()
+        .rounded_lg()
+        .child(fill(
+            div().size(px(cover)),
+            crate::ui::cover_rounding(div(), flush),
+        ))
+        .child(
+            v_flex()
+                .gap_0()
+                .when(flush, |t| t.px(px(card_inset())).pb(px(card_inset())))
+                .child(div().text_sm().line_height(px(20.)).child(skeleton_text(
+                    (name, ix * 2),
+                    show,
+                    "Album Title",
+                    cx,
+                )))
+                .child(div().text_xs().line_height(px(17.)).child(skeleton_text(
+                    (name, ix * 2 + 1),
+                    show,
+                    "1999",
+                    cx,
+                ))),
+        )
+        .into_any_element()
 }
 
 /// Collapsed-bio length; roughly four lines at typical window widths.
@@ -2170,15 +2399,26 @@ fn bio_column_width(content_w: f32) -> Option<BioColumn> {
 fn bio_body(
     text: Option<String>,
     read_more: Option<String>,
-    placeholder: Option<&'static str>,
+    placeholder: Option<BioPlaceholder>,
     cx: &App,
 ) -> gpui::AnyElement {
     let Some(text) = text else {
-        return div()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .children(placeholder)
-            .into_any_element();
+        return match placeholder {
+            // A preview's worth of sample prose in the bio's own width and
+            // type: the text engine wraps it to the height the preview will
+            // take, where a fixed number of bars would guess.
+            Some(BioPlaceholder::Loading { show }) => div()
+                .max_w(px(ABOUT_PROSE_MAX_W))
+                .text_sm()
+                .child(skeleton_block("ar-bio-sk", show, &bio_sample(), cx))
+                .into_any_element(),
+            Some(BioPlaceholder::Missing) => div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("No biography is available for this artist yet.")
+                .into_any_element(),
+            None => div().into_any_element(),
+        };
     };
     v_flex()
         .max_w(px(ABOUT_PROSE_MAX_W))

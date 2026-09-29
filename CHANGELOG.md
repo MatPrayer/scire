@@ -6,6 +6,22 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.3] — 2026-09-29
+
+### Fixed
+
+- An artist's photo and the full-size image that opens when it is clicked
+  no longer show two different pictures. The cached photo is rechecked
+  against the server once per session when the artist page opens, and the
+  full-size view follows whichever photo the page settled on.
+
+### Changed
+
+- The artist page shows loading placeholders like the album page: the
+  name, album cards, genres, biography and photo hold their place and
+  pulse while a slow server answers, and album covers pulse while they
+  download.
+
 ## [1.2.2] — 2026-09-29
 
 ### Fixed
@@ -323,7 +339,8 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/MatPrayer/scire/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/MatPrayer/scire/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/MatPrayer/scire/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/MatPrayer/scire/compare/v1.1.2...v1.2.0

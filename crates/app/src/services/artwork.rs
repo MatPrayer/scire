@@ -120,9 +120,10 @@ pub fn bucket(size: u32) -> u32 {
 ///
 /// The trade: art genuinely replaced on the server is not noticed here. A sync
 /// that sees an album's cover id move rechecks its cached art
-/// ([`revalidate_album_covers`]); artist photos are not rechecked. Only a
-/// trailing `_` followed by hex is removed, so an `album-<id>` key — or any id
-/// without that shape — passes through untouched.
+/// ([`revalidate_album_covers`]); an artist page rechecks its photo
+/// ([`revalidate_artist_cover`]). Only a trailing `_` followed by hex is
+/// removed, so an `album-<id>` key — or any id without that shape — passes
+/// through untouched.
 fn stable_key(key: &str) -> &str {
     match key.rsplit_once('_') {
         Some((head, suffix))
@@ -331,51 +332,104 @@ fn album_art_keys(cover_id: &str) -> Vec<String> {
 
 /// Check one album's cached art; returns the paths rewritten.
 async fn revalidate_album(client: &SubsonicClient, cover_id: &str) -> Result<Vec<PathBuf>> {
-    let dir = config::artwork_cache_dir()?;
     let mut replaced = Vec::new();
     for key in album_art_keys(cover_id) {
-        let rungs: Vec<u32> = SIZE_LADDER
-            .into_iter()
-            .filter(|&rung| cached(&key, rung).is_some())
-            .collect();
-        let mut changed = false;
-        for (ix, rung) in rungs.into_iter().enumerate() {
-            let path = dir.join(format!("{}-{rung}.img", config::sanitize(&key)));
-            let url = client.cover_art_url(cover_id, Some(rung))?;
-            let bytes = http()
-                .get(url)
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?;
-            let out = path.clone();
-            let wrote = tokio::task::spawn_blocking(move || -> Result<bool> {
-                let bytes = square_crop(&bytes).unwrap_or_else(|| bytes.to_vec());
-                if std::fs::read(&out).is_ok_and(|old| old == bytes) {
-                    return Ok(false);
-                }
-                write_atomic(&out, &bytes)?;
-                Ok(true)
-            })
-            .await??;
-            if wrote {
-                changed = true;
-                replaced.push(path);
-            } else if ix == 0 {
-                // The smallest rung is unchanged: so is the art.
-                break;
+        replaced.extend(revalidate_key(client, cover_id, &key, Probe::SmallestFirst).await?);
+    }
+    Ok(replaced)
+}
+
+/// Re-check an artist photo's cached rungs against the server, rewriting in
+/// place (and queueing for [`take_replaced`]) whatever changed.
+///
+/// Navidrome's artist image moves on its own — its agents find a photo some
+/// time after the artist first appears, until then it serves an album cover —
+/// and no sync notices, so the artist page calls this on each visit. Every
+/// cached rung is compared, not just the smallest: the rungs were downloaded
+/// at different times, so an up-to-date grid thumbnail says nothing about the
+/// page's older hero, and the lightbox's fresh full-size copy would then show
+/// a different picture from the hero it opened from.
+///
+/// Once per artist per session: a second visit would re-download the same
+/// bytes, the full-size rung included.
+pub async fn revalidate_artist_cover(client: SubsonicClient, cover_id: String) {
+    static CHECKED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let key = stable_key(&cover_id).to_string();
+    if !CHECKED
+        .lock()
+        .unwrap()
+        .get_or_insert_default()
+        .insert(key.clone())
+    {
+        return;
+    }
+    match revalidate_key(&client, &cover_id, &key, Probe::Every).await {
+        Ok(paths) => REPLACED.lock().unwrap().extend(paths),
+        Err(e) => tracing::debug!("artist photo revalidation failed: {e:#}"),
+    }
+}
+
+/// How many of a key's cached rungs [`revalidate_key`] downloads.
+#[derive(Clone, Copy, PartialEq)]
+enum Probe {
+    /// Stop at the smallest rung if it is unchanged: all rungs were written
+    /// together (album art), so one answers for the rest.
+    SmallestFirst,
+    /// Compare every rung.
+    Every,
+}
+
+/// Re-download the rungs of `key` already on disk from `cover_id`, rewriting
+/// those whose bytes changed; returns the paths rewritten (blur included).
+async fn revalidate_key(
+    client: &SubsonicClient,
+    cover_id: &str,
+    key: &str,
+    probe: Probe,
+) -> Result<Vec<PathBuf>> {
+    let dir = config::artwork_cache_dir()?;
+    let mut replaced = Vec::new();
+    let rungs: Vec<u32> = SIZE_LADDER
+        .into_iter()
+        .filter(|&rung| cached(key, rung).is_some())
+        .collect();
+    let mut changed = false;
+    for (ix, rung) in rungs.into_iter().enumerate() {
+        let path = dir.join(format!("{}-{rung}.img", config::sanitize(key)));
+        let url = client.cover_art_url(cover_id, Some(rung))?;
+        let bytes = http()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        let out = path.clone();
+        let wrote = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let bytes = square_crop(&bytes).unwrap_or_else(|| bytes.to_vec());
+            if std::fs::read(&out).is_ok_and(|old| old == bytes) {
+                return Ok(false);
             }
+            write_atomic(&out, &bytes)?;
+            Ok(true)
+        })
+        .await??;
+        if wrote {
+            changed = true;
+            replaced.push(path);
+        } else if ix == 0 && probe == Probe::SmallestFirst {
+            // The smallest rung is unchanged: so is the art.
+            break;
         }
-        // The fullscreen background is derived from this art, not fetched.
-        if changed
-            && let Some(blurred) = blurred_cached(&key)
-            && let Some(source) = cached_best(&key, BLUR_EDGE)
-        {
-            let out = blurred.clone();
-            tokio::task::spawn_blocking(move || blur_into(&source, &out)).await??;
-            replaced.push(blurred);
-        }
+    }
+    // The fullscreen background is derived from this art, not fetched.
+    if changed
+        && let Some(blurred) = blurred_cached(key)
+        && let Some(source) = cached_best(key, BLUR_EDGE)
+    {
+        let out = blurred.clone();
+        tokio::task::spawn_blocking(move || blur_into(&source, &out)).await??;
+        replaced.push(blurred);
     }
     Ok(replaced)
 }

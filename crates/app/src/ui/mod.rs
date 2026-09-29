@@ -745,6 +745,7 @@ impl LiveWidth {
 /// square, with `title` and `subtitle` fading in over its foot on hover beside
 /// an optional `play` button. The caller adds
 /// the click, context menu and focus cursor, as it does for its cards.
+#[allow(clippy::too_many_arguments)]
 pub fn gallery_tile(
     id: impl Into<ElementId>,
     tile: f32,
@@ -752,9 +753,14 @@ pub fn gallery_tile(
     title: impl Into<SharedString>,
     subtitle: impl Into<SharedString>,
     play: Option<AnyElement>,
+    // The cover is still downloading: the well pulses until it lands.
+    loading: bool,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
     let group: SharedString = "gallery-tile".into();
+    // The tile's own id scopes this one: animation state keys on the path.
+    let pulse =
+        (loading && art.is_none()).then(|| skeleton_fill("tile-sk", div().rounded_md(), cx));
     div()
         .id(id)
         .group(group.clone())
@@ -769,6 +775,7 @@ pub fn gallery_tile(
         .when_some(art, |this, path| {
             this.child(gpui::img(path).size(px(tile)).rounded_md())
         })
+        .children(pulse)
         .child(
             gpui_component::h_flex()
                 .absolute()
@@ -2356,6 +2363,113 @@ pub fn apply_window_chrome(client_titlebar: bool, window: &mut Window, _cx: &mut
         window.request_decorations(WindowDecorations::Server);
     }
     window.set_window_title("Scirè");
+}
+
+/// How long a request runs before its placeholders become *visible*.
+///
+/// The space is reserved from the first frame either way — that is the whole
+/// point of the placeholders, and a gate on the space itself only moved the
+/// shift it exists to prevent back to wherever the gate opened. What the delay
+/// gates is the grey: the cache seeds the page instantly and a warm server
+/// answers in well under a tenth of a second, so bars *painted* the moment a
+/// request is issued are on screen for two frames and gone, which reads as a
+/// flash. Below the delay the placeholder is an empty hole of exactly the right
+/// size, so the words land in silence; past it the request is slow enough that
+/// the page should say so.
+pub const PLACEHOLDER_DELAY: Duration = Duration::from_millis(220);
+
+/// True once a request has been in flight long enough to be worth showing.
+pub fn placeholding(since: Option<Instant>) -> bool {
+    since.is_some_and(|t| t.elapsed() >= PLACEHOLDER_DELAY)
+}
+
+/// The pulse every placeholder shares, over gpui-component's `Skeleton`
+/// colour. Not `Skeleton` itself: that is a bare `div` with no children, so a
+/// placeholder built from it can only be given a size in px, which is the one
+/// thing that must not be guessed.
+///
+/// `show` decides whether anything is painted, never whether anything is laid
+/// out: an unshown placeholder keeps its element, its sample text and so its
+/// exact size, and only loses the fill and the animation.
+pub fn skeleton_pulse(
+    id: impl Into<gpui::ElementId>,
+    show: bool,
+    el: gpui::Div,
+    cx: &gpui::App,
+) -> gpui::AnyElement {
+    // Whatever text is inside is there for its metrics alone.
+    let el = el.rounded_md().text_color(gpui::transparent_black());
+    if !show {
+        return el.into_any_element();
+    }
+    el.bg(cx.theme().skeleton)
+        .with_animation(
+            id,
+            gpui::Animation::new(Duration::from_secs(2))
+                .repeat()
+                .with_easing(gpui::bounce(gpui::ease_in_out)),
+            |this, delta| this.opacity(1. - delta * 0.5),
+        )
+        .into_any_element()
+}
+
+/// A placeholder standing in for a line of text the server has not answered for
+/// yet, shaped by a *sample string* laid out in the surrounding type styles.
+///
+/// The field it replaces is text, so the only height guaranteed to match the
+/// line that lands is the one the text engine produces for the same styles —
+/// hard-coded px were a few off in every place they were used, and the page
+/// still stepped when the words arrived.
+pub fn skeleton_text(
+    id: impl Into<gpui::ElementId>,
+    show: bool,
+    sample: &str,
+    cx: &gpui::App,
+) -> gpui::AnyElement {
+    // Wrapped in a row because a column stretches its children: on its own the
+    // bar would be the width of the page rather than of its own sample.
+    gpui_component::h_flex()
+        .child(skeleton_pulse(
+            id,
+            show,
+            div().child(sample.to_string()),
+            cx,
+        ))
+        .into_any_element()
+}
+
+/// A placeholder for a block of prose: fills its column and takes its height
+/// from the wrapped sample, where `skeleton_line` is one line at a given width.
+pub fn skeleton_block(
+    id: impl Into<gpui::ElementId>,
+    show: bool,
+    sample: &str,
+    cx: &gpui::App,
+) -> gpui::AnyElement {
+    skeleton_pulse(id, show, div().w_full().child(sample.to_string()), cx)
+}
+
+/// The pulse over a whole cover well whose art is still downloading.
+///
+/// Absolute and inset over the well rather than a fill on the well itself: the
+/// well has children (the image, hover controls) that `with_animation` would
+/// swallow. `el` carries the well's own corner rounding, since gpui clips
+/// children to a rectangle.
+pub fn skeleton_fill(
+    id: impl Into<ElementId>,
+    el: gpui::Div,
+    cx: &gpui::App,
+) -> gpui::AnimationElement<gpui::Div> {
+    el.absolute()
+        .inset_0()
+        .bg(cx.theme().skeleton)
+        .with_animation(
+            id,
+            gpui::Animation::new(Duration::from_secs(2))
+                .repeat()
+                .with_easing(gpui::bounce(gpui::ease_in_out)),
+            |this, delta| this.opacity(1. - delta * 0.5),
+        )
 }
 
 #[cfg(test)]

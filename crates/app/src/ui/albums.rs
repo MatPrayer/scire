@@ -1157,6 +1157,7 @@ impl AlbumsView {
             album.name.clone(),
             album.artist.clone().unwrap_or_default(),
             Some(play.into_any_element()),
+            false,
             cx,
         )
         .on_click(move |_, _, cx: &mut App| {

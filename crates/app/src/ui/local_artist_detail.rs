@@ -225,6 +225,7 @@ impl LocalArtistDetailView {
                 album.title.clone(),
                 subtitle,
                 Some(play.into_any_element()),
+                false,
                 cx,
             )
             .when(focused, |style| style.anchor_scroll(Some(anchor)))

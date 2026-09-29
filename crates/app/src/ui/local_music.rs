@@ -408,6 +408,7 @@ impl LocalMusicView {
                 name,
                 artist,
                 Some(play.into_any_element()),
+                false,
                 cx,
             )
             .on_click(move |_, _, cx: &mut gpui::App| {
