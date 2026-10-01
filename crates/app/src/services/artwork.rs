@@ -235,14 +235,16 @@ pub async fn fetch_as(
         if let Some(path) = cached(&key, size) {
             return Ok(path);
         }
-        let url = client.cover_art_url(&cover_id, Some(size))?;
-        let bytes = http()
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+        let bytes = match album_alternative(&cover_id, &key) {
+            None => download(&client, &cover_id, size).await?,
+            Some(album_id) => {
+                let (track, album) = tokio::join!(
+                    download(&client, &cover_id, size),
+                    download(&client, &album_id, size),
+                );
+                sharper(track, album)?
+            }
+        };
         // Square the art before it lands in the cache. Decoding a cover is
         // CPU work and the IO runtime has two workers, so it goes to the
         // blocking pool rather than parking one of them behind a JPEG.
@@ -262,6 +264,70 @@ pub async fn fetch_as(
         Ok(path2)
     })
     .await
+}
+
+/// One cover, as the server sends it for `size`.
+async fn download(client: &SubsonicClient, cover_id: &str, size: u32) -> Result<Vec<u8>> {
+    let url = client.cover_art_url(cover_id, Some(size))?;
+    Ok(http()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?
+        .to_vec())
+}
+
+/// The album's own cover id, when `cover_id` is a song's and `key` files it
+/// under that song's album (see [`song_cover`]).
+///
+/// Navidrome serves a song's cover (`mf-<song>`) from the file's embedded
+/// picture, and the album's (`al-<album>`) by its cover-art priority — usually
+/// a `cover.*`/`folder.*` file first. The two are often the same picture at
+/// different resolutions: a 500px thumbnail embedded in every track next to a
+/// 3000px scan in the folder. Asking for both lets [`sharper`] keep whichever
+/// carries more detail. The bare `al-<album>` id needs no cache-busting
+/// suffix; the server parses it without one.
+fn album_alternative(cover_id: &str, key: &str) -> Option<String> {
+    let album = key.strip_prefix("album-")?;
+    stable_key(cover_id)
+        .starts_with("mf-")
+        .then(|| format!("al-{album}"))
+}
+
+/// Pick between a song's cover and its album's: the album's only when it is
+/// strictly larger, so a tie — both at least the size asked for, which the
+/// server scales down to the same edge — keeps the song's own picture. Either
+/// one failing leaves the other.
+fn sharper(track: Result<Vec<u8>>, album: Result<Vec<u8>>) -> Result<Vec<u8>> {
+    match (track, album) {
+        (Ok(track), Ok(album)) => {
+            if image_edge(&album) > image_edge(&track) {
+                Ok(album)
+            } else {
+                Ok(track)
+            }
+        }
+        (Ok(track), Err(e)) => {
+            tracing::debug!("album cover fetch failed, keeping the song's: {e:#}");
+            Ok(track)
+        }
+        (Err(_), Ok(album)) => Ok(album),
+        (Err(e), Err(_)) => Err(e),
+    }
+}
+
+/// Shorter edge of an image, from its header (no decode). `None` when the
+/// bytes are not an image the `image` crate can size, which loses to any
+/// image that can be.
+fn image_edge(bytes: &[u8]) -> Option<u32> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    Some(width.min(height))
 }
 
 /// Like [`fetch_as`], for art that is not the server's: a plain URL (Cover Art
@@ -782,6 +848,54 @@ fn squarify_dir(dir: &Path) {
     let _ = std::fs::write(&marker, b"");
 }
 
+/// Marks the artwork cache as cleared of song art fetched before
+/// [`album_alternative`] existed. See [`drop_stale_song_art`].
+pub const SONG_ART_MARKER: &str = ".song-art-v2";
+
+fn is_marker(name: &std::ffi::OsStr) -> bool {
+    name == SQUARED_MARKER || name == SONG_ART_MARKER
+}
+
+/// One-off: delete the song art cached under `album-<id>` keys (every rung,
+/// and the blurred background) before songs started weighing their album's
+/// cover against their own, so it is fetched again through [`fetch_as`] and
+/// the sharper picture wins. Album pages and grids cache under `al-<id>` and
+/// are untouched; local art (`album-local_…`) never had a server alternative.
+///
+/// Call before anything fetches art: a cover downloaded meanwhile would be
+/// deleted under the in-memory index that just recorded it.
+pub fn drop_stale_song_art() {
+    let Ok(dir) = config::artwork_cache_dir() else {
+        return;
+    };
+    let marker = dir.join(SONG_ART_MARKER);
+    if marker.exists() {
+        return;
+    }
+    let mut dropped = 0usize;
+    if let Ok(read) = std::fs::read_dir(&dir) {
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            if !name.to_str().is_some_and(is_stale_song_art) {
+                continue;
+            }
+            if std::fs::remove_file(entry.path()).is_ok() {
+                dropped += 1;
+            }
+        }
+    }
+    if dropped > 0 {
+        tracing::info!("dropped {dropped} cached song cover files to refetch at their best");
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&marker, b"");
+}
+
+/// Whether a cache file name is server song art [`drop_stale_song_art`] clears.
+fn is_stale_song_art(name: &str) -> bool {
+    name.starts_with("album-") && !name.starts_with("album-local") && name.ends_with(".img")
+}
+
 /// If the cache exceeds the cap, delete oldest files (by modified time) until
 /// back under it. Best-effort — IO errors are ignored.
 fn evict_if_over_cap(dir: &Path) {
@@ -792,7 +906,9 @@ fn evict_if_over_cap(dir: &Path) {
     };
     for entry in read.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
+        // Markers are empty and the oldest files here, so they would go
+        // first — and a lost marker re-runs its one-off pass.
+        if !meta.is_file() || is_marker(&entry.file_name()) {
             continue;
         }
         let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -827,9 +943,57 @@ fn evict_if_over_cap(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SIZE_LADDER, album_art_keys, bucket, search_order, square_crop, stable_key,
-        thumbnail_from_bytes, write_atomic,
+        SIZE_LADDER, album_alternative, album_art_keys, bucket, is_stale_song_art, search_order,
+        sharper, square_crop, stable_key, thumbnail_from_bytes, write_atomic,
     };
+
+    #[test]
+    fn only_server_song_art_is_dropped() {
+        assert!(is_stale_song_art("album-abc123-512.img"));
+        assert!(is_stale_song_art("album-abc123-blur.img"));
+        assert!(!is_stale_song_art("album-local_deadbeef-blur.img"));
+        assert!(!is_stale_song_art("al-abc123-512.img"));
+        assert!(!is_stale_song_art("local-deadbeef-256.img"));
+        assert!(!is_stale_song_art("album-abc123-512.img.part"));
+    }
+
+    #[test]
+    fn song_covers_also_ask_for_their_album_cover() {
+        assert_eq!(
+            album_alternative("mf-song1_6789abcd", "album-alb1").as_deref(),
+            Some("al-alb1")
+        );
+        // Already an album cover, or a server that doesn't mint per-song ids.
+        assert_eq!(album_alternative("al-alb1_6789abcd", "album-alb1"), None);
+        assert_eq!(album_alternative("alb1", "album-alb1"), None);
+        // Not filed under an album (no album id on the song).
+        assert_eq!(album_alternative("mf-song1", "mf-song1"), None);
+    }
+
+    #[test]
+    fn the_album_cover_wins_only_when_strictly_larger() {
+        let small = encode(300, 300);
+        let big = encode(500, 500);
+        let pick = |track: &Vec<u8>, album: &Vec<u8>| {
+            sharper(Ok(track.clone()), Ok(album.clone())).unwrap()
+        };
+        assert_eq!(pick(&small, &big), big);
+        assert_eq!(pick(&big, &small), big);
+        // A tie keeps the song's own picture.
+        let other = encode(300, 300);
+        assert_eq!(pick(&small, &other), small);
+        // Unreadable album bytes lose to a readable song cover.
+        assert_eq!(pick(&small, &b"not an image".to_vec()), small);
+    }
+
+    #[test]
+    fn either_cover_failing_leaves_the_other() {
+        let art = encode(10, 10);
+        let failed = || Err(anyhow::anyhow!("404"));
+        assert_eq!(sharper(Ok(art.clone()), failed()).unwrap(), art);
+        assert_eq!(sharper(failed(), Ok(art.clone())).unwrap(), art);
+        assert!(sharper(failed(), failed()).is_err());
+    }
 
     fn encode(width: u32, height: u32) -> Vec<u8> {
         let img =

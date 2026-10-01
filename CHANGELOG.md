@@ -6,6 +6,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-10-01
+
+### Fixed
+
+- The player bar, fullscreen player, recent list and search show an album's
+  own cover when it is sharper than the picture embedded in the playing
+  track — a small thumbnail tagged into every file no longer stands in for
+  the full-size `cover.jpg` beside them. Song covers cached by earlier
+  versions are dropped once on launch and fetched again.
+
 ## [1.3.0] — 2026-10-01
 
 ### Added
@@ -382,7 +392,9 @@ is the feature set 1.0 ships with rather than a diff against a previous tag.
 - Arch Linux: a `scire` package in the AUR, built from source at the tag.
 - Tagging `v*` builds both on GitHub Actions and drafts the release.
 
-[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.2.3...HEAD
+[Unreleased]: https://github.com/MatPrayer/scire/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/MatPrayer/scire/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/MatPrayer/scire/compare/v1.2.3...v1.3.0
 [1.2.3]: https://github.com/MatPrayer/scire/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/MatPrayer/scire/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/MatPrayer/scire/compare/v1.2.0...v1.2.1

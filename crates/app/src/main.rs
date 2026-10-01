@@ -120,6 +120,10 @@ fn main() {
                 p.set_transcoding(settings.transcoding.to_stream_options())
             });
             services::artwork::set_cache_cap_mb(settings.artwork_cache_mb);
+            // One-off: song art cached before songs weighed their album's
+            // cover against their own. A directory listing and some deletes,
+            // run before any view can fetch art into the same entries.
+            services::artwork::drop_stale_song_art();
             // One-off: square art cached before covers were cropped on the way
             // in. Whole-file decodes, so it goes to the blocking pool and is
             // left to run — the views paint from the same cache meanwhile and
