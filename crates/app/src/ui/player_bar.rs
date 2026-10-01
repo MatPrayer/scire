@@ -701,6 +701,7 @@ impl Render for PlayerBar {
                                             .flex()
                                             .items_center()
                                             .justify_center()
+                                            .rounded_md()
                                             .bg(gpui::hsla(0., 0., 0., 0.45))
                                             .text_color(gpui::white())
                                             .invisible()

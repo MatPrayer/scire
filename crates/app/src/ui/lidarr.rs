@@ -254,7 +254,10 @@ impl MissingReleases {
         name: &str,
         mbid: Option<&str>,
         owned: Vec<(Option<String>, String)>,
-        tile: f32,
+        // Cover edge of the cards, `None` while they are not on screen.
+        // Lidarr is asked either way, since the header card's "Open in
+        // Lidarr" needs its answer; covers only when the cards are drawn.
+        tile: Option<f32>,
         width: Option<f32>,
         cx: &mut Context<Self>,
     ) {
@@ -265,7 +268,9 @@ impl MissingReleases {
         self.ensure_loaded(cx);
         // The cards are drawn by the artist page, so their covers are asked
         // for here rather than from this view's `render`.
-        if let Some(client) = lidarr_state(cx).read(cx).client.clone() {
+        if let Some(tile) = tile
+            && let Some(client) = lidarr_state(cx).read(cx).client.clone()
+        {
             let art_px = (tile * 2.) as u32;
             for album in self.missing() {
                 self.covers
@@ -283,6 +288,30 @@ impl MissingReleases {
         let mut missing = lidarr::missing_albums(albums.clone(), &self.owned);
         missing.sort_by(|a, b| b.release_day().cmp(&a.release_day()));
         missing
+    }
+
+    /// How many releases are missing, once Lidarr has answered.
+    pub fn missing_count(&self) -> Option<usize> {
+        matches!(self.load, MissingLoad::Loaded { .. }).then(|| self.missing().len())
+    }
+
+    /// The artist's page on the Lidarr server, once Lidarr has answered with
+    /// it. The artist page puts it in its header card.
+    pub fn artist_url(&self, cx: &App) -> Option<String> {
+        let client = lidarr_state(cx).read(cx).client.clone()?;
+        match &self.load {
+            MissingLoad::Loaded { artist, .. } if !artist.foreign_artist_id.is_empty() => Some(
+                format!("{}/artist/{}", client.base(), artist.foreign_artist_id),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether `render` draws anything: a status line or an error. Once
+    /// loaded the cards are the artist page's, so the page leaves this out
+    /// rather than keep a gap for an empty element.
+    pub fn has_body(&self) -> bool {
+        !matches!(self.load, MissingLoad::Loaded { .. }) || self.action_error.is_some()
     }
 
     fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
@@ -538,96 +567,71 @@ impl Render for MissingReleases {
         let Some(client) = state_entity.read(cx).client.clone() else {
             return div().into_any_element();
         };
-        let missing = self.missing();
         let muted = cx.theme().muted_foreground;
-        let body: gpui::AnyElement = match &self.load {
-            MissingLoad::Idle | MissingLoad::Loading => div()
-                .text_sm()
-                .text_color(muted)
-                .child("Asking Lidarr…")
-                .into_any_element(),
+        let body: Option<gpui::AnyElement> = match &self.load {
+            MissingLoad::Idle | MissingLoad::Loading => Some(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("Asking Lidarr…")
+                    .into_any_element(),
+            ),
             MissingLoad::NotInLidarr => {
                 let url = client.base().to_string();
+                Some(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(format!("Lidarr doesn't track {}.", self.name)),
+                        )
+                        .child(
+                            Button::new("lidarr-open-add")
+                                .ghost()
+                                .small()
+                                .label("Add it in Lidarr")
+                                .on_click(move |_, _, cx| cx.open_url(&format!("{url}/add/new"))),
+                        )
+                        .into_any_element(),
+                )
+            }
+            MissingLoad::Failed(why) => Some(
                 h_flex()
                     .gap_3()
                     .items_center()
                     .child(
                         div()
                             .text_sm()
-                            .text_color(muted)
-                            .child(format!("Lidarr doesn't track {}.", self.name)),
+                            .text_color(cx.theme().danger)
+                            .child(why.clone()),
                     )
                     .child(
-                        Button::new("lidarr-open-add")
+                        Button::new("lidarr-missing-retry")
                             .ghost()
                             .small()
-                            .label("Add it in Lidarr")
-                            .on_click(move |_, _, cx| cx.open_url(&format!("{url}/add/new"))),
+                            .label("Retry")
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                     )
-                    .into_any_element()
-            }
-            MissingLoad::Failed(why) => h_flex()
-                .gap_3()
-                .items_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .child(why.clone()),
-                )
-                .child(
-                    Button::new("lidarr-missing-retry")
-                        .ghost()
-                        .small()
-                        .label("Retry")
-                        .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
-                )
-                .into_any_element(),
-            MissingLoad::Loaded { .. } if missing.is_empty() => div()
-                .text_sm()
-                .text_color(muted)
-                .child("Nothing missing — the library has every release Lidarr lists.")
-                .into_any_element(),
-            MissingLoad::Loaded { .. } => div()
-                .text_sm()
-                .text_color(muted)
-                .child("Shown dimmed among the releases above, each in its own section.")
-                .into_any_element(),
-        };
-        let count = (!missing.is_empty()).then(|| missing.len().to_string());
-        let artist_link = match &self.load {
-            MissingLoad::Loaded { artist, .. } if !artist.foreign_artist_id.is_empty() => Some(
-                format!("{}/artist/{}", client.base(), artist.foreign_artist_id),
+                    .into_any_element(),
             ),
-            _ => None,
+            // The count is on the switch and the cards are among the
+            // releases above: nothing left to say here.
+            MissingLoad::Loaded { .. } => None,
         };
+        // No heading: the switch above already names the section and carries
+        // the count. "Open in Lidarr" lives in the artist page's header card
+        // (`artist_url`).
         v_flex()
             .when_some(self.width, |this, w| this.w(px(w)))
             .flex_none()
             .gap_2()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_sm().font_medium().child("Missing releases"))
-                    .when_some(count, |this, n| {
-                        this.child(div().text_xs().text_color(muted).child(n))
-                    })
-                    .child(div().flex_1())
-                    .when_some(artist_link, |this, url| {
-                        this.child(
-                            Button::new("lidarr-artist-open")
-                                .ghost()
-                                .xsmall()
-                                .label("Open in Lidarr")
-                                .on_click(move |_, _, cx| cx.open_url(&url)),
-                        )
-                    }),
-            )
             .when_some(self.action_error.clone(), |this, why| {
                 this.child(div().text_xs().text_color(cx.theme().danger).child(why))
             })
-            .child(body)
+            .children(body)
             .into_any_element()
     }
 }
@@ -635,6 +639,8 @@ impl Render for MissingReleases {
 /// The artist page's switch row for the section above.
 pub fn missing_toggle(
     on: bool,
+    // Filled in once Lidarr has answered; nothing is shown before that.
+    count: Option<usize>,
     on_toggle: impl Fn(&bool, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
@@ -646,7 +652,10 @@ pub fn missing_toggle(
                 .small()
                 .text_color(cx.theme().muted_foreground),
         )
-        .child(div().text_sm().child("Show missing releases"))
+        .child(div().text_sm().child(match count {
+            Some(n) => format!("Show missing releases ({n})"),
+            None => "Show missing releases".to_string(),
+        }))
         .child(
             div()
                 .text_xs()

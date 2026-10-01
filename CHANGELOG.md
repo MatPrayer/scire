@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.2] — 2026-10-01
+
+### Changed
+
+- The artist page's Lidarr switch carries the count of missing releases —
+  **Show missing releases (3)** — once Lidarr has answered, and the
+  "Missing releases" heading and the caption under the switch are gone.
+- **Open in Lidarr** moves to the artist's name in the header card, and shows
+  whether or not missing releases are.
+
+### Fixed
+
+- The album page's About card no longer draws its More button over the last
+  line of the description.
+- The darkened hover over the player bar's cover follows the cover's rounded
+  corners.
+
 ## [1.3.1] — 2026-10-01
 
 ### Fixed

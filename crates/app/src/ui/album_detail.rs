@@ -1899,6 +1899,13 @@ impl Render for AlbumDetailView {
         // Grey from `PLACEHOLDER_DELAY` after the first request went out, and
         // for as long as either is in flight — not only the first.
         let show_about = about_loading && placeholding(self.info_since.or(self.online_since));
+        // Card and prose take px widths like the header card: stretch-sized,
+        // the wrapped prose was measured at a narrower width than it was laid
+        // out at, so its height came up short and the More row sat on top of
+        // the last line.
+        let prose_w = (header_w - HEADER_CARD_PADDING)
+            .min(ABOUT_PROSE_MAX_W)
+            .floor();
         let about = (!waiting && (notes_text.is_some() || has_links)).then(|| {
             let pills = (sources.len() > 1).then(|| {
                 h_flex().gap_1().children(sources.iter().map(|&source| {
@@ -1919,6 +1926,8 @@ impl Render for AlbumDetailView {
                 }))
             });
             v_flex()
+                .when(header_w > 0., |this| this.w(px(header_w)))
+                .flex_none()
                 .rounded_2xl()
                 .p_4()
                 .gap_3()
@@ -1939,7 +1948,10 @@ impl Render for AlbumDetailView {
                     // and run together they read as one wall of text.
                     .child(
                         v_flex()
-                            .max_w(px(ABOUT_PROSE_MAX_W))
+                            .map(|this| match prose_w > 0. {
+                                true => this.w(px(prose_w)),
+                                false => this.max_w(px(ABOUT_PROSE_MAX_W)),
+                            })
                             .gap_2()
                             .text_sm()
                             .children(
@@ -2014,6 +2026,8 @@ impl Render for AlbumDetailView {
         let about = about.or_else(|| {
             about_loading.then(|| {
                 v_flex()
+                    .when(header_w > 0., |this| this.w(px(header_w)))
+                    .flex_none()
                     .rounded_2xl()
                     .p_4()
                     .gap_3()

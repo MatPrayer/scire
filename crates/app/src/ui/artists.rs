@@ -1559,13 +1559,20 @@ impl ArtistDetailView {
         let mbid = self.info.as_ref().and_then(|i| i.music_brainz_id.clone());
         let show = self.session.read(cx).settings.lidarr_show_missing;
         let width = hero_card_width(content_w);
-        if show {
-            self.lidarr_missing.update(cx, |missing, cx| {
-                missing.set_context(&name, mbid.as_deref(), owned, tile, width, cx)
-            });
-        }
+        self.lidarr_missing.update(cx, |missing, cx| {
+            missing.set_context(
+                &name,
+                mbid.as_deref(),
+                owned,
+                show.then_some(tile),
+                width,
+                cx,
+            )
+        });
+        let count = self.lidarr_missing.read(cx).missing_count();
         let toggle = crate::ui::lidarr::missing_toggle(
             show,
+            count,
             cx.listener(|this, checked: &bool, _, cx| {
                 let checked = *checked;
                 this.session.update(cx, |session, _| {
@@ -1582,7 +1589,9 @@ impl ArtistDetailView {
                 .flex_none()
                 .gap_3()
                 .child(toggle)
-                .when(show, |this| this.child(self.lidarr_missing.clone()))
+                .when(show && self.lidarr_missing.read(cx).has_body(), |this| {
+                    this.child(self.lidarr_missing.clone())
+                })
                 .into_any_element(),
         )
     }
@@ -1978,6 +1987,10 @@ impl Render for ArtistDetailView {
         // Before the sections: it hands the missing-releases view what the
         // page shows, and that view's albums are filed into the sections too.
         let lidarr_block = self.lidarr_block(content_w, tile, cx);
+        let lidarr_url = lidarr_block
+            .is_some()
+            .then(|| self.lidarr_missing.read(cx).artist_url(cx))
+            .flatten();
         // Each card's `discography_order` key, parallel to `section_cards`,
         // so the missing releases below slot in among the library's own.
         let mut section_keys: Vec<Vec<DiscographyKey>> = vec![Vec::new(); section_cards.len()];
@@ -2169,7 +2182,31 @@ impl Render for ArtistDetailView {
                                         None => col.flex_1().min_w(px(BIO_MIN_W)),
                                     })
                                     .gap_2()
-                                    .child(div().text_2xl().font_medium().child(name))
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_start()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .text_2xl()
+                                                    .font_medium()
+                                                    .child(name),
+                                            )
+                                            .when_some(lidarr_url, |this, url| {
+                                                this.child(
+                                                    Button::new("lidarr-artist-open")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .flex_none()
+                                                        .label("Open in Lidarr")
+                                                        .on_click(move |_, _, cx| {
+                                                            cx.open_url(&url)
+                                                        }),
+                                                )
+                                            }),
+                                    )
                                     .when(bio_text.is_some() || bio_placeholder.is_some(), |this| {
                                         let pills =
                                             (bio_text.is_some() && sources.len() > 1).then(|| {
