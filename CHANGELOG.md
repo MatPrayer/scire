@@ -4,6 +4,17 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.3] — 2026-10-01
+
+### Fixed
+
+- The player bar's cover is as sharp as the album page's. It was the same
+  file, drawn at a fraction of its size by a renderer that samples only a few
+  of its pixels; the bar now draws a copy scaled down to the slot.
+- The fullscreen player's cover is as sharp as the album page's full-size
+  view. It was always fetched at 640px and stretched when a large window drew
+  it bigger; it is now fetched at the size it is drawn.
+
 ## [1.3.2] — 2026-10-01
 
 ### Changed

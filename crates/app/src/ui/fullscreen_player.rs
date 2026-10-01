@@ -32,6 +32,8 @@ use crate::state::session::Session;
 use crate::ui::format_duration;
 use crate::ui::visualizer::Visualizer;
 
+/// Rung the cover is first fetched at, before a frame has said how big it is
+/// drawn. `sync_art_size` moves up from there.
 const ART_SIZE: u32 = 600;
 
 /// Padding either side of the info card's text, subtracted from the card width
@@ -1202,6 +1204,12 @@ pub struct FullscreenPlayer {
     gradient_palette: Option<Vec<gpui::Rgba>>,
     /// Album-scoped art key the loaded art belongs to (see `artwork::song_cover`).
     last_art_key: Option<String>,
+    /// Rung the drawn cover wants: its laid-out edge in device pixels,
+    /// bucketed. Kept across tracks so the next one is fetched at it.
+    art_want: u32,
+    /// Rung `art_path` is at, or is being fetched at, for `last_art_key`. 0
+    /// when nothing was asked; `u32::MAX` for local art (the file as is).
+    art_rung: u32,
     panel: Option<SidePanel>,
     /// Scroll handle of the queue panel's list, so the playing track can be
     /// scrolled back into view when it changes.
@@ -1364,6 +1372,7 @@ impl FullscreenPlayer {
             let key = cover.as_ref().map(|(_, key)| key.clone());
             if key != this.last_art_key {
                 this.last_art_key = key;
+                this.art_rung = 0;
                 this.art_path = None;
                 this.bg_art_path = None;
                 this.gradient_palette = None;
@@ -1400,6 +1409,8 @@ impl FullscreenPlayer {
             bg_art_path: None,
             gradient_palette: None,
             last_art_key: None,
+            art_want: artwork::bucket(ART_SIZE),
+            art_rung: 0,
             panel: None,
             queue_scroll: gpui::UniformListScrollHandle::new(),
             queue_followed: None,
@@ -2827,6 +2838,7 @@ impl FullscreenPlayer {
             crate::services::local_library::local_art_path(&cover_id).filter(|p| p.exists())
         {
             self.art_path = Some(path.clone());
+            self.art_rung = u32::MAX;
             self.bg_art_path = artwork::blurred_cached(&key);
             self.gradient_palette = extract_palette(&path);
             cx.notify();
@@ -2850,16 +2862,7 @@ impl FullscreenPlayer {
         let client2 = client.clone();
         let cover_id2 = cover_id.clone();
         let key2 = key.clone();
-        // Full-res for the center art card.
-        cx.spawn(async move |this, cx| {
-            if let Ok(path) = artwork::fetch_as(client, cover_id, key, ART_SIZE).await {
-                let _ = this.update(cx, |view, cx| {
-                    view.art_path = Some(path);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.fetch_cover_rung(client, cover_id, key, self.art_want, cx);
         // Tiny version for color extraction — a low-res average is a fast
         // palette sample, and it is *only* a palette sample: the blurred
         // background is its own rendition below.
@@ -2893,6 +2896,62 @@ impl FullscreenPlayer {
             })
             .detach();
         }
+    }
+}
+
+impl FullscreenPlayer {
+    /// Fetch the centre cover at `rung`, replacing `art_path` when it lands
+    /// unless playback moved to other art meanwhile.
+    fn fetch_cover_rung(
+        &mut self,
+        client: SubsonicClient,
+        cover_id: String,
+        key: String,
+        rung: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.art_rung = rung;
+        cx.spawn(async move |this, cx| {
+            if let Ok(path) = artwork::fetch_as(client, cover_id, key.clone(), rung).await {
+                let _ = this.update(cx, |view, cx| {
+                    if view.last_art_key.as_deref() == Some(key.as_str()) {
+                        view.art_path = Some(path);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Ask for a larger rung when the cover is drawn bigger than the one held.
+    /// Only ever upward: a shrinking window keeps the sharper file.
+    fn sync_art_size(&mut self, art_px: f32, window: &Window, cx: &mut Context<Self>) {
+        if art_px <= 0. {
+            return;
+        }
+        let want = artwork::bucket((art_px * window.scale_factor()).ceil() as u32);
+        self.art_want = self.art_want.max(want);
+        // Nothing asked yet (the first fetch will use `art_want`), local art,
+        // or already held big enough.
+        if self.art_rung == 0 || self.art_rung >= want {
+            return;
+        }
+        let Some((cover_id, key)) = self
+            .player
+            .read(cx)
+            .current_song()
+            .and_then(artwork::song_cover)
+        else {
+            return;
+        };
+        if Some(&key) != self.last_art_key.as_ref() {
+            return;
+        }
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        self.fetch_cover_rung(client, cover_id, key, want, cx);
     }
 }
 
@@ -3323,6 +3382,9 @@ impl Render for FullscreenPlayer {
         // Follow the playing track in the queue panel, now that the room the
         // panel gets — and so how many rows it holds — is known.
         self.sync_queue_scroll(layout.panel_max_h, cx);
+        // The cover can grow past the rung first fetched (`roomy_art_cap`);
+        // drawn upscaled it is visibly softer than the album page's lightbox.
+        self.sync_art_size(layout.art, window, cx);
         // And the line being sung in the lyrics panel, which the position tick
         // brings us back here for twice a second.
         self.sync_lyrics_scroll(cx);

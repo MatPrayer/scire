@@ -638,6 +638,57 @@ pub fn album_side_panel(content_w: f32, window_w: f32, window_h: f32) -> Option<
     (art >= SIDE_PANEL_ART_MIN).then_some(AlbumSidePanel { width, art })
 }
 
+/// Art for a slot much smaller than the file: swaps in a CPU-downscaled copy
+/// at the slot's device-pixel size once it is ready (`artwork::display_copy`
+/// says why). Draws the source meanwhile, and when no copy is worth making.
+#[derive(Default)]
+pub struct SharpArt {
+    /// Source and edge the copy (or the job in flight) is for.
+    want: Option<(PathBuf, u32)>,
+    /// Filled by the job; shared because it lands outside the view's borrow.
+    copy: Rc<std::cell::RefCell<Option<PathBuf>>>,
+}
+
+impl SharpArt {
+    /// Path to draw `source` with in a slot `logical_px` wide. Call from
+    /// `render`; notifies the view when the copy lands.
+    pub fn path<V: 'static>(
+        &mut self,
+        source: &std::path::Path,
+        logical_px: f32,
+        window: &Window,
+        cx: &mut gpui::Context<V>,
+    ) -> PathBuf {
+        let edge = (logical_px * window.scale_factor()).round().max(1.) as u32;
+        let want = (source.to_path_buf(), edge);
+        if self.want.as_ref() != Some(&want) {
+            self.want = Some(want);
+            // A fresh cell: a job still running for the old source writes
+            // into the one it holds, not into this.
+            self.copy = Rc::new(std::cell::RefCell::new(
+                crate::services::artwork::display_cached(source, edge),
+            ));
+            if self.copy.borrow().is_none() {
+                let cell = self.copy.clone();
+                let source = source.to_path_buf();
+                cx.spawn(async move |this, cx| {
+                    let Some(copy) = crate::services::artwork::display_copy(&source, edge).await
+                    else {
+                        return;
+                    };
+                    *cell.borrow_mut() = Some(copy);
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
+            }
+        }
+        self.copy
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| source.to_path_buf())
+    }
+}
+
 /// Frame-accurate width for a layout that reflows with the window.
 ///
 /// A `ScrollHandle`'s bounds are last frame's layout, so a grid whose column

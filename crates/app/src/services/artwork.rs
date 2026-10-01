@@ -656,6 +656,56 @@ fn thumbnail_from_bytes(bytes: &[u8], edge: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A copy of `source` downscaled on the CPU to exactly `edge` device pixels,
+/// for art drawn much smaller than the rung it was fetched at.
+///
+/// gpui samples images with plain bilinear filtering and no mipmaps, so a
+/// 512px cover drawn in the player bar's 76px slot reads only four texels per
+/// pixel out of every ~45 under it: aliased and visibly coarser than the same
+/// file on the album page, drawn near 1:1. A Lanczos copy at the slot's size
+/// is drawn 1:1 instead.
+///
+/// `None` when the source is already within 2× of `edge` (bilinear is still
+/// clean there) or cannot be read; callers keep drawing the source. The copy
+/// is rebuilt when the source is newer, so revalidated art is picked up.
+pub fn display_cached(source: &Path, edge: u32) -> Option<PathBuf> {
+    let path = display_path(source, edge)?;
+    let made = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    let source_at = std::fs::metadata(source).and_then(|m| m.modified()).ok()?;
+    (made >= source_at).then_some(path)
+}
+
+/// Build (or reuse) the copy [`display_cached`] looks for. See there.
+pub async fn display_copy(source: &Path, edge: u32) -> Option<PathBuf> {
+    if let Some(path) = display_cached(source, edge) {
+        return Some(path);
+    }
+    let out = display_path(source, edge)?;
+    let source = source.to_path_buf();
+    runtime::spawn_blocking_io(move || -> Result<Option<PathBuf>> {
+        let (w, h) = image::image_dimensions(&source)?;
+        if w.min(h) <= edge.saturating_mul(2) {
+            return Ok(None);
+        }
+        let bytes = thumbnail_bytes(&source, edge)?;
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)?;
+            write_atomic(&out, &bytes)?;
+            evict_if_over_cap(dir);
+        }
+        Ok(Some(out))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn display_path(source: &Path, edge: u32) -> Option<PathBuf> {
+    let stem = source.file_stem()?.to_str()?;
+    let dir = config::artwork_cache_dir().ok()?;
+    Some(dir.join(format!("display-{}-{edge}.img", config::sanitize(stem))))
+}
+
 /// Center-crop art that is not square, so a cover fills the square tile it is
 /// drawn in instead of being letterboxed.
 ///

@@ -223,6 +223,9 @@ pub struct PlayerBar {
     title_hovered: bool,
     /// Index of the artist credit currently hovered (for the underline).
     artist_hovered: Option<usize>,
+    /// The cover downscaled to the slot (gpui's bilinear sampling aliases a
+    /// 512px file drawn at 76px).
+    cover: crate::ui::SharpArt,
 }
 
 impl PlayerBar {
@@ -319,6 +322,7 @@ impl PlayerBar {
             seek_hover: None,
             title_hovered: false,
             artist_hovered: None,
+            cover: Default::default(),
         }
     }
 
@@ -661,6 +665,9 @@ impl Render for PlayerBar {
                                 // every track change and the cover visibly blinked.
                                 let anim_id: SharedString =
                                     format!("np-cover-art-{}", path.display()).into();
+                                // Keyed above by the source, so the sharp copy
+                                // replacing it doesn't replay the fade.
+                                let path = self.cover.path(&path, cover_px, window, cx);
                                 this.child(
                                     img(path).size(px(cover_px)).rounded_md().with_animation(
                                         ElementId::Name(anim_id),
