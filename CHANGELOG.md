@@ -4,6 +4,19 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.5] — 2026-10-01
+
+### Changed
+
+- Lidarr has its own **Downloads** card in Settings, after Connections.
+
+### Fixed
+
+- The settings page is a grid again in a maximized 1440p window. Lidarr's
+  fields made the Connections card taller than the layout planned for, and
+  the page fell back to the scrolling column; the grid may now also use six
+  columns where five no longer fit.
+
 ## [1.3.4] — 2026-10-01
 
 ### Changed

@@ -113,11 +113,14 @@ const COMPACT_RUNOUT: f32 = 16.;
 /// is a weights table that wants fixing, not a rounding error, and a scale
 /// beyond this only pushes every window onto the scrolling column.
 const COMPACT_SCALE_MAX: f32 = 1.25;
-/// Past five columns the cards are short and far apart — the page reads as a
-/// scattering rather than a grid. Five, not four: Connections is a column on
-/// its own, and on a 1440p window Account and About under it no longer fit, so
-/// a fifth column is what keeps the page a grid there.
-const COMPACT_COL_MAX: usize = 5;
+/// Past six columns the cards are short and far apart — the page reads as a
+/// scattering rather than a grid. Six, not five: the columns are contiguous
+/// runs and Connections is one on its own, so five put Window through
+/// Fullscreen in the first column — about 1130px, more than a maximized 1440p
+/// window has under the docked bar once the calibration takes its margin. Six
+/// columns of `COMPACT_COL_MIN` still fit across 2560px with the sidebar
+/// folded, and the squareness pick still prefers five where five fit.
+const COMPACT_COL_MAX: usize = 6;
 /// How far a column's width may fall below and rise above an even split. The
 /// asymmetry is the point — a column carrying more gets more room, so its rows
 /// wrap less and the columns come out closer to the same height — but a column
@@ -136,7 +139,7 @@ const COMPACT_SHARE_MAX: f32 = 1.3;
 ///
 /// Account is the one section that may be absent (signed out); see
 /// [`present_sections`].
-const COMPACT_SECTIONS: [(&str, u16); 13] = [
+const COMPACT_SECTIONS: [(&str, u16); 14] = [
     ("Window", 4),
     ("Appearance", 14),
     ("Album pages", 8),
@@ -147,7 +150,9 @@ const COMPACT_SECTIONS: [(&str, u16); 13] = [
     ("Browsing", 18),
     ("Streaming", 5),
     ("Library", 12),
-    ("Connections", 31),
+    ("Connections", 30),
+    // Counted with Lidarr switched on: the address and key fields under it.
+    ("Downloads", 6),
     ("Account", 3),
     ("About", 4),
 ];
@@ -4705,9 +4710,15 @@ impl Render for SettingsView {
             .child(self.subheading_with_notes("Artist bios", ARTIST_NOTES, cx))
             .child(bio_list)
             .child(self.note(ARTIST_NOTES[0], cx))
-            .child(artist_cache)
-            .child(crate::ui::divider())
-            .child(self.subheading_with_notes("Downloads", LIDARR_NOTES, cx))
+            .child(artist_cache);
+
+        // Lidarr: its own card rather than a fifth group under Connections. It
+        // is a server of yours with its own address and key, not a feature's
+        // lookup — and in the grid a Connections card that tall was a column
+        // on its own the height of the window, which pushed 1440p windows onto
+        // the scrolling page.
+        let downloads_section = self
+            .section_with_notes("Downloads", LIDARR_NOTES, cx)
             .child(lidarr_list)
             .child(self.note(LIDARR_NOTES[0], cx));
 
@@ -4839,6 +4850,7 @@ impl Render for SettingsView {
             Some(streaming_section.into_any_element()),
             Some(library_section.into_any_element()),
             Some(connections_section.into_any_element()),
+            Some(downloads_section.into_any_element()),
         ];
         cards.extend(account_section.map(Some));
         cards.push(Some(about_section.into_any_element()));
@@ -5176,8 +5188,8 @@ mod tests {
     /// A content area tall enough for a roomy compact grid.
     const TALL: f32 = 1800.;
     /// Short, but tall enough for four columns — the tallest being
-    /// Connections with Account and About under it.
-    const SHORT: f32 = 1250.;
+    /// Connections with Downloads, Account and About under it.
+    const SHORT: f32 = 1450.;
 
     #[test]
     fn the_grid_places_every_section_in_page_order() {
@@ -5210,8 +5222,8 @@ mod tests {
     #[test]
     fn the_slack_goes_to_the_shortest_column_not_the_last() {
         // Too short for four columns, so five: Connections stands alone and
-        // Account and About share the last column, rather than Account filling
-        // Connections' column and leaving About on its own.
+        // the cards after it share the last column, rather than Downloads
+        // filling Connections' column and leaving the rest on their own.
         let w = weights();
         let grid = compact_grid(&w, 2600., 1180.);
         assert_eq!(grid.len(), 5);
@@ -5220,8 +5232,24 @@ mod tests {
             .iter()
             .map(|&i| COMPACT_SECTIONS[i].0)
             .collect();
-        assert_eq!(titles, ["Account", "About"]);
+        assert_eq!(titles, ["Downloads", "Account", "About"]);
         assert_eq!(grid[3].sections.len(), 1);
+    }
+
+    #[test]
+    fn a_maximized_1440p_window_is_a_grid() {
+        // 2560x1440 maximized, sidebar folded, docked bar: about 2490px of
+        // body and 1150px of room — less again once the calibration has
+        // raised its scale a little. Five columns need Window through
+        // Fullscreen in one (~1130px) and missed it; the sixth is what holds.
+        let w = weights();
+        for room in [1150., 1150. / 1.1] {
+            let grid = compact_grid(&w, 2490., room);
+            assert!(!grid.is_empty(), "2490x{room} fell back to the column");
+            for h in column_heights(&grid, &w) {
+                assert!(h <= room, "a column came out {h}px tall in {room}px");
+            }
+        }
     }
 
     #[test]
