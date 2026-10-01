@@ -57,6 +57,8 @@ pub enum NavSection {
     Recent,
     Radio,
     LocalMusic,
+    /// Download queue and wanted list; only while the Lidarr integration is on.
+    Lidarr,
     Settings,
 }
 
@@ -72,7 +74,8 @@ pub enum SidebarFocus {
 }
 
 /// Section order for the vi-mode cursor, excluding Settings (which is always
-/// the last target, after Refresh).
+/// the last target, after Refresh) and Lidarr (conditional, right after
+/// these).
 pub const SIDEBAR_SECTIONS: &[NavSection] = &[
     NavSection::Albums,
     NavSection::Artists,
@@ -93,12 +96,19 @@ pub const SIDEBAR_SECTIONS: &[NavSection] = &[
 ///
 /// `collapsed` is kept in the signature: the shapes have diverged before and
 /// the caller should not have to know that they currently agree.
-pub fn sidebar_targets(_collapsed: bool, playlists: &[(String, String)]) -> Vec<SidebarFocus> {
+pub fn sidebar_targets(
+    _collapsed: bool,
+    lidarr: bool,
+    playlists: &[(String, String)],
+) -> Vec<SidebarFocus> {
     let mut targets: Vec<SidebarFocus> = SIDEBAR_SECTIONS
         .iter()
         .copied()
         .map(SidebarFocus::Section)
         .collect();
+    if lidarr {
+        targets.push(SidebarFocus::Section(NavSection::Lidarr));
+    }
     for (id, _) in playlists {
         targets.push(SidebarFocus::Playlist(id.clone()));
     }
@@ -130,8 +140,18 @@ pub enum SidebarAction {
     PlaylistMenu(bool),
 }
 
+/// What the Lidarr row says about the download queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LidarrBadge {
+    pub downloads: usize,
+    pub problems: usize,
+    pub online: bool,
+}
+
 pub struct SidebarModel {
     pub active: Option<NavSection>,
+    /// `Some` while the Lidarr integration is on: the row shows.
+    pub lidarr: Option<LidarrBadge>,
     pub active_playlist: Option<String>,
     pub playlists: Vec<(String, String, bool)>, // (id, name, shared-by-other-user)
     /// Available libraries (id, name); switcher shown only when > 1.
@@ -285,7 +305,7 @@ pub fn render_sidebar(
     cx: &App,
 ) -> impl IntoElement {
     let collapsed = model.collapsed;
-    let nav_item = |label: &'static str, icon: IconName, section: NavSection| {
+    let nav_item = |label: &'static str, icon: Icon, section: NavSection| {
         let on_action = on_action.clone();
         let is_active = model.active == Some(section);
         let is_vi_sel = model.vi_selected == Some(SidebarFocus::Section(section));
@@ -313,7 +333,7 @@ pub fn render_sidebar(
                 s.tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
             })
             .on_click(move |_, window, cx| on_action(SidebarAction::Select(section), window, cx))
-            .child(row_icon(Icon::new(icon), collapsed))
+            .child(row_icon(icon, collapsed))
             .when(!collapsed, |s| s.child(label))
     };
 
@@ -615,7 +635,11 @@ pub fn render_sidebar(
 
     // Expanded, the fold handle rides the first row that exists; only the
     // collapsed rail spends a line on it.
-    let albums = nav_item("Albums", IconName::LayoutDashboard, NavSection::Albums);
+    let albums = nav_item(
+        "Albums",
+        Icon::new(IconName::LayoutDashboard),
+        NavSection::Albums,
+    );
     let albums_row = match fold_slot.take() {
         Some(fold) => h_flex()
             .w_full()
@@ -652,22 +676,97 @@ pub fn render_sidebar(
         .child(albums_row)
         .child(nav_item(
             "Artists",
-            IconName::CircleUser,
+            Icon::new(IconName::CircleUser),
             NavSection::Artists,
         ))
-        .child(nav_item("Search", IconName::Search, NavSection::Search))
+        .child(nav_item(
+            "Search",
+            Icon::new(IconName::Search),
+            NavSection::Search,
+        ))
         .child(nav_item(
             "Favorites",
-            IconName::Heart,
+            Icon::new(IconName::Heart),
             NavSection::Favorites,
         ))
         .child(nav_item(
             "Recent",
-            IconName::GalleryVerticalEnd,
+            Icon::new(IconName::GalleryVerticalEnd),
             NavSection::Recent,
         ))
-        .child(nav_item("Radio", IconName::Globe, NavSection::Radio))
-        .child(nav_item("Local", IconName::Folder, NavSection::LocalMusic))
+        .child(nav_item(
+            "Radio",
+            Icon::new(IconName::Globe),
+            NavSection::Radio,
+        ))
+        .child(nav_item(
+            "Local",
+            Icon::new(IconName::Folder),
+            NavSection::LocalMusic,
+        ))
+        .when_some(model.lidarr, |this, badge| {
+            let tip: SharedString = if !badge.online {
+                "Lidarr · unreachable".into()
+            } else if badge.downloads == 0 {
+                "Lidarr · nothing downloading".into()
+            } else if badge.problems > 0 {
+                format!(
+                    "Lidarr · {} in queue, {} need attention",
+                    badge.downloads, badge.problems
+                )
+                .into()
+            } else {
+                format!("Lidarr · {} in queue", badge.downloads).into()
+            };
+            let tone = if !badge.online || badge.problems > 0 {
+                cx.theme().warning
+            } else {
+                cx.theme().primary
+            };
+            let row = nav_item(
+                "Lidarr",
+                crate::assets::app_icon(crate::assets::icons::DOWNLOAD),
+                NavSection::Lidarr,
+            )
+            .relative();
+            // Collapsed the label is a tooltip already; expanded, the queue
+            // says itself in one.
+            let row = if collapsed {
+                row
+            } else {
+                row.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            };
+            let row = if collapsed {
+                row.when(badge.downloads > 0 || !badge.online, |s| {
+                    s.child(
+                        div()
+                            .absolute()
+                            .top(px(4.))
+                            .right(px(8.))
+                            .size(px(7.))
+                            .rounded_full()
+                            .bg(tone),
+                    )
+                })
+            } else {
+                row.child(div().flex_1())
+                    .when(!badge.online, |s| {
+                        s.child(div().size(px(7.)).rounded_full().bg(tone))
+                    })
+                    .when(badge.online && badge.downloads > 0, |s| {
+                        s.child(
+                            div()
+                                .px_1p5()
+                                .rounded_full()
+                                .text_xs()
+                                .bg(tone.opacity(0.18))
+                                .text_color(tone)
+                                .child(badge.downloads.to_string()),
+                        )
+                    })
+            };
+            this.child(row)
+        })
         .child(div().px_3().child(super::divider()))
         .when(!collapsed, |this| this.child(playlists_header))
         // Same place the playlists header sits expanded, so the fold does not
@@ -755,7 +854,7 @@ pub fn render_sidebar(
         })
         .child(nav_item(
             "Settings",
-            IconName::Settings,
+            Icon::new(IconName::Settings),
             NavSection::Settings,
         ))
 }

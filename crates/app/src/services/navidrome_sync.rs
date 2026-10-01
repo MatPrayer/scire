@@ -266,6 +266,7 @@ pub async fn sync_navidrome(
             play_count: album.play_count.map(|c| c as i64),
             starred: album.starred.clone(),
             library_id: folder_id.clone(),
+            release_types: album.release_types.clone(),
         });
 
         if needs_track_fetch(&album, cached.get(&album_id)) {
@@ -655,6 +656,7 @@ mod tests {
             play_count: None,
             starred: None,
             library_id: None,
+            release_types: Vec::new(),
         }
     }
 
@@ -768,6 +770,7 @@ mod tests {
             play_count: None,
             starred: None,
             library_id: None,
+            release_types: Vec::new(),
         })
         .unwrap();
         db.upsert_track(

@@ -236,6 +236,14 @@ DELETE FROM track_artists;
 DELETE FROM tracks WHERE source = 'navidrome';
 ";
 
+/// An album's OpenSubsonic `releaseTypes`, so the artist page can file a
+/// cached record under Live, Compilations, DJ mixes … before `getArtist`
+/// answers. Nothing is wiped: album rows are rewritten by every sync, so the
+/// next one fills the column in.
+const SCHEMA_V10: &str = "
+ALTER TABLE albums ADD COLUMN release_types TEXT;
+";
+
 /// One migration step, applied atomically with the version it records.
 ///
 /// SQLite makes DDL transactional, and the two halves of a step have to travel
@@ -418,6 +426,7 @@ impl LibraryDb {
             (7, SCHEMA_V7),
             (8, SCHEMA_V8),
             (9, SCHEMA_V9),
+            (10, SCHEMA_V10),
         ] {
             if version < target {
                 migration_step(&conn, sql, Some(target))?;
@@ -655,7 +664,7 @@ impl LibraryDb {
         let where_clause = like_clause(&["title", "artist"], terms.len());
         let mut stmt = conn.prepare(&format!(
             "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-                    created, play_count, starred_at, library_id
+                    created, play_count, starred_at, library_id, release_types
              FROM albums
              WHERE {where_clause}
              ORDER BY title COLLATE NOCASE
@@ -799,8 +808,8 @@ impl LibraryDb {
         conn.execute(
             "INSERT OR REPLACE INTO albums
              (id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-              created, play_count, starred_at, library_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+              created, play_count, starred_at, library_id, release_types)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![
                 album.id,
                 album.source,
@@ -815,6 +824,7 @@ impl LibraryDb {
                 album.play_count,
                 album.starred,
                 album.library_id,
+                encode_release_types(&album.release_types),
             ],
         )?;
         Ok(())
@@ -852,8 +862,8 @@ impl LibraryDb {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO albums
                  (id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-                  created, play_count, starred_at, library_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                  created, play_count, starred_at, library_id, release_types)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             )?;
             for album in albums {
                 stmt.execute(rusqlite::params![
@@ -870,6 +880,7 @@ impl LibraryDb {
                     album.play_count,
                     album.starred,
                     album.library_id,
+                    encode_release_types(&album.release_types),
                 ])?;
             }
         }
@@ -895,7 +906,7 @@ impl LibraryDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-                    created, play_count, starred_at, library_id
+                    created, play_count, starred_at, library_id, release_types
              FROM albums WHERE source = ?1
              ORDER BY title COLLATE NOCASE",
         )?;
@@ -914,6 +925,7 @@ impl LibraryDb {
                 play_count: row.get(10)?,
                 starred: row.get(11)?,
                 library_id: row.get(12)?,
+                release_types: decode_release_types(row.get(13)?),
             })
         })?;
         rows.collect()
@@ -928,7 +940,7 @@ impl LibraryDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-                    created, play_count, starred_at, library_id
+                    created, play_count, starred_at, library_id, release_types
              FROM albums WHERE source = ?1 AND artist_id = ?2
              ORDER BY title COLLATE NOCASE",
         )?;
@@ -947,6 +959,7 @@ impl LibraryDb {
                 play_count: row.get(10)?,
                 starred: row.get(11)?,
                 library_id: row.get(12)?,
+                release_types: decode_release_types(row.get(13)?),
             })
         })?;
         rows.collect()
@@ -963,7 +976,7 @@ impl LibraryDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-                    created, play_count, starred_at, library_id
+                    created, play_count, starred_at, library_id, release_types
              FROM albums a
              WHERE source = ?1
                AND (artist_id = ?2
@@ -986,6 +999,7 @@ impl LibraryDb {
                 play_count: row.get(10)?,
                 starred: row.get(11)?,
                 library_id: row.get(12)?,
+                release_types: decode_release_types(row.get(13)?),
             })
         })?;
         rows.collect()
@@ -1001,7 +1015,7 @@ impl LibraryDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-                    created, play_count, starred_at, library_id
+                    created, play_count, starred_at, library_id, release_types
              FROM albums WHERE source = ?1 AND id = ?2",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![source, id], |row| {
@@ -1019,6 +1033,7 @@ impl LibraryDb {
                 play_count: row.get(10)?,
                 starred: row.get(11)?,
                 library_id: row.get(12)?,
+                release_types: decode_release_types(row.get(13)?),
             })
         })?;
         rows.next().transpose()
@@ -1073,6 +1088,7 @@ impl LibraryDb {
         let mut stmt = conn.prepare(
             "SELECT a.id, a.source, a.title, a.artist, a.artist_id, a.year, a.cover_art,
                     a.song_count, a.duration, a.created, a.play_count, a.starred_at, a.library_id,
+                    a.release_types,
                     COUNT(DISTINCT t.id)
              FROM albums a
              JOIN tracks t ON t.album_id = a.id
@@ -1116,8 +1132,9 @@ impl LibraryDb {
                     play_count: row.get(10)?,
                     starred: row.get(11)?,
                     library_id: row.get(12)?,
+                    release_types: decode_release_types(row.get(13)?),
                 },
-                row.get(13)?,
+                row.get(14)?,
             ))
         })?;
         rows.collect()
@@ -1615,6 +1632,22 @@ fn replay_gain_from_row(
 pub const SOURCE_NAVIDROME: &str = "navidrome";
 pub const SOURCE_LOCAL: &str = "local";
 
+/// `releaseTypes` as stored: `;`-joined (no MusicBrainz type contains one),
+/// NULL for none.
+fn encode_release_types(types: &[String]) -> Option<String> {
+    (!types.is_empty()).then(|| types.join(";"))
+}
+
+fn decode_release_types(stored: Option<String>) -> Vec<String> {
+    stored
+        .iter()
+        .flat_map(|s| s.split(';'))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub(crate) fn album_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlbumRow> {
     Ok(AlbumRow {
         id: row.get(0)?,
@@ -1630,6 +1663,7 @@ pub(crate) fn album_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlbumR
         play_count: row.get(10)?,
         starred: row.get(11)?,
         library_id: row.get(12)?,
+        release_types: decode_release_types(row.get(13)?),
     })
 }
 
@@ -1717,6 +1751,9 @@ pub struct AlbumRow {
     /// Music folder this row was synced from; `None` when the server exposes
     /// only one library (or the folder list was unavailable).
     pub library_id: Option<String>,
+    /// OpenSubsonic `releaseTypes` (`Album`, `Live`, `DJ-mix`, …); empty when
+    /// the server sent none or the row predates the column.
+    pub release_types: Vec<String>,
 }
 
 impl AlbumRow {
@@ -1737,6 +1774,7 @@ impl AlbumRow {
             play_count: None,
             starred: None,
             library_id: None,
+            release_types: Vec::new(),
         }
     }
 }
@@ -1779,6 +1817,29 @@ mod tests {
 
     fn test_db() -> LibraryDb {
         LibraryDb::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn release_types_survive_the_cache() {
+        let db = test_db();
+        let mut live = AlbumRow::new("navidrome:album:1", "navidrome", "Alive");
+        live.artist_id = Some("navidrome:artist:a".into());
+        live.release_types = vec!["Album".into(), "Live".into()];
+        let mut plain = AlbumRow::new("navidrome:album:2", "navidrome", "Studio");
+        plain.artist_id = Some("navidrome:artist:a".into());
+        db.upsert_catalog("navidrome", &[live, plain], &[], &[])
+            .unwrap();
+        let rows = db
+            .credited_albums("navidrome", "navidrome:artist:a")
+            .unwrap();
+        let types = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .map(|r| r.release_types.clone())
+                .unwrap()
+        };
+        assert_eq!(types("navidrome:album:1"), vec!["Album", "Live"]);
+        assert!(types("navidrome:album:2").is_empty());
     }
 
     /// A step that dies partway takes its own half-applied columns with it.
@@ -1863,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_8() {
+    fn schema_version_is_current() {
         let db = test_db();
         let conn = db.conn.lock().unwrap();
         let version: i32 = conn
@@ -1871,7 +1932,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]

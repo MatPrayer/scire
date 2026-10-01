@@ -147,7 +147,7 @@ const COMPACT_SECTIONS: [(&str, u16); 13] = [
     ("Browsing", 18),
     ("Streaming", 5),
     ("Library", 12),
-    ("Connections", 30),
+    ("Connections", 31),
     ("Account", 3),
     ("About", 4),
 ];
@@ -501,6 +501,7 @@ enum SettingsSwitch {
     FullscreenVolume,
     Scrobble,
     ListenBrainz,
+    Lidarr,
     ResumePlayback,
     DefaultShuffle,
     WaveformSeekbar,
@@ -813,6 +814,8 @@ enum SettingsAction {
     OutputDevice,
     DirInput,
     LbInput,
+    LidarrUrl,
+    LidarrKey,
 }
 
 /// A quick-nav jump in flight: the scroll offsets it runs between, the section
@@ -834,6 +837,8 @@ pub struct SettingsView {
     player: Entity<PlayerState>,
     dir_input: Entity<InputState>,
     lb_input: Entity<InputState>,
+    lidarr_url_input: Entity<InputState>,
+    lidarr_key_input: Entity<InputState>,
     library_db: Arc<LibraryDb>,
     /// The three maintenance jobs' statuses. Owned by the root view rather
     /// than by this one, which is rebuilt on every visit — see
@@ -946,12 +951,43 @@ impl SettingsView {
             }
         })
         .detach();
+        let (lidarr_url, lidarr_key) = {
+            let settings = &session.read(cx).settings;
+            (
+                settings.lidarr_url.clone(),
+                crate::config::load_lidarr_key(settings).unwrap_or_default(),
+            )
+        };
+        let lidarr_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("http://localhost:8686")
+                .default_value(lidarr_url)
+        });
+        let lidarr_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Lidarr API key")
+                .default_value(lidarr_key)
+                .masked(true)
+        });
+        for input in [&lidarr_url_input, &lidarr_key_input] {
+            cx.subscribe(input, |this: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.save_lidarr(cx);
+                }
+            })
+            .detach();
+        }
+        // Connection status line; the state notifies only on change.
+        cx.observe(&crate::state::lidarr::lidarr(cx), |_, _, cx| cx.notify())
+            .detach();
         let scroll = ScrollHandle::new();
         let mut view = Self {
             session,
             player,
             dir_input,
             lb_input,
+            lidarr_url_input,
+            lidarr_key_input,
             library_db,
             jobs,
             scroll: scroll.clone(),
@@ -1422,6 +1458,39 @@ impl SettingsView {
         self.save_lb_token(cx);
     }
 
+    fn set_lidarr(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.lidarr_enabled = enabled);
+        self.save_lidarr(cx);
+    }
+
+    /// Stores the URL and key (key in the keyring) and reconnects if either
+    /// moved; the state keeps its poll when nothing did.
+    fn save_lidarr(&mut self, cx: &mut Context<Self>) {
+        let url = self.lidarr_url_input.read(cx).value().trim().to_string();
+        let key = self.lidarr_key_input.read(cx).value().trim().to_string();
+        let fallback = if key.is_empty() {
+            crate::config::delete_lidarr_key();
+            None
+        } else if let Err(error) = crate::config::store_lidarr_key(&key) {
+            tracing::warn!("keyring unavailable ({error:#}); storing Lidarr API key in settings");
+            Some(key.clone())
+        } else {
+            None
+        };
+        let enabled = self.session.update(cx, |session, _| {
+            session.settings.lidarr_url = url.clone();
+            session.settings.lidarr_key_plaintext = fallback;
+            session.settings.lidarr_enabled
+        });
+        let client = enabled
+            .then(|| crate::services::lidarr::Lidarr::new(&url, &key))
+            .flatten();
+        crate::state::lidarr::lidarr(cx).update(cx, |state, cx| state.set_client(client, cx));
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn save_lb_token(&mut self, cx: &mut Context<Self>) {
         let token = self.lb_input.read(cx).value().trim().to_string();
         let fallback = if token.is_empty() {
@@ -1801,6 +1870,7 @@ impl SettingsView {
             SettingsSwitch::FullscreenVolume => s.fullscreen_volume,
             SettingsSwitch::Scrobble => s.scrobble_enabled,
             SettingsSwitch::ListenBrainz => s.listenbrainz_enabled,
+            SettingsSwitch::Lidarr => s.lidarr_enabled,
             SettingsSwitch::ResumePlayback => s.resume_playback,
             SettingsSwitch::DefaultShuffle => s.default_shuffle,
             SettingsSwitch::WaveformSeekbar => s.waveform_seekbar,
@@ -1906,6 +1976,7 @@ impl SettingsView {
             SettingsSwitch::FullscreenVolume => self.set_fullscreen_volume(value, cx),
             SettingsSwitch::Scrobble => self.set_scrobble(value, cx),
             SettingsSwitch::ListenBrainz => self.set_listenbrainz(value, cx),
+            SettingsSwitch::Lidarr => self.set_lidarr(value, cx),
             SettingsSwitch::ResumePlayback => self.set_resume_playback(value, cx),
             SettingsSwitch::DefaultShuffle => self.set_default_shuffle(value, cx),
             SettingsSwitch::WaveformSeekbar => self.set_waveform(value, cx),
@@ -2223,6 +2294,16 @@ impl SettingsView {
     pub fn is_typing(&self, window: &Window, cx: &App) -> bool {
         self.dir_input.read(cx).focus_handle(cx).is_focused(window)
             || self.lb_input.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .lidarr_url_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .lidarr_key_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
     }
 
     /// Cycle sections with `[`/`]`: jump the vi cursor to the next/prev
@@ -2385,17 +2466,31 @@ impl SettingsView {
                 self.lb_input.update(cx, |s, cx| s.focus(window, cx));
                 cx.notify();
             }
+            SettingsAction::LidarrUrl => {
+                self.lidarr_url_input
+                    .update(cx, |s, cx| s.focus(window, cx));
+                cx.notify();
+            }
+            SettingsAction::LidarrKey => {
+                self.lidarr_key_input
+                    .update(cx, |s, cx| s.focus(window, cx));
+                cx.notify();
+            }
         }
     }
 
     /// `i` focuses the selected text field, or the local-directory field when
     /// the cursor is elsewhere.
     pub fn vi_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(
-            self.vi_cursor.and_then(|i| self.vi_actions.get(i)),
-            Some(SettingsAction::LbInput)
-        ) {
+        let selected = self.vi_cursor.and_then(|i| self.vi_actions.get(i));
+        if matches!(selected, Some(SettingsAction::LbInput)) {
             self.lb_input.update(cx, |s, cx| s.focus(window, cx));
+        } else if matches!(selected, Some(SettingsAction::LidarrUrl)) {
+            self.lidarr_url_input
+                .update(cx, |s, cx| s.focus(window, cx));
+        } else if matches!(selected, Some(SettingsAction::LidarrKey)) {
+            self.lidarr_key_input
+                .update(cx, |s, cx| s.focus(window, cx));
         } else {
             self.dir_input.update(cx, |s, cx| s.focus(window, cx));
         }
@@ -4502,6 +4597,60 @@ impl Render for SettingsView {
         let bio_list = self.service_list(bio_services, cx);
         let artist_cache = self.cache_row(OnlineCache::ArtistInfo, artist_info_cached, cx);
 
+        let lidarr_enabled = self.session.read(cx).settings.lidarr_enabled;
+        let lidarr_connection = crate::state::lidarr::lidarr(cx).read(cx).connection.clone();
+        let lidarr_switch =
+            self.vi_toggle(SettingsSwitch::Lidarr, "lidarr", lidarr_enabled, false, cx);
+        let lidarr_fields = lidarr_enabled.then(|| {
+            let failed = match &lidarr_connection {
+                crate::state::lidarr::Connection::Failed(why) => Some(why.clone()),
+                _ => None,
+            };
+            v_flex()
+                .w_full()
+                .gap_2()
+                .child(self.vi_control(
+                    SettingsAction::LidarrUrl,
+                    div().w_full().child(Input::new(&self.lidarr_url_input)),
+                    cx,
+                ))
+                .child(self.vi_control(
+                    SettingsAction::LidarrKey,
+                    div().w_full().child(Input::new(&self.lidarr_key_input)),
+                    cx,
+                ))
+                .children(
+                    failed.map(|why| div().text_xs().text_color(cx.theme().danger).child(why)),
+                )
+                .into_any_element()
+        });
+        let lidarr_status = {
+            use crate::state::lidarr::Connection;
+            match &lidarr_connection {
+                _ if !lidarr_enabled => None,
+                Connection::Off => Some(("Needs URL and key", cx.theme().warning)),
+                Connection::Checking => Some(("Connecting…", cx.theme().warning)),
+                Connection::Online { .. } => Some(("Connected", cx.theme().success)),
+                Connection::Failed(_) => Some(("Unreachable", cx.theme().danger)),
+            }
+        };
+        let lidarr_list = self.service_list(
+            vec![Service {
+                mark: app_icon(icons::DOWNLOAD),
+                name: "Lidarr",
+                route: Route::Direct,
+                detail: "your Lidarr server · missing releases, searches, downloads",
+                status: lidarr_status,
+                switch: Some(lidarr_switch),
+                lit: matches!(
+                    lidarr_connection,
+                    crate::state::lidarr::Connection::Online { .. }
+                ),
+                extra: lidarr_fields,
+            }],
+            cx,
+        );
+
         // Each caption is drawn in place by the scrolling column and moved
         // behind its heading's info icon by the compact grid, so both read
         // the same text.
@@ -4520,6 +4669,12 @@ impl Render for SettingsView {
             "LRCLIB is sent the track's artist, title, album and length, \
              only while the lyrics panel is open. Prefer synced lyrics lets the \
              second source win when the first has only untimed words.",
+        ];
+        const LIDARR_NOTES: &[&str] = &[
+            "Shows the releases an artist page is missing, searches for them \
+             automatically or interactively, and adds a Lidarr page to the \
+             sidebar with the download queue. Scirè talks to Lidarr itself; \
+             the API key is under Settings → General in Lidarr's interface.",
         ];
         const SCROBBLE_NOTES: &[&str] = &[
             "Server tracks are scrobbled to Navidrome, which forwards them to the \
@@ -4550,7 +4705,11 @@ impl Render for SettingsView {
             .child(self.subheading_with_notes("Artist bios", ARTIST_NOTES, cx))
             .child(bio_list)
             .child(self.note(ARTIST_NOTES[0], cx))
-            .child(artist_cache);
+            .child(artist_cache)
+            .child(crate::ui::divider())
+            .child(self.subheading_with_notes("Downloads", LIDARR_NOTES, cx))
+            .child(lidarr_list)
+            .child(self.note(LIDARR_NOTES[0], cx));
 
         // Account (only when connected).
         let account_section = account.map(|(url, user)| {

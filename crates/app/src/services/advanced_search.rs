@@ -444,7 +444,7 @@ impl Filters {
             SearchKind::Albums | SearchKind::All => (
                 "albums",
                 "id, source, title, artist, artist_id, year, cover_art, song_count, duration, \
-                 created, play_count, starred_at, library_id",
+                 created, play_count, starred_at, library_id, release_types",
             ),
             SearchKind::Artists => ("artists", "id, source, name, cover_art, library_id"),
             SearchKind::Tracks => (
@@ -648,7 +648,7 @@ mod tests {
             "CREATE TABLE albums (id TEXT PRIMARY KEY, source TEXT, title TEXT, artist TEXT,
                 artist_id TEXT, year INTEGER, cover_art TEXT, song_count INTEGER,
                 duration REAL, created TEXT, play_count INTEGER, starred_at TEXT,
-                library_id TEXT);
+                library_id TEXT, release_types TEXT);
              CREATE TABLE artists (id TEXT PRIMARY KEY, source TEXT, name TEXT, cover_art TEXT,
                 library_id TEXT);
              CREATE TABLE tracks (id TEXT PRIMARY KEY, source TEXT, title TEXT, artist TEXT,

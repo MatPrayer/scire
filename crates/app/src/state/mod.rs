@@ -1,3 +1,4 @@
+pub mod lidarr;
 pub mod maintenance;
 pub mod player;
 pub mod playlists;

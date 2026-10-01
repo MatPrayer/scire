@@ -30,14 +30,17 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
 };
 
+use crate::assets::{app_icon, icons};
 use crate::services::advanced_search::{
     AdvancedResults, Facets, Filters, SearchKind, SortBy, SourceFilter,
 };
 use crate::services::library_db::{LibraryDb, SOURCE_LOCAL};
 use crate::services::local_library::local_art_path;
 use crate::services::{artwork, runtime};
+use crate::state::lidarr::lidarr as lidarr_state;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
+use crate::ui::lidarr_add::{self, LidarrHit};
 use crate::ui::search_bar::sort_key;
 use crate::ui::{format_count, format_duration, format_playtime, with_focus_cursor};
 
@@ -55,6 +58,10 @@ const DEBOUNCE: Duration = Duration::from_millis(120);
 /// Column widths, fixed so they line up down the page.
 const SECONDARY_W: f32 = 200.;
 const TRAILING_W: f32 = 64.;
+/// Lidarr hits listed per kind (artists, albums).
+const MAX_LIDARR: usize = 25;
+/// Lidarr row thumbnail edge.
+const LIDARR_THUMB: f32 = 40.;
 
 /// Length bands offered instead of a free-text duration, which is two more text
 /// fields for a filter nobody expresses in seconds.
@@ -83,6 +90,7 @@ pub enum AdvancedSearchEvent {
     OpenAlbum(String),
     OpenLocalAlbum(String),
     OpenArtist(String),
+    OpenLidarr(LidarrHit),
 }
 
 impl EventEmitter<AdvancedSearchEvent> for AdvancedSearchView {}
@@ -321,6 +329,17 @@ pub struct AdvancedSearchView {
     art_range: Option<(usize, usize)>,
     scroll: UniformListScrollHandle,
     vi_cursor: Option<usize>,
+    /// Searching Lidarr's metadata instead of the library. Lookups go out to
+    /// MusicBrainz, so they run on Enter or the button, not per keystroke.
+    lidarr_mode: bool,
+    lidarr_hits: Vec<LidarrHit>,
+    lidarr_searching: bool,
+    lidarr_error: Option<String>,
+    /// The query the hits answer.
+    lidarr_asked: Option<String>,
+    lidarr_art: HashMap<String, PathBuf>,
+    lidarr_generation: u64,
+    lidarr_scroll: gpui::ScrollHandle,
 }
 
 impl AdvancedSearchView {
@@ -342,10 +361,10 @@ impl AdvancedSearchView {
         cx.subscribe_in(
             &input,
             window,
-            |this, _, event: &InputEvent, _window, cx| {
-                if let InputEvent::Change = event {
-                    this.on_query_changed(cx);
-                }
+            |this, _, event: &InputEvent, _window, cx| match event {
+                InputEvent::Change => this.on_query_changed(cx),
+                InputEvent::PressEnter { .. } if this.lidarr_mode => this.run_lidarr(cx),
+                _ => {}
             },
         )
         .detach();
@@ -377,6 +396,14 @@ impl AdvancedSearchView {
             art_range: None,
             scroll: UniformListScrollHandle::new(),
             vi_cursor: None,
+            lidarr_mode: false,
+            lidarr_hits: Vec::new(),
+            lidarr_searching: false,
+            lidarr_error: None,
+            lidarr_asked: None,
+            lidarr_art: HashMap::new(),
+            lidarr_generation: 0,
+            lidarr_scroll: gpui::ScrollHandle::new(),
         };
         this.load_facets(cx);
         this.run_search(cx);
@@ -411,7 +438,254 @@ impl AdvancedSearchView {
 
     fn on_query_changed(&mut self, cx: &mut Context<Self>) {
         self.query = self.input.read(cx).value().to_string();
+        if self.lidarr_mode {
+            // The button's label carries the query.
+            cx.notify();
+            return;
+        }
         self.run_search(cx);
+    }
+
+    fn lidarr_enabled(cx: &gpui::App) -> bool {
+        lidarr_state(cx).read(cx).enabled()
+    }
+
+    fn set_lidarr_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.lidarr_mode == on {
+            return;
+        }
+        self.lidarr_mode = on;
+        self.vi_cursor = None;
+        if on {
+            // Coming in with a query already typed: ask straight away, which
+            // is what pressing the mode button means.
+            if self.lidarr_asked.as_deref() != Some(self.query.trim()) {
+                self.run_lidarr(cx);
+            }
+        } else {
+            self.run_search(cx);
+        }
+        cx.notify();
+    }
+
+    /// Ask Lidarr's metadata search for the query.
+    fn run_lidarr(&mut self, cx: &mut Context<Self>) {
+        let query = self.query.trim().to_string();
+        let Some(client) = lidarr_state(cx).read(cx).client.clone() else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+        self.lidarr_generation += 1;
+        let generation = self.lidarr_generation;
+        self.lidarr_searching = true;
+        self.lidarr_error = None;
+        self.lidarr_asked = Some(query.clone());
+        self.vi_cursor = None;
+        cx.notify();
+        let lookup = client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                Ok::<_, anyhow::Error>(lidarr_add::lookup(lookup, query, MAX_LIDARR).await)
+            })
+            .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.lidarr_generation != generation {
+                    return;
+                }
+                view.lidarr_searching = false;
+                let (hits, error) = result.unwrap_or_else(|e| {
+                    (
+                        Vec::new(),
+                        Some(format!("Lidarr: {}", crate::errors::error_text(&e))),
+                    )
+                });
+                lidarr_add::want_hit_art(
+                    &mut view.lidarr_art,
+                    &client,
+                    &hits,
+                    (LIDARR_THUMB * 2.) as u32,
+                    |view: &mut Self| &mut view.lidarr_art,
+                    cx,
+                );
+                view.lidarr_hits = hits;
+                view.lidarr_error = error;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn lidarr_summary(&self) -> String {
+        if self.lidarr_asked.is_none() || self.lidarr_searching {
+            return String::new();
+        }
+        let artists = self
+            .lidarr_hits
+            .iter()
+            .filter(|h| matches!(h, LidarrHit::Artist(_)))
+            .count();
+        let albums = self.lidarr_hits.len() - artists;
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        format!(
+            "{} · {} from Lidarr",
+            plural(artists, "artist", "artists"),
+            plural(albums, "album", "albums")
+        )
+    }
+
+    fn render_lidarr_row(
+        &self,
+        ix: usize,
+        hit: &LidarrHit,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let glow = self.session.read(cx).settings.selection_glow_vi;
+        let focused = self.vi_cursor == Some(ix);
+        let path = self.lidarr_art.get(&hit.art_key()).cloned();
+        let round = matches!(hit, LidarrHit::Artist(_));
+        let fallback = if round {
+            IconName::CircleUser
+        } else {
+            IconName::LayoutDashboard
+        };
+        let tracked = hit.in_lidarr();
+        let open = hit.clone();
+        let thumb = div()
+            .flex_none()
+            .size(px(LIDARR_THUMB))
+            .overflow_hidden()
+            .bg(cx.theme().muted)
+            .map(|d| {
+                if round {
+                    d.rounded_full()
+                } else {
+                    d.rounded_md()
+                }
+            })
+            .map(|d| match path {
+                Some(path) => d.child(img(path).size(px(LIDARR_THUMB))),
+                None => d
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(muted)
+                    .child(Icon::new(fallback).small()),
+            });
+        let row = h_flex()
+            .id(("adv-lidarr", ix))
+            .w_full()
+            .px_2()
+            .py_1p5()
+            .gap_3()
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().muted))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(AdvancedSearchEvent::OpenLidarr(open.clone()))
+            }))
+            .child(thumb)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_sm().truncate().child(hit.title()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(hit.subtitle()),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(if tracked { cx.theme().success } else { muted })
+                    .when(!tracked, |this| {
+                        this.child(Icon::new(IconName::Plus).size_3())
+                    })
+                    .child(if tracked { "In Lidarr" } else { "Add" }),
+            );
+        with_focus_cursor(
+            format!("adv-lidarr-focus-{ix}"),
+            row,
+            focused,
+            glow,
+            None,
+            cx,
+        )
+    }
+
+    fn render_lidarr(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let note = |text: String| {
+            div()
+                .px_4()
+                .pt_2()
+                .text_sm()
+                .text_color(muted)
+                .child(text)
+                .into_any_element()
+        };
+        if self.lidarr_searching {
+            return note("Searching Lidarr…".into());
+        }
+        let mut column = v_flex()
+            .id("adv-lidarr-scroll")
+            .flex_1()
+            .min_h_0()
+            .px_4()
+            .gap_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.lidarr_scroll);
+        if let Some(why) = &self.lidarr_error {
+            column = column.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(why.clone()),
+            );
+        }
+        if self.lidarr_asked.is_none() {
+            return note(
+                "Type an artist or album and press Enter to search Lidarr's metadata.".into(),
+            );
+        }
+        if self.lidarr_hits.is_empty() && self.lidarr_error.is_none() {
+            return note("Lidarr found nothing.".into());
+        }
+        let split = self
+            .lidarr_hits
+            .iter()
+            .position(|h| matches!(h, LidarrHit::Album(_)))
+            .unwrap_or(self.lidarr_hits.len());
+        let title = |label: &'static str| {
+            div()
+                .pt_2()
+                .pb_1()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(muted)
+                .child(label)
+        };
+        for (ix, hit) in self.lidarr_hits.iter().enumerate() {
+            if ix == 0 && split > 0 {
+                column = column.child(title("Artists"));
+            }
+            if ix == split {
+                column = column.child(title("Albums"));
+            }
+            column = column.child(self.render_lidarr_row(ix, hit, cx));
+        }
+        column.into_any_element()
     }
 
     /// Re-run after a filter change. Immediate: a click is not a keystroke and
@@ -641,6 +915,14 @@ impl AdvancedSearchView {
     // -----------------------------------------------------------------------
 
     fn set_kind(&mut self, kind: SearchKind, cx: &mut Context<Self>) {
+        if self.lidarr_mode {
+            self.lidarr_mode = false;
+            self.vi_cursor = None;
+            if self.filters.kind == kind {
+                self.run_search(cx);
+                return;
+            }
+        }
         if self.filters.kind == kind {
             return;
         }
@@ -698,7 +980,7 @@ impl AdvancedSearchView {
             })
     }
 
-    fn filter_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn filter_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let f = self.filters.clone();
         let kind = f.kind;
 
@@ -707,7 +989,7 @@ impl AdvancedSearchView {
         let view = cx.entity();
         let kinds = h_flex().gap_1().children(SearchKind::ALL.map(|k| {
             let view = view.clone();
-            let active = k == kind;
+            let active = k == kind && !self.lidarr_mode;
             let button = Button::new(ElementId::from(SharedString::from(format!(
                 "adv-kind-{}",
                 k.label()
@@ -725,6 +1007,53 @@ impl AdvancedSearchView {
                 button.ghost()
             }
         }));
+        let lidarr_on = Self::lidarr_enabled(cx);
+        let kinds = kinds.when(lidarr_on, |row| {
+            let view = view.clone();
+            let button = Button::new("adv-kind-lidarr")
+                .icon(app_icon(icons::DOWNLOAD))
+                .label("Lidarr")
+                .tooltip("Find music to add with Lidarr")
+                .small()
+                .h(px(32.))
+                .text_size(px(13.))
+                .on_click(move |_, _, cx: &mut gpui::App| {
+                    view.update(cx, |this, cx| this.set_lidarr_mode(true, cx));
+                });
+            row.child(div().w(px(8.))).child(if self.lidarr_mode {
+                button.primary()
+            } else {
+                button.ghost()
+            })
+        });
+        if self.lidarr_mode {
+            let query = self.query.trim().to_string();
+            let label = if self.lidarr_searching {
+                "Searching Lidarr…".to_string()
+            } else if query.is_empty() {
+                "Search Lidarr".to_string()
+            } else {
+                format!("Search Lidarr for “{query}”")
+            };
+            return v_flex()
+                .w_full()
+                .gap_2()
+                .child(kinds)
+                .child(
+                    h_flex().child(
+                        Button::new("adv-lidarr-search")
+                            .outline()
+                            .small()
+                            .h(px(32.))
+                            .icon(Icon::new(IconName::Search))
+                            .label(label)
+                            .loading(self.lidarr_searching)
+                            .disabled(query.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| this.run_lidarr(cx))),
+                    ),
+                )
+                .into_any_element();
+        }
 
         let genres: Vec<(SharedString, Option<String>)> =
             std::iter::once((SharedString::from("Any genre"), None))
@@ -810,219 +1139,224 @@ impl AdvancedSearchView {
         let clear_view = cx.entity();
         let active = f.active_count();
 
-        v_flex().w_full().gap_2().child(kinds).child(
-            h_flex()
-                .w_full()
-                .flex_wrap()
-                .gap_2()
-                .items_center()
-                .child(self.choice(
-                    "adv-genre",
-                    genre_label,
-                    150.,
-                    kind.supports_genre() && !self.facets.genres.is_empty(),
-                    genres,
-                    f.genre.clone(),
-                    |this, v, cx| {
-                        this.filters.genre = v;
-                        this.refilter(cx);
-                    },
-                    cx,
-                ))
-                .child(self.choice(
-                    "adv-year-from",
-                    year_from_label,
-                    92.,
-                    kind.supports_year(),
-                    years("From"),
-                    f.year_min,
-                    |this, v, cx| {
-                        this.filters.year_min = v;
-                        // A range that crosses itself matches nothing, and
-                        // silently matching nothing reads as a bug — so the
-                        // other end is carried along.
-                        if let (Some(a), Some(b)) = (v, this.filters.year_max)
-                            && a > b
-                        {
-                            this.filters.year_max = Some(a);
-                        }
-                        this.refilter(cx);
-                    },
-                    cx,
-                ))
-                .child(self.choice(
-                    "adv-year-to",
-                    year_to_label,
-                    92.,
-                    kind.supports_year(),
-                    years("To"),
-                    f.year_max,
-                    |this, v, cx| {
-                        this.filters.year_max = v;
-                        if let (Some(a), Some(b)) = (this.filters.year_min, v)
-                            && a > b
-                        {
-                            this.filters.year_min = Some(b);
-                        }
-                        this.refilter(cx);
-                    },
-                    cx,
-                ))
-                .child(
-                    self.choice(
-                        "adv-length",
-                        duration_label,
-                        128.,
-                        kind.supports_duration(),
-                        DURATION_BANDS
-                            .iter()
-                            .map(|(l, min, max)| (SharedString::from(*l), (*min, *max)))
-                            .collect(),
-                        (f.duration_min, f.duration_max),
-                        |this, (min, max), cx| {
-                            this.filters.duration_min = min;
-                            this.filters.duration_max = max;
-                            this.refilter(cx);
-                        },
-                        cx,
-                    ),
-                )
-                .child(
-                    self.choice(
-                        "adv-source",
-                        f.source.label(),
-                        128.,
-                        true,
-                        SourceFilter::ALL
-                            .into_iter()
-                            .map(|s| (SharedString::from(s.label()), s))
-                            .collect(),
-                        f.source,
+        v_flex()
+            .w_full()
+            .gap_2()
+            .child(kinds)
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(self.choice(
+                        "adv-genre",
+                        genre_label,
+                        150.,
+                        kind.supports_genre() && !self.facets.genres.is_empty(),
+                        genres,
+                        f.genre.clone(),
                         |this, v, cx| {
-                            this.filters.source = v;
+                            this.filters.genre = v;
                             this.refilter(cx);
                         },
                         cx,
-                    ),
-                )
-                .child(self.choice(
-                    "adv-format",
-                    format_label,
-                    128.,
-                    kind.supports_technical() && !self.facets.formats.is_empty(),
-                    formats,
-                    f.format.clone(),
-                    |this, v, cx| {
-                        this.filters.format = v;
-                        this.refilter(cx);
-                    },
-                    cx,
-                ))
-                .child(
-                    self.choice(
-                        "adv-bitrate",
-                        bitrate_label,
-                        128.,
-                        kind.supports_technical(),
-                        BITRATES
-                            .iter()
-                            .map(|(l, v)| (SharedString::from(*l), *v))
-                            .collect(),
-                        f.bitrate_min,
+                    ))
+                    .child(self.choice(
+                        "adv-year-from",
+                        year_from_label,
+                        92.,
+                        kind.supports_year(),
+                        years("From"),
+                        f.year_min,
                         |this, v, cx| {
-                            this.filters.bitrate_min = v;
+                            this.filters.year_min = v;
+                            // A range that crosses itself matches nothing, and
+                            // silently matching nothing reads as a bug — so the
+                            // other end is carried along.
+                            if let (Some(a), Some(b)) = (v, this.filters.year_max)
+                                && a > b
+                            {
+                                this.filters.year_max = Some(a);
+                            }
                             this.refilter(cx);
                         },
                         cx,
-                    ),
-                )
-                // Starred is a switch rather than a dropdown: it has two
-                // states and one of them is "don't care".
-                .child(
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .h(px(32.))
-                        .px_1()
-                        .child(
-                            Switch::new("adv-starred")
-                                .checked(f.starred_only)
-                                .disabled(!kind.supports_starred())
-                                .on_click(move |checked, _, cx: &mut gpui::App| {
-                                    let checked = *checked;
-                                    star_view.update(cx, |this, cx| {
-                                        this.filters.starred_only = checked;
-                                        this.refilter(cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(if kind.supports_starred() {
-                                    cx.theme().muted_foreground
-                                } else {
-                                    cx.theme().muted_foreground.opacity(0.5)
-                                })
-                                .child("Starred"),
-                        ),
-                )
-                .child(div().flex_1())
-                .child(self.choice(
-                    "adv-sort",
-                    sort.label(),
-                    150.,
-                    true,
-                    sorts,
-                    sort,
-                    |this, v, cx| {
-                        this.filters.sort = v;
-                        this.refilter(cx);
-                    },
-                    cx,
-                ))
-                // Direction is a separate toggle rather than doubling every
-                // sort entry into an ascending and a descending copy.
-                .child(
-                    Button::new("adv-sort-dir")
-                        .icon(if f.descending {
-                            IconName::SortDescending
-                        } else {
-                            IconName::SortAscending
-                        })
-                        .outline()
-                        .small()
-                        .h(px(32.))
-                        .disabled(f.sort == SortBy::Relevance)
-                        .tooltip(if f.descending {
-                            "Descending"
-                        } else {
-                            "Ascending"
-                        })
-                        .on_click(move |_, _, cx: &mut gpui::App| {
-                            dir_view.update(cx, |this, cx| {
-                                this.filters.descending = !this.filters.descending;
+                    ))
+                    .child(self.choice(
+                        "adv-year-to",
+                        year_to_label,
+                        92.,
+                        kind.supports_year(),
+                        years("To"),
+                        f.year_max,
+                        |this, v, cx| {
+                            this.filters.year_max = v;
+                            if let (Some(a), Some(b)) = (this.filters.year_min, v)
+                                && a > b
+                            {
+                                this.filters.year_min = Some(b);
+                            }
+                            this.refilter(cx);
+                        },
+                        cx,
+                    ))
+                    .child(
+                        self.choice(
+                            "adv-length",
+                            duration_label,
+                            128.,
+                            kind.supports_duration(),
+                            DURATION_BANDS
+                                .iter()
+                                .map(|(l, min, max)| (SharedString::from(*l), (*min, *max)))
+                                .collect(),
+                            (f.duration_min, f.duration_max),
+                            |this, (min, max), cx| {
+                                this.filters.duration_min = min;
+                                this.filters.duration_max = max;
                                 this.refilter(cx);
-                            });
-                        }),
-                )
-                .when(active > 0, |this| {
-                    this.child(
-                        Button::new("adv-clear")
-                            .label(format!("Clear {active}"))
-                            .ghost()
+                            },
+                            cx,
+                        ),
+                    )
+                    .child(
+                        self.choice(
+                            "adv-source",
+                            f.source.label(),
+                            128.,
+                            true,
+                            SourceFilter::ALL
+                                .into_iter()
+                                .map(|s| (SharedString::from(s.label()), s))
+                                .collect(),
+                            f.source,
+                            |this, v, cx| {
+                                this.filters.source = v;
+                                this.refilter(cx);
+                            },
+                            cx,
+                        ),
+                    )
+                    .child(self.choice(
+                        "adv-format",
+                        format_label,
+                        128.,
+                        kind.supports_technical() && !self.facets.formats.is_empty(),
+                        formats,
+                        f.format.clone(),
+                        |this, v, cx| {
+                            this.filters.format = v;
+                            this.refilter(cx);
+                        },
+                        cx,
+                    ))
+                    .child(
+                        self.choice(
+                            "adv-bitrate",
+                            bitrate_label,
+                            128.,
+                            kind.supports_technical(),
+                            BITRATES
+                                .iter()
+                                .map(|(l, v)| (SharedString::from(*l), *v))
+                                .collect(),
+                            f.bitrate_min,
+                            |this, v, cx| {
+                                this.filters.bitrate_min = v;
+                                this.refilter(cx);
+                            },
+                            cx,
+                        ),
+                    )
+                    // Starred is a switch rather than a dropdown: it has two
+                    // states and one of them is "don't care".
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .h(px(32.))
+                            .px_1()
+                            .child(
+                                Switch::new("adv-starred")
+                                    .checked(f.starred_only)
+                                    .disabled(!kind.supports_starred())
+                                    .on_click(move |checked, _, cx: &mut gpui::App| {
+                                        let checked = *checked;
+                                        star_view.update(cx, |this, cx| {
+                                            this.filters.starred_only = checked;
+                                            this.refilter(cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(if kind.supports_starred() {
+                                        cx.theme().muted_foreground
+                                    } else {
+                                        cx.theme().muted_foreground.opacity(0.5)
+                                    })
+                                    .child("Starred"),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(self.choice(
+                        "adv-sort",
+                        sort.label(),
+                        150.,
+                        true,
+                        sorts,
+                        sort,
+                        |this, v, cx| {
+                            this.filters.sort = v;
+                            this.refilter(cx);
+                        },
+                        cx,
+                    ))
+                    // Direction is a separate toggle rather than doubling every
+                    // sort entry into an ascending and a descending copy.
+                    .child(
+                        Button::new("adv-sort-dir")
+                            .icon(if f.descending {
+                                IconName::SortDescending
+                            } else {
+                                IconName::SortAscending
+                            })
+                            .outline()
                             .small()
                             .h(px(32.))
-                            .text_size(px(13.))
+                            .disabled(f.sort == SortBy::Relevance)
+                            .tooltip(if f.descending {
+                                "Descending"
+                            } else {
+                                "Ascending"
+                            })
                             .on_click(move |_, _, cx: &mut gpui::App| {
-                                clear_view.update(cx, |this, cx| {
-                                    this.filters.clear();
+                                dir_view.update(cx, |this, cx| {
+                                    this.filters.descending = !this.filters.descending;
                                     this.refilter(cx);
                                 });
                             }),
                     )
-                }),
-        )
+                    .when(active > 0, |this| {
+                        this.child(
+                            Button::new("adv-clear")
+                                .label(format!("Clear {active}"))
+                                .ghost()
+                                .small()
+                                .h(px(32.))
+                                .text_size(px(13.))
+                                .on_click(move |_, _, cx: &mut gpui::App| {
+                                    clear_view.update(cx, |this, cx| {
+                                        this.filters.clear();
+                                        this.refilter(cx);
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
 
     // -----------------------------------------------------------------------
@@ -1203,17 +1537,35 @@ impl AdvancedSearchView {
     // -----------------------------------------------------------------------
 
     pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+        let count = if self.lidarr_mode {
+            self.lidarr_hits.len()
+        } else {
+            self.rows.len()
+        };
+        if count == 0 {
             return;
         }
         let cur = self.vi_cursor.unwrap_or(0);
         let next = if delta > 0 {
-            (cur + delta as usize).min(self.rows.len() - 1)
+            (cur + delta as usize).min(count - 1)
         } else {
             cur.saturating_sub(delta.unsigned_abs())
         };
         self.vi_cursor = Some(next);
-        self.scroll.scroll_to_item(next, gpui::ScrollStrategy::Top);
+        if self.lidarr_mode {
+            // Children are interleaved with section titles: one before the
+            // artists (when any), one before the albums.
+            let artists = self
+                .lidarr_hits
+                .iter()
+                .filter(|h| matches!(h, LidarrHit::Artist(_)))
+                .count();
+            let error = usize::from(self.lidarr_error.is_some());
+            let titles = usize::from(artists > 0) + usize::from(next >= artists);
+            self.lidarr_scroll.scroll_to_item(next + titles + error);
+        } else {
+            self.scroll.scroll_to_item(next, gpui::ScrollStrategy::Top);
+        }
         cx.notify();
     }
 
@@ -1224,13 +1576,23 @@ impl AdvancedSearchView {
     }
 
     pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
-        if let Some(ix) = self.vi_cursor {
+        let Some(ix) = self.vi_cursor else {
+            return;
+        };
+        if self.lidarr_mode {
+            if let Some(hit) = self.lidarr_hits.get(ix) {
+                cx.emit(AdvancedSearchEvent::OpenLidarr(hit.clone()));
+            }
+        } else {
             self.activate(ix, cx);
         }
     }
 
     /// Space: play the focused row where that means anything.
     pub fn vi_play(&mut self, cx: &mut Context<Self>) {
+        if self.lidarr_mode {
+            return;
+        }
         if let Some(ix) = self.vi_cursor {
             self.play_from(ix, cx);
         }
@@ -1242,14 +1604,22 @@ impl AdvancedSearchView {
     }
 
     /// `[` / `]`: cycle the kind, the page's own tab strip.
+    /// Lidarr, when on, is the last stop after the kinds.
     pub fn vi_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
         let all = SearchKind::ALL;
-        let cur = all
-            .iter()
-            .position(|k| *k == self.filters.kind)
-            .unwrap_or(0);
-        let next = (cur as isize + delta).rem_euclid(all.len() as isize) as usize;
-        self.set_kind(all[next], cx);
+        let stops = all.len() + usize::from(Self::lidarr_enabled(cx));
+        let cur = if self.lidarr_mode {
+            all.len()
+        } else {
+            all.iter()
+                .position(|k| *k == self.filters.kind)
+                .unwrap_or(0)
+        };
+        let next = (cur as isize + delta).rem_euclid(stops as isize) as usize;
+        match all.get(next) {
+            Some(kind) => self.set_kind(*kind, cx),
+            None => self.set_lidarr_mode(true, cx),
+        }
     }
 }
 
@@ -1257,8 +1627,19 @@ impl Render for AdvancedSearchView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_art_for_viewport(cx);
 
+        // Lidarr turned off under the page: back to the library.
+        if self.lidarr_mode && !Self::lidarr_enabled(cx) {
+            self.lidarr_mode = false;
+            self.run_search(cx);
+        }
         let entity = cx.entity();
         let empty = self.rows.is_empty();
+        let lidarr_mode = self.lidarr_mode;
+        let summary: SharedString = if lidarr_mode {
+            self.lidarr_summary().into()
+        } else {
+            self.summary.clone()
+        };
         let list = uniform_list("adv-list", self.rows.len(), move |range, _window, cx| {
             let view = entity.read(cx);
             range
@@ -1281,12 +1662,12 @@ impl Render for AdvancedSearchView {
                     .gap_4()
                     .child(div().text_lg().child("Search"))
                     .child(div().flex_1())
-                    .when(!self.summary.is_empty(), |this| {
+                    .when(!summary.is_empty(), |this| {
                         this.child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(self.summary.clone()),
+                                .child(summary),
                         )
                     }),
             )
@@ -1305,7 +1686,8 @@ impl Render for AdvancedSearchView {
                     cx,
                 )))
             })
-            .when(empty, |this| {
+            .when(lidarr_mode, |this| this.child(self.render_lidarr(cx)))
+            .when(!lidarr_mode && empty, |this| {
                 this.child(
                     div()
                         .px_4()
@@ -1315,7 +1697,7 @@ impl Render for AdvancedSearchView {
                         .child(self.empty_text()),
                 )
             })
-            .when(!empty, |this| this.child(list))
+            .when(!lidarr_mode && !empty, |this| this.child(list))
     }
 }
 

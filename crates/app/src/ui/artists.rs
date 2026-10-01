@@ -752,8 +752,8 @@ pub struct ArtistDetailView {
     live_width: crate::ui::LiveWidth,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
-    /// Album id per flattened discography card (album cards then singles/EPs),
-    /// rebuilt each render to map the vi cursor index onto a card.
+    /// Album id per flattened discography card (sections in `RELEASE_SECTIONS`
+    /// order, then Appears on), rebuilt each render to map the vi cursor index onto a card.
     discography_ids: Vec<String>,
     /// Whether the bio "Read more" button is present and can take the cursor.
     bio_toggle_focusable: bool,
@@ -767,10 +767,14 @@ pub struct ArtistDetailView {
     /// Resolution the discography covers are currently fetched at, so a
     /// cover-size change is noticed in `render` and refetched once.
     album_art_px: u32,
+    /// "Missing releases" from Lidarr, under the discography.
+    lidarr_missing: Entity<crate::ui::lidarr::MissingReleases>,
 }
 
 pub enum ArtistDetailEvent {
     OpenAlbum(String),
+    /// A missing release, by Lidarr album id.
+    OpenLidarrAlbum(i64),
 }
 
 impl EventEmitter<ArtistDetailEvent> for ArtistDetailView {}
@@ -785,6 +789,15 @@ impl ArtistDetailView {
     ) -> Self {
         let scroll = ScrollHandle::new();
         let album_art_px = album_cover(&session, cx).wrap_art_px();
+        let lidarr_missing = cx.new(crate::ui::lidarr::MissingReleases::new);
+        cx.subscribe(&lidarr_missing, |_, _, event, cx| {
+            let crate::ui::lidarr::MissingEvent::OpenAlbum(id) = event;
+            cx.emit(ArtistDetailEvent::OpenLidarrAlbum(*id));
+        })
+        .detach();
+        // Its cards are drawn among this page's own: a lookup or cover landing
+        // there repaints here.
+        cx.observe(&lidarr_missing, |_, _, cx| cx.notify()).detach();
         let mut this = Self {
             session,
             player,
@@ -825,6 +838,7 @@ impl ArtistDetailView {
             vi_scroll_synced: None,
             glow_accents: RefCell::new(HashMap::new()),
             album_art_px,
+            lidarr_missing,
         };
         this.load_appears_on(cx);
         this.seed_from_cache(cx);
@@ -885,6 +899,14 @@ impl ArtistDetailView {
         cx.notify();
     }
 
+    /// Whether this page is the artist Lidarr calls `name` (folded compare).
+    pub fn shows_artist(&self, name: &str) -> bool {
+        use crate::services::lidarr::fold;
+        self.artist
+            .as_ref()
+            .is_some_and(|a| fold(&a.artist.name) == fold(name))
+    }
+
     /// The artist's id as the sync namespaces it in the cache.
     fn cache_artist_id(&self) -> String {
         if self.artist_id.starts_with("navidrome:artist:") {
@@ -923,8 +945,10 @@ impl ArtistDetailView {
 
     /// Paint the header and discography from the last sync, like "Appears
     /// on", so a slow `getArtist` doesn't leave the page empty. The live answer
-    /// replaces it wholesale; release types and genres arrive only with it
-    /// (the cache stores neither), so a single can move section then.
+    /// replaces it wholesale. The cache keeps each album's release types (so a
+    /// live record is filed under Live from the first frame) but not genres,
+    /// which arrive only with it; a row synced before the types were stored
+    /// can still move section then.
     fn seed_from_cache(&mut self, cx: &mut Context<Self>) {
         let id = self.cache_artist_id();
         let Ok(Some(row)) = self.library_db.artist_by_id("navidrome", &id) else {
@@ -1263,8 +1287,10 @@ impl ArtistDetailView {
         };
         // Full albums first: a single's title is the song's, and a search by
         // it finds every cover version.
-        let (albums, singles): (Vec<&Album>, Vec<&Album>) =
-            artist.album.iter().partition(|a| !is_single_or_ep(a));
+        let (albums, singles): (Vec<&Album>, Vec<&Album>) = artist
+            .album
+            .iter()
+            .partition(|a| release_section(a) != ReleaseSection::SinglesEps);
         let query = artist_info::Query {
             name: artist.artist.name.clone(),
             mbid: self
@@ -1511,6 +1537,56 @@ impl ArtistDetailView {
 
     /// One discography card, focus-ringed and scroll-anchored when the vi
     /// cursor is on it.
+    /// The Lidarr switch and, when on, the missing-releases section — only
+    /// while the integration is on and the artist is known.
+    fn lidarr_block(
+        &mut self,
+        content_w: f32,
+        tile: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !crate::state::lidarr::lidarr(cx).read(cx).enabled() {
+            return None;
+        }
+        let artist = self.artist.as_ref()?;
+        let name = artist.artist.name.clone();
+        let owned: Vec<(Option<String>, String)> = artist
+            .album
+            .iter()
+            .chain(self.appears_on.iter().map(|(album, _)| album))
+            .map(|album| (None, album.name.clone()))
+            .collect();
+        let mbid = self.info.as_ref().and_then(|i| i.music_brainz_id.clone());
+        let show = self.session.read(cx).settings.lidarr_show_missing;
+        let width = hero_card_width(content_w);
+        if show {
+            self.lidarr_missing.update(cx, |missing, cx| {
+                missing.set_context(&name, mbid.as_deref(), owned, tile, width, cx)
+            });
+        }
+        let toggle = crate::ui::lidarr::missing_toggle(
+            show,
+            cx.listener(|this, checked: &bool, _, cx| {
+                let checked = *checked;
+                this.session.update(cx, |session, _| {
+                    session.settings.lidarr_show_missing = checked;
+                    session.persist_settings();
+                });
+                cx.notify();
+            }),
+            cx,
+        );
+        Some(
+            v_flex()
+                .when_some(width, |this, w| this.w(px(w)))
+                .flex_none()
+                .gap_3()
+                .child(toggle)
+                .when(show, |this| this.child(self.lidarr_missing.clone()))
+                .into_any_element(),
+        )
+    }
+
     fn render_album_card(
         &self,
         album: &Album,
@@ -1688,11 +1764,32 @@ impl ArtistDetailView {
 /// behaviour, since a yearless key sorts as `(year, 0, 0)`.
 fn sort_discography(albums: &mut [Album]) {
     albums.sort_by(|a, b| {
-        let key = |album: &Album| album.release_key().unwrap_or((i32::MIN, 0, 0));
-        key(b)
-            .cmp(&key(a))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        discography_order(
+            (a.release_key(), &a.name.to_lowercase()),
+            (b.release_key(), &b.name.to_lowercase()),
+        )
     });
+}
+
+/// A release's place in a section: its `release_key` and lowercased title.
+type DiscographyKey = (Option<(i32, u32, u32)>, String);
+
+/// Newest first, undated last, then by title. Shared by the library's
+/// albums and Lidarr's missing ones so the two interleave.
+fn discography_order(
+    a: (Option<(i32, u32, u32)>, &str),
+    b: (Option<(i32, u32, u32)>, &str),
+) -> std::cmp::Ordering {
+    let key = |k: Option<(i32, u32, u32)>| k.unwrap_or((i32::MIN, 0, 0));
+    key(b.0).cmp(&key(a.0)).then_with(|| a.1.cmp(b.1))
+}
+
+/// Where a release with `key` goes among `keys` (already in
+/// `discography_order`): after every one that sorts before or level with it.
+fn discography_slot(keys: &[DiscographyKey], key: &DiscographyKey) -> usize {
+    keys.partition_point(|k| {
+        discography_order((k.0, &k.1), (key.0, &key.1)) != std::cmp::Ordering::Greater
+    })
 }
 
 impl Render for ArtistDetailView {
@@ -1870,29 +1967,59 @@ impl Render for ArtistDetailView {
             self.refetch_art(cover.wrap_art_px(), cx);
         }
 
-        // Build the discography in render order (album cards first, then
-        // singles/EPs) and record each card's album id at its flat vi index.
+        // Build the discography in render order (one section after another,
+        // `RELEASE_SECTIONS` order) and record each card's album id at its
+        // flat vi index.
         self.discography_ids.clear();
-        let mut album_cards: Vec<gpui::AnyElement> = Vec::new();
-        let mut single_cards: Vec<gpui::AnyElement> = Vec::new();
+        let mut section_cards: Vec<(ReleaseSection, Vec<gpui::AnyElement>)> = RELEASE_SECTIONS
+            .iter()
+            .map(|&section| (section, Vec::new()))
+            .collect();
+        // Before the sections: it hands the missing-releases view what the
+        // page shows, and that view's albums are filed into the sections too.
+        let lidarr_block = self.lidarr_block(content_w, tile, cx);
+        // Each card's `discography_order` key, parallel to `section_cards`,
+        // so the missing releases below slot in among the library's own.
+        let mut section_keys: Vec<Vec<DiscographyKey>> = vec![Vec::new(); section_cards.len()];
         if let Some(artist) = self.artist.as_ref() {
-            for album in artist.album.iter() {
-                if is_single_or_ep(album) {
-                    continue;
+            let filed: Vec<ReleaseSection> = artist.album.iter().map(release_section).collect();
+            for ((section, cards), keys) in section_cards.iter_mut().zip(&mut section_keys) {
+                for (album, _) in artist
+                    .album
+                    .iter()
+                    .zip(&filed)
+                    .filter(|(_, filed)| *filed == section)
+                {
+                    let flat = self.discography_ids.len();
+                    self.discography_ids.push(album.id.clone());
+                    let focused = self.vi_cursor == Some(flat);
+                    cards.push(self.render_album_card(album, flat, focused, None, tile, cx));
+                    keys.push((album.release_key(), album.name.to_lowercase()));
                 }
-                let flat = self.discography_ids.len();
-                self.discography_ids.push(album.id.clone());
-                let focused = self.vi_cursor == Some(flat);
-                album_cards.push(self.render_album_card(album, flat, focused, None, tile, cx));
             }
-            for album in artist.album.iter() {
-                if !is_single_or_ep(album) {
-                    continue;
+        }
+        // Lidarr's releases the library lacks, by date among the library's
+        // own in the section their Lidarr types name. Not in the vi walk.
+        if lidarr_block.is_some() && self.session.read(cx).settings.lidarr_show_missing {
+            let flush = !self.session.read(cx).settings.classic_album_cards;
+            let entity = self.lidarr_missing.clone();
+            for album in entity.read(cx).missing() {
+                let section = tagged_section(&album.release_types());
+                if let Some(((_, cards), keys)) = section_cards
+                    .iter_mut()
+                    .zip(&mut section_keys)
+                    .find(|((s, _), _)| *s == section)
+                {
+                    let key = (album.release_key(), album.title.to_lowercase());
+                    let slot = discography_slot(keys, &key);
+                    keys.insert(slot, key);
+                    cards.insert(
+                        slot,
+                        crate::ui::lidarr::MissingReleases::card(
+                            &entity, &album, tile, gallery, flush, cx,
+                        ),
+                    );
                 }
-                let flat = self.discography_ids.len();
-                self.discography_ids.push(album.id.clone());
-                let focused = self.vi_cursor == Some(flat);
-                single_cards.push(self.render_album_card(album, flat, focused, None, tile, cx));
             }
         }
         // Guest appearances last: they are someone else's records, and the
@@ -1921,12 +2048,28 @@ impl Render for ArtistDetailView {
         // fills in rather than jumping from "No albums yet." to a grid.
         if loading_artist {
             let flush = !self.session.read(cx).settings.classic_album_cards;
-            album_cards = (0..ALBUM_SKELETONS)
-                .map(|i| skeleton_card(("ar-album-sk", i), show_artist, tile, gallery, flush, cx))
-                .collect();
-            single_cards = (0..SINGLE_SKELETONS)
-                .map(|i| skeleton_card(("ar-single-sk", i), show_artist, tile, gallery, flush, cx))
-                .collect();
+            for (section, cards) in section_cards.iter_mut() {
+                *cards = match section {
+                    ReleaseSection::Albums => (0..ALBUM_SKELETONS)
+                        .map(|i| {
+                            skeleton_card(("ar-album-sk", i), show_artist, tile, gallery, flush, cx)
+                        })
+                        .collect(),
+                    ReleaseSection::SinglesEps => (0..SINGLE_SKELETONS)
+                        .map(|i| {
+                            skeleton_card(
+                                ("ar-single-sk", i),
+                                show_artist,
+                                tile,
+                                gallery,
+                                flush,
+                                cx,
+                            )
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+            }
         }
         // The bio More/Less toggle is the last target when it exists.
         self.bio_toggle_focusable = bio_long;
@@ -2137,11 +2280,19 @@ impl Render for ArtistDetailView {
                     cx,
                 ))
             })
-            .child(make_section("Albums".to_string(), album_cards))
-            .child(make_section("Singles / EPs".to_string(), single_cards))
-            // Unlike the other two, this section is dropped when it is empty:
-            // it answers a question nobody asked, and an artist who guests on
-            // nothing should not be told so.
+            // The missing-releases switch heads the discography: its cards
+            // are filed into the sections below.
+            .children(lidarr_block)
+            // Albums and Singles / EPs always stand, saying so when empty;
+            // the narrower kinds (Live, DJ mixes, …) and Appears on are drawn
+            // only when they hold something — an artist with no live record
+            // should not be told so.
+            .children(
+                section_cards
+                    .into_iter()
+                    .filter(|(section, cards)| section.always_shown() || !cards.is_empty())
+                    .map(|(section, cards)| make_section(section.title().to_string(), cards)),
+            )
             .when(!appears_cards.is_empty(), |this| {
                 this.child(make_section("Appears on".to_string(), appears_cards))
             });
@@ -2476,20 +2627,154 @@ fn clean_server_bio(raw: &str) -> Option<(String, bool)> {
     (!body.is_empty()).then(|| (body.to_string(), anchored || looks_truncated(body)))
 }
 
-/// Whether an album belongs under "Singles / EPs" rather than "Albums".
+/// The discography sections of an artist page, in the order they are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseSection {
+    Albums,
+    SinglesEps,
+    Live,
+    Compilations,
+    Remixes,
+    DjMixes,
+    Mixtapes,
+    Soundtracks,
+    Demos,
+    /// Spoken word, interviews, audiobooks, field recordings, broadcasts.
+    Other,
+}
+
+const RELEASE_SECTIONS: [ReleaseSection; 10] = [
+    ReleaseSection::Albums,
+    ReleaseSection::SinglesEps,
+    ReleaseSection::Live,
+    ReleaseSection::Compilations,
+    ReleaseSection::Remixes,
+    ReleaseSection::DjMixes,
+    ReleaseSection::Mixtapes,
+    ReleaseSection::Soundtracks,
+    ReleaseSection::Demos,
+    ReleaseSection::Other,
+];
+
+impl ReleaseSection {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Albums => "Albums",
+            Self::SinglesEps => "Singles / EPs",
+            Self::Live => "Live albums",
+            Self::Compilations => "Compilations",
+            Self::Remixes => "Remixes",
+            Self::DjMixes => "DJ mixes",
+            Self::Mixtapes => "Mixtapes",
+            Self::Soundtracks => "Soundtracks",
+            Self::Demos => "Demos",
+            Self::Other => "Other releases",
+        }
+    }
+
+    /// Drawn even when empty (with a "No … yet." line); the rest only appear
+    /// when the artist has something of that kind.
+    fn always_shown(self) -> bool {
+        matches!(self, Self::Albums | Self::SinglesEps)
+    }
+}
+
+/// Which section an artist's own release is drawn under.
 ///
 /// The server's own `releaseTypes` decide it when present: they come from the
 /// files' tags, i.e. from whoever released the record, and no guess made from
-/// the title or the length can overrule that. Only an untagged album (or a
-/// vanilla server) falls through to the heuristic.
-fn is_single_or_ep(album: &Album) -> bool {
+/// the title or the length can overrule that. A secondary type (MusicBrainz's
+/// Live, DJ-mix, Compilation, …) says more than the primary one, so it wins:
+/// `Album; Live` is a live album, `EP; Remix` a remix EP. Only an untagged
+/// album (or a vanilla server) falls through to the title and length
+/// heuristics.
+fn release_section(album: &Album) -> ReleaseSection {
     if !album.release_types.is_empty() {
-        return album
-            .release_types
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case("single") || t.eq_ignore_ascii_case("ep"));
+        return tagged_section(&album.release_types);
     }
-    titled_single_or_ep(&album.name) || short_release(album.song_count, album.duration)
+    titled_section(&album.name).unwrap_or(
+        if titled_single_or_ep(&album.name) || short_release(album.song_count, album.duration) {
+            ReleaseSection::SinglesEps
+        } else {
+            ReleaseSection::Albums
+        },
+    )
+}
+
+/// The section `releaseTypes` name. Servers spell them as tagged — `DJ-mix`,
+/// `dj-mix`, `djmix`, `Mixtape/Street` — so only letters are compared.
+fn tagged_section(types: &[String]) -> ReleaseSection {
+    let types: Vec<String> = types
+        .iter()
+        .map(|t| {
+            t.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .collect();
+    let has = |names: &[&str]| types.iter().any(|t| names.contains(&t.as_str()));
+    // Most specific first: a live DJ set is a DJ mix, a live compilation live.
+    let secondary = [
+        (&["djmix"][..], ReleaseSection::DjMixes),
+        (&["live"], ReleaseSection::Live),
+        (&["soundtrack"], ReleaseSection::Soundtracks),
+        (&["remix"], ReleaseSection::Remixes),
+        (&["compilation"], ReleaseSection::Compilations),
+        (
+            &["mixtapestreet", "mixtape", "street"],
+            ReleaseSection::Mixtapes,
+        ),
+        (&["demo"], ReleaseSection::Demos),
+        (
+            &[
+                "spokenword",
+                "interview",
+                "audiobook",
+                "audiodrama",
+                "fieldrecording",
+            ],
+            ReleaseSection::Other,
+        ),
+    ];
+    if let Some((_, section)) = secondary.iter().find(|(names, _)| has(names)) {
+        return *section;
+    }
+    if has(&["single", "ep"]) {
+        ReleaseSection::SinglesEps
+    } else if has(&["broadcast", "other"]) {
+        ReleaseSection::Other
+    } else {
+        ReleaseSection::Albums
+    }
+}
+
+/// What an untagged title says outright: a bracketed "(Live)", "[Live at
+/// Wembley]", "(DJ Mix)", "(Mixed by …)", or a title that opens "Live at",
+/// "Live in", "Live from". A bare trailing "Live" is not enough — "Long Live",
+/// "Love Live" are studio records.
+fn titled_section(name: &str) -> Option<ReleaseSection> {
+    let lower = name.trim().to_lowercase();
+    let bracketed = lower
+        .split(['(', '['])
+        .skip(1)
+        .filter_map(|rest| rest.split([')', ']']).next())
+        .map(str::trim);
+    for phrase in bracketed {
+        if ["dj mix", "dj-mix", "mixed by", "continuous mix"]
+            .iter()
+            .any(|p| phrase.contains(p))
+        {
+            return Some(ReleaseSection::DjMixes);
+        }
+        if phrase == "live" || phrase.starts_with("live ") {
+            return Some(ReleaseSection::Live);
+        }
+    }
+    ["live at ", "live in ", "live from "]
+        .iter()
+        .any(|p| lower.starts_with(p))
+        .then_some(ReleaseSection::Live)
 }
 
 /// A title *ending* in "EP" or "Single" as a word of its own — "Title - EP",
@@ -2538,8 +2823,12 @@ async fn download_remote_image(url: &str) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_single_or_ep;
+    use super::{ReleaseSection, release_section};
     use subsonic::Album;
+
+    fn is_single_or_ep(album: &Album) -> bool {
+        release_section(album) == ReleaseSection::SinglesEps
+    }
 
     #[test]
     fn the_header_card_and_bio_popup_fit_the_content_area() {
@@ -2699,6 +2988,61 @@ mod tests {
         assert!(!is_single_or_ep(&release("C", None, None, &[])));
         assert!(!is_single_or_ep(&release("D", Some(0), Some(0), &[])));
     }
+
+    #[test]
+    fn secondary_release_types_get_their_own_sections() {
+        let filed = |types: &[&str]| release_section(&release("X", Some(12), Some(3600), types));
+        assert_eq!(filed(&["Album", "Live"]), ReleaseSection::Live);
+        assert_eq!(filed(&["album", "dj-mix"]), ReleaseSection::DjMixes);
+        assert_eq!(filed(&["DJ-mix", "Live"]), ReleaseSection::DjMixes);
+        assert_eq!(
+            filed(&["Album", "Compilation"]),
+            ReleaseSection::Compilations
+        );
+        assert_eq!(
+            filed(&["Album", "Compilation", "Live"]),
+            ReleaseSection::Live
+        );
+        assert_eq!(filed(&["EP", "Remix"]), ReleaseSection::Remixes);
+        assert_eq!(filed(&["Album", "Soundtrack"]), ReleaseSection::Soundtracks);
+        assert_eq!(
+            filed(&["Album", "Mixtape/Street"]),
+            ReleaseSection::Mixtapes
+        );
+        assert_eq!(filed(&["Album", "Demo"]), ReleaseSection::Demos);
+        assert_eq!(filed(&["Album", "Spokenword"]), ReleaseSection::Other);
+        assert_eq!(filed(&["Broadcast"]), ReleaseSection::Other);
+        assert_eq!(filed(&["Album"]), ReleaseSection::Albums);
+        // An unknown type is not a reason to leave Albums.
+        assert_eq!(filed(&["Album", "Bootleg"]), ReleaseSection::Albums);
+    }
+
+    #[test]
+    fn an_untagged_title_can_say_live_or_dj_mix() {
+        let filed = |name: &str| release_section(&release(name, Some(14), Some(4200), &[]));
+        assert_eq!(filed("Alive (Live)"), ReleaseSection::Live);
+        assert_eq!(filed("Songs [Live at Wembley]"), ReleaseSection::Live);
+        assert_eq!(filed("Live at the Apollo"), ReleaseSection::Live);
+        assert_eq!(filed("Fabric 50 (DJ Mix)"), ReleaseSection::DjMixes);
+        assert_eq!(
+            filed("Global Underground (Mixed by Sasha)"),
+            ReleaseSection::DjMixes
+        );
+        for name in [
+            "Long Live",
+            "Love Live",
+            "Lively",
+            "Live Forever",
+            "Delivered (Deluxe)",
+        ] {
+            assert_eq!(filed(name), ReleaseSection::Albums, "{name}");
+        }
+        // Tags win over the title.
+        assert_eq!(
+            release_section(&release("Alive (Live)", Some(14), None, &["Album"])),
+            ReleaseSection::Albums
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2825,6 +3169,25 @@ mod grid_tests {
         sort_discography(&mut albums);
         let names: Vec<_> = albums.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Dated", "Year only"]);
+    }
+
+    /// A missing release lands by date among the library's own, undated
+    /// ones last, and after a library album it ties with.
+    #[test]
+    fn a_missing_release_slots_in_by_date() {
+        let keys: Vec<DiscographyKey> = vec![
+            (Some((2020, 6, 1)), "b".into()),
+            (Some((2015, 0, 0)), "c".into()),
+            (None, "d".into()),
+        ];
+        let slot = |key: Option<(i32, u32, u32)>, name: &str| {
+            discography_slot(&keys, &(key, name.to_string()))
+        };
+        assert_eq!(slot(Some((2024, 1, 1)), "a"), 0);
+        assert_eq!(slot(Some((2018, 3, 0)), "x"), 1);
+        assert_eq!(slot(Some((2015, 0, 0)), "c"), 2);
+        assert_eq!(slot(Some((2010, 0, 0)), "a"), 2);
+        assert_eq!(slot(None, "z"), 3);
     }
 
     /// `releaseDate` (this edition) only answers where `originalReleaseDate`

@@ -20,9 +20,12 @@ use std::time::Duration;
 
 use crate::config::{DefaultPage, PlayerBarStyle, ThemePref};
 use crate::services::{
-    art_precache, artwork, library_db::LibraryDb, local_library::LocalScanner, navidrome_sync,
-    runtime,
+    art_precache, artwork,
+    library_db::{self, LibraryDb},
+    local_library::LocalScanner,
+    navidrome_sync, runtime,
 };
+use crate::state::lidarr::ImportedAlbum;
 use crate::state::maintenance::MaintenanceJobs;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
@@ -35,6 +38,10 @@ use crate::ui::albums::{AlbumsEvent, AlbumsView};
 use crate::ui::artists::{ArtistDetailEvent, ArtistDetailView, ArtistsEvent, ArtistsView};
 use crate::ui::favorites::{FavoritesEvent, FavoritesView};
 use crate::ui::fullscreen_player::{FullscreenEvent, FullscreenPlayer};
+use crate::ui::lidarr::LidarrAlbumEvent;
+use crate::ui::lidarr::{LidarrAlbumView, LidarrEvent, LidarrView};
+use crate::ui::lidarr_add::{LidarrAddEvent, LidarrAddView, LidarrHit};
+use crate::ui::lidarr_artist::{LidarrArtistEvent, LidarrArtistView};
 use crate::ui::local_album_detail::LocalAlbumDetailView;
 use crate::ui::local_artist_detail::{LocalArtistDetailView, LocalArtistEvent};
 use crate::ui::local_music::{LocalMusicEvent, LocalMusicView};
@@ -53,6 +60,15 @@ use crate::ui::sidebar::{
 
 /// How often a running refresh resamples its workers' progress counters.
 const REFRESH_POLL: Duration = Duration::from_millis(400);
+/// How long after Lidarr reports an import the library refresh waits: the rest
+/// of a download is often still being imported, and a burst of imports should
+/// share one refresh. Each new import restarts the wait.
+const LIDARR_SETTLE: Duration = Duration::from_secs(8);
+/// An imported album the library still doesn't list after a refresh (the
+/// server's folder watcher hadn't got to it) is looked for again this often,
+/// up to `ARRIVAL_RECHECKS` times.
+const ARRIVAL_RECHECK: Duration = Duration::from_secs(60);
+const ARRIVAL_RECHECKS: u32 = 5;
 
 /// How long the window's position has to hold still before it is written to
 /// disk. Long enough that a resize drag costs one write rather than one per
@@ -182,6 +198,9 @@ enum NavEntry {
     LocalArtist(String),
     Artist(String),
     Playlist(String),
+    LidarrAlbum(i64),
+    LidarrAdd(LidarrHit),
+    LidarrArtist(i64),
 }
 
 enum Content {
@@ -198,6 +217,10 @@ enum Content {
     Settings(Entity<SettingsView>),
     Recent(Entity<RecentView>),
     LocalMusic(Entity<LocalMusicView>),
+    Lidarr(Entity<LidarrView>),
+    LidarrAlbum(Entity<LidarrAlbumView>),
+    LidarrAdd(Entity<LidarrAddView>),
+    LidarrArtist(Entity<LidarrArtistView>),
 }
 
 fn command_section(name: &str) -> Option<NavSection> {
@@ -209,6 +232,7 @@ fn command_section(name: &str) -> Option<NavSection> {
         "recent" => Some(NavSection::Recent),
         "radio" => Some(NavSection::Radio),
         "local" | "localmusic" | "local-music" => Some(NavSection::LocalMusic),
+        "lidarr" | "downloads" => Some(NavSection::Lidarr),
         "settings" | "config" => Some(NavSection::Settings),
         _ => None,
     }
@@ -343,6 +367,21 @@ pub struct RootView {
     precaching: bool,
     /// What that refresh is doing right now, for the sidebar's progress bar.
     refresh_stage: RefreshStage,
+    /// `LidarrState::landed_generation` last acted on.
+    lidarr_landed_seen: u64,
+    /// Albums Lidarr imported that the next automatic refresh is for.
+    lidarr_landed: Vec<ImportedAlbum>,
+    /// The pending automatic refresh after a Lidarr import (dropping it
+    /// restarts the wait).
+    lidarr_refresh: Option<gpui::Task<()>>,
+    /// Another library refresh for imported albums not listed yet.
+    arrival_recheck: Option<gpui::Task<()>>,
+    /// `arrival_recheck` is waiting (the task itself outlives its run).
+    arrival_recheck_armed: bool,
+    arrival_rechecks: u32,
+    /// Albums the running refresh was started for: pages showing them are
+    /// reloaded when it finishes.
+    reload_after_refresh: Vec<ImportedAlbum>,
     /// Folded rail only: whether the playlist dropdown is showing. The vi
     /// cursor opens it on its way through the playlists, so it cannot be left
     /// to the popover's own internal state.
@@ -447,6 +486,7 @@ impl RootView {
                 SearchBarEvent::OpenAdvancedSearch(query) => {
                     this.open_advanced_search(query.clone(), window, cx)
                 }
+                SearchBarEvent::OpenLidarr(hit) => this.open_lidarr_hit(hit.clone(), cx),
             },
         )
         .detach();
@@ -506,6 +546,29 @@ impl RootView {
 
         // Re-render the sidebar's playlist list when playlists change.
         cx.observe(&playlists, |_, _, cx| cx.notify()).detach();
+        // The sidebar's Lidarr row, and the library refresh after an import;
+        // the state notifies only on change.
+        cx.observe_in(
+            &crate::state::lidarr::lidarr(cx),
+            window,
+            |this, state, window, cx| {
+                let (generation, landed) = {
+                    let state = state.read(cx);
+                    (state.landed_generation, state.landed.clone())
+                };
+                if generation != this.lidarr_landed_seen {
+                    this.lidarr_landed_seen = generation;
+                    this.lidarr_imported(landed, window, cx);
+                }
+                // A download left the queue finished: look for it in the
+                // library in a while, in case no import refresh finds it.
+                if state.read(cx).has_arrived() {
+                    this.schedule_arrival_recheck(window, cx);
+                }
+                cx.notify();
+            },
+        )
+        .detach();
 
         // Any view asks for the song details dialog through this global.
         cx.set_global(crate::ui::song_info::SongInfoRequest::default());
@@ -802,6 +865,13 @@ impl RootView {
             refreshing: false,
             precaching: false,
             refresh_stage: RefreshStage::Idle,
+            lidarr_landed_seen: crate::state::lidarr::lidarr(cx).read(cx).landed_generation,
+            lidarr_landed: Vec::new(),
+            lidarr_refresh: None,
+            arrival_recheck: None,
+            arrival_recheck_armed: false,
+            arrival_rechecks: 0,
+            reload_after_refresh: Vec::new(),
             last_libraries: Vec::new(),
             libraries_collapsed,
             playlists_collapsed,
@@ -1042,12 +1112,140 @@ impl RootView {
                 if on_catalog_page && let Some(section) = this.section {
                     this.navigate(section, Some(window), cx);
                 }
+                // Pages showing what Lidarr just imported.
+                let imported = std::mem::take(&mut this.reload_after_refresh);
+                this.reload_imported(&imported, cx);
+                // Download cards for albums the library now lists go.
+                this.settle_lidarr_arrivals(window, cx);
                 // Covers for whatever the refresh just added.
                 this.maybe_precache_art(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Lidarr put `albums` in the music folder: after `LIDARR_SETTLE`, ask the
+    /// server to scan (admin only — otherwise Navidrome's own folder watcher
+    /// has to have seen them), then run the sidebar's library refresh and
+    /// reload a page showing one of them.
+    fn lidarr_imported(
+        &mut self,
+        albums: Vec<ImportedAlbum>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.arrival_rechecks = 0;
+        for album in albums {
+            if !self.lidarr_landed.contains(&album) {
+                self.lidarr_landed.push(album);
+            }
+        }
+        self.lidarr_refresh = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(LIDARR_SETTLE).await;
+            let client = this
+                .update(cx, |this, cx| this.session.read(cx).client.clone())
+                .ok()
+                .flatten();
+            if let Some(client) = client {
+                let files = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let scan = runtime::spawn_io(async move {
+                    navidrome_sync::run_server_scan(&client, files).await
+                })
+                .await;
+                if let Err(e) = scan {
+                    tracing::info!("server scan after a Lidarr import: {e:#}");
+                }
+            }
+            // A refresh already running may have read the server before the
+            // files were there; wait it out and run another.
+            loop {
+                let Ok(busy) = this.update(cx, |this, _| this.refreshing) else {
+                    return;
+                };
+                if !busy {
+                    break;
+                }
+                cx.background_executor().timer(REFRESH_POLL).await;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.reload_after_refresh = std::mem::take(&mut this.lidarr_landed);
+                this.refresh_library(window, cx);
+            });
+        }));
+    }
+
+    /// Drops the album grid's "waiting for library" cards for albums the
+    /// refresh just wrote, and looks again later for the rest.
+    fn settle_lidarr_arrivals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::services::lidarr::fold;
+        let lidarr = crate::state::lidarr::lidarr(cx);
+        if !lidarr.read(cx).has_arrived() {
+            return;
+        }
+        let known: Vec<(String, String)> = [library_db::SOURCE_NAVIDROME, library_db::SOURCE_LOCAL]
+            .into_iter()
+            .flat_map(|source| self.library_db.albums_by_source(source).unwrap_or_default())
+            .map(|row| {
+                (
+                    fold(row.artist.as_deref().unwrap_or_default()),
+                    fold(&row.title),
+                )
+            })
+            .collect();
+        lidarr.update(cx, |state, cx| {
+            state.settle_arrived(
+                |artist, title| {
+                    let (artist, title) = (fold(artist), fold(title));
+                    known
+                        .iter()
+                        .any(|(credit, name)| *name == title && credit.contains(&artist))
+                },
+                cx,
+            )
+        });
+        if lidarr.read(cx).has_arrived() {
+            self.schedule_arrival_recheck(window, cx);
+        }
+    }
+
+    /// A library refresh in `ARRIVAL_RECHECK`, unless one is already waiting
+    /// or the imports have been looked for `ARRIVAL_RECHECKS` times.
+    fn schedule_arrival_recheck(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.arrival_recheck_armed || self.arrival_rechecks >= ARRIVAL_RECHECKS {
+            return;
+        }
+        self.arrival_recheck_armed = true;
+        self.arrival_rechecks += 1;
+        self.arrival_recheck = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(ARRIVAL_RECHECK).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.arrival_recheck_armed = false;
+                this.refresh_library(window, cx);
+            });
+        }));
+    }
+
+    /// Reload the album or artist page on screen if it shows one of `albums`.
+    fn reload_imported(&mut self, albums: &[ImportedAlbum], cx: &mut Context<Self>) {
+        if albums.is_empty() {
+            return;
+        }
+        match &self.content {
+            Some(Content::AlbumDetail(view))
+                if albums
+                    .iter()
+                    .any(|a| view.read(cx).shows_album(&a.artist, &a.title)) =>
+            {
+                view.update(cx, |view, cx| view.reload(cx));
+            }
+            Some(Content::ArtistDetail(view))
+                if albums.iter().any(|a| view.read(cx).shows_artist(&a.artist)) =>
+            {
+                view.update(cx, |view, cx| view.reload_libraries(cx));
+            }
+            _ => {}
+        }
     }
 
     /// Await `work` while republishing `stage()` into the sidebar a few times a
@@ -1308,6 +1506,7 @@ impl RootView {
                     cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
                         AlbumsEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
                         AlbumsEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+                        AlbumsEvent::OpenLidarrAlbum(id) => this.open_lidarr_album(*id, cx),
                     })
                     .detach();
                     self.albums_view = Some(view.clone());
@@ -1372,6 +1571,7 @@ impl RootView {
                         this.open_local_album(id.clone(), cx)
                     }
                     AdvancedSearchEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+                    AdvancedSearchEvent::OpenLidarr(hit) => this.open_lidarr_hit(hit.clone(), cx),
                 })
                 .detach();
                 // A page whose whole point is a query field starts with the
@@ -1394,6 +1594,15 @@ impl RootView {
                     )
                 });
                 Content::Radio(view)
+            }
+            NavSection::Lidarr => {
+                let view = cx.new(|cx| LidarrView::new(self.session.clone(), cx));
+                cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+                    let LidarrEvent::OpenAlbum(id) = event;
+                    this.open_lidarr_album(*id, cx);
+                })
+                .detach();
+                Content::Lidarr(view)
             }
             NavSection::LocalMusic => {
                 let view = cx.new(|cx| {
@@ -1520,6 +1729,9 @@ impl RootView {
             NavEntry::LocalArtist(id) => self.open_local_artist(id, cx),
             NavEntry::Artist(id) => self.open_artist(id, cx),
             NavEntry::Playlist(id) => self.open_playlist(id, window, cx),
+            NavEntry::LidarrAlbum(id) => self.open_lidarr_album(id, cx),
+            NavEntry::LidarrAdd(hit) => self.open_lidarr_add(hit, cx),
+            NavEntry::LidarrArtist(id) => self.open_lidarr_artist(id, false, cx),
         }
         self.in_history_restore = false;
     }
@@ -1614,12 +1826,71 @@ impl RootView {
                 cx,
             )
         });
-        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
-            let ArtistDetailEvent::OpenAlbum(id) = event;
-            this.open_album(id.clone(), cx);
+        cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
+            ArtistDetailEvent::OpenAlbum(id) => this.open_album(id.clone(), cx),
+            ArtistDetailEvent::OpenLidarrAlbum(id) => this.open_lidarr_album(*id, cx),
         })
         .detach();
         self.content = Some(Content::ArtistDetail(view));
+        cx.notify();
+    }
+
+    fn open_lidarr_album(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.push_history();
+        self.current_entry = Some(NavEntry::LidarrAlbum(id));
+        let view = cx.new(|cx| LidarrAlbumView::new(self.session.clone(), id, cx));
+        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+            let LidarrAlbumEvent::OpenArtist(id) = event;
+            this.open_lidarr_artist(*id, false, cx);
+        })
+        .detach();
+        self.content = Some(Content::LidarrAlbum(view));
+        cx.notify();
+    }
+
+    /// `fresh`: just added, so the page waits for Lidarr's discography.
+    fn open_lidarr_artist(&mut self, id: i64, fresh: bool, cx: &mut Context<Self>) {
+        self.push_history();
+        self.current_entry = Some(NavEntry::LidarrArtist(id));
+        let view = cx.new(|cx| LidarrArtistView::new(self.session.clone(), id, fresh, cx));
+        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+            let LidarrArtistEvent::OpenAlbum(id) = event;
+            this.open_lidarr_album(*id, cx);
+        })
+        .detach();
+        self.content = Some(Content::LidarrArtist(view));
+        cx.notify();
+    }
+
+    /// A palette Lidarr hit: an album Lidarr has already opens its page,
+    /// anything else the add page.
+    fn open_lidarr_hit(&mut self, hit: LidarrHit, cx: &mut Context<Self>) {
+        match &hit {
+            LidarrHit::Album(album) if album.item.in_lidarr() => {
+                self.open_lidarr_album(album.item.id, cx)
+            }
+            LidarrHit::Artist(artist) if artist.item.in_lidarr() => {
+                self.open_lidarr_artist(artist.item.id, false, cx)
+            }
+            _ => self.open_lidarr_add(hit, cx),
+        }
+    }
+
+    fn open_lidarr_add(&mut self, hit: LidarrHit, cx: &mut Context<Self>) {
+        self.push_history();
+        self.current_entry = Some(NavEntry::LidarrAdd(hit.clone()));
+        let view = cx.new(|cx| LidarrAddView::new(self.session.clone(), hit, cx));
+        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
+            // What was added replaces its add page in history: going back
+            // to a form for something Lidarr now has would offer it again.
+            this.current_entry = None;
+            match event {
+                LidarrAddEvent::OpenAlbum(id) => this.open_lidarr_album(*id, cx),
+                LidarrAddEvent::OpenArtist(id) => this.open_lidarr_artist(*id, true, cx),
+            }
+        })
+        .detach();
+        self.content = Some(Content::LidarrAdd(view));
         cx.notify();
     }
 
@@ -1766,7 +2037,8 @@ impl RootView {
             .iter()
             .map(|p| (p.id.clone(), p.name.clone()))
             .collect();
-        sidebar_targets(self.sidebar_collapsed, &playlists)
+        let lidarr = crate::state::lidarr::lidarr(cx).read(cx).enabled();
+        sidebar_targets(self.sidebar_collapsed, lidarr, &playlists)
     }
 
     fn sidebar_select_next(&mut self, cx: &mut Context<Self>) {
@@ -1826,6 +2098,10 @@ impl RootView {
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Lidarr(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::LidarrAlbum(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::LidarrAdd(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::LidarrArtist(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             None => {}
         }
     }
@@ -1846,6 +2122,10 @@ impl RootView {
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_activate(window, cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Lidarr(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::LidarrAlbum(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::LidarrAdd(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::LidarrArtist(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             None => {}
         }
     }
@@ -1928,6 +2208,10 @@ impl RootView {
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::LocalMusic(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Lidarr(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::LidarrAlbum(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::LidarrAdd(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::LidarrArtist(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             None => {}
         }
     }
@@ -3371,6 +3655,10 @@ impl Render for RootView {
             Some(Content::Settings(v)) => v.clone().into_any_element(),
             Some(Content::Recent(v)) => v.clone().into_any_element(),
             Some(Content::LocalMusic(v)) => v.clone().into_any_element(),
+            Some(Content::Lidarr(v)) => v.clone().into_any_element(),
+            Some(Content::LidarrAlbum(v)) => v.clone().into_any_element(),
+            Some(Content::LidarrAdd(v)) => v.clone().into_any_element(),
+            Some(Content::LidarrArtist(v)) => v.clone().into_any_element(),
             None => div().into_any_element(),
         };
 
@@ -3394,8 +3682,21 @@ impl Render for RootView {
         } else {
             None
         };
+        let lidarr = {
+            let state = crate::state::lidarr::lidarr(cx);
+            let state = state.read(cx);
+            state.enabled().then(|| crate::ui::sidebar::LidarrBadge {
+                downloads: state.active_downloads(),
+                problems: state.queue_problems(),
+                online: !matches!(
+                    state.connection,
+                    crate::state::lidarr::Connection::Failed(_)
+                ),
+            })
+        };
         let sidebar_model = SidebarModel {
             active: self.section,
+            lidarr,
             refresh_error: self.refresh_error.clone(),
             active_playlist: self.active_playlist.clone(),
             playlists: self
@@ -3969,6 +4270,7 @@ mod tests {
     fn sidebar_targets_expanded_walk_sections_playlists_refresh_settings() {
         let targets = sidebar_targets(
             false,
+            false,
             &[("pl-a".into(), "A".into()), ("pl-b".into(), "B".into())],
         );
         // Counted off `SIDEBAR_SECTIONS` rather than written out: what the
@@ -3993,9 +4295,9 @@ mod tests {
         // rows — but they are still there, so the walk is the same one and the
         // cursor entering their range is what opens the dropdown.
         let playlists = [("pl-a".into(), "A".into()), ("pl-b".into(), "B".into())];
-        let collapsed = sidebar_targets(true, &playlists);
+        let collapsed = sidebar_targets(true, false, &playlists);
         let n = SIDEBAR_SECTIONS.len();
-        assert_eq!(collapsed, sidebar_targets(false, &playlists));
+        assert_eq!(collapsed, sidebar_targets(false, false, &playlists));
         assert_eq!(collapsed[n], SidebarFocus::Playlist("pl-a".into()));
         assert_eq!(collapsed[n + 1], SidebarFocus::Playlist("pl-b".into()));
         assert_eq!(collapsed[n + 2], SidebarFocus::Refresh);
@@ -4010,11 +4312,24 @@ mod tests {
     fn sidebar_targets_without_playlists_are_sections_refresh_settings() {
         // Nothing to walk into, so the cursor can never sit on a playlist and
         // the folded rail's dropdown is never opened by j/k.
-        let targets = sidebar_targets(true, &[]);
+        let targets = sidebar_targets(true, false, &[]);
         let n = SIDEBAR_SECTIONS.len();
         assert_eq!(targets.len(), n + 2); // the sections + Refresh + Settings
         assert_eq!(targets[n], SidebarFocus::Refresh);
         assert_eq!(targets[n + 1], SidebarFocus::Section(NavSection::Settings));
+    }
+
+    #[test]
+    fn sidebar_targets_walk_lidarr_after_the_sections_when_on() {
+        let n = SIDEBAR_SECTIONS.len();
+        let targets = sidebar_targets(false, true, &[("pl-a".into(), "A".into())]);
+        assert_eq!(targets[n], SidebarFocus::Section(NavSection::Lidarr));
+        assert_eq!(targets[n + 1], SidebarFocus::Playlist("pl-a".into()));
+        assert_eq!(targets.len(), n + 4);
+        assert!(
+            !sidebar_targets(false, false, &[])
+                .contains(&SidebarFocus::Section(NavSection::Lidarr))
+        );
     }
 
     #[test]

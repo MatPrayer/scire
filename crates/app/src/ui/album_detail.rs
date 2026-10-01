@@ -524,6 +524,29 @@ impl AlbumDetailView {
         .detach();
     }
 
+    /// Whether this page shows the album `title` by `artist`, compared the way
+    /// Lidarr names are matched against the library (folded; the page's
+    /// artist line may credit several).
+    pub fn shows_album(&self, artist: &str, title: &str) -> bool {
+        use crate::services::lidarr::fold;
+        let Some(album) = self.album.as_ref().map(|a| &a.album) else {
+            return false;
+        };
+        let artist = fold(artist);
+        fold(&album.name) == fold(title)
+            && album
+                .artist
+                .as_deref()
+                .is_some_and(|credit| fold(credit).contains(&artist))
+    }
+
+    /// Ask the server again, keeping what is on screen until it answers —
+    /// files were added to this album outside the app.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.load(cx);
+    }
+
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;

@@ -6,6 +6,49 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-10-01
+
+### Added
+
+- The artist page files releases under their own sections: **Live albums**,
+  **Compilations**, **Remixes**, **DJ mixes**, **Mixtapes**, **Soundtracks**,
+  **Demos** and **Other releases** (spoken word, interviews, broadcasts), next
+  to Albums and Singles / EPs. The server's release types decide it, from the
+  files' `RELEASETYPE` tags; an untagged record is filed as live or a DJ mix
+  when its title says so — "(Live)", "Live at …", "(DJ Mix)", "(Mixed by …)".
+  A section only appears when the artist has something in it. Release types
+  are kept in the library cache, so sections are right from the first frame
+  after the next sync.
+- **Lidarr integration** (Settings → Connections → Downloads; URL and API key,
+  the key kept in the system keyring). Artist pages get a *Show missing
+  releases* switch that adds the releases Lidarr knows of and the library lacks
+  to the page's own sections (Albums, Singles / EPs, Live, … by Lidarr's
+  release types, in date order among the library's own), dimmed and
+  dash-bordered, with what each is doing
+  (searching, downloading, not monitored). A missing
+  release opens its own page: cover, track list, monitored switch, **Search
+  automatically** (Lidarr's album search) and **Interactive search** (every
+  indexer's results with size, quality, seeders, age and Lidarr's rejections;
+  pick one to send it to the download client). A **Lidarr** sidebar entry
+  appears while the integration is on, with a badge counting the queue: its
+  page shows downloads with progress and ETA (removable), the monitored albums
+  Lidarr still wants, and recent activity. When Lidarr finishes importing,
+  the app asks the server to scan (admins) and refreshes the library on its
+  own; an album or artist page showing the import reloads. New music can be found
+  and added from search: the palette (Ctrl/Cmd+K) has a **Search Lidarr**
+  row under *Advanced search*, and the search page a **Lidarr** tab (Enter or
+  the button asks). Artists and albums from Lidarr's metadata search open an
+  add page (root folder, quality and metadata profiles, what to monitor,
+  search on add) when Lidarr lacks them. A **Lidarr artist page** (from a
+  hit, a Lidarr album's artist line, or after adding) shows the discography
+  in sections by type with each release's state, its own monitored switch and
+  search button, an *Only missing* filter, a summary of what's on disk, and
+  the artist's monitored switch and *Search monitored*. Albums downloading
+  show up first on the album grid's *All* and *New* tabs as cards that fill
+  left to right in the cover's own colour as the download progresses (the
+  cover lighting up as the fill crosses it), then wait as *Waiting for library*
+  until the server lists them and the normal card takes over.
+
 ## [1.2.3] — 2026-09-29
 
 ### Fixed

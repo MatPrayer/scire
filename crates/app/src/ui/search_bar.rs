@@ -23,11 +23,14 @@ use gpui_component::{
 };
 use subsonic::{SearchResult3, Song};
 
+use crate::assets::{app_icon, icons};
 use crate::services::library_db::{CatalogSearch, LibraryDb};
 use crate::services::local_library::local_art_path;
 use crate::services::{artwork, runtime};
+use crate::state::lidarr::lidarr as lidarr_state;
 use crate::state::player::PlayerState;
 use crate::state::session::Session;
+use crate::ui::lidarr_add::{self, LidarrHit};
 
 /// Wait before asking the server; see also `CACHE_DEBOUNCE`.
 const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -40,6 +43,8 @@ const ART_SIZE: u32 = 64;
 const MAX_SONGS: usize = 8;
 const MAX_ALBUMS: usize = 6;
 const MAX_ARTISTS: usize = 5;
+/// Lidarr hits shown per kind (artists, albums).
+const MAX_LIDARR: usize = 5;
 /// Rows pulled from the cache per category before ranking. Generous, because
 /// SQL returns them alphabetically and the good match may sit anywhere in
 /// that order; the list is cut to the `MAX_*` caps only after ranking.
@@ -152,6 +157,9 @@ pub enum SearchBarEvent {
     OpenLocalAlbum(String),
     OpenArtist(String),
     OpenLocalArtist(String),
+    /// A Lidarr metadata hit: its add page, or its Lidarr album page when
+    /// Lidarr tracks the album already.
+    OpenLidarr(LidarrHit),
 }
 
 /// Where a row's thumbnail comes from.
@@ -494,6 +502,11 @@ enum PaletteItem {
         local: bool,
     },
     Song(Box<Song>),
+    /// Index into `lidarr_hits`.
+    Lidarr(usize),
+    /// The footer row that asks Lidarr's metadata search. Asked only on
+    /// demand: each lookup goes out to MusicBrainz through Lidarr.
+    LidarrSearch,
     /// The footer row. It sits in this list rather than beside it so the
     /// arrow keys reach it: a row that can only be clicked is a dead end for
     /// anyone who opened the palette with a shortcut and never left the
@@ -529,6 +542,16 @@ pub struct SearchBar {
     /// Album-scoped art key (or plain cover id for albums/artists) → path.
     art_paths: HashMap<String, PathBuf>,
     generation: u64,
+    /// Lidarr's metadata search, artists then albums. Drawn last, so their
+    /// late arrival moves none of the rows above.
+    lidarr_hits: Vec<LidarrHit>,
+    lidarr_searching: bool,
+    lidarr_error: Option<String>,
+    /// Lidarr is on, so its footer row exists. Read from the shared state in
+    /// `render`/`open_palette`; `items` has no `App` to ask.
+    lidarr_enabled: bool,
+    /// The query field holds something; the Lidarr row needs a query.
+    has_query: bool,
 }
 
 impl EventEmitter<SearchBarEvent> for SearchBar {}
@@ -568,7 +591,23 @@ impl SearchBar {
             error: None,
             art_paths: HashMap::new(),
             generation: 0,
+            lidarr_hits: Vec::new(),
+            lidarr_searching: false,
+            lidarr_error: None,
+            lidarr_enabled: false,
+            has_query: false,
         }
+    }
+
+    fn clear_lidarr(&mut self) {
+        self.lidarr_hits.clear();
+        self.lidarr_searching = false;
+        self.lidarr_error = None;
+    }
+
+    /// Whether the Lidarr section is drawn (and its title counted).
+    fn lidarr_section(&self) -> bool {
+        !self.lidarr_hits.is_empty() || self.lidarr_searching || self.lidarr_error.is_some()
     }
 
     /// Focus the input (wired to the `/` shortcut in the root view).
@@ -624,6 +663,9 @@ impl SearchBar {
         self.pending = false;
         self.searching = false;
         self.error = None;
+        self.clear_lidarr();
+        self.lidarr_enabled = lidarr_state(cx).read(cx).enabled();
+        self.has_query = false;
         self.open = false;
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
@@ -674,17 +716,36 @@ impl SearchBar {
         for s in self.results.local_songs.iter().take(MAX_SONGS) {
             v.push(PaletteItem::Song(Box::new(s.song.clone())));
         }
+        for i in 0..self.lidarr_hits.len() {
+            v.push(PaletteItem::Lidarr(i));
+        }
         // Last, because it is where the list runs out: Down from the bottom
         // result lands on it, which is the order the page is reached for in.
         v.push(PaletteItem::Advanced);
+        if self.lidarr_enabled && self.has_query {
+            v.push(PaletteItem::LidarrSearch);
+        }
         v
     }
 
-    /// Index of the footer row in [`items`], for the highlight.
+    /// Index of the "Advanced search" footer row in [`items`].
     ///
     /// [`items`]: Self::items
     fn advanced_index(&self) -> usize {
-        self.items().len().saturating_sub(1)
+        self.items()
+            .iter()
+            .position(|i| matches!(i, PaletteItem::Advanced))
+            .unwrap_or(0)
+    }
+
+    /// Whether the "Search Lidarr" footer row is highlighted. It always
+    /// follows "Advanced search", so it is never index 0.
+    fn lidarr_search_selected(&self) -> bool {
+        let items = self.items();
+        items
+            .iter()
+            .position(|i| matches!(i, PaletteItem::LidarrSearch))
+            .is_some_and(|ix| self.row_selected(ix))
     }
 
     /// Whether the footer row should draw the highlight. It is last in
@@ -742,6 +803,25 @@ impl SearchBar {
                 item += 1;
             }
         }
+        if !self.lidarr_section() {
+            return None;
+        }
+        // The library's placeholder and error rows sit between its rows and
+        // the Lidarr section (see `result_rows`).
+        if item == 0 {
+            child += 1;
+        }
+        if self.error.is_some() {
+            child += 1;
+        }
+        child += 1; // Lidarr title
+        for _ in &self.lidarr_hits {
+            if item == self.selected {
+                return Some(child);
+            }
+            child += 1;
+            item += 1;
+        }
         None
     }
 
@@ -760,9 +840,19 @@ impl SearchBar {
                 self.player
                     .update(cx, |p, cx| p.play_queue(vec![*song], 0, cx));
             }
+            PaletteItem::Lidarr(i) => {
+                if let Some(hit) = self.lidarr_hits.get(i) {
+                    cx.emit(SearchBarEvent::OpenLidarr(hit.clone()));
+                }
+            }
             PaletteItem::Advanced => {
                 let query = self.input.read(cx).value().trim().to_string();
                 cx.emit(SearchBarEvent::OpenAdvancedSearch(query));
+            }
+            // Stays open: the answer lands in this palette.
+            PaletteItem::LidarrSearch => {
+                self.run_lidarr(cx);
+                return;
             }
         }
         self.dismiss(window, cx);
@@ -773,6 +863,8 @@ impl SearchBar {
         self.selected = 0;
         let generation = self.generation;
         let query = self.input.read(cx).value().trim().to_string();
+        self.clear_lidarr();
+        self.has_query = !query.is_empty();
         if query.is_empty() {
             self.open = false;
             self.results = Hits::default();
@@ -899,6 +991,65 @@ impl SearchBar {
                     // A dead server is not a dead search — the cache's rows
                     // stay up, and the error explains what is missing.
                     Err(e) => bar.error = Some(crate::errors::error_text(&e)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Ask Lidarr's metadata search for the query (the footer row). The hits
+    /// go under the library's; the highlight moves to the first.
+    fn run_lidarr(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = lidarr_state(cx).read(cx).client.clone() else {
+            return;
+        };
+        let query = self.input.read(cx).value().trim().to_string();
+        if query.is_empty() || self.lidarr_searching {
+            return;
+        }
+        let generation = self.generation;
+        self.lidarr_hits.clear();
+        self.lidarr_error = None;
+        self.lidarr_searching = true;
+        cx.notify();
+        let lookup = client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                Ok::<_, anyhow::Error>(lidarr_add::lookup(lookup, query, MAX_LIDARR).await)
+            })
+            .await;
+            let _ = this.update(cx, |bar, cx| {
+                if bar.generation != generation {
+                    return;
+                }
+                bar.lidarr_searching = false;
+                let (hits, error) = result.unwrap_or_else(|e| {
+                    (
+                        Vec::new(),
+                        Some(format!("Lidarr: {}", crate::errors::error_text(&e))),
+                    )
+                });
+                lidarr_add::want_hit_art(
+                    &mut bar.art_paths,
+                    &client,
+                    &hits,
+                    ART_SIZE,
+                    |bar: &mut Self| &mut bar.art_paths,
+                    cx,
+                );
+                bar.lidarr_hits = hits;
+                bar.lidarr_error = error;
+                if !bar.lidarr_hits.is_empty()
+                    && let Some(first) = bar
+                        .items()
+                        .iter()
+                        .position(|i| matches!(i, PaletteItem::Lidarr(_)))
+                {
+                    bar.selected = first;
+                    if let Some(child) = bar.selected_child_index() {
+                        bar.results_scroll.scroll_to_item(child);
+                    }
                 }
                 cx.notify();
             });
@@ -1273,6 +1424,8 @@ impl SearchBar {
                     .text_color(cx.theme().muted_foreground)
                     .child(if self.pending || self.searching {
                         "Searching…"
+                    } else if self.lidarr_section() {
+                        "Nothing in your library"
                     } else {
                         "No results"
                     })
@@ -1288,6 +1441,88 @@ impl SearchBar {
                     .child(e.clone())
                     .into_any_element(),
             );
+        }
+
+        // Lidarr: what could be added. A row opens its add page (or the
+        // album's Lidarr page when Lidarr has it already).
+        if self.lidarr_section() {
+            rows.push(Self::section_title("Lidarr", cx));
+            for (i, hit) in self.lidarr_hits.iter().enumerate() {
+                let (prefix, fallback, mbid) = match hit {
+                    LidarrHit::Artist(a) => (
+                        "sb-lidarr-artist",
+                        IconName::CircleUser,
+                        a.item.foreign_artist_id.clone(),
+                    ),
+                    LidarrHit::Album(a) => (
+                        "sb-lidarr-album",
+                        IconName::LayoutDashboard,
+                        a.item.foreign_album_id.clone(),
+                    ),
+                };
+                // The thumbnail is looked up by key only.
+                let cover = Cover {
+                    id: String::new(),
+                    key: hit.art_key(),
+                    local: false,
+                };
+                let open = hit.clone();
+                let tracked = hit.in_lidarr();
+                rows.push(
+                    self.row_shell(
+                        Self::row_id(prefix, false, &format!("{i}-{mbid}")),
+                        idx,
+                        Some(&cover),
+                        fallback,
+                        (hit.title(), Some(hit.subtitle())),
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.emit(SearchBarEvent::OpenLidarr(open.clone()));
+                        this.dismiss(window, cx);
+                    }))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .items_center()
+                            .text_xs()
+                            .text_color(if tracked {
+                                cx.theme().success
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .when(!tracked, |this| {
+                                this.child(Icon::new(IconName::Plus).size_3())
+                            })
+                            .child(if tracked { "In Lidarr" } else { "Add" }),
+                    )
+                    .into_any_element(),
+                );
+                idx += 1;
+            }
+            if self.lidarr_hits.is_empty() && self.lidarr_searching {
+                rows.push(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Searching Lidarr…")
+                        .into_any_element(),
+                );
+            }
+            if let Some(e) = &self.lidarr_error {
+                rows.push(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(e.clone())
+                        .into_any_element(),
+                );
+            }
         }
 
         rows
@@ -1410,6 +1645,38 @@ impl SearchBar {
                     .child(Icon::new(IconName::Settings2).size_3())
                     .child(div().flex_1().child("Advanced search")),
             )
+            // Lidarr's metadata search, asked for rather than run per
+            // keystroke.
+            .when(self.lidarr_enabled && has_query, |this| {
+                let query = self.input.read(cx).value().trim().to_string();
+                this.child(
+                    h_flex()
+                        .id("palette-lidarr")
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().muted))
+                        .when(self.lidarr_search_selected(), |s| {
+                            s.bg(cx.theme().muted)
+                                .border_l_2()
+                                .border_color(cx.theme().primary)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.run_lidarr(cx)))
+                        .child(app_icon(icons::DOWNLOAD).size_3())
+                        .child(div().flex_1().truncate().child(if self.lidarr_searching {
+                            "Searching Lidarr…".to_string()
+                        } else {
+                            format!("Search Lidarr for “{query}”")
+                        })),
+                )
+            })
             // Fade off the reveal's clock rather than a `with_animation`
             // wrapper, so it plays on the way out too — an element dropped
             // from the tree the moment it closes animates nothing.
@@ -1421,6 +1688,7 @@ impl SearchBar {
 impl Render for SearchBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(fade) = self.palette_reveal(cx) {
+            self.lidarr_enabled = lidarr_state(cx).read(cx).enabled();
             if self.palette_settling(cx) {
                 window.request_animation_frame();
             }

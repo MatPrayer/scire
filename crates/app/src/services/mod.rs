@@ -4,6 +4,7 @@ pub mod art_precache;
 pub mod artist_info;
 pub mod artwork;
 pub mod library_db;
+pub mod lidarr;
 pub mod listenbrainz;
 pub mod local_library;
 pub mod lyrics;

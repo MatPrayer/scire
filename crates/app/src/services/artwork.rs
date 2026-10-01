@@ -264,6 +264,56 @@ pub async fn fetch_as(
     .await
 }
 
+/// Like [`fetch_as`], for art that is not the server's: a plain URL (Cover Art
+/// Archive, a Lidarr `MediaCover`), with an optional header (Lidarr's API key).
+/// Cached under `key` at `size`'s rung like any other cover; the image is
+/// fetched as given, `size` only names the entry.
+pub async fn fetch_url(
+    url: String,
+    header: Option<(&'static str, String)>,
+    key: String,
+    size: u32,
+) -> Result<PathBuf> {
+    if let Some(path) = cached(&key, size) {
+        return Ok(path);
+    }
+    let size = bucket(size);
+    let cache_key = format!("{key}-{size}");
+    let dir = config::artwork_cache_dir()?;
+    let path = dir.join(format!("{}-{size}.img", config::sanitize(&key)));
+    runtime::spawn_io(async move {
+        let _permit = fetch_sem().acquire().await?;
+        if let Some(path) = cached(&key, size) {
+            return Ok(path);
+        }
+        let mut request = http().get(url);
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        let bytes = request
+            .send()
+            .await
+            .map_err(|e| e.without_url())?
+            .error_for_status()
+            .map_err(|e| e.without_url())?
+            .bytes()
+            .await?;
+        let bytes = tokio::task::spawn_blocking(move || {
+            square_crop(&bytes).unwrap_or_else(|| bytes.to_vec())
+        })
+        .await?;
+        std::fs::create_dir_all(&dir)?;
+        write_atomic(&path, &bytes)?;
+        evict_if_over_cap(&dir);
+        mem_cache()
+            .lock()
+            .unwrap()
+            .insert(cache_key, Some(path.clone()));
+        Ok(path)
+    })
+    .await
+}
+
 /// Covers rewritten in place by [`revalidate_album_covers`], waiting for the
 /// UI to drop gpui's decoded copy (it caches images by path, and the path did
 /// not move). Drained by [`take_replaced`].

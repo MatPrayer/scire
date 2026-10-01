@@ -130,6 +130,7 @@ fn main() {
             }))
             .detach();
             let playlists = state::playlists::init(session.clone(), cx);
+            state::lidarr::init(&settings, cx);
 
             // Music library database — shared between local scanner, navidrome
             // sync, and future local-music views.

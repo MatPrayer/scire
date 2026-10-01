@@ -84,6 +84,11 @@ pub fn artist_info_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("artist_info"))
 }
 
+/// Lidarr's answers for artist pages' missing releases (`services::lidarr`).
+pub fn lidarr_cache_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("lidarr"))
+}
+
 pub fn queue_path() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("queue.json"))
 }
@@ -144,6 +149,21 @@ pub struct Settings {
     /// Only written when keyring storage fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listenbrainz_token_plaintext: Option<String>,
+    /// Lidarr integration (`services::lidarr`): missing releases on artist
+    /// pages and the sidebar's Lidarr page. Needs `lidarr_url` and an API key.
+    #[serde(default)]
+    pub lidarr_enabled: bool,
+    /// Lidarr base URL as typed (`http://host:8686`, URL base included).
+    #[serde(default)]
+    pub lidarr_url: String,
+    /// Plaintext API key fallback for systems without a usable keyring.
+    /// Only written when keyring storage fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lidarr_key_plaintext: Option<String>,
+    /// Artist pages list the releases Lidarr knows of and the library lacks
+    /// (the page's own switch).
+    #[serde(default)]
+    pub lidarr_show_missing: bool,
     /// Default shuffle state for new sessions.
     pub default_shuffle: bool,
     /// Default repeat mode for new sessions.
@@ -1053,6 +1073,10 @@ impl Default for Settings {
             scrobble_enabled: true,
             listenbrainz_enabled: false,
             listenbrainz_token_plaintext: None,
+            lidarr_enabled: false,
+            lidarr_url: String::new(),
+            lidarr_key_plaintext: None,
+            lidarr_show_missing: false,
             default_shuffle: false,
             default_repeat: RepeatMode::Off,
             artwork_cache_mb: 256,
@@ -1355,6 +1379,30 @@ pub fn load_lb_token(settings: &Settings) -> Result<String> {
         .listenbrainz_token_plaintext
         .clone()
         .context("ListenBrainz token not found")
+}
+
+pub fn store_lidarr_key(key: &str) -> Result<()> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, "lidarr")?;
+    entry.set_password(key)?;
+    Ok(())
+}
+
+pub fn load_lidarr_key(settings: &Settings) -> Result<String> {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "lidarr")
+        && let Ok(key) = entry.get_password()
+    {
+        return Ok(key);
+    }
+    settings
+        .lidarr_key_plaintext
+        .clone()
+        .context("Lidarr API key not found")
+}
+
+pub fn delete_lidarr_key() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "lidarr") {
+        let _ = entry.delete_credential();
+    }
 }
 
 pub fn delete_lb_token() {

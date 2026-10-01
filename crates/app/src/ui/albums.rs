@@ -21,9 +21,11 @@ use crate::assets::{app_icon, icons};
 use crate::config::{AlbumCardStyle, AlbumSort, TimelineGrouping};
 use crate::services::library_db::{AlbumRow, LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
+use crate::state::lidarr::Incoming;
 use crate::state::player::PlayerState;
 use crate::state::playlists::PlaylistsState;
 use crate::state::session::{ConnectionStatus, Session};
+use crate::ui::lidarr::Covers;
 use crate::ui::with_focus_cursor;
 
 const PAGE_SIZE: u32 = 100;
@@ -46,6 +48,9 @@ const ART_LOOKAHEAD_ROWS: usize = 2;
 const NAME_LINE_H: f32 = 20.;
 const META_LINE_H: f32 = 17.;
 const TEXT_BLOCK_H: f32 = NAME_LINE_H * 2. + META_LINE_H * 2.;
+
+/// Corner radius of a download card's lit front.
+const FRONT_RADIUS: f32 = 8.;
 
 /// All selectable filters, in display order.
 const TABS: &[AlbumSort] = &[
@@ -184,13 +189,14 @@ pub(crate) fn album_from_row(row: AlbumRow) -> Album {
         created: row.created,
         starred: row.starred,
         play_count: row.play_count.map(|c| c as u64),
+        // The artist page files a cached card under its section by these.
+        release_types: row.release_types,
         // Not stored by the sync; nothing on a card reads them.
         genre: None,
         user_rating: None,
         artists: Vec::new(),
         original_release_date: None,
         release_date: None,
-        release_types: Vec::new(),
     }
 }
 
@@ -378,9 +384,12 @@ fn timeline_album_at(rows: &[TimelineRow], row: usize) -> Option<usize> {
     })
 }
 
+#[allow(clippy::enum_variant_names)]
 pub enum AlbumsEvent {
     OpenAlbum(String),
     OpenArtist(String),
+    /// A download card: Lidarr's page for the album.
+    OpenLidarrAlbum(i64),
 }
 
 /// How a context-menu action should enqueue an album's songs.
@@ -442,6 +451,11 @@ pub struct AlbumsView {
     /// The timeline's own width tracker: its list sits beside the year rail,
     /// so it measures differently from the card grid.
     timeline_width: crate::ui::LiveWidth,
+    /// Lidarr downloads drawn ahead of the albums on the All and New tabs;
+    /// refreshed from `LidarrState::incoming` each frame.
+    incoming: Rc<Vec<Incoming>>,
+    lidarr_covers: Covers,
+    _lidarr_watch: gpui::Subscription,
 }
 
 impl EventEmitter<AlbumsEvent> for AlbumsView {}
@@ -479,6 +493,9 @@ impl AlbumsView {
             timeline_rows: Rc::new(Vec::new()),
             timeline_sig: None,
             timeline_width: crate::ui::LiveWidth::default(),
+            incoming: Rc::new(Vec::new()),
+            lidarr_covers: Covers::default(),
+            _lidarr_watch: cx.observe(&crate::state::lidarr::lidarr(cx), |_, _, cx| cx.notify()),
         };
         this.refresh_stats(cx);
         this.seed_from_cache(active_tab, cx);
@@ -755,8 +772,10 @@ impl AlbumsView {
             }
         } else {
             let cols = self.grid_cols(window, cx).max(1);
+            // Download cards sit ahead of the albums in the same rows.
+            let lead = self.incoming.len();
             self.scroll
-                .scroll_to_item(next / cols, gpui::ScrollStrategy::Top);
+                .scroll_to_item((next + lead) / cols, gpui::ScrollStrategy::Top);
         }
         cx.notify();
     }
@@ -996,8 +1015,12 @@ impl AlbumsView {
             // rather than nothing — the next frame corrects it.
             (0, ART_LOOKAHEAD_ROWS)
         };
-        let start = first_row.saturating_sub(ART_LOOKAHEAD_ROWS) * cols;
-        let end = ((last_row + 1 + ART_LOOKAHEAD_ROWS) * cols).min(album_count);
+        // Grid positions to album indices: download cards come first.
+        let lead = self.incoming.len();
+        let start = (first_row.saturating_sub(ART_LOOKAHEAD_ROWS) * cols).saturating_sub(lead);
+        let end = ((last_row + 1 + ART_LOOKAHEAD_ROWS) * cols)
+            .saturating_sub(lead)
+            .min(album_count);
         if start >= end || self.art_range == Some((start, end)) {
             return;
         }
@@ -1459,6 +1482,289 @@ impl AlbumsView {
         }
     }
 
+    /// Lidarr's downloads for the All and New tabs, their covers asked for.
+    fn sync_incoming(&mut self, cx: &mut Context<Self>) {
+        let lidarr = crate::state::lidarr::lidarr(cx);
+        let incoming = match self.active_tab {
+            AlbumSort::All | AlbumSort::New => lidarr.read(cx).incoming(),
+            _ => Vec::new(),
+        };
+        if *self.incoming != incoming {
+            // Every album moved along the grid; the cover window with it.
+            if incoming.len() != self.incoming.len() {
+                self.art_range = None;
+            }
+            self.incoming = Rc::new(incoming);
+        }
+        let Some(client) = lidarr.read(cx).client.clone() else {
+            return;
+        };
+        let size = self.art_px;
+        for item in self.incoming.clone().iter() {
+            self.lidarr_covers.want(
+                &client,
+                &item.album,
+                size,
+                |v: &mut Self| &mut v.lidarr_covers,
+                cx,
+            );
+        }
+    }
+
+    /// A download's card: the cover dimmed, lit from the left as far as the
+    /// download has got; title, artist and what Lidarr is doing under it.
+    /// Same footprint as an album card, so the rows stay uniform.
+    fn render_incoming(
+        &self,
+        entity: &Entity<Self>,
+        item: &Incoming,
+        tile: f32,
+        gallery: bool,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let album_id = item.album.id;
+        let art = self.lidarr_covers.get(album_id);
+        let flush = !self.session.read(cx).settings.classic_album_cards;
+        let round = move |el: gpui::Div| match gallery {
+            true => el.rounded_md(),
+            false => crate::ui::cover_rounding(el, flush),
+        };
+        let round_img = move |el: gpui::Img| match gallery {
+            true => el.rounded_md(),
+            false => crate::ui::cover_rounding(el, flush),
+        };
+        let edge = match gallery {
+            true => tile,
+            false => crate::ui::card_cover_edge(tile, flush),
+        };
+        let progress = item.progress.clamp(0., 1.);
+        // One front runs across the whole card, cover and text block alike;
+        // the cover is lit as far as the front has reached into it. Whole
+        // pixels, or the edge shimmers as the width creeps.
+        let card_w = match gallery {
+            true => tile,
+            false => tile + crate::ui::card_padding(),
+        };
+        let front = (card_w * progress).floor();
+        // Where the cover starts inside the card: past the 1px border, and
+        // the inset too when the cover doesn't take it.
+        let cover_left = match (gallery, flush) {
+            (true, _) => 0.,
+            (false, true) => 1.,
+            (false, false) => 1. + crate::ui::card_inset(),
+        };
+        let lit = (front - cover_left).clamp(0., edge);
+        // The cover's own colour, once it is here.
+        let accent = art
+            .as_ref()
+            .and_then(|path| {
+                crate::ui::album_glow_accent(
+                    &mut self.glow_accents.borrow_mut(),
+                    &format!("lidarr-{album_id}"),
+                    path,
+                )
+            })
+            .unwrap_or(cx.theme().primary);
+        let status: gpui::SharedString = match progress {
+            p if p > 0. && p < 1. => format!("{} · {}%", item.label, (p * 100.) as u32).into(),
+            _ => item.label.into(),
+        };
+        let status_color = match item.problem {
+            true => cx.theme().danger,
+            false => cx.theme().muted_foreground,
+        };
+
+        // The cover's corners, per side: a gallery tile is rounded all round,
+        // a card cover at the top (and the bottom too unless flush).
+        let square_bottom = !gallery && crate::ui::cover_square_bottom(flush);
+        let round_left = move |el: gpui::Div| match (gallery, square_bottom) {
+            (true, _) => el.rounded_tl_md().rounded_bl_md(),
+            (false, true) => el.rounded_tl_lg(),
+            (false, false) => el.rounded_tl_lg().rounded_bl_lg(),
+        };
+        let round_right = move |el: gpui::Div| match (gallery, square_bottom) {
+            (true, _) => el.rounded_tr_md().rounded_br_md(),
+            (false, true) => el.rounded_tr_lg(),
+            (false, false) => el.rounded_tr_lg().rounded_br_lg(),
+        };
+        let muted = cx.theme().muted;
+        // The front's own corners: the top one on a card, where the card's
+        // fill carries the front on down; both on a gallery tile.
+        let fillet = FRONT_RADIUS.min(lit).min(edge - lit);
+        let moving = fillet > 0.;
+
+        // Bright cover with the part still to come dimmed by the well's own
+        // colour at 0.7 — the same pixels as the art at 0.3 over the well. An
+        // overlay, not a clipped bright copy: clipping is rectangular, and
+        // the overlay's fillets are what round the lit part's front.
+        let well = round(div())
+            .flex_none()
+            .size(px(edge))
+            .relative()
+            .overflow_hidden()
+            .bg(muted)
+            .when(!gallery, |w| w.shadow_sm())
+            .map(|w| match art {
+                Some(path) => w
+                    .child(round_img(img(path).size(px(edge))))
+                    .when(lit < edge, |w| {
+                        let overlay = div()
+                            .absolute()
+                            .top_0()
+                            .left(px(lit))
+                            .w(px(edge - lit))
+                            .h(px(edge))
+                            .bg(muted.opacity(0.7));
+                        // Hardly started: its left edge is still inside the
+                        // cover's own corners.
+                        let overlay = match lit < FRONT_RADIUS {
+                            true => round_left(overlay),
+                            false => overlay,
+                        };
+                        w.child(round_right(overlay))
+                    })
+                    .when(moving, |w| {
+                        w.child(front_fillet(lit, 0., true, fillet, muted.opacity(0.7)))
+                            .when(gallery, |w| {
+                                w.child(front_fillet(
+                                    lit,
+                                    edge - fillet,
+                                    false,
+                                    fillet,
+                                    muted.opacity(0.7),
+                                ))
+                            })
+                    }),
+                None => w.when(lit > 0., |w| {
+                    let fill = div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h(px(edge))
+                        .w(px(lit))
+                        .bg(accent.opacity(0.3));
+                    let fill = match lit >= edge {
+                        true => round(fill),
+                        false => round_left(fill)
+                            .rounded_tr(px(fillet))
+                            .when(gallery, |f| f.rounded_br(px(fillet))),
+                    };
+                    w.child(fill)
+                }),
+            });
+
+        let open_view = entity.clone();
+        let open = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+            open_view.update(cx, |_, cx| cx.emit(AlbumsEvent::OpenLidarrAlbum(album_id)));
+        };
+        let id = gpui::SharedString::from(format!("incoming-{album_id}"));
+        let title = item.album.title.clone();
+        let artist = item.artist.clone();
+
+        if gallery {
+            return well
+                .id(id)
+                .cursor_pointer()
+                .active(|s| s.opacity(0.8))
+                .on_click(open)
+                .child(
+                    v_flex()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .px_2()
+                        .py_1p5()
+                        .bg(gpui::hsla(0., 0., 0., 0.6))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(gpui::white())
+                                .truncate()
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(match item.problem {
+                                    true => cx.theme().danger,
+                                    false => gpui::hsla(0., 0., 1., 0.75),
+                                })
+                                .truncate()
+                                .child(status),
+                        ),
+                )
+                .into_any_element();
+        }
+
+        v_flex()
+            .id(id)
+            .w(px(tile + crate::ui::card_padding()))
+            .border_1()
+            .border_color(gpui::hsla(0., 0., 0.5, 0.15))
+            .map(|c| match flush {
+                true => c,
+                false => c.p(px(crate::ui::card_inset())),
+            })
+            .gap_1p5()
+            .rounded_lg()
+            .cursor_pointer()
+            .relative()
+            .hover(|s| s.bg(cx.theme().muted))
+            .active(|s| s.opacity(0.8))
+            .on_click(open)
+            // The card's fill in the cover's colour, behind the cover and the
+            // text (its top corner is the cover's, rounded there); absolute
+            // children sit inside the 1px border.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px((front - 1.).clamp(0., card_w - 2.)))
+                    .rounded_lg()
+                    .bg(accent.opacity(0.22)),
+            )
+            .child(well)
+            .child(
+                v_flex()
+                    // Same block as an album card's, so the row height holds.
+                    .h(px(TEXT_BLOCK_H))
+                    .map(|t| match flush {
+                        true => t
+                            .px(px(crate::ui::card_inset()))
+                            .pb(px(crate::ui::card_inset())),
+                        false => t,
+                    })
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_sm()
+                            .line_height(px(NAME_LINE_H))
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(px(META_LINE_H))
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(artist),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(px(META_LINE_H))
+                            .text_color(status_color)
+                            .truncate()
+                            .child(status),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_card(
         &self,
         entity: &Entity<Self>,
@@ -1685,24 +1991,31 @@ impl Render for AlbumsView {
                 FALLBACK_COLS,
                 gallery,
             );
-            let row_count = album_count.div_ceil(cols);
+            self.sync_incoming(cx);
+            let lead = self.incoming.len();
+            let row_count = (album_count + lead).div_ceil(cols);
             self.ensure_art_for_viewport(row_count, cols, cx);
 
             let entity = cx.entity();
             uniform_list("albums-grid", row_count, move |range, _window, cx| {
                 let view = entity.read(cx);
-                let Some(tab) = view.tabs.get(&active) else {
-                    return Vec::new();
-                };
+                let albums = view
+                    .tabs
+                    .get(&active)
+                    .map(|t| t.albums.as_slice())
+                    .unwrap_or_default();
                 range
                     .map(|row| {
+                        // Grid positions: download cards, then the albums.
                         let start = row * cols;
-                        let end = ((row + 1) * cols).min(tab.albums.len());
-                        let cards: Vec<_> = tab.albums[start..end]
-                            .iter()
-                            .enumerate()
-                            .map(|(j, album)| {
-                                let card_index = start + j;
+                        let end = ((row + 1) * cols).min(albums.len() + lead);
+                        let cards: Vec<_> = (start..end)
+                            .map(|pos| {
+                                if let Some(item) = view.incoming.get(pos) {
+                                    return view.render_incoming(&entity, item, tile, gallery, cx);
+                                }
+                                let card_index = pos - lead;
+                                let album = &albums[card_index];
                                 let focused = view.vi_cursor == Some(card_index);
                                 match gallery {
                                     true => view
@@ -1824,6 +2137,31 @@ impl Render for AlbumsView {
                 )
             })
     }
+}
+
+/// One rounded corner of a download card's lit front at `x`: an `r` square
+/// just left of the front, painted `color` outside a quarter circle by a ring
+/// centred on the corner's inner point (clipping is rectangular, so a curve
+/// has to be painted, not cut). `top` picks which way the circle opens.
+fn front_fillet(x: f32, y: f32, top: bool, r: f32, color: gpui::Hsla) -> gpui::Div {
+    // Wide enough to reach the square's far corner, r·√2 from the centre.
+    let ring = r;
+    div()
+        .absolute()
+        .left(px(x - r))
+        .top(px(y))
+        .size(px(r))
+        .overflow_hidden()
+        .child(
+            div()
+                .absolute()
+                .left(px(-(r + ring)))
+                .top(px(if top { -ring } else { -(r + ring) }))
+                .size(px(2. * (r + ring)))
+                .rounded_full()
+                .border(px(ring))
+                .border_color(color),
+        )
 }
 
 #[cfg(test)]
@@ -2067,6 +2405,7 @@ mod tests {
             play_count: Some(3),
             starred: None,
             library_id: Some("1".into()),
+            release_types: Vec::new(),
         };
         let a = album_from_row(row);
         // Ids must match the live listing's, or the swap reloads every cover
