@@ -1261,10 +1261,8 @@ pub struct FullscreenPlayer {
     /// on every instrumental. Any manual toggle clears it: a panel the user
     /// closed themselves stays closed.
     lyrics_auto_closed: bool,
-    /// Waveform peaks for the track in `waveform_for` (when the waveform
-    /// seek bar is enabled and the decode finished).
-    waveform: Option<Vec<f32>>,
-    waveform_for: Option<String>,
+    /// Seek-bar peaks for the playing track.
+    waveform: crate::ui::waveform_slot::WaveformSlot,
     /// Fraction of the seek bar under the cursor, for the hover indicator.
     seek_hover: Option<f32>,
     /// Hover state of the track-info links (gpui's `hover` can't style text,
@@ -1427,8 +1425,7 @@ impl FullscreenPlayer {
             lyrics_followed: None,
             lyrics_scroll_anim: None,
             lyrics_auto_closed: false,
-            waveform: None,
-            waveform_for: None,
+            waveform: Default::default(),
             seek_hover: None,
             album_hovered: false,
             artist_hovered: None,
@@ -1537,52 +1534,21 @@ impl FullscreenPlayer {
     }
 
     /// Kick off a waveform decode when the current track changed (and the
-    /// setting is on). Same flow as the player bar; the on-disk peak cache
-    /// makes the second consumer effectively free.
+    /// setting is on), or retry one that failed. See [`WaveformSlot`].
+    ///
+    /// [`WaveformSlot`]: crate::ui::waveform_slot::WaveformSlot
     fn maybe_fetch_waveform(&mut self, cx: &mut Context<Self>) {
-        let enabled = self.session.read(cx).settings.waveform_seekbar;
-        let song = {
-            let p = self.player.read(cx);
-            if !enabled || p.is_radio() {
-                None
-            } else {
-                p.current_song()
-                    .map(|s| (s.id.clone(), s.local_path.clone()))
-            }
-        };
-        let Some((id, local_path)) = song else {
-            self.waveform = None;
-            self.waveform_for = None;
+        let Some((id, source)) = self
+            .waveform
+            .begin(self.player.read(cx), self.session.read(cx))
+        else {
             return;
         };
-        if self.waveform_for.as_deref() == Some(id.as_str()) {
-            return;
-        }
-        let source = if let Some(path) = local_path {
-            crate::services::waveform::Source::Local(path.into())
-        } else {
-            let opts = crate::services::waveform::stream_options();
-            let url = self
-                .session
-                .read(cx)
-                .client
-                .as_ref()
-                .and_then(|c| c.stream_url(&id, &opts).ok().map(|u| u.to_string()));
-            let Some(url) = url else { return };
-            crate::services::waveform::Source::Remote(url)
-        };
-        self.waveform = None;
-        self.waveform_for = Some(id.clone());
         cx.spawn(async move |this, cx| {
             let result =
                 runtime::spawn_io(crate::services::waveform::fetch_peaks(source, id.clone())).await;
             let _ = this.update(cx, |view, cx| {
-                // Ignore results for a track that is no longer current.
-                if view.waveform_for.as_deref() == Some(id.as_str()) {
-                    match result {
-                        Ok(peaks) => view.waveform = Some(peaks),
-                        Err(e) => tracing::warn!("waveform peaks failed: {e:#}"),
-                    }
+                if view.waveform.finish(&id, result) {
                     cx.notify();
                 }
             });
@@ -3681,26 +3647,27 @@ impl Render for FullscreenPlayer {
                                                     .child(mini_time_now),
                                             )
                                             .map(|this| {
-                                                let bar =
-                                                    match (waveform_enabled, self.waveform.clone())
-                                                    {
-                                                        (true, Some(peaks)) => {
-                                                            crate::ui::waveform_seek_bar(
-                                                                &peaks,
-                                                                seek_fraction,
-                                                                22.,
-                                                                cx.theme().primary,
-                                                                cx.theme()
-                                                                    .muted_foreground
-                                                                    .opacity(0.35),
-                                                                self.player.clone(),
-                                                            )
-                                                        }
-                                                        _ => div()
-                                                            .flex_1()
-                                                            .child(Slider::new(&self.seek))
-                                                            .into_any_element(),
-                                                    };
+                                                let bar = match (
+                                                    waveform_enabled,
+                                                    self.waveform.peaks.clone(),
+                                                ) {
+                                                    (true, Some(peaks)) => {
+                                                        crate::ui::waveform_seek_bar(
+                                                            &peaks,
+                                                            seek_fraction,
+                                                            22.,
+                                                            cx.theme().primary,
+                                                            cx.theme()
+                                                                .muted_foreground
+                                                                .opacity(0.35),
+                                                            self.player.clone(),
+                                                        )
+                                                    }
+                                                    _ => div()
+                                                        .flex_1()
+                                                        .child(Slider::new(&self.seek))
+                                                        .into_any_element(),
+                                                };
                                                 let view = cx.entity();
                                                 this.child(crate::ui::seek_hover_wrap(
                                                     "fs-mini-seek-hover",
@@ -4023,20 +3990,23 @@ impl Render for FullscreenPlayer {
                                             .child(time_now),
                                     )
                                     .map(|this| {
-                                        let bar = match (waveform_enabled, self.waveform.clone()) {
-                                            (true, Some(peaks)) => crate::ui::waveform_seek_bar(
-                                                &peaks,
-                                                seek_fraction,
-                                                34.,
-                                                cx.theme().primary,
-                                                cx.theme().muted_foreground.opacity(0.35),
-                                                self.player.clone(),
-                                            ),
-                                            _ => div()
-                                                .flex_1()
-                                                .child(Slider::new(&self.seek))
-                                                .into_any_element(),
-                                        };
+                                        let bar =
+                                            match (waveform_enabled, self.waveform.peaks.clone()) {
+                                                (true, Some(peaks)) => {
+                                                    crate::ui::waveform_seek_bar(
+                                                        &peaks,
+                                                        seek_fraction,
+                                                        34.,
+                                                        cx.theme().primary,
+                                                        cx.theme().muted_foreground.opacity(0.35),
+                                                        self.player.clone(),
+                                                    )
+                                                }
+                                                _ => div()
+                                                    .flex_1()
+                                                    .child(Slider::new(&self.seek))
+                                                    .into_any_element(),
+                                            };
                                         let view = cx.entity();
                                         this.child(crate::ui::seek_hover_wrap(
                                             "fs-seek-hover",

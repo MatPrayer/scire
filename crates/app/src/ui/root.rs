@@ -8,9 +8,10 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{IndentInline, Input, InputEvent, InputState};
+use gpui_component::notification::Notification;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
 };
 
 use std::future::Future;
@@ -27,7 +28,7 @@ use crate::services::{
 };
 use crate::state::lidarr::ImportedAlbum;
 use crate::state::maintenance::MaintenanceJobs;
-use crate::state::player::PlayerState;
+use crate::state::player::{PlayerNotice, PlayerState};
 use crate::state::playlists::PlaylistsState;
 use crate::state::queue::RepeatMode;
 use crate::state::radio::RadioState;
@@ -615,6 +616,17 @@ impl RootView {
         cx.observe(&player, |this: &mut Self, _, cx| {
             this.maybe_update_adaptive_accent(cx);
         })
+        .detach();
+
+        // Playback failures come up as toasts: they are events, not state, and
+        // the player-bar line that used to carry them outlived its cause.
+        cx.subscribe_in(
+            &player,
+            window,
+            |this: &mut Self, _, notice: &PlayerNotice, window, cx| {
+                this.raise_player_notice(notice, window, cx);
+            },
+        )
         .detach();
 
         let new_pl_name = cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
@@ -1285,6 +1297,49 @@ impl RootView {
     /// bar, sliders, fullscreen overlay — belongs to playback. An album page
     /// showing a different album tints itself locally instead
     /// (`Settings::adaptive_from_page`, handled in `album_detail.rs`).
+    /// Shows a [`PlayerNotice`] as a toast. Each kind holds one slot, so a run
+    /// of failures (the network gone, the queue skipping track after track)
+    /// updates one toast rather than stacking them.
+    fn raise_player_notice(
+        &mut self,
+        notice: &PlayerNotice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        struct FailedToast;
+        struct NextTrackToast;
+        struct StoppedToast;
+        let note = match notice {
+            PlayerNotice::Failed(msg) => Notification::warning(msg.clone()).id::<FailedToast>(),
+            PlayerNotice::NextUnavailable(msg) => {
+                Notification::warning(msg.clone()).id::<NextTrackToast>()
+            }
+            // Playback has given up: this one waits for the user (or for
+            // something to play again) rather than fading on its own.
+            PlayerNotice::Stopped(msg) => {
+                window.remove_notification::<FailedToast>(cx);
+                let player = self.player.clone();
+                Notification::error(msg.clone())
+                    .title("Playback stopped")
+                    .id::<StoppedToast>()
+                    .autohide(false)
+                    .action(move |_, _, _| {
+                        let player = player.clone();
+                        Button::new("retry-playback")
+                            .label("Retry")
+                            .on_click(move |_, _, cx| {
+                                player.update(cx, |p, cx| p.toggle_play(cx));
+                            })
+                    })
+            }
+            PlayerNotice::Recovered => {
+                window.remove_notification::<StoppedToast>(cx);
+                return;
+            }
+        };
+        window.push_notification(note, cx);
+    }
+
     fn maybe_update_adaptive_accent(&mut self, cx: &mut Context<Self>) {
         if self.session.read(cx).settings.theme != ThemePref::Adaptive {
             self.adaptive_cover = None;
@@ -4154,6 +4209,8 @@ impl Render for RootView {
                         ),
                 )
             })
+            // Toasts over everything, the fullscreen player included.
+            .children(Root::render_notification_layer(window, cx))
             .into_any_element()
     }
 }

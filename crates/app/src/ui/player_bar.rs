@@ -212,10 +212,8 @@ pub struct PlayerBar {
     vol_input: Entity<InputState>,
     /// True while the dB input has focus (don't overwrite the user's typing).
     vol_input_focused: bool,
-    /// Waveform peaks for the track in `waveform_for` (when the waveform
-    /// seek bar is enabled and the decode finished).
-    waveform: Option<Vec<f32>>,
-    waveform_for: Option<String>,
+    /// Seek-bar peaks for the playing track.
+    waveform: crate::ui::waveform_slot::WaveformSlot,
     /// Fraction of the seek bar under the cursor, for the hover indicator.
     seek_hover: Option<f32>,
     /// Hover styles can't underline text in gpui (text is shaped at layout,
@@ -317,8 +315,7 @@ impl PlayerBar {
             volume,
             vol_input,
             vol_input_focused: false,
-            waveform: None,
-            waveform_for: None,
+            waveform: Default::default(),
             seek_hover: None,
             title_hovered: false,
             artist_hovered: None,
@@ -327,51 +324,20 @@ impl PlayerBar {
     }
 
     /// Kick off a waveform decode when the current track changed (and the
-    /// setting is on). Drops stale peaks when playback moved on or the
-    /// setting was turned off.
+    /// setting is on), or retry one that failed. See [`WaveformSlot`].
+    ///
+    /// [`WaveformSlot`]: crate::ui::waveform_slot::WaveformSlot
     fn maybe_fetch_waveform(&mut self, cx: &mut Context<Self>) {
-        let enabled = self.session.read(cx).settings.waveform_seekbar;
-        let song = {
-            let p = self.player.read(cx);
-            if !enabled || p.is_radio() {
-                None
-            } else {
-                p.current_song()
-                    .map(|s| (s.id.clone(), s.local_path.clone()))
-            }
-        };
-        let Some((id, local_path)) = song else {
-            self.waveform = None;
-            self.waveform_for = None;
+        let Some((id, source)) = self
+            .waveform
+            .begin(self.player.read(cx), self.session.read(cx))
+        else {
             return;
         };
-        if self.waveform_for.as_deref() == Some(id.as_str()) {
-            return;
-        }
-        let source = if let Some(path) = local_path {
-            waveform::Source::Local(path.into())
-        } else {
-            let opts = waveform::stream_options();
-            let url = self
-                .session
-                .read(cx)
-                .client
-                .as_ref()
-                .and_then(|c| c.stream_url(&id, &opts).ok().map(|u| u.to_string()));
-            let Some(url) = url else { return };
-            waveform::Source::Remote(url)
-        };
-        self.waveform = None;
-        self.waveform_for = Some(id.clone());
         cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(waveform::fetch_peaks(source, id.clone())).await;
             let _ = this.update(cx, |bar, cx| {
-                // Ignore results for a track that is no longer current.
-                if bar.waveform_for.as_deref() == Some(id.as_str()) {
-                    match result {
-                        Ok(peaks) => bar.waveform = Some(peaks),
-                        Err(e) => tracing::warn!("waveform peaks failed: {e:#}"),
-                    }
+                if bar.waveform.finish(&id, result) {
                     cx.notify();
                 }
             });
@@ -442,7 +408,6 @@ impl Render for PlayerBar {
             buffering,
             has_track,
             is_radio,
-            error,
             shuffle,
             repeat,
             art_path,
@@ -459,7 +424,6 @@ impl Render for PlayerBar {
                 p.buffering,
                 np.is_some(),
                 p.is_radio(),
-                p.last_error.clone(),
                 p.queue.shuffle,
                 p.queue.repeat,
                 p.current_art_path.clone(),
@@ -815,15 +779,6 @@ impl Render for PlayerBar {
                                         .child(info),
                                 )
                             })
-                            .when_some(error, |this, e| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().danger)
-                                        .truncate()
-                                        .child(e),
-                                )
-                            })
                             .with_animation(
                                 ElementId::Name(
                                     format!("np-info-{}", track_id.as_deref().unwrap_or("none"))
@@ -841,7 +796,7 @@ impl Render for PlayerBar {
                 v_flex()
                     .flex_1()
                     .gap(
-                        match (waveform_enabled && self.waveform.is_some(), floating) {
+                        match (waveform_enabled && self.waveform.peaks.is_some(), floating) {
                             // The waveform is a taller, busier shape than the
                             // slider and wants room under the controls — room the
                             // floating card does not have to give.
@@ -938,7 +893,8 @@ impl Render for PlayerBar {
                                 .map(|this| {
                                     // Waveform seek bar when enabled and
                                     // decoded; slider otherwise.
-                                    let bar = match (waveform_enabled, self.waveform.clone()) {
+                                    let bar = match (waveform_enabled, self.waveform.peaks.clone())
+                                    {
                                         (true, Some(peaks)) => crate::ui::waveform_seek_bar(
                                             &peaks,
                                             seek_fraction,

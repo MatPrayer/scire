@@ -24,6 +24,28 @@ const ART_SIZE: u32 = 300;
 /// the queue would only repeat the same failed request per track.
 const MAX_FAILED_STREAK: usize = 5;
 
+/// A playback failure worth telling the user about.
+///
+/// The player has no window to put a toast in, so it emits these and the root
+/// view raises them. A line in the player bar used to carry them instead, and
+/// it outlived its cause: with the network gone, "Next track unavailable" sat
+/// there long after the network was back, with nothing to dismiss it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlayerNotice {
+    /// A track could not be played; the queue moved past it (or is retrying
+    /// it transcoded). One slot: a run of these replaces itself.
+    Failed(String),
+    /// The track after the current one is already known to be unplayable.
+    NextUnavailable(String),
+    /// A run of failures stopped the queue. Stays up until playback starts
+    /// again ([`PlayerNotice::Recovered`]) or the user dismisses it.
+    Stopped(String),
+    /// Something played: a standing [`PlayerNotice::Stopped`] is out of date.
+    Recovered,
+}
+
+impl gpui::EventEmitter<PlayerNotice> for PlayerState {}
+
 /// How far [`PlayerState::smooth_position`] will run ahead of the last position
 /// event on its own.
 ///
@@ -116,7 +138,12 @@ pub struct PlayerState {
     pub volume: f32,
     pub muted: bool,
     last_volume: f32,
-    pub last_error: Option<String>,
+    /// The song a [`PlayerNotice::NextUnavailable`] was last raised for. The
+    /// prefetch is re-sent on every queue edit, and with the server gone each
+    /// one fails again — the same warning once is enough.
+    next_failure_reported: Option<String>,
+    /// A [`PlayerNotice::Stopped`] is standing, to be taken down on recovery.
+    stopped_notice: bool,
     /// Tracks that failed to start back to back, without one playing in
     /// between. A single unplayable file is skipped; a run of them is the
     /// server or the network being gone, and walking the whole queue into it
@@ -252,7 +279,8 @@ impl PlayerState {
             volume,
             muted: false,
             last_volume: if volume > 0.0 { volume } else { 1.0 },
-            last_error: None,
+            next_failure_reported: None,
+            stopped_notice: false,
             failed_streak: 0,
             client: None,
             scrobble: ScrobbleTracker::default(),
@@ -455,7 +483,6 @@ impl PlayerState {
         self.radio_station = None;
         self.set_position(Duration::ZERO);
         self.duration = None;
-        self.last_error = None;
         self.failed_streak = 0;
         self.buffering = true;
         self.player.play(TrackSource {
@@ -1130,7 +1157,7 @@ impl PlayerState {
                 Ok(u) => (u, None),
                 Err(e) => {
                     self.buffering = false;
-                    self.last_error = Some(e);
+                    cx.emit(PlayerNotice::Failed(e));
                     cx.notify();
                     return;
                 }
@@ -1146,7 +1173,6 @@ impl PlayerState {
         self.set_position(resume.unwrap_or(Duration::ZERO));
         self.resume_written_secs = self.position.as_secs();
         self.duration = duration;
-        self.last_error = None;
         self.failed_streak = 0;
         // Apply this track's ReplayGain before playback opens so the engine
         // starts the sink at the normalized volume.
@@ -1246,6 +1272,16 @@ impl PlayerState {
                 self.playing = true;
                 self.buffering = false;
                 self.failed_streak = 0;
+                if std::mem::take(&mut self.stopped_notice) {
+                    cx.emit(PlayerNotice::Recovered);
+                }
+                // The track warned about as the next one played after all (the
+                // network came back): should it fail again later, say so again.
+                if self.next_failure_reported.as_deref()
+                    == self.current_song().map(|s| s.id.as_str())
+                {
+                    self.next_failure_reported = None;
+                }
                 // The restored position went to the engine with the track
                 // (`TrackSource::start_at`); once it has opened, it is spent.
                 if self
@@ -1347,16 +1383,16 @@ impl PlayerState {
                     // `start_current` clears the streak as a user-intent entry
                     // point; a retry is not new intent, and letting it reset
                     // would keep the queue walking into a dead server forever.
+                    // No notice: the retry is meant to go unnoticed, and if
+                    // it fails too, that failure raises one.
                     self.failed_streak = streak;
-                    self.last_error = Some(msg);
                     cx.notify();
                     return;
                 }
                 // One unplayable file must not end the session: move on to the
                 // next track. `start_current` is also the user-intent entry
-                // point, so it clears both the streak and `last_error` — they
-                // are re-applied after, leaving this skip counted and its
-                // reason on screen until the track after it starts.
+                // point, so it clears the streak — re-applied after, leaving
+                // this skip counted.
                 if streak < MAX_FAILED_STREAK
                     && let Some(pos) = self.queue.next_pos()
                 {
@@ -1368,13 +1404,15 @@ impl PlayerState {
                 // network being gone — and the queue has stopped rather than
                 // walked on, which the message has to account for or the app
                 // looks like it simply quit playing.
-                self.last_error = Some(match streak >= MAX_FAILED_STREAK {
-                    true => format!(
+                if streak >= MAX_FAILED_STREAK {
+                    self.stopped_notice = true;
+                    cx.emit(PlayerNotice::Stopped(format!(
                         "{msg}. Stopped after {MAX_FAILED_STREAK} tracks failed in a row — \
                          check the server and the network."
-                    ),
-                    false => msg,
-                });
+                    )));
+                } else {
+                    cx.emit(PlayerNotice::Failed(msg));
+                }
             }
             Event::PrefetchFailed { id, error } => {
                 tracing::warn!(?id, "next track could not be prepared: {error}");
@@ -1384,16 +1422,20 @@ impl PlayerState {
                 // The event names the song it was preparing, which is the one
                 // to name back — `next_pos` would be re-derived and can have
                 // moved if the queue was edited inside the prefetch window.
+                if id.is_some() && self.next_failure_reported == id {
+                    return;
+                }
+                self.next_failure_reported = id.clone();
                 let title = id.as_ref().and_then(|id| {
                     self.queue
                         .iter_ordered()
                         .find(|(_, song)| &song.id == id)
                         .map(|(_, song)| song.title.clone())
                 });
-                self.last_error = Some(format!(
+                cx.emit(PlayerNotice::NextUnavailable(format!(
                     "Next track unavailable — {}",
                     crate::errors::playback_error(&error, title.as_deref())
-                ));
+                )));
             }
             Event::OutputOpened {
                 device,

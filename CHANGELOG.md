@@ -4,6 +4,23 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.4] — 2026-10-01
+
+### Changed
+
+- Playback failures show as toasts in the top-right corner instead of a red
+  line under the track title. That line stayed until another track started —
+  with the network gone, "Next track unavailable" outlived the outage with no
+  way to dismiss it. A skipped track or an unplayable next track fades on its
+  own; when a run of failures stops the queue, the toast stays, offers
+  **Retry**, and goes away once something plays.
+
+### Fixed
+
+- The player bar's waveform comes back after a lost connection. A failed
+  fetch was never asked again for that track (the fullscreen player, opened
+  later, fetched its own and showed it); it is now retried with a backoff.
+
 ## [1.3.3] — 2026-10-01
 
 ### Fixed

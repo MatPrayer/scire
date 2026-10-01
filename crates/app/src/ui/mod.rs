@@ -21,6 +21,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod song_info;
 pub mod visualizer;
+pub mod waveform_slot;
 
 use std::future::Future;
 use std::path::PathBuf;
