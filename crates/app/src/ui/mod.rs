@@ -7,6 +7,7 @@ pub mod fullscreen_player;
 pub mod lidarr;
 pub mod lidarr_add;
 pub mod lidarr_artist;
+pub mod lidarr_release;
 pub mod local_album_detail;
 pub mod local_artist_detail;
 pub mod local_music;
@@ -639,6 +640,22 @@ pub fn album_side_panel(content_w: f32, window_w: f32, window_h: f32) -> Option<
     (art >= SIDE_PANEL_ART_MIN).then_some(AlbumSidePanel { width, art })
 }
 
+/// Largest edge a click-to-enlarge lightbox draws its art at.
+const LIGHTBOX_ART_MAX: f32 = 820.;
+/// A lightbox's `p_8` on both sides.
+const LIGHTBOX_PADDING: f32 = 64.;
+
+/// Edge of the album and artist pages' lightbox art: the window's shorter side
+/// less the padding, capped. Sized explicitly rather than by `max_w`/`max_h`
+/// so [`SharpArt`] makes its copy at the edge actually drawn (art is squared
+/// on the way in).
+pub fn lightbox_art_px(window: &Window) -> f32 {
+    let viewport = window.viewport_size();
+    (f32::from(viewport.width.min(viewport.height)) - LIGHTBOX_PADDING)
+        .clamp(1., LIGHTBOX_ART_MAX)
+        .floor()
+}
+
 /// Art for a slot much smaller than the file: swaps in a CPU-downscaled copy
 /// at the slot's device-pixel size once it is ready (`artwork::display_copy`
 /// says why). Draws the source meanwhile, and when no copy is worth making.
@@ -660,7 +677,10 @@ impl SharpArt {
         window: &Window,
         cx: &mut gpui::Context<V>,
     ) -> PathBuf {
-        let edge = (logical_px * window.scale_factor()).round().max(1.) as u32;
+        // As gpui paints it: layout rounds the logical size, the sprite's
+        // device size is ceiled. A copy a pixel off is resampled by the GPU
+        // and comes out blurred.
+        let edge = (logical_px.round() * window.scale_factor()).ceil().max(1.) as u32;
         let want = (source.to_path_buf(), edge);
         if self.want.as_ref() != Some(&want) {
             self.want = Some(want);
@@ -2068,6 +2088,71 @@ pub fn divider() -> gpui::Div {
     div().h(px(1.)).w_full().bg(hsla(0., 0., 0.5, 0.15))
 }
 
+/// The disc heading to draw above each track of an album's track list:
+/// `Some(disc)` where a new disc starts, `None` elsewhere. Single-disc albums
+/// (fewer than two distinct disc numbers) get no headings at all, and a track
+/// without a disc number never starts one.
+pub fn disc_headings(discs: &[Option<u32>]) -> Vec<Option<u32>> {
+    let mut distinct: Vec<u32> = discs.iter().flatten().copied().collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() < 2 {
+        return vec![None; discs.len()];
+    }
+    let mut previous = None;
+    discs
+        .iter()
+        .map(|&disc| {
+            let starts = disc.is_some() && disc != previous;
+            if disc.is_some() {
+                previous = disc;
+            }
+            disc.filter(|_| starts)
+        })
+        .collect()
+}
+
+/// An album's track rows with a `disc_heading` slotted in wherever
+/// `disc_headings` starts a disc. `discs` is per row, in the same order.
+pub fn with_disc_headings(
+    rows: Vec<AnyElement>,
+    discs: &[Option<u32>],
+    cx: &App,
+) -> Vec<AnyElement> {
+    let mut first = true;
+    let mut out = Vec::with_capacity(rows.len());
+    for (row, heading) in rows.into_iter().zip(disc_headings(discs)) {
+        if let Some(disc) = heading {
+            out.push(disc_heading(disc, first, cx).into_any_element());
+            first = false;
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// "Disc N" label followed by a rule across the rest of the track column.
+/// The first heading sits flush with the list's top; later ones leave a gap
+/// to the disc before.
+fn disc_heading(disc: u32, first: bool, cx: &App) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .pb_1()
+        .when(!first, |this| this.pt_4())
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("Disc {disc}")),
+        )
+        .child(divider().flex_1())
+}
+
 /// How long a non-essential transition should run for.
 ///
 /// One place decides it so `Settings::reduced_motion` cannot be honoured by
@@ -2358,6 +2443,121 @@ pub fn sync_focus_scroll(
     }
 }
 
+/// A modal dialog's frame: dimmed backdrop (click closes), centred card of
+/// `width` with a title, a muted subtitle and a close button, `body` in one
+/// scrolling column (on `scroll` when given) and an optional `footer` pinned
+/// under it. `t` is the reveal's openness; `active` false while it leaves, so
+/// a closing dialog takes no clicks. Ids are derived from `id`.
+#[allow(clippy::too_many_arguments)]
+pub fn dialog<V: 'static>(
+    id: &str,
+    width: f32,
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    t: f32,
+    active: bool,
+    on_close: impl Fn(&mut V, &mut gpui::Context<V>) + 'static + Clone,
+    body: AnyElement,
+    footer: Option<AnyElement>,
+    scroll: Option<&gpui::ScrollHandle>,
+    window: &Window,
+    cx: &mut gpui::Context<V>,
+) -> AnyElement {
+    use gpui_component::button::{Button, ButtonVariants as _};
+    use gpui_component::{IconName, Sizable as _, StyledExt as _, h_flex, v_flex};
+
+    let theme = cx.theme().clone();
+    let max_h = f32::from(window.viewport_size().height) * 0.8;
+    let close_backdrop = on_close.clone();
+    let close_button = on_close;
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .pt(px(28. * (1. - t)))
+        .occlude()
+        .bg(hsla(0., 0., 0., 0.6 * t))
+        .when(active, |this| {
+            this.on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| close_backdrop(this, cx)),
+            )
+        })
+        .child(
+            v_flex()
+                .w(px(width))
+                .max_w_full()
+                .max_h(px(max_h))
+                .opacity(t)
+                .rounded_xl()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .occlude()
+                // Clicks inside the card must not reach the backdrop.
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .px_5()
+                        .pt_5()
+                        .pb_3()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_lg().font_semibold().child(title.into()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .truncate()
+                                        .child(subtitle.into()),
+                                ),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{id}-close")))
+                                .ghost()
+                                .small()
+                                .icon(IconName::Close)
+                                .when(active, |b| {
+                                    b.on_click(
+                                        cx.listener(move |this, _, _, cx| close_button(this, cx)),
+                                    )
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{id}-scroll")))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .when_some(scroll, |this, handle| this.track_scroll(handle))
+                        .px_5()
+                        .pb_4()
+                        .child(body),
+                )
+                .when_some(footer, |this, footer| {
+                    this.child(
+                        div()
+                            .px_5()
+                            .pt_3()
+                            .pb_5()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .child(footer),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
 /// Height of the minimal title bar. macOS's traffic lights are 12px tall and
 /// `TitleBar::title_bar_options` puts them at (9, 9), so 30px is the shortest
 /// bar that still leaves them evenly inset. gpui-component's own bar is 34px
@@ -2529,6 +2729,29 @@ pub fn skeleton_fill(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disc_headings_mark_where_each_disc_starts() {
+        use super::disc_headings;
+        assert_eq!(
+            disc_headings(&[Some(1), Some(1), Some(2), Some(2)]),
+            vec![Some(1), None, Some(2), None]
+        );
+        // A track missing its number neither starts nor ends a disc.
+        assert_eq!(
+            disc_headings(&[Some(1), None, Some(1), Some(2)]),
+            vec![Some(1), None, None, Some(2)]
+        );
+    }
+
+    #[test]
+    fn single_disc_albums_get_no_headings() {
+        use super::disc_headings;
+        assert_eq!(disc_headings(&[Some(1), Some(1)]), vec![None, None]);
+        assert_eq!(disc_headings(&[None, None]), vec![None, None]);
+        assert_eq!(disc_headings(&[Some(2), None]), vec![None, None]);
+        assert!(disc_headings(&[]).is_empty());
+    }
+
     #[test]
     fn only_a_clearly_portrait_window_stacks_the_header_on_shape() {
         use super::header_stacks_for_shape;

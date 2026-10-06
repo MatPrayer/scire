@@ -1151,7 +1151,11 @@ impl AlbumsView {
     ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = album.id.clone();
-        let art = self.art_paths.get(&album.id).cloned();
+        let art = self
+            .art_paths
+            .get(&album.id)
+            .cloned()
+            .or_else(|| self.stand_in_art(album));
         let settings = &self.session.read(cx).settings;
         let glow = settings.selection_glow_vi;
         let accent = if settings.selection_glow_album_color {
@@ -1511,6 +1515,21 @@ impl AlbumsView {
         }
     }
 
+    /// The Lidarr cover of a download the library already lists, for its card
+    /// to draw while its own cover is not on disk yet. Matched like the
+    /// arrival itself: folded title, and the album's credit naming the Lidarr
+    /// artist. Once the download card goes, `RootView::settle_lidarr_arrivals`
+    /// has filed this cover as the album's own.
+    fn stand_in_art(&self, album: &Album) -> Option<PathBuf> {
+        use crate::services::lidarr::fold;
+        let title = fold(&album.name);
+        let credit = fold(album.artist.as_deref().unwrap_or_default());
+        self.incoming
+            .iter()
+            .find(|i| fold(&i.album.title) == title && credit.contains(&fold(&i.artist)))
+            .and_then(|i| self.lidarr_covers.get(i.album.id))
+    }
+
     /// A download's card: the cover dimmed, lit from the left as far as the
     /// download has got; title, artist and what Lidarr is doing under it.
     /// Same footprint as an album card, so the rows stay uniform.
@@ -1565,6 +1584,23 @@ impl AlbumsView {
                 )
             })
             .unwrap_or(cx.theme().primary);
+        // Downloaded, waiting for Lidarr's import or in it: the download's
+        // colour breathes, so a card that sits full doesn't read as stuck.
+        let pulse = item.waiting && !self.session.read(cx).settings.reduced_motion;
+        let breathe = move |el: gpui::Div, part: &str| -> gpui::AnyElement {
+            if !pulse {
+                return el.into_any_element();
+            }
+            gpui::AnimationExt::with_animation(
+                el,
+                gpui::SharedString::from(format!("incoming-pulse-{part}-{album_id}")),
+                gpui::Animation::new(std::time::Duration::from_millis(1600))
+                    .repeat()
+                    .with_easing(gpui::bounce(gpui::ease_in_out)),
+                |el, delta| el.opacity(1. - delta * 0.7),
+            )
+            .into_any_element()
+        };
         let status: gpui::SharedString = match progress {
             p if p > 0. && p < 1. => format!("{} · {}%", item.label, (p * 100.) as u32).into(),
             _ => item.label.into(),
@@ -1649,7 +1685,7 @@ impl AlbumsView {
                             .rounded_tr(px(fillet))
                             .when(gallery, |f| f.rounded_br(px(fillet))),
                     };
-                    w.child(fill)
+                    w.child(breathe(fill, "well"))
                 }),
             });
 
@@ -1716,7 +1752,7 @@ impl AlbumsView {
             // The card's fill in the cover's colour, behind the cover and the
             // text (its top corner is the cover's, rounded there); absolute
             // children sit inside the 1px border.
-            .child(
+            .child(breathe(
                 div()
                     .absolute()
                     .top_0()
@@ -1725,7 +1761,8 @@ impl AlbumsView {
                     .w(px((front - 1.).clamp(0., card_w - 2.)))
                     .rounded_lg()
                     .bg(accent.opacity(0.22)),
-            )
+                "card",
+            ))
             .child(well)
             .child(
                 v_flex()
@@ -1776,7 +1813,11 @@ impl AlbumsView {
     ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = album.id.clone();
-        let art = self.art_paths.get(&album.id).cloned();
+        let art = self
+            .art_paths
+            .get(&album.id)
+            .cloned()
+            .or_else(|| self.stand_in_art(album));
         let name = album.name.clone();
         let artist = album.artist.clone().unwrap_or_default();
         let year = album.year.map(|y| y.to_string()).unwrap_or_default();

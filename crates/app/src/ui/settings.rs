@@ -3402,7 +3402,7 @@ impl Render for SettingsView {
                 hide_album_stars,
                 false,
                 "Hide star buttons",
-                Some("On the title and each track row; the context menu still stars"),
+                Some("Title, track rows and the rating; the context menu still stars"),
                 cx,
             ),
             self.switch_row(

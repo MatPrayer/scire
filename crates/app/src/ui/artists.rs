@@ -721,6 +721,9 @@ pub struct ArtistDetailView {
     /// from: a hero that has since moved to another source must not open onto
     /// the old picture.
     full_art: Option<(String, PathBuf)>,
+    /// The lightbox image downscaled to the edge drawn (gpui's bilinear
+    /// sampling aliases the 1500 rung drawn at up to 820px).
+    sharp_full_art: crate::ui::SharpArt,
     error: Option<crate::errors::ErrorNote>,
     /// Biography + image URLs from getArtistInfo2 (Navidrome's agents).
     info: Option<ArtistInfo2>,
@@ -818,6 +821,7 @@ impl ArtistDetailView {
             artist_image_source: None,
             show_full_art: false,
             full_art: None,
+            sharp_full_art: Default::default(),
             error: None,
             info: None,
             image_requested: false,
@@ -1009,6 +1013,8 @@ impl ArtistDetailView {
                         // artist's own URL is the last fallback.
                         let fallback = artist.artist.artist_image_url.clone();
                         view.artist = Some(artist);
+                        view.lidarr_missing
+                            .update(cx, |missing, _| missing.library_reloaded());
                         view.revalidate_artist_image(cover.clone(), cx);
                         view.fetch_artist_image(cover, cx);
                         if !view.image_requested {
@@ -1611,7 +1617,13 @@ impl ArtistDetailView {
     ) -> gpui::AnyElement {
         let id = album.id.clone();
         let play_id = album.id.clone();
-        let art = self.art_paths.get(&album.id).cloned();
+        // A release Lidarr just imported draws the cover its missing card
+        // showed until its own is on disk.
+        let art = self
+            .art_paths
+            .get(&album.id)
+            .cloned()
+            .or_else(|| self.lidarr_missing.read(cx).stand_in_art(&album.name));
         let art_loading = art.is_none() && placeholding(self.art_pending.get(&album.id).copied());
         // The discography is sorted by year and says so under each cover; an
         // "Appears on" card is about someone else's album, so it names them
@@ -2358,6 +2370,14 @@ impl Render for ArtistDetailView {
             // Full-resolution artist photo; click anywhere to dismiss, same as
             // the album page's cover.
             .when(self.show_full_art, |this| {
+                let full_px = crate::ui::lightbox_art_px(window);
+                let full_art = self
+                    .full_art
+                    .as_ref()
+                    .filter(|(of, _)| self.artist_image_source.as_ref() == Some(of))
+                    .map(|(_, path)| path.clone())
+                    .or_else(|| self.artist_image_path.clone())
+                    .map(|path| self.sharp_full_art.path(&path, full_px, window, cx));
                 this.child(
                     div()
                         .id("artist-lightbox")
@@ -2376,16 +2396,9 @@ impl Render for ArtistDetailView {
                             this.show_full_art = false;
                             cx.notify();
                         }))
-                        .when_some(
-                            self.full_art
-                                .as_ref()
-                                .filter(|(of, _)| self.artist_image_source.as_ref() == Some(of))
-                                .map(|(_, path)| path.clone())
-                                .or_else(|| self.artist_image_path.clone()),
-                            |this, path| {
-                                this.child(img(path).max_w(px(820.)).max_h(px(820.)).rounded_lg())
-                            },
-                        ),
+                        .when_some(full_art, |this, path| {
+                            this.child(img(path).size(px(full_px)).rounded_lg())
+                        }),
                 )
             })
     }

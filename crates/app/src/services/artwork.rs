@@ -455,6 +455,50 @@ async fn revalidate_album(client: &SubsonicClient, cover_id: &str) -> Result<Vec
     Ok(replaced)
 }
 
+/// File the art cached under `from_key` as the server album `cover_id`'s own,
+/// at every rung it has none of yet; returns how many files were written.
+///
+/// For an album Lidarr has just imported: the server lists it before its
+/// cover settles (or answers with its placeholder until it rescans the
+/// folder), so the grid and the album page would draw an empty well — or the
+/// placeholder, cached for good — where the download card showed a cover. A
+/// rung is seeded only from a `from_key` rung at least as big, so nothing is
+/// drawn from fewer pixels than asked for; bigger rungs are left to the
+/// server. A later sync that sees the cover id move rechecks it
+/// ([`revalidate_album_covers`]).
+pub fn seed_album_cover(cover_id: &str, from_key: &str) -> usize {
+    let Ok(dir) = config::artwork_cache_dir() else {
+        return 0;
+    };
+    let mut written = 0;
+    for key in album_art_keys(cover_id) {
+        for rung in SIZE_LADDER {
+            if cached(&key, rung).is_some() {
+                continue;
+            }
+            let Some(source) = SIZE_LADDER
+                .into_iter()
+                .filter(|&r| r >= rung)
+                .find_map(|r| cached(from_key, r))
+            else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&source) else {
+                continue;
+            };
+            let path = dir.join(format!("{}-{rung}.img", config::sanitize(&key)));
+            if write_atomic(&path, &bytes).is_ok() {
+                mem_cache()
+                    .lock()
+                    .unwrap()
+                    .insert(format!("{key}-{rung}"), Some(path));
+                written += 1;
+            }
+        }
+    }
+    written
+}
+
 /// Re-check an artist photo's cached rungs against the server, rewriting in
 /// place (and queueing for [`take_replaced`]) whatever changed.
 ///
@@ -665,9 +709,9 @@ fn thumbnail_from_bytes(bytes: &[u8], edge: u32) -> Result<Vec<u8>> {
 /// file on the album page, drawn near 1:1. A Lanczos copy at the slot's size
 /// is drawn 1:1 instead.
 ///
-/// `None` when the source is already within 2× of `edge` (bilinear is still
-/// clean there) or cannot be read; callers keep drawing the source. The copy
-/// is rebuilt when the source is newer, so revalidated art is picked up.
+/// `None` when the source is already about `edge` ([`wants_display_copy`])
+/// or cannot be read; callers keep drawing the source. The copy is rebuilt
+/// when the source is newer, so revalidated art is picked up.
 pub fn display_cached(source: &Path, edge: u32) -> Option<PathBuf> {
     let path = display_path(source, edge)?;
     let made = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
@@ -683,8 +727,7 @@ pub async fn display_copy(source: &Path, edge: u32) -> Option<PathBuf> {
     let out = display_path(source, edge)?;
     let source = source.to_path_buf();
     runtime::spawn_blocking_io(move || -> Result<Option<PathBuf>> {
-        let (w, h) = image::image_dimensions(&source)?;
-        if w.min(h) <= edge.saturating_mul(2) {
+        if !wants_display_copy(file_edge(&source)?, edge) {
             return Ok(None);
         }
         let bytes = thumbnail_bytes(&source, edge)?;
@@ -698,6 +741,23 @@ pub async fn display_copy(source: &Path, edge: u32) -> Option<PathBuf> {
     .await
     .ok()
     .flatten()
+}
+
+/// Shorter edge of an image file, format sniffed from its bytes: cache files
+/// are all `.img`, which `image::image_dimensions` (by extension) can't place.
+fn file_edge(source: &Path) -> Result<u32> {
+    let (w, h) = image::ImageReader::open(source)?
+        .with_guessed_format()?
+        .into_dimensions()?;
+    Ok(w.min(h))
+}
+
+/// Whether art `source_edge` pixels across drawn at `edge` needs a CPU copy.
+/// Bilinear without mipmaps already skips texels past 1×: a 1500 rung in the
+/// fullscreen player's ~800px slot (1.9×) looked coarser than the 640 it
+/// replaced. Only a source within an eighth of the slot is drawn as is.
+fn wants_display_copy(source_edge: u32, edge: u32) -> bool {
+    source_edge > edge.saturating_add(edge / 8)
 }
 
 fn display_path(source: &Path, edge: u32) -> Option<PathBuf> {
@@ -992,6 +1052,27 @@ fn evict_if_over_cap(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn display_copy_reads_sniffed_cache_files() {
+        let dir = std::env::temp_dir().join(format!("scire-edge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("al-x-1500.img");
+        image::RgbImage::new(40, 30)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(super::file_edge(&path).unwrap(), 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_copy_only_for_real_downscales() {
+        assert!(super::wants_display_copy(1500, 800));
+        assert!(super::wants_display_copy(512, 220));
+        assert!(!super::wants_display_copy(640, 640));
+        assert!(!super::wants_display_copy(700, 640));
+        assert!(!super::wants_display_copy(512, 700));
+    }
+
     use super::{
         SIZE_LADDER, album_alternative, album_art_keys, bucket, is_stale_song_art, search_order,
         sharper, square_crop, stable_key, thumbnail_from_bytes, write_atomic,

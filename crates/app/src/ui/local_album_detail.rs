@@ -79,6 +79,9 @@ pub struct LocalAlbumDetailView {
     album: Option<AlbumRow>,
     tracks: Vec<crate::services::library_db::TrackRow>,
     art_path: Option<PathBuf>,
+    /// The header cover downscaled to its slot (gpui's bilinear sampling
+    /// aliases a large embedded cover drawn at 220px).
+    sharp_art: crate::ui::SharpArt,
     /// Last completed local scan loaded into this open page.
     scan_version: u64,
     scroll: ScrollHandle,
@@ -122,6 +125,7 @@ impl LocalAlbumDetailView {
             album: None,
             tracks: Vec::new(),
             art_path: None,
+            sharp_art: Default::default(),
             scan_version,
             scroll: scroll.clone(),
             panel_scroll: ScrollHandle::new(),
@@ -353,6 +357,10 @@ impl Render for LocalAlbumDetailView {
                 art_px
             };
 
+            let art_path = self
+                .art_path
+                .clone()
+                .map(|path| self.sharp_art.path(&path, art_px, window, cx));
             let cover = div()
                 .id("local-album-cover")
                 .flex_none()
@@ -360,7 +368,7 @@ impl Render for LocalAlbumDetailView {
                 .rounded_2xl()
                 .bg(cx.theme().muted)
                 .overflow_hidden()
-                .when_some(self.art_path.clone(), |this, path| {
+                .when_some(art_path, |this, path| {
                     this.child(img(path).size(px(art_px)).rounded_2xl())
                 });
 
@@ -619,6 +627,12 @@ impl Render for LocalAlbumDetailView {
                 with_focus_cursor(format!("vi-focus-{i}"), row, focused, glow, accent, cx)
             })
             .collect();
+        let discs: Vec<Option<u32>> = self
+            .tracks
+            .iter()
+            .map(|t| t.disc_number.and_then(|d| d.try_into().ok()))
+            .collect();
+        let rows = crate::ui::with_disc_headings(rows, &discs, cx);
 
         let header_card = v_flex()
             // In the panel the card's width is its column's; the scrolling page

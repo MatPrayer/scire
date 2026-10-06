@@ -19,16 +19,21 @@ use gpui_component::progress::Progress;
 use gpui_component::switch::Switch;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    StyledExt as _, h_flex, v_flex,
 };
 
 use crate::assets::{app_icon, icons};
+use crate::services::album_info::{self, AlbumInfo};
 use crate::services::lidarr::{self, Album, HistoryItem, Lidarr, QueueItem, Release, Track};
 use crate::services::{artwork, runtime};
 use crate::state::lidarr::{Connection, LidarrState, lidarr as lidarr_state};
 use crate::state::session::Session;
-use crate::ui::{sync_focus_scroll, with_focus_cursor};
+use crate::ui::album_detail::{
+    ABOUT_PROSE_MAX_W, AboutSource, NOTES_PREVIEW_CHARS, about_sources, ext_links, link_icon,
+    online_sources, waiting_online,
+};
+use crate::ui::{strip_html, sync_focus_scroll, truncate_at_word, with_focus_cursor};
 
 /// Cover edge on the Lidarr page's rows.
 pub(super) const ROW_COVER: f32 = 40.;
@@ -37,14 +42,6 @@ pub(super) const HEADER_COVER: f32 = 200.;
 
 // ---------------------------------------------------------------------------
 // Covers
-
-fn cover_key(album: &Album) -> String {
-    if album.foreign_album_id.is_empty() {
-        format!("lidarr-{}", album.id)
-    } else {
-        format!("lidarr-{}", album.foreign_album_id)
-    }
-}
 
 /// Lidarr album covers, by Lidarr album id. One attempt per album per view:
 /// a release with no art on Cover Art Archive stays a plain well.
@@ -78,23 +75,13 @@ impl Covers {
         if !self.tried.insert(id) {
             return;
         }
-        let key = cover_key(album);
-        if let Some(path) = artwork::cached_best(&key, size) {
+        if let Some(path) = artwork::cached_best(&album.cover_key(), size) {
             self.paths.insert(id, path);
             return;
         }
-        let Some((url, remote)) = album.cover() else {
+        let Some(fetch) = client.cover_fetch(album, size) else {
             return;
         };
-        let (url, header) = if remote {
-            (lidarr::cover_thumbnail_url(url, size), None)
-        } else {
-            (
-                client.absolute(url),
-                Some(("X-Api-Key", client.api_key().to_string())),
-            )
-        };
-        let fetch = artwork::fetch_url(url, header, key, size);
         let task = cx.spawn(async move |this, cx| {
             let result = fetch.await;
             let _ = this.update(cx, |view, cx| {
@@ -209,6 +196,11 @@ pub struct MissingReleases {
     /// The next lookup skips the disk cache: an import or a retry asked.
     refresh: bool,
     imports_seen: u64,
+    /// Releases shown as missing that a later answer says Lidarr now has
+    /// files for. Kept on screen until the artist page's library reload
+    /// lands ([`MissingReleases::library_reloaded`]), so the card gives way
+    /// to the real album rather than leaving a gap while the server scans.
+    held: HashSet<i64>,
     covers: Covers,
     task: Option<Task<()>>,
     action_error: Option<String>,
@@ -240,6 +232,7 @@ impl MissingReleases {
             load: MissingLoad::Idle,
             refresh: false,
             imports_seen,
+            held: HashSet::new(),
             covers: Covers::default(),
             task: None,
             action_error: None,
@@ -285,9 +278,50 @@ impl MissingReleases {
         let MissingLoad::Loaded { albums, .. } = &self.load else {
             return Vec::new();
         };
-        let mut missing = lidarr::missing_albums(albums.clone(), &self.owned);
+        let mut missing = lidarr::missing_albums(albums.clone(), &self.owned, &self.held);
         missing.sort_by(|a, b| b.release_day().cmp(&a.release_day()));
         missing
+    }
+
+    /// Take a discography answer, holding on to every release on screen as
+    /// missing that Lidarr has meanwhile imported (see `held`).
+    fn take_answer(&mut self, found: lidarr::Discography) {
+        let shown: HashSet<i64> = self.missing().iter().map(|a| a.id).collect();
+        self.load = missing_load(found);
+        if let MissingLoad::Loaded { albums, .. } = &self.load {
+            self.held.extend(
+                albums
+                    .iter()
+                    .filter(|a| a.has_files() && shown.contains(&a.id))
+                    .map(|a| a.id),
+            );
+        }
+    }
+
+    /// From the artist page when its `getArtist` answer lands: the library's
+    /// albums are current, so imports it still lacks stop being held.
+    pub fn library_reloaded(&mut self) {
+        self.held.clear();
+    }
+
+    /// Whether `album` is only on screen because it is held: Lidarr has it,
+    /// the library doesn't show it yet.
+    fn is_held(&self, album: &Album) -> bool {
+        self.held.contains(&album.id) && album.has_files()
+    }
+
+    /// The Lidarr cover already drawn for the release titled `title` (folded
+    /// compare), for the library album that replaces its missing card to show
+    /// while the server's cover downloads.
+    pub fn stand_in_art(&self, title: &str) -> Option<PathBuf> {
+        let MissingLoad::Loaded { albums, .. } = &self.load else {
+            return None;
+        };
+        let title = lidarr::fold(title);
+        albums
+            .iter()
+            .filter(|a| lidarr::fold(&a.title) == title)
+            .find_map(|a| self.covers.get(a.id))
     }
 
     /// How many releases are missing, once Lidarr has answered.
@@ -367,7 +401,7 @@ impl MissingReleases {
                 if let Some((found, fresh)) = cached {
                     painted = true;
                     let _ = this.update(cx, |this, cx| {
-                        this.load = missing_load(found);
+                        this.take_answer(found);
                         cx.notify();
                     });
                     if fresh {
@@ -380,7 +414,7 @@ impl MissingReleases {
                     .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(found) => this.load = missing_load(found),
+                    Ok(found) => this.take_answer(found),
                     // A stale answer on screen beats an error in its place.
                     Err(e) if painted => tracing::warn!("lidarr: refreshing discography: {e:#}"),
                     Err(e) => this.load = MissingLoad::Failed(crate::errors::error_text(&e)),
@@ -432,6 +466,7 @@ impl MissingReleases {
         let (status, color) = match album_activity(state, id) {
             Some((label, true)) => (label, cx.theme().warning),
             Some((label, false)) => (label, cx.theme().primary),
+            None if this.is_held(album) => ("Imported".into(), cx.theme().primary),
             None if !album.monitored => ("Not monitored".into(), cx.theme().muted_foreground),
             None => ("Not in library".into(), cx.theme().muted_foreground),
         };
@@ -446,7 +481,7 @@ impl MissingReleases {
                 entity.update(cx, |_, cx| cx.emit(MissingEvent::OpenAlbum(id)));
             }
         };
-        let search = (!searching).then(|| {
+        let search = (!searching && !this.is_held(album)).then(|| {
             let entity = entity.clone();
             Button::new(("lidarr-missing-search", id as u64))
                 .primary()
@@ -707,11 +742,30 @@ pub struct LidarrAlbumView {
     /// table sorts them last.
     show_rejected: bool,
     imports_seen: u64,
+    /// The About card's MusicBrainz / Wikipedia answer, looked up by the
+    /// release group Lidarr names (`foreignAlbumId`), as on a library album.
+    online: Option<AlbumInfo>,
+    /// The services the online lookup asked, once it has been sent.
+    online_asked: Option<album_info::Sources>,
+    /// The online lookup is out; see `album_detail::ONLINE_WAIT`.
+    online_since: Option<Instant>,
+    /// The About source picked from the pills; Lidarr's overview is the
+    /// page's "server" text.
+    about_pick: Option<AboutSource>,
+    notes_expanded: bool,
+    live_width: crate::ui::LiveWidth,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
     /// 0 = automatic search, 1 = interactive search, then release rows.
     vi_cursor: Option<usize>,
     vi_scroll_synced: Option<usize>,
+    /// The interactive search's results dialog, drawn like *Change release*
+    /// (`ui::dialog`). Results are kept when it closes.
+    search_open: bool,
+    search_reveal: crate::ui::Reveal,
+    /// The dialog's own scroll, which the vi cursor's release rows anchor to.
+    release_scroll: ScrollHandle,
+    release_anchor: ScrollAnchor,
     _load: Option<Task<()>>,
     _search: Option<Task<()>>,
 }
@@ -730,6 +784,7 @@ impl LidarrAlbumView {
         })
         .detach();
         let scroll = ScrollHandle::new();
+        let release_scroll = ScrollHandle::new();
         let mut this = Self {
             session,
             album_id,
@@ -742,10 +797,20 @@ impl LidarrAlbumView {
             action_error: None,
             show_rejected: false,
             imports_seen,
+            online: None,
+            online_asked: None,
+            online_since: None,
+            about_pick: None,
+            notes_expanded: false,
+            live_width: crate::ui::LiveWidth::default(),
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
             vi_scroll_synced: None,
+            search_open: false,
+            search_reveal: crate::ui::Reveal::new(170, 120),
+            release_scroll: release_scroll.clone(),
+            release_anchor: ScrollAnchor::for_handle(release_scroll),
             _load: None,
             _search: None,
         };
@@ -775,12 +840,231 @@ impl LidarrAlbumView {
                         this.album = Some(album);
                         this.tracks = Some(tracks);
                         this.error = None;
+                        this.maybe_load_online(cx);
                     }
                     Err(e) => this.error = Some(crate::errors::error_text(&e)),
                 }
                 cx.notify();
             });
         }));
+    }
+
+    /// Ask MusicBrainz / Wikipedia about the album, behind the same
+    /// `Settings::album_info_*` switches as a library album's About card.
+    /// Lidarr's `foreignAlbumId` is the release group, so nothing is searched
+    /// for: the lookup goes straight to its links and Wikipedia article.
+    fn maybe_load_online(&mut self, cx: &mut Context<Self>) {
+        let sources = online_sources(&self.session.read(cx).settings);
+        if !sources.any() || self.online_asked.is_some_and(|asked| asked.covers(sources)) {
+            return;
+        }
+        let Some(album) = self.album.as_ref() else {
+            return;
+        };
+        let query = album_info::Query {
+            album: album.title.clone(),
+            artist: album.artist.as_ref().map(|a| a.artist_name.clone()),
+            mbid: None,
+            group_mbid: Some(album.foreign_album_id.clone()).filter(|id| !id.is_empty()),
+            year: album.year().and_then(|y| y.parse().ok()),
+            sources,
+        };
+        self.online_asked = Some(sources);
+        self.online_since = Some(Instant::now());
+        // The wait running out has to repaint, or Lidarr's overview only
+        // appears at the next unrelated notify.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::ui::album_detail::ONLINE_WAIT)
+                .await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(album_info::fetch(query)).await;
+            let _ = this.update(cx, |view, cx| {
+                // Past the wait the overview is already up; the pill offers
+                // the switch rather than swapping text under the reader.
+                if !waiting_online(view.online_since) && view.about_pick.is_none() {
+                    view.about_pick = view.overview().map(|_| AboutSource::Server);
+                }
+                view.online_since = None;
+                match result {
+                    Ok(info) => view.online = info,
+                    Err(e) => tracing::warn!("lidarr album info lookup failed: {e:#}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Lidarr's own description of the album, tags stripped.
+    fn overview(&self) -> Option<String> {
+        self.album
+            .as_ref()
+            .and_then(|a| a.overview.as_deref())
+            .map(strip_html)
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+    }
+
+    /// The About card: description (Wikipedia, Lidarr's overview or the
+    /// MusicBrainz annotation, switched by pills) and the album's external
+    /// links. `card_w` is the card's px width, 0 before the first measurement.
+    fn about_card(
+        &self,
+        album: &Album,
+        card_w: f32,
+        cx: &Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        // Held back while the lookup is inside its wait, so Wikipedia's intro
+        // doesn't replace the overview a moment after it appeared.
+        if waiting_online(self.online_since) {
+            return None;
+        }
+        let want = online_sources(&self.session.read(cx).settings);
+        let online = self.online.as_ref();
+        let wikipedia = online
+            .and_then(|o| o.wikipedia.as_ref())
+            .filter(|_| want.wikipedia);
+        let annotation = online
+            .and_then(|o| o.annotation.as_ref())
+            .filter(|_| want.musicbrainz);
+        let overview = self.overview();
+        let (sources, shown) = about_sources(
+            wikipedia.is_some(),
+            overview.is_some(),
+            annotation.is_some(),
+            self.about_pick,
+        );
+        let notes = match shown {
+            Some(AboutSource::Wikipedia) => wikipedia.map(|d| d.text.clone()),
+            Some(AboutSource::MusicBrainz) => annotation.map(|d| d.text.clone()),
+            Some(AboutSource::Server) => overview,
+            None => None,
+        };
+        let notes_long = notes
+            .as_ref()
+            .is_some_and(|n| n.chars().count() > NOTES_PREVIEW_CHARS);
+        let expanded = self.notes_expanded;
+        let notes = notes.map(|n| match expanded || !notes_long {
+            true => n,
+            false => truncate_at_word(&n, NOTES_PREVIEW_CHARS),
+        });
+        // Lidarr's release group is the album's MusicBrainz page, known
+        // without asking anybody.
+        let group_url = album_info::is_mbid(&album.foreign_album_id).then(|| {
+            format!(
+                "https://musicbrainz.org/release-group/{}",
+                album.foreign_album_id
+            )
+        });
+        let online_links: Vec<album_info::Link> = online
+            .map(|o| o.links.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter(|l| want.allows(l.kind))
+            .cloned()
+            .collect();
+        let links = ext_links(group_url, None, &online_links);
+        if notes.is_none() && links.is_empty() {
+            return None;
+        }
+        // Px widths as on the album page: stretch-sized, wrapped prose is
+        // measured at a narrower width than it is laid out at.
+        let prose_w = (card_w - 32.).min(ABOUT_PROSE_MAX_W).floor();
+        let pills = (sources.len() > 1).then(|| {
+            h_flex().gap_1().children(sources.iter().map(|&source| {
+                let label = match source {
+                    AboutSource::Wikipedia => "Wikipedia",
+                    AboutSource::Server => "Lidarr",
+                    AboutSource::MusicBrainz => "MusicBrainz",
+                };
+                Button::new(SharedString::from(format!("lidarr-about-src-{label}")))
+                    .ghost()
+                    .xsmall()
+                    .label(label)
+                    .selected(shown == Some(source))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.about_pick = Some(source);
+                        cx.notify();
+                    }))
+            }))
+        });
+        let has_links = !links.is_empty();
+        Some(
+            v_flex()
+                .when(card_w > 0., |this| this.w(px(card_w)))
+                .flex_none()
+                .rounded_2xl()
+                .p_4()
+                .gap_3()
+                .bg(cx.theme().sidebar)
+                .when_some(notes, |this, text| {
+                    this.child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(div().text_sm().font_medium().child("About"))
+                            .children(pills),
+                    )
+                    .child(
+                        v_flex()
+                            .map(|this| match prose_w > 0. {
+                                true => this.w(px(prose_w)),
+                                false => this.max_w(px(ABOUT_PROSE_MAX_W)),
+                            })
+                            .gap_2()
+                            .text_sm()
+                            .children(
+                                text.split('\n')
+                                    .map(str::trim)
+                                    .filter(|p| !p.is_empty())
+                                    .map(|p| div().child(p.to_string()))
+                                    .collect::<Vec<_>>(),
+                            ),
+                    )
+                })
+                .when(notes_long || has_links, |this| {
+                    this.child(
+                        h_flex()
+                            .when(notes_long, |this| this.justify_between())
+                            .gap_2()
+                            .child(h_flex().when(notes_long, |this| {
+                                this.child(
+                                    Button::new("lidarr-notes-toggle")
+                                        .ghost()
+                                        .xsmall()
+                                        .label(if expanded { "Less" } else { "More" })
+                                        .icon(Icon::new(if expanded {
+                                            IconName::ChevronUp
+                                        } else {
+                                            IconName::ChevronDown
+                                        }))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.notes_expanded = !this.notes_expanded;
+                                            cx.notify();
+                                        })),
+                                )
+                            }))
+                            .child(h_flex().gap_1().children(links.into_iter().map(
+                                |(label, url)| {
+                                    Button::new(SharedString::from(format!(
+                                        "lidarr-al-link-{label}"
+                                    )))
+                                    .ghost()
+                                    .small()
+                                    .icon(link_icon(label))
+                                    .tooltip(label)
+                                    .on_click(move |_, _, cx| cx.open_url(&url))
+                                },
+                            ))),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn search_automatic(&mut self, cx: &mut Context<Self>) {
@@ -794,6 +1078,29 @@ impl LidarrAlbumView {
             });
         })
         .detach();
+    }
+
+    /// Opens the results dialog, asking the indexers unless it already holds
+    /// an answer (its *Search again* asks anew).
+    fn open_interactive(&mut self, cx: &mut Context<Self>) {
+        self.search_open = true;
+        if matches!(self.releases, Releases::NotAsked | Releases::Failed(_)) {
+            self.search_interactive(cx);
+        }
+        cx.notify();
+    }
+
+    /// Escape: closes the results dialog when it is open.
+    pub fn close_dialog(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.search_open {
+            return false;
+        }
+        self.search_open = false;
+        if self.vi_cursor.is_some_and(|c| c >= 2) {
+            self.vi_cursor = Some(1);
+        }
+        cx.notify();
+        true
     }
 
     fn search_interactive(&mut self, cx: &mut Context<Self>) {
@@ -903,7 +1210,13 @@ impl LidarrAlbumView {
     }
 
     pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = 2 + self.visible_releases().len();
+        // Release rows are only walkable while their dialog is open.
+        let rows = if self.search_open {
+            self.visible_releases().len()
+        } else {
+            0
+        };
+        let count = 2 + rows;
         let cur = self.vi_cursor.unwrap_or(0);
         let next = if delta > 0 {
             (cur + delta as usize).min(count - 1)
@@ -917,7 +1230,7 @@ impl LidarrAlbumView {
     pub fn vi_activate(&mut self, cx: &mut Context<Self>) {
         match self.vi_cursor {
             Some(0) => self.search_automatic(cx),
-            Some(1) => self.search_interactive(cx),
+            Some(1) => self.open_interactive(cx),
             Some(i) => {
                 if let Some(release) = self.visible_releases().get(i - 2).cloned() {
                     self.grab(release, cx);
@@ -1041,7 +1354,7 @@ impl LidarrAlbumView {
             .rounded_md()
             .hover(|s| s.bg(cx.theme().muted))
             .when(focused, |s| {
-                s.anchor_scroll(Some(self.focus_anchor.clone()))
+                s.anchor_scroll(Some(self.release_anchor.clone()))
             })
             .child(
                 h_flex()
@@ -1130,13 +1443,25 @@ impl LidarrAlbumView {
 
 impl Render for LidarrAlbumView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Release rows live in the dialog's scroll, the buttons on the page's.
+        let anchor = match self.vi_cursor {
+            Some(c) if c >= 2 => self.release_anchor.clone(),
+            _ => self.focus_anchor.clone(),
+        };
         sync_focus_scroll(
-            &self.focus_anchor,
+            &anchor,
             self.vi_cursor,
             &mut self.vi_scroll_synced,
             window,
             cx,
         );
+        // A switch turned on in Settings since the page opened asks now.
+        self.maybe_load_online(cx);
+        // Scroll pane minus its `p_4`, whole pixels (see `ui::LiveWidth`).
+        let content_w = self
+            .live_width
+            .resolve(f32::from(self.scroll.bounds().size.width), window);
+        let card_w = (content_w - 32.).max(0.).floor();
         let client = self.client(cx);
         if let (Some(client), Some(album)) = (client.as_ref(), self.album.clone()) {
             self.covers.want(
@@ -1228,7 +1553,7 @@ impl Render for LidarrAlbumView {
             .icon(Icon::new(IconName::Search))
             .label("Interactive search")
             .loading(interactive_busy)
-            .on_click(cx.listener(|this, _, _, cx| this.search_interactive(cx)));
+            .on_click(cx.listener(|this, _, _, cx| this.open_interactive(cx)));
         let monitored = album.monitored;
 
         let header = h_flex()
@@ -1379,7 +1704,6 @@ impl Render for LidarrAlbumView {
                     .into_any_element(),
             ),
             Releases::Loaded(all) => {
-                let rejected = all.iter().filter(|r| !r.approved).count();
                 let shown = self.visible_releases();
                 let rows: Vec<gpui::AnyElement> = shown
                     .iter()
@@ -1388,7 +1712,6 @@ impl Render for LidarrAlbumView {
                         self.render_release(i, r, self.vi_cursor == Some(i + 2), glow, cx)
                     })
                     .collect();
-                let show_rejected = self.show_rejected;
                 Some(
                     v_flex()
                         .gap_0p5()
@@ -1409,31 +1732,79 @@ impl Render for LidarrAlbumView {
                             )
                         })
                         .children(rows)
-                        .when(rejected > 0, |this| {
-                            this.child(
-                                div().pt_1().child(
-                                    Button::new("lidarr-show-rejected")
-                                        .ghost()
-                                        .xsmall()
-                                        .label(if show_rejected {
-                                            "Hide rejected".to_string()
-                                        } else {
-                                            format!("Show {rejected} rejected")
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.show_rejected = !this.show_rejected;
-                                            this.vi_cursor = None;
-                                            cx.notify();
-                                        })),
-                                ),
-                            )
-                        })
                         .into_any_element(),
                 )
             }
         };
 
-        v_flex()
+        // Interactive results, in a dialog over the page.
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        self.search_reveal.set(self.search_open, reduced_motion);
+        if self.search_reveal.settling(reduced_motion) {
+            window.request_animation_frame();
+        }
+        let dialog = (self.search_reveal.visible(reduced_motion))
+            .then_some(releases_section)
+            .flatten()
+            .map(|body| {
+                let rejected = match &self.releases {
+                    Releases::Loaded(all) => all.iter().filter(|r| !r.approved).count(),
+                    _ => 0,
+                };
+                let show_rejected = self.show_rejected;
+                let loading = matches!(self.releases, Releases::Loading(_));
+                let footer = h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().when(rejected > 0, |this| {
+                        this.child(
+                            Button::new("lidarr-show-rejected")
+                                .ghost()
+                                .xsmall()
+                                .label(if show_rejected {
+                                    "Hide rejected".to_string()
+                                } else {
+                                    format!("Show {rejected} rejected")
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_rejected = !this.show_rejected;
+                                    this.vi_cursor = None;
+                                    cx.notify();
+                                })),
+                        )
+                    }))
+                    .child(
+                        Button::new("lidarr-search-again")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::Search))
+                            .label("Search again")
+                            .loading(loading)
+                            .on_click(cx.listener(|this, _, _, cx| this.search_interactive(cx))),
+                    );
+                let subtitle = match album.artist.as_ref() {
+                    Some(artist) => format!("{} · {}", album.title, artist.artist_name),
+                    None => album.title.clone(),
+                };
+                crate::ui::dialog(
+                    "lidarr-releases",
+                    760.,
+                    "Interactive search",
+                    subtitle,
+                    self.search_reveal.openness(reduced_motion),
+                    self.search_open,
+                    |this: &mut Self, cx| {
+                        this.close_dialog(cx);
+                    },
+                    body,
+                    Some(footer.into_any_element()),
+                    Some(&self.release_scroll),
+                    window,
+                    cx,
+                )
+            });
+
+        let page = v_flex()
             .id("lidarr-album-scroll")
             .size_full()
             .overflow_y_scroll()
@@ -1441,15 +1812,6 @@ impl Render for LidarrAlbumView {
             .p_4()
             .gap_4()
             .child(header)
-            .when_some(releases_section, |this, section| {
-                this.child(
-                    v_flex()
-                        .flex_none()
-                        .gap_2()
-                        .child(div().text_sm().font_medium().child("Releases"))
-                        .child(section),
-                )
-            })
             .child(
                 v_flex()
                     .flex_none()
@@ -1464,18 +1826,12 @@ impl Render for LidarrAlbumView {
                             .children(tracks.iter().map(|t| self.render_track(t, cx))),
                     ),
             )
-            .when_some(
-                album.overview.clone().filter(|o| !o.trim().is_empty()),
-                |this, o| {
-                    this.child(
-                        v_flex()
-                            .flex_none()
-                            .gap_2()
-                            .child(div().text_sm().font_medium().child("About"))
-                            .child(div().text_sm().text_color(muted).child(o)),
-                    )
-                },
-            )
+            .children(self.about_card(&album, card_w, cx));
+        div()
+            .relative()
+            .size_full()
+            .child(page)
+            .children(dialog)
             .into_any_element()
     }
 }

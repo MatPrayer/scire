@@ -69,6 +69,9 @@ const LIDARR_SETTLE: Duration = Duration::from_secs(8);
 /// server's folder watcher hadn't got to it) is looked for again this often,
 /// up to `ARRIVAL_RECHECKS` times.
 const ARRIVAL_RECHECK: Duration = Duration::from_secs(60);
+/// Longest a library refresh holds the album grid's rebuild for the Lidarr
+/// covers of albums it brought in (`RootView::arrival_covers_missing`).
+const ARRIVAL_COVER_WAIT: Duration = Duration::from_secs(5);
 const ARRIVAL_RECHECKS: u32 = 5;
 
 /// How long the window's position has to hold still before it is written to
@@ -323,6 +326,11 @@ pub struct RootView {
     song_info: Option<crate::ui::song_info::SongInfo>,
     song_info_open: bool,
     song_info_reveal: crate::ui::Reveal,
+    /// The Lidarr edition picker an album page asked for (kept after close so
+    /// the exit can play).
+    release_picker: Option<Entity<crate::ui::lidarr_release::ReleasePicker>>,
+    release_picker_open: bool,
+    release_picker_reveal: crate::ui::Reveal,
     /// Open/close travel of the `:` command bar.
     command_reveal: crate::ui::Reveal,
     show_fullscreen: bool,
@@ -449,6 +457,20 @@ pub struct RootView {
 /// visualizer uses it). From a click handler or from `render` it panics on both
 /// counts. `Context::on_next_frame` names the entity outright and has no phase
 /// requirement.
+/// The library album (folded credit, folded title, server cover id) a Lidarr
+/// arrival is: same folded title, credit naming the Lidarr artist.
+fn arrival_match<'a>(
+    known: &'a [(String, String, Option<String>)],
+    artist: &str,
+    title: &str,
+) -> Option<&'a (String, String, Option<String>)> {
+    use crate::services::lidarr::fold;
+    let (artist, title) = (fold(artist), fold(title));
+    known
+        .iter()
+        .find(|(credit, name, _)| *name == title && credit.contains(&artist))
+}
+
 fn settle_reflow(window: &mut Window, cx: &mut Context<RootView>) {
     cx.on_next_frame(window, |_, _, cx| cx.notify());
 }
@@ -863,6 +885,9 @@ impl RootView {
             song_info: None,
             song_info_open: false,
             song_info_reveal: crate::ui::Reveal::new(170, 120),
+            release_picker: None,
+            release_picker_open: false,
+            release_picker_reveal: crate::ui::Reveal::new(170, 120),
             vi_help_reveal: crate::ui::Reveal::new(170, 120),
             command_reveal: crate::ui::Reveal::new(150, 110),
             show_fullscreen: false,
@@ -1109,14 +1134,39 @@ impl RootView {
                 // its failure wins over the local scan's.
                 failure = sync_failure.or(failure);
             }
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = this.update(cx, |this, cx| {
                 this.refreshing = false;
                 this.refresh_stage = RefreshStage::Idle;
                 this.refresh_error = failure;
+                cx.notify();
+            });
+            // Albums Lidarr imported that the library now lists take over
+            // their download card's cover; one the card never fetched is
+            // fetched first (bounded), so the rebuilt grid doesn't ask the
+            // server, which may not have the art yet, and keep its answer.
+            let waits = this
+                .update(cx, |this, cx| this.arrival_covers_missing(cx))
+                .unwrap_or_default();
+            if !waits.is_empty() {
+                let _ = runtime::spawn_io(async move {
+                    let _ = tokio::time::timeout(ARRIVAL_COVER_WAIT, async {
+                        for wait in waits {
+                            let _ = wait.await;
+                        }
+                    })
+                    .await;
+                    Ok(())
+                })
+                .await;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
                 // The catalog views hold the rows they were built from and
                 // never reload on their own; drop them so the next visit
                 // re-seeds from what the refresh just wrote.
                 let on_catalog_page = this.on_catalog_page();
+                // Download cards for albums the library now lists go; their
+                // covers are handed to the albums first.
+                this.settle_lidarr_arrivals(window, cx);
                 this.invalidate_catalog_views();
                 // Redraw the current page only if it is one of those listings —
                 // a detail page the user opened meanwhile must not be replaced
@@ -1127,8 +1177,6 @@ impl RootView {
                 // Pages showing what Lidarr just imported.
                 let imported = std::mem::take(&mut this.reload_after_refresh);
                 this.reload_imported(&imported, cx);
-                // Download cards for albums the library now lists go.
-                this.settle_lidarr_arrivals(window, cx);
                 // Covers for whatever the refresh just added.
                 this.maybe_precache_art(cx);
                 cx.notify();
@@ -1189,33 +1237,79 @@ impl RootView {
 
     /// Drops the album grid's "waiting for library" cards for albums the
     /// refresh just wrote, and looks again later for the rest.
-    fn settle_lidarr_arrivals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The library's albums as `settle_lidarr_arrivals` matches them:
+    /// (folded credit, folded title, server cover id).
+    fn arrival_index(&self) -> Vec<(String, String, Option<String>)> {
         use crate::services::lidarr::fold;
+        [library_db::SOURCE_NAVIDROME, library_db::SOURCE_LOCAL]
+            .into_iter()
+            .flat_map(|source| self.library_db.albums_by_source(source).unwrap_or_default())
+            .map(|row| {
+                let cover = (row.source == library_db::SOURCE_NAVIDROME)
+                    .then_some(row.cover_art)
+                    .flatten();
+                (
+                    fold(row.artist.as_deref().unwrap_or_default()),
+                    fold(&row.title),
+                    cover,
+                )
+            })
+            .collect()
+    }
+
+    /// Downloads of the Lidarr covers `settle_lidarr_arrivals` is about to
+    /// hand to server albums but finds no copy of on disk.
+    fn arrival_covers_missing(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<impl Future<Output = anyhow::Result<std::path::PathBuf>> + Send + use<>> {
+        let lidarr = crate::state::lidarr::lidarr(cx);
+        let state = lidarr.read(cx);
+        let Some(client) = state.client.clone() else {
+            return Vec::new();
+        };
+        if !state.has_arrived() {
+            return Vec::new();
+        }
+        let known = self.arrival_index();
+        state
+            .arrived()
+            .filter(|(album, artist)| {
+                matches!(
+                    arrival_match(&known, artist, &album.title),
+                    Some((_, _, Some(_)))
+                )
+            })
+            .filter(|(album, _)| {
+                artwork::cached_best(&album.cover_key(), crate::state::lidarr::ARRIVAL_COVER_PX)
+                    .is_none()
+            })
+            .filter_map(|(album, _)| {
+                client.cover_fetch(album, crate::state::lidarr::ARRIVAL_COVER_PX)
+            })
+            .collect()
+    }
+
+    fn settle_lidarr_arrivals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let lidarr = crate::state::lidarr::lidarr(cx);
         if !lidarr.read(cx).has_arrived() {
             return;
         }
-        let known: Vec<(String, String)> = [library_db::SOURCE_NAVIDROME, library_db::SOURCE_LOCAL]
-            .into_iter()
-            .flat_map(|source| self.library_db.albums_by_source(source).unwrap_or_default())
-            .map(|row| {
-                (
-                    fold(row.artist.as_deref().unwrap_or_default()),
-                    fold(&row.title),
-                )
-            })
-            .collect();
-        lidarr.update(cx, |state, cx| {
+        let known = self.arrival_index();
+        let settled = lidarr.update(cx, |state, cx| {
             state.settle_arrived(
-                |artist, title| {
-                    let (artist, title) = (fold(artist), fold(title));
-                    known
-                        .iter()
-                        .any(|(credit, name)| *name == title && credit.contains(&artist))
-                },
+                |artist, title| arrival_match(&known, artist, title).is_some(),
                 cx,
             )
         });
+        // The download card's cover becomes the album's until the server's
+        // own is known: the server lists an import before its art settles.
+        // Before the catalog views are rebuilt, so their first lookup hits it.
+        for (album, artist) in &settled {
+            if let Some((_, _, Some(cover_id))) = arrival_match(&known, artist, &album.title) {
+                artwork::seed_album_cover(cover_id, &album.cover_key());
+            }
+        }
         if lidarr.read(cx).has_arrived() {
             self.schedule_arrival_recheck(window, cx);
         }
@@ -1804,9 +1898,11 @@ impl RootView {
                 cx,
             )
         });
-        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
-            let AlbumDetailEvent::OpenArtist(id) = event;
-            this.open_artist(id.clone(), cx);
+        cx.subscribe(&view, |this: &mut Self, _, event, cx| match event {
+            AlbumDetailEvent::OpenArtist(id) => this.open_artist(id.clone(), cx),
+            AlbumDetailEvent::ChangeRelease { artists, title } => {
+                this.open_release_picker(artists.clone(), title.clone(), cx)
+            }
         })
         .detach();
         self.content = Some(Content::AlbumDetail(view));
@@ -2064,6 +2160,27 @@ impl RootView {
 
     fn close_song_info(&mut self, cx: &mut Context<Self>) {
         self.song_info_open = false;
+        cx.notify();
+    }
+
+    fn open_release_picker(&mut self, artists: Vec<String>, title: String, cx: &mut Context<Self>) {
+        use crate::ui::lidarr_release::{self, ReleasePickerEvent};
+        let picker = lidarr_release::open(artists, title, cx);
+        cx.subscribe(&picker, |this: &mut Self, _, event, cx| {
+            let ReleasePickerEvent::OpenLidarrAlbum(id) = event;
+            this.close_release_picker(cx);
+            this.open_lidarr_album(*id, cx);
+        })
+        .detach();
+        // Drawn by this view, so its changes repaint this view.
+        cx.observe(&picker, |_, _, cx| cx.notify()).detach();
+        self.release_picker = Some(picker);
+        self.release_picker_open = true;
+        cx.notify();
+    }
+
+    fn close_release_picker(&mut self, cx: &mut Context<Self>) {
+        self.release_picker_open = false;
         cx.notify();
     }
 
@@ -2578,6 +2695,13 @@ impl RootView {
             (false, "escape") => {
                 if self.song_info_open {
                     self.close_song_info(cx);
+                    cx.stop_propagation();
+                } else if self.release_picker_open {
+                    self.close_release_picker(cx);
+                    cx.stop_propagation();
+                } else if let Some(Content::LidarrAlbum(view)) = &self.content
+                    && view.update(cx, |view, cx| view.close_dialog(cx))
+                {
                     cx.stop_propagation();
                 } else if self.show_vi_help {
                     self.show_vi_help = false;
@@ -3671,6 +3795,7 @@ impl Render for RootView {
         }
         let modal_open = self.new_playlist_open
             || self.song_info_open
+            || self.release_picker_open
             || self.show_fullscreen
             || palette_open
             || self.mode == KeyboardMode::Command
@@ -3839,6 +3964,8 @@ impl Render for RootView {
         self.vi_help_reveal.set(self.show_vi_help, reduced_motion);
         self.song_info_reveal
             .set(self.song_info_open, reduced_motion);
+        self.release_picker_reveal
+            .set(self.release_picker_open, reduced_motion);
         self.command_reveal
             .set(self.mode == KeyboardMode::Command, reduced_motion);
         let new_playlist_t = self.new_playlist_reveal.openness(reduced_motion);
@@ -3846,12 +3973,15 @@ impl Render for RootView {
         let vi_help_t = self.vi_help_reveal.openness(reduced_motion);
         let song_info_t = self.song_info_reveal.openness(reduced_motion);
         let song_info_visible = self.song_info_reveal.visible(reduced_motion);
+        let release_picker_t = self.release_picker_reveal.openness(reduced_motion);
+        let release_picker_visible = self.release_picker_reveal.visible(reduced_motion);
         let vi_help_visible = self.vi_help_reveal.visible(reduced_motion);
         let command_t = self.command_reveal.openness(reduced_motion);
         let command_visible = self.command_reveal.visible(reduced_motion);
         if self.new_playlist_reveal.settling(reduced_motion)
             || self.vi_help_reveal.settling(reduced_motion)
             || self.song_info_reveal.settling(reduced_motion)
+            || self.release_picker_reveal.settling(reduced_motion)
             || self.command_reveal.settling(reduced_motion)
         {
             window.request_animation_frame();
@@ -3928,6 +4058,13 @@ impl Render for RootView {
                         "escape" => {
                             if this.song_info_open {
                                 this.close_song_info(cx);
+                                cx.stop_propagation();
+                            } else if this.release_picker_open {
+                                this.close_release_picker(cx);
+                                cx.stop_propagation();
+                            } else if let Some(Content::LidarrAlbum(view)) = &this.content
+                                && view.update(cx, |view, cx| view.close_dialog(cx))
+                            {
                                 cx.stop_propagation();
                             } else if this.new_playlist_open {
                                 this.cancel_new_playlist(cx);
@@ -4161,6 +4298,22 @@ impl Render for RootView {
                         song_info_t,
                         self.song_info_open,
                         |this: &mut Self, cx| this.close_song_info(cx),
+                        window,
+                        cx,
+                    ))
+                },
+            )
+            // Lidarr edition picker.
+            .when_some(
+                self.release_picker
+                    .as_ref()
+                    .filter(|_| release_picker_visible),
+                |this, picker| {
+                    this.child(crate::ui::lidarr_release::render(
+                        picker,
+                        release_picker_t,
+                        self.release_picker_open,
+                        |this: &mut Self, cx| this.close_release_picker(cx),
                         window,
                         cx,
                     ))

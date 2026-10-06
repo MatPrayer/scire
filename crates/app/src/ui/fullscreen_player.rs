@@ -1202,6 +1202,11 @@ pub struct FullscreenPlayer {
     art_path: Option<PathBuf>,
     bg_art_path: Option<PathBuf>,
     gradient_palette: Option<Vec<gpui::Rgba>>,
+    /// The centre cover downscaled to its slot: a 1500 rung drawn at ~800px
+    /// aliases under gpui's bilinear sampling.
+    sharp_art: crate::ui::SharpArt,
+    /// The same for the visualizer's mini player thumb.
+    sharp_thumb: crate::ui::SharpArt,
     /// Album-scoped art key the loaded art belongs to (see `artwork::song_cover`).
     last_art_key: Option<String>,
     /// Rung the drawn cover wants: its laid-out edge in device pixels,
@@ -1406,6 +1411,8 @@ impl FullscreenPlayer {
             art_path: None,
             bg_art_path: None,
             gradient_palette: None,
+            sharp_art: Default::default(),
+            sharp_thumb: Default::default(),
             last_art_key: None,
             art_want: artwork::bucket(ART_SIZE),
             art_rung: 0,
@@ -1644,12 +1651,16 @@ impl FullscreenPlayer {
         // track, and every row on screen stays whole. Centring on the track
         // itself would leave half a row at each edge, which is the thing the
         // panel's row-snapped height is there to avoid.
+        //
+        // Strict: plain `scroll_to_item` only moves when the target row is off
+        // screen, and the row sent to the top sits *above* the playing track —
+        // still visible as the track walks down, so the list never followed.
         let visible = queue_visible_rows(panel_max_h, len);
         let top = pos
             .saturating_sub(visible / 2)
             .min(len.saturating_sub(visible));
         self.queue_scroll
-            .scroll_to_item(top, gpui::ScrollStrategy::Top);
+            .scroll_to_item_strict(top, gpui::ScrollStrategy::Top);
     }
 
     /// Light the line being sung and keep it on screen.
@@ -3351,6 +3362,14 @@ impl Render for FullscreenPlayer {
         // The cover can grow past the rung first fetched (`roomy_art_cap`);
         // drawn upscaled it is visibly softer than the album page's lightbox.
         self.sync_art_size(layout.art, window, cx);
+        let art_path = self.art_path.clone().filter(|_| !is_radio);
+        let main_art = art_path
+            .clone()
+            .filter(|_| !viz_mode.is_on() && layout.art > 0.)
+            .map(|path| self.sharp_art.path(&path, layout.art, window, cx));
+        let thumb_art = art_path
+            .filter(|_| viz_mode.is_on())
+            .map(|path| self.sharp_thumb.path(&path, 56., window, cx));
         // And the line being sung in the lyrics panel, which the position tick
         // brings us back here for twice a second.
         self.sync_lyrics_scroll(cx);
@@ -3546,14 +3565,9 @@ impl Render for FullscreenPlayer {
                                                 .rounded_lg()
                                                 .bg(cx.theme().muted)
                                                 .overflow_hidden()
-                                                .when_some(
-                                                    self.art_path.clone().filter(|_| !is_radio),
-                                                    |this, path| {
-                                                        this.child(
-                                                            img(path).size(px(56.)).rounded_lg(),
-                                                        )
-                                                    },
-                                                )
+                                                .when_some(thumb_art, |this, path| {
+                                                    this.child(img(path).size(px(56.)).rounded_lg())
+                                                })
                                                 .when(is_radio, |this| {
                                                     this.flex()
                                                         .items_center()
@@ -3848,12 +3862,9 @@ impl Render for FullscreenPlayer {
                                     .bg(cx.theme().muted)
                                     .overflow_hidden()
                                     .shadow_xl()
-                                    .when_some(
-                                        self.art_path.clone().filter(|_| !is_radio),
-                                        |this, path| {
-                                            this.child(img(path).size(px(art_size)).rounded_2xl())
-                                        },
-                                    )
+                                    .when_some(main_art, |this, path| {
+                                        this.child(img(path).size(px(art_size)).rounded_2xl())
+                                    })
                                     // A station has no artwork; mark the slot as
                                     // radio rather than leaving a blank square the
                                     // size of a record sleeve.

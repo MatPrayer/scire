@@ -45,7 +45,7 @@ use crate::ui::{
 const ART_SIZE: u32 = 512;
 
 /// Collapsed album-notes length, matching the artist page's bio preview.
-const NOTES_PREVIEW_CHARS: usize = 400;
+pub(crate) const NOTES_PREVIEW_CHARS: usize = 400;
 
 /// Read a cached cover file and reduce it to a page accent.
 ///
@@ -168,7 +168,7 @@ pub(crate) fn about_sources(
 }
 
 /// The online services the album page may ask, per the settings.
-fn online_sources(settings: &crate::config::Settings) -> album_info::Sources {
+pub(crate) fn online_sources(settings: &crate::config::Settings) -> album_info::Sources {
     album_info::Sources {
         wikipedia: settings.album_info_wikipedia,
         musicbrainz: settings.album_info_musicbrainz,
@@ -287,6 +287,11 @@ fn notes_sample() -> String {
 
 pub enum AlbumDetailEvent {
     OpenArtist(String),
+    /// *Change release*: pick the edition Lidarr keeps of this album.
+    ChangeRelease {
+        artists: Vec<String>,
+        title: String,
+    },
 }
 
 pub struct AlbumDetailView {
@@ -311,6 +316,21 @@ pub struct AlbumDetailView {
     /// The About card's description source the user picked from its pills.
     about_pick: Option<AboutSource>,
     art_path: Option<PathBuf>,
+    /// Rung the header cover wants: its drawn edge in device pixels, bucketed.
+    /// Starts at `ART_SIZE`; `sync_art_size` raises it when the side panel or
+    /// the centred stack draws the cover bigger. Only ever upward.
+    art_want: u32,
+    /// Cover id and rung of the newest fetch asked for. A landing answer
+    /// replaces `art_path` only while it is still that cover and at least
+    /// `art_held`, so a slow smaller download can't replace a sharper one.
+    art_asked: Option<(String, u32)>,
+    /// Rung `art_path` was fetched at (0 for the grid's seed, any size).
+    art_held: u32,
+    /// The header cover downscaled to its slot (gpui's bilinear sampling
+    /// aliases a 512px file drawn at 220px).
+    sharp_art: crate::ui::SharpArt,
+    /// The same for the lightbox, which draws the 1500 rung at up to 820px.
+    sharp_full_art: crate::ui::SharpArt,
     error: Option<crate::errors::ErrorNote>,
     /// Last observed playing-song id; used to refresh play counts when a track
     /// from this album finishes (its scrobble updates the server count).
@@ -426,6 +446,11 @@ impl AlbumDetailView {
             online_since: None,
             about_pick: None,
             art_path: None,
+            art_want: ART_SIZE,
+            art_asked: None,
+            art_held: 0,
+            sharp_art: Default::default(),
+            sharp_full_art: Default::default(),
             error: None,
             last_playing_id,
             show_full_art: false,
@@ -478,7 +503,7 @@ impl AlbumDetailView {
             // `fetch_art` below replaces it with the requested size when that
             // lands; drawing the grid's thumbnail scaled up in the meantime is
             // what stops the header opening empty.
-            self.art_path = artwork::cached_best(&cover, ART_SIZE);
+            self.art_path = artwork::cached_best(&cover, self.art_want);
             self.refresh_accent(cx);
             self.fetch_art(cover, cx);
         }
@@ -538,6 +563,24 @@ impl AlbumDetailView {
                 .artist
                 .as_deref()
                 .is_some_and(|credit| fold(credit).contains(&artist))
+    }
+
+    /// Ask for the Lidarr edition picker: credited artists in order (each
+    /// one tried until Lidarr tracks one), then the joined credit line.
+    fn change_release(&mut self, cx: &mut Context<Self>) {
+        let Some(album) = self.album.as_ref().map(|a| &a.album) else {
+            return;
+        };
+        let mut artists: Vec<String> = album.artists.iter().map(|a| a.name.clone()).collect();
+        if let Some(credit) = &album.artist
+            && !artists.contains(credit)
+        {
+            artists.push(credit.clone());
+        }
+        cx.emit(AlbumDetailEvent::ChangeRelease {
+            artists,
+            title: album.name.clone(),
+        });
     }
 
     /// Ask the server again, keeping what is on screen until it answers —
@@ -657,6 +700,7 @@ impl AlbumDetailView {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(str::to_string),
+            group_mbid: None,
             sources,
         };
         self.online_asked = Some(sources);
@@ -699,13 +743,30 @@ impl AlbumDetailView {
             .filter(|n| !n.is_empty())
     }
 
-    fn fetch_art(&self, cover_id: String, cx: &mut Context<Self>) {
+    fn fetch_art(&mut self, cover_id: String, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
         };
+        let rung = self.art_want;
+        if self
+            .art_asked
+            .as_ref()
+            .is_some_and(|(id, _)| *id != cover_id)
+        {
+            self.art_held = 0;
+        }
+        self.art_asked = Some((cover_id.clone(), rung));
         cx.spawn(async move |this, cx| {
-            if let Ok(path) = artwork::fetch(client, cover_id, ART_SIZE).await {
+            if let Ok(path) = artwork::fetch(client, cover_id.clone(), rung).await {
                 let _ = this.update(cx, |view, cx| {
+                    let current = view
+                        .art_asked
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == cover_id);
+                    if !current || rung < view.art_held {
+                        return;
+                    }
+                    view.art_held = rung;
                     view.art_path = Some(path);
                     view.refresh_accent(cx);
                     cx.notify();
@@ -713,6 +774,25 @@ impl AlbumDetailView {
             }
         })
         .detach();
+    }
+
+    /// Ask for a larger rung when the header cover is drawn bigger than the
+    /// one asked for — the side panel and the centred stack grow it past
+    /// `ART_SIZE`, which was then stretched. Only ever upward: a shrinking
+    /// window keeps the sharper file.
+    fn sync_art_size(&mut self, art_px: f32, window: &Window, cx: &mut Context<Self>) {
+        if art_px <= 0. {
+            return;
+        }
+        let want = artwork::bucket((art_px * window.scale_factor()).ceil() as u32);
+        if want <= self.art_want {
+            return;
+        }
+        self.art_want = want;
+        // Nothing asked yet: the first fetch uses `art_want`.
+        if let Some((cover, _)) = self.art_asked.clone() {
+            self.fetch_art(cover, cx);
+        }
     }
 
     /// The accent this page paints itself with, or `None` when it should use
@@ -1138,6 +1218,7 @@ impl Render for AlbumDetailView {
         let show_album = loading_album && placeholding(self.album_since);
 
         let hide_stars = self.session.read(cx).settings.hide_album_stars;
+        let lidarr_enabled = crate::state::lidarr::lidarr(cx).read(cx).enabled();
         let detailed_dates = self.session.read(cx).settings.detailed_album_dates;
         let (album_starred, album_rating) = self
             .album
@@ -1290,6 +1371,11 @@ impl Render for AlbumDetailView {
                         }))
                 }));
 
+            self.sync_art_size(art_px, window, cx);
+            let art_path = self
+                .art_path
+                .clone()
+                .map(|path| self.sharp_art.path(&path, art_px, window, cx));
             let cover = div()
                 .id("album-cover")
                 .flex_none()
@@ -1297,7 +1383,7 @@ impl Render for AlbumDetailView {
                 .rounded_2xl()
                 .bg(cx.theme().muted)
                 .overflow_hidden()
-                .when_some(self.art_path.clone(), |this, path| {
+                .when_some(art_path, |this, path| {
                     // Click to view the cover at full resolution.
                     this.cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.open_full_art(cx)))
@@ -1425,7 +1511,7 @@ impl Render for AlbumDetailView {
                             .child(skeleton_text("al-rg-sk", show_album, REPLAYGAIN_SAMPLE, cx)),
                     ),
                 })
-                .child(rating_stars)
+                .when(!hide_stars, |this| this.child(rating_stars))
                 .child(
                     h_flex()
                         .gap_2()
@@ -1788,6 +1874,12 @@ impl Render for AlbumDetailView {
                 )
             })
             .collect();
+        let discs: Vec<Option<u32>> = self
+            .album
+            .iter()
+            .flat_map(|a| a.song.iter().map(|s| s.disc_number))
+            .collect();
+        let rows = crate::ui::with_disc_headings(rows, &discs, cx);
 
         // Description + external links: the server's `getAlbumInfo2` and
         // whatever `services::album_info` found online. Collapsed by truncating
@@ -2092,6 +2184,24 @@ impl Render for AlbumDetailView {
             })
             .child(header);
 
+        // Under the About card, flush right with the cards above it: a Lidarr
+        // chore, not something to do with the album, so it stays small and
+        // out of the header.
+        let change_release = (lidarr_enabled && self.album.is_some()).then(|| {
+            h_flex()
+                .when(header_w > 0., |this| this.w(px(header_w)))
+                .flex_none()
+                .justify_end()
+                .child(
+                    Button::new("album-change-release")
+                        .ghost()
+                        .xsmall()
+                        .text_color(cx.theme().muted_foreground)
+                        .label("Change release")
+                        .on_click(cx.listener(|this, _, _, cx| this.change_release(cx))),
+                )
+        });
+
         let error_line = self.error.clone().map(|note| {
             crate::ui::error_banner(
                 &note,
@@ -2185,7 +2295,8 @@ impl Render for AlbumDetailView {
                     .p_4()
                     .gap_4()
                     .child(header_card)
-                    .children(about);
+                    .children(about)
+                    .children(change_release);
                 let row = h_flex().size_full().items_start();
                 // Which column leads is `Settings::album_panel_right`, off by
                 // default; nothing else about either one changes with it.
@@ -2210,6 +2321,7 @@ impl Render for AlbumDetailView {
                 // above the track list is the track list stepping down. At the
                 // end of the column it grows into empty page.
                 .children(about)
+                .children(change_release)
                 .into_any_element(),
         };
 
@@ -2222,6 +2334,12 @@ impl Render for AlbumDetailView {
             .child(scroll)
             // Full-resolution cover lightbox; click anywhere to dismiss.
             .when(self.show_full_art, |this| {
+                let full_px = crate::ui::lightbox_art_px(window);
+                let full_art = self
+                    .full_art_path
+                    .clone()
+                    .or_else(|| self.art_path.clone())
+                    .map(|path| self.sharp_full_art.path(&path, full_px, window, cx));
                 this.child(
                     div()
                         .id("album-lightbox")
@@ -2240,12 +2358,9 @@ impl Render for AlbumDetailView {
                             this.show_full_art = false;
                             cx.notify();
                         }))
-                        .when_some(
-                            self.full_art_path.clone().or_else(|| self.art_path.clone()),
-                            |this, path| {
-                                this.child(img(path).max_w(px(820.)).max_h(px(820.)).rounded_lg())
-                            },
-                        ),
+                        .when_some(full_art, |this, path| {
+                            this.child(img(path).size(px(full_px)).rounded_lg())
+                        }),
                 )
             })
     }

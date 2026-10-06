@@ -4,6 +4,61 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-10-06
+
+### Added
+
+- Albums spanning several discs show a **Disc N** heading with a divider
+  where each disc starts, on server and local album pages.
+- Lidarr album pages have an About card like a library album's: Lidarr's
+  own overview, labelled Lidarr, alongside Wikipedia and MusicBrainz.
+- **Change release** on a library album page (with Lidarr connected): lists
+  the editions Lidarr knows of the album — format, tracks, length, country,
+  label — with the one it keeps marked, and switches Lidarr to another,
+  optionally starting a search for it. The download replaces the album
+  through the usual import.
+
+### Changed
+
+- A Lidarr album page's **Interactive search** shows its results in a dialog
+  like *Change release* instead of a list wedged between the header and the
+  tracks. Closing it keeps the results; *Search again* asks the indexers anew.
+- **Hide star buttons** also hides the 1–5 rating stars in the album header.
+
+### Fixed
+
+- Album page covers are sharp. The header always fetched the 512px cover,
+  stretched in the side panel and the centred layout where it is drawn
+  bigger; it now asks for the size it is drawn at (times the display scale),
+  and a cover drawn smaller than its file is downscaled cleanly instead of
+  aliasing.
+- The clean downscale meant to sharpen covers since 1.3.3 never ran: cached
+  art has no image extension, so its size could not be read and every cover
+  was drawn from the raw file. It now works in the player bar, on album pages
+  (header cover and the click-to-enlarge view), on the artist page's
+  enlarged photo and in the fullscreen player (cover and visualizer thumb),
+  and kicks in for any real downscale rather than only past 2×, where the
+  fullscreen cover sat.
+- An artist page shows Lidarr's missing releases from the last visit at once
+  again after a change made from Scirè (monitoring, adding): the change
+  threw away every artist's saved answer, so the next visit to any artist
+  waited for Lidarr with no missing releases drawn. Saved answers are now
+  kept and refreshed behind the page.
+- A missing release Lidarr has just imported stays on the artist page until
+  the library refresh brings the real album in, instead of vanishing and
+  leaving a gap while the server scans.
+- A freshly imported album keeps the Lidarr cover its download card showed,
+  in the album grid, on the album and artist pages and in the player, instead
+  of an empty well or the server's placeholder while the server is still
+  picking its art up. The cover is downloaded as soon as the album is in
+  Lidarr's queue (or, failing that, before the grid redraws, waiting at most
+  5 seconds) and filed as the album's own when the download card goes; a
+  later sync that sees the server's cover change replaces it.
+- A download card waiting for Lidarr to import it, or being imported, pulses
+  its colour, so a full card no longer reads as stuck.
+- The fullscreen player's queue panel follows the playing track again; it
+  only scrolled once the track had left the visible rows.
+
 ## [1.3.5] — 2026-10-01
 
 ### Changed

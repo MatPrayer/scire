@@ -150,6 +150,9 @@ pub struct Query {
     pub artist: Option<String>,
     /// The *release* MBID the server read from the file's tags.
     pub mbid: Option<String>,
+    /// The *release group* MBID, when the caller already knows it — Lidarr's
+    /// `foreignAlbumId`. Skips the resolving step entirely.
+    pub group_mbid: Option<String>,
     /// The album's year, to tell apart two records by one artist sharing a
     /// title (a self-titled debut and a self-titled second album). Not part
     /// of the cache key: it only steers a search that the title and artist
@@ -200,11 +203,16 @@ impl Sources {
 impl Query {
     fn cache_key(&self) -> String {
         let mut h = DefaultHasher::new();
-        match self.mbid.as_deref().filter(|id| is_mbid(id)) {
+        let release = self.mbid.as_deref().filter(|id| is_mbid(id));
+        let group = self.group_mbid.as_deref().filter(|id| is_mbid(id));
+        match (release, group) {
             // An MBID names the release on its own; keying on the tags as well
             // would re-ask for the same album after a retag.
-            Some(id) => id.to_ascii_lowercase().hash(&mut h),
-            None => {
+            (Some(id), _) => id.to_ascii_lowercase().hash(&mut h),
+            // Tagged apart from a release MBID: the two are ids of different
+            // entities and must never share a cache file.
+            (None, Some(id)) => ("release-group", id.to_ascii_lowercase()).hash(&mut h),
+            (None, None) => {
                 normalize(&base_title(&self.album)).hash(&mut h);
                 normalize(self.artist.as_deref().unwrap_or("")).hash(&mut h);
             }
@@ -358,6 +366,9 @@ async fn lookup(query: &Query) -> Result<Option<AlbumInfo>> {
 async fn release_group_id(query: &Query) -> Result<Option<String>> {
     if !query.sources.musicbrainz {
         return Ok(None);
+    }
+    if let Some(id) = query.group_mbid.as_deref().filter(|id| is_mbid(id)) {
+        return Ok(Some(id.to_ascii_lowercase()));
     }
     if let Some(mbid) = query.mbid.as_deref().filter(|id| is_mbid(id)) {
         let release =
@@ -1016,6 +1027,7 @@ mod tests {
             album: "In Rainbows".into(),
             artist: Some("Radiohead".into()),
             mbid: None,
+            group_mbid: None,
             year: None,
             sources: Sources {
                 wikipedia,
@@ -1035,6 +1047,29 @@ mod tests {
         assert_ne!(full, q(true, false).cache_key());
         assert_ne!(full, q(false, true).cache_key());
         assert_ne!(q(true, false).cache_key(), q(false, true).cache_key());
+    }
+
+    #[test]
+    fn a_release_group_lookup_is_cached_apart_from_the_release() {
+        const ID: &str = "1d5d5b7c-1ff2-3a7e-9d22-2a0c4f5e8a01";
+        let q = |mbid: Option<&str>, group: Option<&str>| Query {
+            album: "In Rainbows".into(),
+            artist: Some("Radiohead".into()),
+            mbid: mbid.map(str::to_string),
+            group_mbid: group.map(str::to_string),
+            ..Query::default()
+        };
+        let group = q(None, Some(ID)).cache_key();
+        assert_ne!(group, q(Some(ID), None).cache_key());
+        assert_ne!(group, q(None, None).cache_key());
+        // The release MBID is the more exact id and keys the lookup when both
+        // are known.
+        assert_eq!(
+            q(Some(ID), Some(ID)).cache_key(),
+            q(Some(ID), None).cache_key()
+        );
+        // Not an MBID: keyed by the tags as if absent.
+        assert_eq!(q(None, Some("nope")).cache_key(), q(None, None).cache_key());
     }
 
     #[test]

@@ -26,6 +26,11 @@ const HISTORY_PEEK: u32 = 25;
 /// card gives up — a server that never scans, or a title the server spells
 /// differently enough that the match never lands.
 const ARRIVED_TTL: Duration = Duration::from_secs(60 * 60);
+/// Rung a download's cover is fetched at as soon as it is in the queue: by
+/// the time the library lists the album, `RootView::settle_lidarr_arrivals`
+/// files it as the album's own cover, at every rung up to this one (the album
+/// page's header included).
+pub const ARRIVAL_COVER_PX: u32 = 640;
 
 /// An album on its way into the library: in Lidarr's queue, or imported and
 /// waiting for the server to list it. The album grid draws one card each.
@@ -38,6 +43,8 @@ pub struct Incoming {
     pub progress: f32,
     pub label: &'static str,
     pub problem: bool,
+    /// Downloaded, waiting for Lidarr to import it or being imported.
+    pub waiting: bool,
 }
 
 /// An album whose download left the queue finished, not yet in the library.
@@ -97,6 +104,8 @@ pub struct LidarrState {
     last_history_id: Option<i64>,
     busy_polls: u32,
     poll: Option<Task<()>>,
+    /// Lidarr albums whose cover was asked for at `ARRIVAL_COVER_PX`.
+    covers_asked: HashSet<i64>,
 }
 
 pub struct LidarrHandle(pub Entity<LidarrState>);
@@ -125,6 +134,7 @@ pub fn init(settings: &Settings, cx: &mut App) -> Entity<LidarrState> {
             last_history_id: None,
             busy_polls: 0,
             poll: None,
+            covers_asked: HashSet::new(),
         };
         state.set_client(client, cx);
         state
@@ -177,6 +187,7 @@ impl LidarrState {
             if let Some(seen) = out.iter_mut().find(|i| i.album.id == album.id) {
                 seen.progress = seen.progress.min(item.progress());
                 seen.problem |= item.has_problem();
+                seen.waiting &= waiting_import(item);
                 continue;
             }
             out.push(Incoming {
@@ -185,6 +196,7 @@ impl LidarrState {
                 progress: queue_progress(item),
                 label: item.state_label(),
                 problem: item.has_problem(),
+                waiting: waiting_import(item),
             });
         }
         for arrived in &self.arrived {
@@ -197,24 +209,55 @@ impl LidarrState {
                 progress: 1.0,
                 label: "Waiting for library",
                 problem: false,
+                waiting: false,
             });
         }
         out
     }
 
-    /// Drops imported albums the library now lists. `in_library(artist,
-    /// title)` asks the caller's copy of the catalog.
+    /// Drops imported albums the library now lists, returning them (album,
+    /// artist). `in_library(artist, title)` asks the caller's copy of the
+    /// catalog.
     pub fn settle_arrived(
         &mut self,
         in_library: impl Fn(&str, &str) -> bool,
         cx: &mut Context<Self>,
-    ) {
-        let before = self.arrived.len();
-        self.arrived
-            .retain(|a| !in_library(&a.artist, &a.album.title));
-        if self.arrived.len() != before {
+    ) -> Vec<(Album, String)> {
+        let (settled, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.arrived)
+            .into_iter()
+            .partition(|a| in_library(&a.artist, &a.album.title));
+        self.arrived = kept;
+        if !settled.is_empty() {
             cx.notify();
         }
+        settled.into_iter().map(|a| (a.album, a.artist)).collect()
+    }
+
+    /// Starts the cover download of every queued album not asked for yet. A
+    /// failure is not retried this session; the settle step asks once more.
+    fn prefetch_covers(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        for album in self.queue.iter().filter_map(|q| q.album.as_ref()) {
+            if !self.covers_asked.insert(album.id) {
+                continue;
+            }
+            if let Some(fetch) = client.cover_fetch(album, ARRIVAL_COVER_PX) {
+                let id = album.id;
+                cx.background_spawn(async move {
+                    if let Err(e) = fetch.await {
+                        tracing::debug!("lidarr cover {id}: {e:#}");
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Finished downloads waiting for the library, (album, artist).
+    pub fn arrived(&self) -> impl Iterator<Item = (&Album, &str)> {
+        self.arrived.iter().map(|a| (&a.album, a.artist.as_str()))
     }
 
     pub fn has_arrived(&self) -> bool {
@@ -232,6 +275,7 @@ impl LidarrState {
         self.searching.clear();
         self.searching_artists.clear();
         self.arrived.clear();
+        self.covers_asked.clear();
         self.last_history_id = None;
         self.poll = None;
         self.connection = match &client {
@@ -324,6 +368,7 @@ impl LidarrState {
                     self.landed = landed;
                 }
                 self.queue = queue;
+                self.prefetch_covers(cx);
                 self.searching = searching;
                 self.searching_artists = searching_artists;
                 self.queue_loaded = true;
@@ -450,6 +495,13 @@ fn queue_artist(item: &QueueItem) -> String {
 
 /// Download progress, held at full once the files are down and Lidarr is
 /// importing them — the size fields can lag behind that.
+fn waiting_import(item: &QueueItem) -> bool {
+    matches!(
+        item.tracked_download_state.as_deref(),
+        Some("importPending") | Some("importing")
+    )
+}
+
 fn queue_progress(item: &QueueItem) -> f32 {
     match item.tracked_download_state.as_deref() {
         Some("importPending") | Some("importing") | Some("imported") => 1.0,

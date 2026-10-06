@@ -87,6 +87,32 @@ impl Lidarr {
         &self.key
     }
 
+    /// Downloads `album`'s cover into the artwork cache at `size`'s rung, under
+    /// [`Album::cover_key`]: the Cover Art Archive thumbnail when Lidarr names
+    /// one, else Lidarr's own `MediaCover` (with the key header). `None` when
+    /// the album has no image.
+    pub fn cover_fetch(
+        &self,
+        album: &Album,
+        size: u32,
+    ) -> Option<impl Future<Output = Result<PathBuf>> + Send + use<>> {
+        let (url, remote) = album.cover()?;
+        let (url, header) = if remote {
+            (cover_thumbnail_url(url, size), None)
+        } else {
+            (
+                self.absolute(url),
+                Some(("X-Api-Key", self.api_key().to_string())),
+            )
+        };
+        Some(crate::services::artwork::fetch_url(
+            url,
+            header,
+            album.cover_key(),
+            size,
+        ))
+    }
+
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
         self.get_with(http(), path, query).await
     }
@@ -148,6 +174,54 @@ impl Lidarr {
 
     pub async fn album(&self, album_id: i64) -> Result<Album> {
         self.get(&format!("album/{album_id}"), &[]).await
+    }
+
+    /// A tracked album, raw record kept so it can be written back
+    /// ([`Lidarr::set_release`]); its editions are [`album_releases`].
+    pub async fn album_record(&self, album_id: i64) -> Result<Lookup<Album>> {
+        let raw: serde_json::Value = self.get(&format!("album/{album_id}"), &[]).await?;
+        let item = serde_json::from_value(raw.clone()).context("unexpected album record")?;
+        Ok(Lookup { item, raw })
+    }
+
+    /// The Lidarr album a library album is: the first of `artists` Lidarr
+    /// tracks (see [`Lidarr::find_artist`]) with an album of the same title
+    /// ([`same_album_title`]). `Ok(None)` = Lidarr doesn't track it.
+    pub async fn find_album(
+        &self,
+        artists: &[String],
+        title: &str,
+    ) -> Result<Option<Lookup<Album>>> {
+        for name in artists {
+            let Some(artist) = self.find_artist(None, name).await? else {
+                continue;
+            };
+            let albums = self.albums(artist.id).await?;
+            if let Some(album) = pick_same_title(&albums, title) {
+                return self.album_record(album.id).await.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// `PUT /album/{id}` with the record as read, `release_id` the one
+    /// monitored release and `anyReleaseOk` off, so Lidarr matches the files
+    /// to that edition and searches for that one.
+    pub async fn set_release(
+        &self,
+        album: &Lookup<Album>,
+        release_id: i64,
+    ) -> Result<Lookup<Album>> {
+        let raw: serde_json::Value = self
+            .send_json(
+                reqwest::Method::PUT,
+                &format!("album/{}", album.item.id),
+                &with_release(&album.raw, release_id),
+            )
+            .await?;
+        stale_discographies();
+        let item = serde_json::from_value(raw.clone()).context("unexpected album record")?;
+        Ok(Lookup { item, raw })
     }
 
     pub async fn tracks(&self, album_id: i64) -> Result<Vec<Track>> {
@@ -231,7 +305,7 @@ impl Lidarr {
                 },
             )
             .await?;
-        forget_discographies();
+        stale_discographies();
         Ok(())
     }
 
@@ -348,7 +422,7 @@ impl Lidarr {
                 &body,
             )
             .await?;
-        forget_discographies();
+        stale_discographies();
         let item = serde_json::from_value(raw.clone()).context("unexpected artist record")?;
         Ok(Lookup { item, raw })
     }
@@ -392,7 +466,7 @@ impl Lidarr {
                 &artist_body(&artist.raw, opts),
             )
             .await;
-        forget_discographies();
+        stale_discographies();
         added
     }
 
@@ -405,7 +479,7 @@ impl Lidarr {
                 &album_body(&album.raw, opts),
             )
             .await;
-        forget_discographies();
+        stale_discographies();
         added
     }
 
@@ -537,11 +611,31 @@ impl CachedDiscography {
     }
 }
 
-/// Drops every cached discography: called after an edit made from here
-/// (monitoring, adding), which the cached answers no longer show.
-fn forget_discographies() {
+/// Marks every cached discography out of date: called after an edit made
+/// from here (monitoring, adding), which the cached answers no longer show.
+/// They are kept, not deleted, so an artist page still paints the last answer
+/// at once and asks Lidarr again behind it.
+fn stale_discographies() {
     if let Ok(dir) = crate::config::lidarr_cache_dir() {
-        let _ = std::fs::remove_dir_all(dir);
+        stale_discographies_in(&dir);
+    }
+}
+
+fn stale_discographies_in(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        let Some(mut entry) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<CachedDiscography>(&json).ok())
+        else {
+            continue;
+        };
+        entry.fetched_ms = 0;
+        if let Ok(json) = serde_json::to_string(&entry) {
+            let _ = std::fs::write(&path, json);
+        }
     }
 }
 
@@ -592,6 +686,66 @@ pub fn fold(s: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// Titles naming the same album: equal folded, else equal once edition noise
+/// ("(Deluxe Edition)", "[Remastered]") is stripped from both.
+pub fn same_album_title(a: &str, b: &str) -> bool {
+    use crate::services::album_info::base_title;
+    let (fa, fb) = (fold(a), fold(b));
+    if !fa.is_empty() && fa == fb {
+        return true;
+    }
+    let (ba, bb) = (fold(&base_title(a)), fold(&base_title(b)));
+    !ba.is_empty() && ba == bb
+}
+
+/// The album among `albums` titled `title`: an exact folded match beats one
+/// equal only without edition noise.
+fn pick_same_title<'a>(albums: &'a [Album], title: &str) -> Option<&'a Album> {
+    let folded = fold(title);
+    albums
+        .iter()
+        .find(|a| !folded.is_empty() && fold(&a.title) == folded)
+        .or_else(|| albums.iter().find(|a| same_album_title(&a.title, title)))
+}
+
+/// The editions (MusicBrainz releases) of an album record; the monitored one
+/// first, the rest in Lidarr's order. Entries that don't parse are skipped.
+pub fn album_releases(raw: &serde_json::Value) -> Vec<AlbumRelease> {
+    let mut releases: Vec<AlbumRelease> = raw
+        .get("releases")
+        .and_then(|r| r.as_array())
+        .map(|all| {
+            all.iter()
+                .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    releases.sort_by_key(|r| !r.monitored);
+    releases
+}
+
+/// `raw` with `release_id` the only monitored release and `anyReleaseOk`
+/// off: with it on, Lidarr imports whichever edition a download turns out to
+/// be, and the pick would not hold.
+pub fn with_release(raw: &serde_json::Value, release_id: i64) -> serde_json::Value {
+    let mut body = raw.clone();
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(releases) = obj.get_mut("releases").and_then(|r| r.as_array_mut()) {
+            for release in releases {
+                let id = release.get("id").and_then(|v| v.as_i64());
+                if let Some(release) = release.as_object_mut() {
+                    release.insert(
+                        "monitored".into(),
+                        serde_json::json!(id == Some(release_id)),
+                    );
+                }
+            }
+        }
+        obj.insert("anyReleaseOk".into(), serde_json::json!(false));
+    }
+    body
 }
 
 /// Approved first, then Lidarr's own quality weight, then seeders.
@@ -660,15 +814,20 @@ pub fn human_age(hours: f64) -> String {
 
 /// Lidarr albums the server's library doesn't have: no files in Lidarr and
 /// not matched (MBID, else folded title) to any `owned` album.
-pub fn missing_albums(albums: Vec<Album>, owned: &[(Option<String>, String)]) -> Vec<Album> {
+///
+/// `held` albums count as missing even with files: ones the page showed as
+/// missing that Lidarr has just imported, which the server's library has not
+/// picked up yet. Dropping them on Lidarr's word left a hole until the library
+/// refresh brought the real album in.
+pub fn missing_albums(
+    albums: Vec<Album>,
+    owned: &[(Option<String>, String)],
+    held: &std::collections::HashSet<i64>,
+) -> Vec<Album> {
     let mut missing: Vec<Album> = albums
         .into_iter()
         .filter(|album| {
-            if album
-                .statistics
-                .as_ref()
-                .is_some_and(|s| s.track_file_count > 0)
-            {
+            if !held.contains(&album.id) && album.has_files() {
                 return false;
             }
             let title = fold(&album.title);
@@ -755,6 +914,13 @@ fn image_source(image: &Image) -> Option<(&str, bool)> {
 pub struct Lookup<T> {
     pub item: T,
     raw: serde_json::Value,
+}
+
+impl Lookup<Album> {
+    /// The album's editions; see [`album_releases`].
+    pub fn releases(&self) -> Vec<AlbumRelease> {
+        album_releases(&self.raw)
+    }
 }
 
 /// Hits that don't parse are skipped, not the whole answer.
@@ -1080,6 +1246,21 @@ impl Album {
         (s.track_file_count, s.track_count)
     }
 
+    /// The artwork cache key its cover is held under: its MusicBrainz id,
+    /// else Lidarr's own.
+    pub fn cover_key(&self) -> String {
+        if self.foreign_album_id.is_empty() {
+            format!("lidarr-{}", self.id)
+        } else {
+            format!("lidarr-{}", self.foreign_album_id)
+        }
+    }
+
+    /// Lidarr holds at least one of its tracks.
+    pub fn has_files(&self) -> bool {
+        self.file_counts().0 > 0
+    }
+
     /// Every track has a file.
     pub fn complete(&self) -> bool {
         let (files, tracks) = self.file_counts();
@@ -1097,6 +1278,76 @@ impl Album {
             .as_ref()
             .map(|a| a.artist_name.as_str())
             .unwrap_or("")
+    }
+}
+
+/// One edition of an album (a MusicBrainz release), as Lidarr lists them
+/// under `releases`. Lidarr sends `null` for unknown strings, hence the
+/// `Option`s.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumRelease {
+    pub id: i64,
+    #[serde(default)]
+    pub foreign_release_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `Official`, `Promotion`, `Bootleg`, …
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Milliseconds.
+    #[serde(default)]
+    pub duration: Option<u64>,
+    #[serde(default)]
+    pub track_count: Option<u32>,
+    #[serde(default)]
+    pub disambiguation: Option<String>,
+    #[serde(default)]
+    pub country: Option<Vec<String>>,
+    #[serde(default)]
+    pub label: Option<Vec<String>>,
+    /// Media summary as MusicBrainz writes it: `CD`, `2xVinyl`, `Digital Media`.
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub monitored: bool,
+}
+
+impl AlbumRelease {
+    /// Title plus disambiguation: `Abbey Road (2019 mix)`.
+    pub fn name(&self) -> String {
+        let title = self.title.as_deref().unwrap_or("").trim();
+        match self.disambiguation.as_deref().map(str::trim) {
+            Some(d) if !d.is_empty() => format!("{title} ({d})"),
+            _ => title.to_string(),
+        }
+    }
+
+    /// `2xCD · 17 tracks · 47:23 · GB · Apple Records · Official`, empty
+    /// parts left out.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut push = |s: Option<String>| {
+            if let Some(s) = s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                parts.push(s);
+            }
+        };
+        push(self.format.clone());
+        push(self.track_count.filter(|n| *n > 0).map(|n| match n {
+            1 => "1 track".to_string(),
+            n => format!("{n} tracks"),
+        }));
+        push(self.duration.filter(|d| *d > 0).map(|ms| {
+            let secs = ms / 1000;
+            match secs / 3600 {
+                0 => format!("{}:{:02}", secs / 60, secs % 60),
+                h => format!("{h}:{:02}:{:02}", secs / 60 % 60, secs % 60),
+            }
+        }));
+        push(self.country.as_ref().map(|c| c.join(", ")));
+        push(self.label.as_ref().map(|l| l.join(", ")));
+        push(self.status.clone());
+        parts.join(" · ")
     }
 }
 
@@ -1506,6 +1757,28 @@ mod tests {
         assert_eq!(back.fetched_ms, 42);
     }
 
+    #[test]
+    fn an_edit_keeps_cached_discographies_but_ages_them() {
+        let dir = std::env::temp_dir().join(format!("scire-lidarr-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = CachedDiscography {
+            found: Some((Artist::default(), vec![album(1, "One", "mb-1", 0, None)])),
+            mbid: None,
+            fetched_ms: now_ms(),
+        };
+        let path = dir.join("artist-0.json");
+        std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
+        std::fs::write(dir.join("junk.json"), "not json").unwrap();
+
+        stale_discographies_in(&dir);
+
+        let back: CachedDiscography =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.found, entry.found);
+        assert_eq!(back.fetched_ms, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn album(id: i64, title: &str, mbid: &str, files: u32, date: Option<&str>) -> Album {
         Album {
             id,
@@ -1562,11 +1835,19 @@ mod tests {
             (Some("mb-1".to_string()), "Something Else".to_string()),
             (None, "owned by title".to_string()),
         ];
-        let ids: Vec<i64> = missing_albums(albums, &owned)
+        let ids: Vec<i64> = missing_albums(albums.clone(), &owned, &Default::default())
             .iter()
             .map(|a| a.id)
             .collect();
         assert_eq!(ids, vec![6, 4, 5]);
+        // Held: an import the library hasn't caught up with stays; an owned
+        // one still goes.
+        let held = [1, 3].into_iter().collect();
+        let ids: Vec<i64> = missing_albums(albums, &owned, &held)
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec![6, 3, 4, 5]);
     }
 
     #[test]
@@ -1812,5 +2093,71 @@ mod tests {
         let c: Command = serde_json::from_str(json).unwrap();
         assert_eq!(c.artist_id(), Some(7));
         assert!(c.album_ids().is_empty());
+    }
+
+    #[test]
+    fn switching_release_monitors_only_the_pick() {
+        let raw = serde_json::json!({
+            "id": 9, "title": "Abbey Road", "anyReleaseOk": true, "extra": "kept",
+            "releases": [
+                {"id": 1, "title": "Abbey Road", "monitored": true},
+                {"id": 2, "title": "Abbey Road", "disambiguation": "2019 mix", "monitored": false}
+            ]
+        });
+        let body = with_release(&raw, 2);
+        assert_eq!(body["anyReleaseOk"], false);
+        assert_eq!(body["extra"], "kept");
+        assert_eq!(body["releases"][0]["monitored"], false);
+        assert_eq!(body["releases"][1]["monitored"], true);
+        let releases = album_releases(&body);
+        assert_eq!(releases[0].id, 2, "monitored release listed first");
+        assert_eq!(releases[0].name(), "Abbey Road (2019 mix)");
+    }
+
+    #[test]
+    fn releases_tolerate_nulls_and_summarise() {
+        let raw = serde_json::json!({ "releases": [
+            {"id": 4, "title": "X", "disambiguation": null, "country": null, "label": ["Apple"],
+             "format": "2xCD", "trackCount": 17, "duration": 2843000, "status": "Official",
+             "monitored": false},
+            {"title": "no id, skipped"}
+        ]});
+        let releases = album_releases(&raw);
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].name(), "X");
+        assert_eq!(
+            releases[0].summary(),
+            "2xCD · 17 tracks · 47:23 · Apple · Official"
+        );
+    }
+
+    #[test]
+    fn album_titles_match_through_edition_noise() {
+        assert!(same_album_title(
+            "Abbey Road (Super Deluxe Edition)",
+            "Abbey Road"
+        ));
+        assert!(same_album_title("AC/DC", "acdc"));
+        assert!(!same_album_title("Let It Be", "Let It Be... Naked"));
+        let albums = vec![
+            Album {
+                id: 1,
+                title: "Abbey Road".into(),
+                ..Default::default()
+            },
+            Album {
+                id: 2,
+                title: "Abbey Road (Remastered)".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            pick_same_title(&albums, "Abbey Road (Remastered)").map(|a| a.id),
+            Some(2)
+        );
+        assert_eq!(
+            pick_same_title(&albums, "Abbey Road [Deluxe]").map(|a| a.id),
+            Some(1)
+        );
     }
 }
