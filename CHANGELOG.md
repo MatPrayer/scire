@@ -4,6 +4,41 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-10-07
+
+### Added
+
+- The Lidarr page pages: **Wanted** and **Recent activity** have a *Show
+  more* button and say how much is left ("50 of 312"). Refreshing keeps
+  what was paged in.
+- Long sections on a Lidarr artist's page (Albums, Singles, …) show their
+  first 12 releases with *Show all*; covers are fetched only for the rows
+  drawn.
+
+### Changed
+
+- Recent activity on the Lidarr page is one row per album, with its cover
+  and what happened to it in order ("Grabbed › Imported 16 tracks ›
+  Retagged 16 tracks"), instead of one row per track file.
+- The Lidarr page, Lidarr album pages and Lidarr artist pages keep their
+  content in a centred column on wide windows.
+- A Lidarr artist's overview sits under the header, folded to a preview
+  with *More*, instead of after the whole discography.
+- The Lidarr add page is laid out as a form: an *Add to Lidarr* card with
+  labelled rows, a single root folder shown as text, what each *Monitor*
+  option does, and the search switch beside the Add button — hidden, with
+  a note, when the artist would monitor nothing. The header takes the
+  cover's tint and links to MusicBrainz; the overview folds to a preview.
+
+### Fixed
+
+- Lidarr album pages take their tint from the album's cover (Adaptive
+  theme, *Tint from the album's own cover*), like library album pages:
+  accent buttons, the download status and its progress bar, and the
+  header wash when that is on.
+- Lidarr album and artist header cards no longer stand far taller than
+  their cover, with the button row wrapping early.
+
 ## [1.4.0] — 2026-10-06
 
 ### Added

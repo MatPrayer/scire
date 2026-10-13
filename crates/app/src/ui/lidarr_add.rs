@@ -15,7 +15,10 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 
-use super::lidarr::{HEADER_COVER, cover_well, muted_line};
+use super::lidarr::{
+    HEADER_COVER, PAGE_MAX_W, PageAccent, accent_primary, cover_well, header_fill, muted_line,
+};
+use crate::assets::{app_icon, icons};
 use crate::services::lidarr::{
     self, AddOptions, Album, Artist, Lidarr, Lookup, Monitor, Profile, RootFolder,
 };
@@ -202,6 +205,9 @@ pub struct LidarrAddView {
     error: Option<String>,
     art: Option<PathBuf>,
     art_loading: bool,
+    accent: PageAccent,
+    overview_expanded: bool,
+    live_width: crate::ui::LiveWidth,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
     vi_cursor: Option<usize>,
@@ -230,6 +236,9 @@ impl LidarrAddView {
             error: None,
             art: None,
             art_loading: false,
+            accent: PageAccent::default(),
+            overview_expanded: false,
+            live_width: crate::ui::LiveWidth::default(),
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
             vi_cursor: None,
@@ -351,7 +360,7 @@ impl LidarrAddView {
             quality_profile_id: self.quality?,
             metadata_profile_id: self.metadata?,
             monitor: self.monitor,
-            search: self.search,
+            search: self.search && self.searches(),
         })
     }
 
@@ -392,6 +401,12 @@ impl LidarrAddView {
         matches!(self.hit, LidarrHit::Artist(_))
     }
 
+    /// Searching on add can find something: an artist monitoring nothing
+    /// has nothing to search for, so the switch is hidden.
+    fn searches(&self) -> bool {
+        !(self.is_artist() && self.monitor == Monitor::None)
+    }
+
     fn vi_items(&self) -> Vec<ViItem> {
         let Load::Loaded(choices) = &self.choices else {
             return Vec::new();
@@ -409,7 +424,9 @@ impl LidarrAddView {
         if self.is_artist() {
             items.push(ViItem::Monitor);
         }
-        items.push(ViItem::Search);
+        if self.searches() {
+            items.push(ViItem::Search);
+        }
         items.push(ViItem::Add);
         items
     }
@@ -482,12 +499,14 @@ impl LidarrAddView {
         }
     }
 
-    /// A labelled group of buttons, the picked one filled.
+    /// One row of the form: the label in a fixed column, the buttons
+    /// beside it, an optional note under them.
     fn choice_group(
         &self,
         item: ViItem,
         label: &'static str,
         buttons: Vec<Button>,
+        note: Option<&'static str>,
         glow: bool,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
@@ -498,90 +517,125 @@ impl LidarrAddView {
             _ => "vi-lidarr-add-monitor",
         };
         let focused = self.vi_focused(item);
-        let group = v_flex()
-            .id((id, 0usize))
+        let control = v_flex()
             .gap_1p5()
+            .child(h_flex().gap_1p5().flex_wrap().children(buttons))
+            .when_some(note, |this, note| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(note),
+                )
+            });
+        let row = form_row(label, control, cx)
+            .id((id, 0usize))
             .when(focused, |s| {
                 s.anchor_scroll(Some(self.focus_anchor.clone()))
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label),
-            )
-            .child(h_flex().gap_1p5().flex_wrap().children(buttons));
-        with_focus_cursor(id, group, focused, glow, None, cx)
+            });
+        with_focus_cursor(id, row, focused, glow, None, cx)
     }
 
-    fn render_form(&self, glow: bool, cx: &Context<Self>) -> gpui::AnyElement {
+    fn render_form(
+        &self,
+        width: f32,
+        accent: Option<gpui::Hsla>,
+        glow: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
         let muted = cx.theme().muted_foreground;
+        let card = v_flex()
+            .flex_none()
+            .w_full()
+            .when(width > 0., |this| this.w(px(width)))
+            .gap_4()
+            .p_4()
+            .rounded_2xl()
+            .bg(cx.theme().sidebar)
+            .child(div().text_sm().font_medium().child("Add to Lidarr"));
         let choices = match &self.choices {
             Load::Loading => {
-                return div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child("Loading Lidarr's settings…")
-                    .into_any_element();
-            }
-            Load::Failed(why) => {
-                return h_flex()
-                    .gap_3()
-                    .items_center()
+                return card
                     .child(
                         div()
                             .text_sm()
-                            .text_color(cx.theme().danger)
-                            .child(why.clone()),
+                            .text_color(muted)
+                            .child("Loading Lidarr's settings…"),
                     )
+                    .into_any_element();
+            }
+            Load::Failed(why) => {
+                return card
                     .child(
-                        Button::new("lidarr-add-retry")
-                            .ghost()
-                            .small()
-                            .label("Retry")
-                            .on_click(cx.listener(|this, _, _, cx| this.load_choices(cx))),
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().danger)
+                                    .child(why.clone()),
+                            )
+                            .child(
+                                Button::new("lidarr-add-retry")
+                                    .ghost()
+                                    .small()
+                                    .label("Retry")
+                                    .on_click(cx.listener(|this, _, _, cx| this.load_choices(cx))),
+                            ),
                     )
                     .into_any_element();
             }
             Load::Loaded(c) => c,
         };
+        let picked = |b: Button, on: bool| {
+            if on {
+                accent_primary(b, accent, cx)
+            } else {
+                b.outline()
+            }
+        };
 
-        let mut form = v_flex()
-            .flex_none()
-            .w_full()
-            .max_w(px(720.))
-            .gap_4()
-            .p_4()
-            .rounded_2xl()
-            .bg(cx.theme().sidebar);
-
-        // A group with one option has nothing to choose; its value still
-        // shows, as a line, so the user knows where the files will go.
-        let root_buttons: Vec<Button> = choices
-            .roots
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let path = r.path.clone();
-                let label = match r.free_space {
-                    Some(free) => format!("{} ({} free)", r.path, lidarr::human_size(free)),
-                    None => r.path.clone(),
-                };
-                Button::new(("lidarr-add-root", i))
-                    .small()
-                    .label(label)
-                    .when(self.root.as_deref() == Some(r.path.as_str()), |b| {
-                        b.primary()
+        let root_label = |r: &RootFolder| match r.free_space {
+            Some(free) => format!("{} ({} free)", r.path, lidarr::human_size(free)),
+            None => r.path.clone(),
+        };
+        // A group with one option has nothing to choose: its value shows as
+        // text, so the user still knows where the files will go.
+        let mut form = card.child(match choices.roots.as_slice() {
+            [only] => form_row(
+                "Root folder",
+                div()
+                    .text_sm()
+                    .pt(px(5.))
+                    .truncate()
+                    .child(root_label(only)),
+                cx,
+            )
+            .into_any_element(),
+            roots => {
+                let buttons: Vec<Button> = roots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let path = r.path.clone();
+                        picked(
+                            Button::new(("lidarr-add-root", i))
+                                .small()
+                                .label(root_label(r)),
+                            self.root.as_deref() == Some(r.path.as_str()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_root(path.clone());
+                            cx.notify();
+                        }))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.pick_root(path.clone());
-                        cx.notify();
-                    }))
-            })
-            .collect();
-        form = form.child(self.choice_group(ViItem::Root, "Root folder", root_buttons, glow, cx));
+                    .collect();
+                self.choice_group(ViItem::Root, "Root folder", buttons, None, glow, cx)
+            }
+        });
 
-        let profile_buttons = |which: ViItem, list: &[Profile], picked: Option<i64>| {
+        let profile_buttons = |which: ViItem, list: &[Profile], current: Option<i64>| {
             list.iter()
                 .map(|p| {
                     let id = p.id;
@@ -590,33 +644,37 @@ impl LidarrAddView {
                     } else {
                         "lidarr-add-metadata"
                     };
-                    Button::new((key, id as usize))
-                        .small()
-                        .label(p.name.clone())
-                        .when(picked == Some(id), |b| b.primary())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if which == ViItem::Quality {
-                                this.quality = Some(id);
-                            } else {
-                                this.metadata = Some(id);
-                            }
-                            cx.notify();
-                        }))
+                    picked(
+                        Button::new((key, id as usize))
+                            .small()
+                            .label(p.name.clone()),
+                        current == Some(id),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if which == ViItem::Quality {
+                            this.quality = Some(id);
+                        } else {
+                            this.metadata = Some(id);
+                        }
+                        cx.notify();
+                    }))
                 })
                 .collect::<Vec<_>>()
         };
         form = form
             .child(self.choice_group(
                 ViItem::Quality,
-                "Quality profile",
+                "Quality",
                 profile_buttons(ViItem::Quality, &choices.quality, self.quality),
+                None,
                 glow,
                 cx,
             ))
             .child(self.choice_group(
                 ViItem::Metadata,
-                "Metadata profile",
+                "Release types",
                 profile_buttons(ViItem::Metadata, &choices.metadata, self.metadata),
+                Some("Lidarr's metadata profile: which kinds of release it lists."),
                 glow,
                 cx,
             ));
@@ -626,55 +684,60 @@ impl LidarrAddView {
                 .into_iter()
                 .enumerate()
                 .map(|(i, m)| {
-                    Button::new(("lidarr-add-monitor", i))
-                        .small()
-                        .label(m.label())
-                        .when(self.monitor == m, |b| b.primary())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.monitor = m;
-                            cx.notify();
-                        }))
+                    picked(
+                        Button::new(("lidarr-add-monitor", i))
+                            .small()
+                            .label(m.label()),
+                        self.monitor == m,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.monitor = m;
+                        cx.notify();
+                    }))
                 })
                 .collect();
             form = form.child(self.choice_group(
                 ViItem::Monitor,
                 "Monitor",
                 monitor_buttons,
+                Some(self.monitor.description()),
                 glow,
                 cx,
             ));
         }
 
         let search_label = if self.is_artist() {
-            "Start searching for monitored albums"
+            "Search for monitored albums now"
         } else {
-            "Start searching for this album"
+            "Search for this album now"
         };
         let search_focused = self.vi_focused(ViItem::Search);
-        form = form.child(with_focus_cursor(
-            "vi-lidarr-add-search",
-            h_flex()
-                .id("lidarr-add-search-row")
-                .gap_2()
-                .items_center()
-                .when(search_focused, |s| {
-                    s.anchor_scroll(Some(self.focus_anchor.clone()))
-                })
-                .child(
-                    Switch::new("lidarr-add-search")
-                        .checked(self.search)
-                        .small()
-                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                            this.search = *checked;
-                            cx.notify();
-                        })),
-                )
-                .child(div().text_sm().child(search_label)),
-            search_focused,
-            glow,
-            None,
-            cx,
-        ));
+        let search = self.searches().then(|| {
+            with_focus_cursor(
+                "vi-lidarr-add-search",
+                h_flex()
+                    .id("lidarr-add-search-row")
+                    .gap_2()
+                    .items_center()
+                    .when(search_focused, |s| {
+                        s.anchor_scroll(Some(self.focus_anchor.clone()))
+                    })
+                    .child(
+                        Switch::new("lidarr-add-search")
+                            .checked(self.search)
+                            .small()
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.search = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().text_sm().child(search_label)),
+                search_focused,
+                glow,
+                None,
+                cx,
+            )
+        });
 
         let add_focused = self.vi_focused(ViItem::Add);
         let add_label = if self.is_artist() {
@@ -682,42 +745,72 @@ impl LidarrAddView {
         } else {
             "Add album"
         };
-        form = form.child(
-            h_flex()
-                .gap_3()
-                .items_center()
-                .child(with_focus_cursor(
-                    "vi-lidarr-add-button",
-                    div()
-                        .id("lidarr-add-button-row")
-                        .when(add_focused, |s| {
-                            s.anchor_scroll(Some(self.focus_anchor.clone()))
-                        })
-                        .child(
-                            Button::new("lidarr-add")
-                                .primary()
-                                .icon(Icon::new(IconName::Plus))
-                                .label(add_label)
-                                .loading(self.adding)
-                                .on_click(cx.listener(|this, _, _, cx| this.add(cx))),
-                        ),
-                    add_focused,
-                    glow,
-                    None,
-                    cx,
-                ))
-                .when_some(self.error.clone(), |this, why| {
-                    this.child(
+        form = form
+            .child(div().h(px(1.)).bg(cx.theme().border))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .children(search)
+                    .when(!self.searches(), |this| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .text_sm()
+                                .text_color(muted)
+                                .child("Nothing downloads until an album is monitored."),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(with_focus_cursor(
+                        "vi-lidarr-add-button",
                         div()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(cx.theme().danger)
-                            .child(why),
-                    )
-                }),
-        );
+                            .id("lidarr-add-button-row")
+                            .when(add_focused, |s| {
+                                s.anchor_scroll(Some(self.focus_anchor.clone()))
+                            })
+                            .child(accent_primary(
+                                Button::new("lidarr-add")
+                                    .icon(Icon::new(IconName::Plus))
+                                    .label(add_label)
+                                    .loading(self.adding)
+                                    .on_click(cx.listener(|this, _, _, cx| this.add(cx))),
+                                accent,
+                                cx,
+                            )),
+                        add_focused,
+                        glow,
+                        None,
+                        cx,
+                    )),
+            )
+            .when_some(self.error.clone(), |this, why| {
+                this.child(div().text_sm().text_color(cx.theme().danger).child(why))
+            });
         form.into_any_element()
     }
+}
+
+/// Label column width on the add form.
+const FORM_LABEL_W: f32 = 140.;
+/// Overview characters shown before "More".
+const OVERVIEW_PREVIEW_CHARS: usize = 400;
+
+/// A form row: `label` in a fixed column, `control` beside it.
+fn form_row(label: &'static str, control: impl IntoElement, cx: &App) -> gpui::Div {
+    h_flex()
+        .items_start()
+        .gap_4()
+        .child(
+            div()
+                .flex_none()
+                .w(px(FORM_LABEL_W))
+                .pt(px(5.))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .child(v_flex().flex_1().min_w_0().child(control))
 }
 
 impl Render for LidarrAddView {
@@ -744,19 +837,42 @@ impl Render for LidarrAddView {
                 .into_any_element();
         };
 
-        let glow = self.session.read(cx).settings.selection_glow_vi;
+        // Scroll pane minus its `p_4`, whole pixels (see `ui::LiveWidth`),
+        // capped like the column it sits in. Explicit, because a
+        // stretch-sized header measured its height at a narrower width and
+        // stood far taller than its cover.
+        let content_w = self
+            .live_width
+            .resolve(f32::from(self.scroll.bounds().size.width), window);
+        let card_w = (content_w - 32.).clamp(0., PAGE_MAX_W).floor();
+
+        let wanted = PageAccent::wanted(&self.session.read(cx).settings);
+        self.accent
+            .refresh(self.art.clone(), wanted, |v: &mut Self| &mut v.accent, cx);
+        let settings = &self.session.read(cx).settings;
+        let accent = self.accent.get(settings);
+        let header_tint = self.accent.header_tint(settings);
+        let glow = settings.selection_glow_vi;
         let muted = cx.theme().muted_foreground;
         let tracked = self.hit.in_lidarr();
-        let (genres, overview, web) = match &self.hit {
+        let (genres, overview, web, musicbrainz) = match &self.hit {
             LidarrHit::Artist(a) => (
                 a.item.genres.clone(),
                 a.item.overview.clone(),
                 format!("{}/artist/{}", client.base(), a.item.foreign_artist_id),
+                format!(
+                    "https://musicbrainz.org/artist/{}",
+                    a.item.foreign_artist_id
+                ),
             ),
             LidarrHit::Album(a) => (
                 a.item.genres.clone(),
                 a.item.overview.clone(),
                 format!("{}/album/{}", client.base(), a.item.foreign_album_id),
+                format!(
+                    "https://musicbrainz.org/release-group/{}",
+                    a.item.foreign_album_id
+                ),
             ),
         };
         let fallback = match &self.hit {
@@ -767,11 +883,12 @@ impl Render for LidarrAddView {
         let header = h_flex()
             .flex_none()
             .w_full()
+            .when(card_w > 0., |this| this.w(px(card_w)))
             .gap_4()
             .items_start()
             .p_4()
             .rounded_2xl()
-            .bg(cx.theme().sidebar)
+            .bg(header_fill(header_tint, cx))
             .child(
                 cover_well(self.art.clone(), HEADER_COVER, self.art_loading, cx).when(
                     self.art.is_none() && !self.art_loading,
@@ -800,14 +917,19 @@ impl Render for LidarrAddView {
                             .items_center()
                             .pt_1()
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(if tracked { cx.theme().success } else { muted })
-                                    .child(if tracked {
+                                h_flex()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .child(div().size(px(7.)).rounded_full().bg(if tracked {
+                                        cx.theme().success
+                                    } else {
+                                        muted
+                                    }))
+                                    .child(div().text_sm().text_color(muted).child(if tracked {
                                         "In Lidarr"
                                     } else {
-                                        "Not in Lidarr"
-                                    }),
+                                        "Not in Lidarr yet"
+                                    })),
                             )
                             .when(tracked, |this| {
                                 this.child(
@@ -817,28 +939,71 @@ impl Render for LidarrAddView {
                                         .label("Open in Lidarr")
                                         .on_click(move |_, _, cx| cx.open_url(&web)),
                                 )
-                            }),
+                            })
+                            .child(
+                                Button::new("lidarr-add-musicbrainz")
+                                    .ghost()
+                                    .small()
+                                    .icon(app_icon(icons::BRAND_MUSICBRAINZ))
+                                    .tooltip("Open on MusicBrainz")
+                                    .on_click(move |_, _, cx| cx.open_url(&musicbrainz)),
+                            ),
                     ),
             );
 
+        let overview_expanded = self.overview_expanded;
+        let about = overview.filter(|o| !o.trim().is_empty()).map(|o| {
+            let o = crate::ui::strip_html(&o);
+            let long = o.chars().count() > OVERVIEW_PREVIEW_CHARS;
+            let text = if long && !overview_expanded {
+                crate::ui::truncate_at_word(&o, OVERVIEW_PREVIEW_CHARS)
+            } else {
+                o
+            };
+            v_flex()
+                .flex_none()
+                .gap_2()
+                .child(div().text_sm().font_medium().child("About"))
+                .child(
+                    div()
+                        .max_w(px(crate::ui::album_detail::ABOUT_PROSE_MAX_W))
+                        .text_sm()
+                        .text_color(muted)
+                        .child(text),
+                )
+                .when(long, |this| {
+                    this.child(
+                        h_flex().child(
+                            Button::new("lidarr-add-overview-more")
+                                .ghost()
+                                .xsmall()
+                                .label(if overview_expanded { "Less" } else { "More" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.overview_expanded = !this.overview_expanded;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                })
+        });
+
+        let column = v_flex()
+            .w_full()
+            .max_w(px(PAGE_MAX_W))
+            .gap_4()
+            .child(header)
+            .when(!tracked, |this| {
+                this.child(self.render_form(card_w, accent, glow, cx))
+            })
+            .children(about);
         v_flex()
             .id("lidarr-add-scroll")
             .size_full()
+            .items_center()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .p_4()
-            .gap_4()
-            .child(header)
-            .when(!tracked, |this| this.child(self.render_form(glow, cx)))
-            .when_some(overview.filter(|o| !o.trim().is_empty()), |this, o| {
-                this.child(
-                    v_flex()
-                        .flex_none()
-                        .gap_2()
-                        .child(div().text_sm().font_medium().child("About"))
-                        .child(div().text_sm().text_color(muted).child(o)),
-                )
-            })
+            .child(column)
             .into_any_element()
     }
 }

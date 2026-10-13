@@ -20,6 +20,13 @@ const UA: &str = concat!(
     " (https://github.com/MatPrayer/scire)"
 );
 
+/// Wanted albums per page on the Lidarr page.
+pub const WANTED_PAGE: u32 = 50;
+/// History records per page. Lidarr writes one per track file (an album's
+/// import is a dozen `trackFileImported`s), so a page is grouped into far
+/// fewer rows ([`group_history`]).
+pub const HISTORY_PAGE: u32 = 250;
+
 static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 static SLOW_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -340,14 +347,15 @@ impl Lidarr {
         check(response).await.map(drop)
     }
 
-    /// Albums Lidarr wants and has no files for, across every artist.
-    pub async fn wanted_missing(&self) -> Result<(u64, Vec<Album>)> {
+    /// One page of monitored albums with no files, newest release first, and
+    /// the total Lidarr counts. `page` is 1-based, in pages of `size`.
+    pub async fn wanted_missing_page(&self, page: u32, size: u32) -> Result<(u64, Vec<Album>)> {
         let page: WantedPage = self
             .get(
                 "wanted/missing",
                 &[
-                    ("page", "1".into()),
-                    ("pageSize", "50".into()),
+                    ("page", page.to_string()),
+                    ("pageSize", size.to_string()),
                     ("sortKey", "releaseDate".into()),
                     ("sortDirection", "descending".into()),
                     ("includeArtist", "true".into()),
@@ -358,18 +366,19 @@ impl Lidarr {
         Ok((page.total_records, page.records))
     }
 
-    /// Recent history (grabs, imports, failures), newest first.
-    pub async fn history(&self) -> Result<Vec<HistoryItem>> {
-        self.recent_history(30).await
-    }
-
     /// The newest `size` history records.
     pub async fn recent_history(&self, size: u32) -> Result<Vec<HistoryItem>> {
+        Ok(self.history_page(1, size).await?.1)
+    }
+
+    /// One page of history (grabs, imports, failures), newest first, and the
+    /// total Lidarr counts. `page` is 1-based, in pages of `size`.
+    pub async fn history_page(&self, page: u32, size: u32) -> Result<(u64, Vec<HistoryItem>)> {
         let page: HistoryPage = self
             .get(
                 "history",
                 &[
-                    ("page", "1".into()),
+                    ("page", page.to_string()),
                     ("pageSize", size.to_string()),
                     ("sortKey", "date".into()),
                     ("sortDirection", "descending".into()),
@@ -378,7 +387,7 @@ impl Lidarr {
                 ],
             )
             .await?;
-        Ok(page.records)
+        Ok((page.total_records, page.records))
     }
 
     /// Lidarr's metadata search for artists (MusicBrainz, through Lidarr's
@@ -1075,6 +1084,19 @@ impl Monitor {
         }
     }
 
+    /// What picking this tells Lidarr, for the add page.
+    pub fn description(self) -> &'static str {
+        match self {
+            Monitor::All => "Every album, past and future.",
+            Monitor::Future => "Only albums released from now on.",
+            Monitor::Missing => "Albums with no files yet, and new ones.",
+            Monitor::Existing => "Only albums that already have files.",
+            Monitor::First => "Only the first album.",
+            Monitor::Latest => "Only the newest album.",
+            Monitor::None => "Nothing: the artist is tracked, albums are picked by hand.",
+        }
+    }
+
     pub fn from_api(raw: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|m| m.api() == raw)
     }
@@ -1512,6 +1534,8 @@ struct WantedPage {
 #[serde(rename_all = "camelCase")]
 struct HistoryPage {
     #[serde(default)]
+    total_records: u64,
+    #[serde(default)]
     records: Vec<HistoryItem>,
 }
 
@@ -1639,7 +1663,7 @@ pub struct StatusMessage {
     pub messages: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryItem {
     pub id: i64,
@@ -1686,6 +1710,98 @@ impl HistoryItem {
             self.event_type.as_str(),
             "downloadFailed" | "albumImportIncomplete"
         )
+    }
+}
+
+/// A run of history records about the same album: what happened to one
+/// download (grabbed, imported, retagged) is one row, not one per track file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryGroup {
+    /// The newest record of the run (history is newest first).
+    pub first: HistoryItem,
+    /// What happened, oldest first, neighbouring records with the same
+    /// label folded together.
+    pub steps: Vec<HistoryStep>,
+}
+
+/// One kind of event in a [`HistoryGroup`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryStep {
+    pub label: String,
+    /// Per-track-file records folded in (`trackFileImported`, …).
+    pub tracks: usize,
+    /// Every record folded in.
+    pub records: usize,
+    pub failure: bool,
+}
+
+impl HistoryStep {
+    /// "Imported 17 tracks", "Grabbed 2×", "Grabbed".
+    pub fn text(&self) -> String {
+        match (self.tracks, self.records) {
+            (1, _) => format!("{} 1 track", self.label),
+            (t, _) if t > 1 => format!("{} {t} tracks", self.label),
+            (_, r) if r > 1 => format!("{} {r}×", self.label),
+            _ => self.label.clone(),
+        }
+    }
+}
+
+/// Fold consecutive records about the same album (or, with none, the same
+/// release title) into one [`HistoryGroup`]. Only neighbouring records merge,
+/// so the list keeps its order in time: an album imported, then another, then
+/// the first one again stays three rows.
+///
+/// Inside a row each kind of event is one step, in the order a download goes
+/// through them (`step_rank`), not the records' order: Lidarr writes an
+/// album's imports and retags in the same second, interleaved.
+pub fn group_history(items: &[HistoryItem]) -> Vec<HistoryGroup> {
+    fn subject(h: &HistoryItem) -> (Option<i64>, &str) {
+        match &h.album {
+            Some(a) if a.id > 0 => (Some(a.id), ""),
+            _ => (None, h.source_title.as_str()),
+        }
+    }
+    let mut groups: Vec<HistoryGroup> = Vec::new();
+    for item in items {
+        let step = HistoryStep {
+            label: item.event_label().to_string(),
+            tracks: usize::from(item.event_type.starts_with("trackFile")),
+            records: 1,
+            failure: item.is_failure(),
+        };
+        match groups.last_mut() {
+            Some(last) if subject(&last.first) == subject(item) => {
+                match last.steps.iter_mut().find(|s| s.label == step.label) {
+                    Some(prev) => {
+                        prev.tracks += step.tracks;
+                        prev.records += 1;
+                        prev.failure |= step.failure;
+                    }
+                    None => last.steps.push(step),
+                }
+            }
+            _ => groups.push(HistoryGroup {
+                first: item.clone(),
+                steps: vec![step],
+            }),
+        }
+    }
+    for group in &mut groups {
+        group.steps.sort_by_key(|s| step_rank(&s.label));
+    }
+    groups
+}
+
+/// Where an event label falls in a download's life, for [`group_history`].
+fn step_rank(label: &str) -> u8 {
+    match label {
+        "Grabbed" => 0,
+        "Download failed" | "Ignored" | "Import incomplete" => 1,
+        "Imported" => 2,
+        "Retagged" | "Renamed" => 3,
+        "Deleted" => 4,
+        _ => 5,
     }
 }
 
@@ -2159,5 +2275,60 @@ mod tests {
             pick_same_title(&albums, "Abbey Road [Deluxe]").map(|a| a.id),
             Some(1)
         );
+    }
+
+    fn history(id: i64, event: &str, album: Option<i64>, source: &str) -> HistoryItem {
+        HistoryItem {
+            id,
+            event_type: event.into(),
+            source_title: source.into(),
+            album: album.map(|a| Album {
+                id: a,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn history_folds_an_albums_run_into_one_row() {
+        let items = [
+            history(10, "trackFileImported", Some(1), "a"),
+            history(9, "trackFileRetagged", Some(1), "a"),
+            history(8, "trackFileImported", Some(1), "b"),
+            history(7, "trackFileRetagged", Some(1), "c"),
+            history(6, "downloadImported", Some(1), "d"),
+            history(5, "grabbed", Some(1), "e"),
+            history(4, "trackFileImported", Some(2), "f"),
+            history(3, "grabbed", Some(1), "g"),
+            history(2, "downloadFailed", None, "Rel"),
+            history(1, "grabbed", None, "Rel"),
+        ];
+        let groups = group_history(&items);
+        let rows: Vec<(i64, Vec<String>)> = groups
+            .iter()
+            .map(|g| (g.first.id, g.steps.iter().map(HistoryStep::text).collect()))
+            .collect();
+        // Steps in lifecycle order however the records interleave; "Imported"
+        // counts track files, not the download's own record; only neighbours
+        // merge; no album → release title.
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    10,
+                    vec![
+                        "Grabbed".to_string(),
+                        "Imported 2 tracks".into(),
+                        "Retagged 2 tracks".into()
+                    ]
+                ),
+                (4, vec!["Imported 1 track".to_string()]),
+                (3, vec!["Grabbed".to_string()]),
+                (2, vec!["Grabbed".to_string(), "Download failed".into()]),
+            ]
+        );
+        assert!(groups[3].steps[1].failure);
+        assert!(group_history(&[]).is_empty());
     }
 }

@@ -37,6 +37,8 @@ use crate::ui::{strip_html, sync_focus_scroll, truncate_at_word, with_focus_curs
 
 /// Cover edge on the Lidarr page's rows.
 pub(super) const ROW_COVER: f32 = 40.;
+/// Widest the Lidarr page's column goes.
+pub(super) const PAGE_MAX_W: f32 = 1100.;
 /// Cover edge on a Lidarr album's page.
 pub(super) const HEADER_COVER: f32 = 200.;
 
@@ -117,6 +119,91 @@ pub(super) fn cover_well(path: Option<PathBuf>, edge: f32, loading: bool, cx: &A
                 cx,
             ))
         })
+}
+
+/// A Lidarr page's own colour, taken from the cover it shows, for the page
+/// tint (`Settings::adaptive_from_page`) as on a library album's page.
+/// Lidarr covers are not the server's, so there is no canonical rendition
+/// shared with the player bar to wait for: the file the header draws is it.
+#[derive(Default)]
+pub(super) struct PageAccent {
+    accent: Option<gpui::Hsla>,
+    /// Cover file the accent was taken from, so repaints don't re-decode it.
+    taken_from: Option<PathBuf>,
+}
+
+impl PageAccent {
+    /// The tint is asked for: the Adaptive theme with page tints on.
+    pub(super) fn wanted(settings: &crate::config::Settings) -> bool {
+        settings.theme == crate::config::ThemePref::Adaptive && settings.adaptive_from_page
+    }
+
+    /// The accent to paint with, or `None` for the theme's own.
+    pub(super) fn get(&self, settings: &crate::config::Settings) -> Option<gpui::Hsla> {
+        Self::wanted(settings).then_some(self.accent).flatten()
+    }
+
+    /// The colour for the header wash, when that is switched on too.
+    pub(super) fn header_tint(&self, settings: &crate::config::Settings) -> Option<gpui::Hsla> {
+        self.get(settings)
+            .filter(|_| settings.adaptive_page_gradient)
+    }
+
+    /// Decode `cover` (once per file) off the UI thread, when the tint is
+    /// `wanted`. Called from `render`; `get` finds this `PageAccent` in the
+    /// view again.
+    pub(super) fn refresh<V: 'static>(
+        &mut self,
+        cover: Option<PathBuf>,
+        wanted: bool,
+        get: fn(&mut V) -> &mut PageAccent,
+        cx: &mut Context<V>,
+    ) {
+        let Some(path) = cover.filter(|_| wanted) else {
+            return;
+        };
+        if self.taken_from.as_ref() == Some(&path) {
+            return;
+        }
+        self.taken_from = Some(path.clone());
+        cx.spawn(async move |this, cx| {
+            // Pure CPU over every pixel: the blocking pool, not an IO worker.
+            // An undecodable cover keeps its key: forgetting it would decode
+            // the same file again every frame.
+            let Ok(accent) = runtime::spawn_blocking_io(move || {
+                crate::ui::album_detail::accent_from_file(&path)
+            })
+            .await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                get(view).accent = Some(accent);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+/// A header card's fill: the page accent washed in when there is one.
+pub(super) fn header_fill(tint: Option<gpui::Hsla>, cx: &App) -> gpui::Background {
+    match tint {
+        Some(accent) => gpui::linear_gradient(
+            160.,
+            gpui::linear_color_stop(crate::ui::page_tint(accent), 0.),
+            gpui::linear_color_stop(cx.theme().sidebar, 0.85),
+        ),
+        None => cx.theme().sidebar.into(),
+    }
+}
+
+/// A primary button, in the page accent when there is one.
+pub(super) fn accent_primary(button: Button, accent: Option<gpui::Hsla>, cx: &App) -> Button {
+    match accent {
+        Some(a) => button.custom(crate::ui::accent_button(a, cx)),
+        None => button.primary(),
+    }
 }
 
 pub(super) fn muted_line(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
@@ -766,6 +853,7 @@ pub struct LidarrAlbumView {
     /// The dialog's own scroll, which the vi cursor's release rows anchor to.
     release_scroll: ScrollHandle,
     release_anchor: ScrollAnchor,
+    accent: PageAccent,
     _load: Option<Task<()>>,
     _search: Option<Task<()>>,
 }
@@ -811,6 +899,7 @@ impl LidarrAlbumView {
             search_reveal: crate::ui::Reveal::new(170, 120),
             release_scroll: release_scroll.clone(),
             release_anchor: ScrollAnchor::for_handle(release_scroll),
+            accent: PageAccent::default(),
             _load: None,
             _search: None,
         };
@@ -1327,7 +1416,9 @@ impl LidarrAlbumView {
                 .tooltip("Sent to the download client")
                 .into_any_element(),
             _ => Button::new(("lidarr-grab", index))
-                .when(release.approved, |b| b.primary())
+                .when(release.approved, |b| {
+                    accent_primary(b, self.accent.get(&self.session.read(cx).settings), cx)
+                })
                 .when(!release.approved, |b| b.outline())
                 .small()
                 .icon(app_icon(icons::DOWNLOAD))
@@ -1461,7 +1552,7 @@ impl Render for LidarrAlbumView {
         let content_w = self
             .live_width
             .resolve(f32::from(self.scroll.bounds().size.width), window);
-        let card_w = (content_w - 32.).max(0.).floor();
+        let card_w = (content_w - 32.).clamp(0., PAGE_MAX_W).floor();
         let client = self.client(cx);
         if let (Some(client), Some(album)) = (client.as_ref(), self.album.clone()) {
             self.covers.want(
@@ -1472,6 +1563,13 @@ impl Render for LidarrAlbumView {
                 cx,
             );
         }
+        let cover = self.covers.get(self.album_id);
+        let wanted = PageAccent::wanted(&self.session.read(cx).settings);
+        self.accent
+            .refresh(cover, wanted, |v: &mut Self| &mut v.accent, cx);
+        let settings = &self.session.read(cx).settings;
+        let page_accent = self.accent.get(settings);
+        let header_tint = self.accent.header_tint(settings);
         let glow = self.session.read(cx).settings.selection_glow_vi;
         let muted = cx.theme().muted_foreground;
         let state = lidarr_state(cx);
@@ -1538,7 +1636,7 @@ impl Render for LidarrAlbumView {
         let art_loading = art.is_none() && self.covers.pending(album.id);
 
         let auto = Button::new("lidarr-auto-search")
-            .primary()
+            .map(|b| accent_primary(b, page_accent, cx))
             .icon(app_icon(icons::DOWNLOAD))
             .label(if busy {
                 "Searching…"
@@ -1556,14 +1654,21 @@ impl Render for LidarrAlbumView {
             .on_click(cx.listener(|this, _, _, cx| this.open_interactive(cx)));
         let monitored = album.monitored;
 
+        // An explicit width, like the About card's: stretch-sized, the
+        // card's height was measured with the info column narrower than it
+        // ends up, so the button row wrapped and the card stood far taller
+        // than its cover.
         let header = h_flex()
             .flex_none()
             .w_full()
+            .when(card_w > 0., |this| this.w(px(card_w)))
             .gap_4()
             .items_start()
             .p_4()
             .rounded_2xl()
-            .bg(cx.theme().sidebar)
+            // The album's colour washes across the header card, as on a
+            // library album's page.
+            .bg(header_fill(header_tint, cx))
             .child(cover_well(art, HEADER_COVER, art_loading, cx))
             .child(
                 v_flex()
@@ -1608,12 +1713,23 @@ impl Render for LidarrAlbumView {
                                         .text_color(if problem {
                                             cx.theme().warning
                                         } else {
-                                            cx.theme().primary
+                                            page_accent.unwrap_or(cx.theme().primary)
                                         })
                                         .child(label),
                                 )
                                 .when_some(progress, |this, p| {
-                                    this.child(Progress::new().value(p * 100.))
+                                    // Same colour as the label above: the theme's
+                                    // `progress_bar` follows the playing track's
+                                    // accent, not this page's.
+                                    this.child(
+                                        Progress::new()
+                                            .bg(if problem {
+                                                cx.theme().warning
+                                            } else {
+                                                page_accent.unwrap_or(cx.theme().primary)
+                                            })
+                                            .value(p * 100.),
+                                    )
                                 }),
                         )
                     })
@@ -1804,12 +1920,10 @@ impl Render for LidarrAlbumView {
                 )
             });
 
-        let page = v_flex()
-            .id("lidarr-album-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .p_4()
+        // Capped and centred like the Lidarr page and a Lidarr artist's.
+        let column = v_flex()
+            .w_full()
+            .max_w(px(PAGE_MAX_W))
             .gap_4()
             .child(header)
             .child(
@@ -1827,6 +1941,14 @@ impl Render for LidarrAlbumView {
                     ),
             )
             .children(self.about_card(&album, card_w, cx));
+        let page = v_flex()
+            .id("lidarr-album-scroll")
+            .size_full()
+            .items_center()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .p_4()
+            .child(column);
         div()
             .relative()
             .size_full()
@@ -1851,8 +1973,16 @@ enum Load<T> {
 
 pub struct LidarrView {
     session: Entity<Session>,
+    /// Lidarr's total, then the albums loaded so far.
     wanted: Load<(u64, Vec<Album>)>,
-    history: Load<Vec<HistoryItem>>,
+    /// Pages of `lidarr::WANTED_PAGE` shown; a reload asks for all of them.
+    wanted_pages: u32,
+    wanted_more: Option<Task<()>>,
+    /// Lidarr's total, then the records loaded so far (one per track file;
+    /// drawn grouped, `lidarr::group_history`).
+    history: Load<(u64, Vec<HistoryItem>)>,
+    history_pages: u32,
+    history_more: Option<Task<()>>,
     imports_seen: u64,
     covers: Covers,
     /// Queue entry whose remove button was pressed once: the second press
@@ -1886,7 +2016,11 @@ impl LidarrView {
         let mut this = Self {
             session,
             wanted: Load::Loading,
+            wanted_pages: 1,
+            wanted_more: None,
             history: Load::Loading,
+            history_pages: 1,
+            history_more: None,
             imports_seen,
             covers: Covers::default(),
             confirm_remove: None,
@@ -1905,9 +2039,18 @@ impl LidarrView {
         let Some(client) = lidarr_state(cx).read(cx).client.clone() else {
             return;
         };
+        // Everything already paged in, in one request each, so a reload (an
+        // import landing, Refresh) doesn't fold the lists back to one page.
+        let wanted_size = self.wanted_pages * lidarr::WANTED_PAGE;
+        let history_size = self.history_pages * lidarr::HISTORY_PAGE;
+        self.wanted_more = None;
+        self.history_more = None;
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = runtime::spawn_io(async move {
-                let (wanted, history) = tokio::join!(client.wanted_missing(), client.history());
+                let (wanted, history) = tokio::join!(
+                    client.wanted_missing_page(1, wanted_size),
+                    client.history_page(1, history_size)
+                );
                 Ok((wanted, history))
             })
             .await;
@@ -1937,6 +2080,71 @@ impl LidarrView {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         lidarr_state(cx).update(cx, |s, cx| s.poke(cx));
         self.load(cx);
+    }
+
+    /// The next page of wanted albums, appended.
+    fn more_wanted(&mut self, cx: &mut Context<Self>) {
+        if self.wanted_more.is_some() || !matches!(self.wanted, Load::Loaded(_)) {
+            return;
+        }
+        let Some(client) = lidarr_state(cx).read(cx).client.clone() else {
+            return;
+        };
+        let page = self.wanted_pages + 1;
+        self.wanted_more = Some(cx.spawn(async move |this, cx| {
+            let result = runtime::spawn_io(async move {
+                client.wanted_missing_page(page, lidarr::WANTED_PAGE).await
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.wanted_more = None;
+                match result {
+                    Ok((total, more)) => {
+                        if let Load::Loaded((t, albums)) = &mut this.wanted {
+                            *t = total;
+                            append_new(albums, more, |a| a.id);
+                            this.wanted_pages = page;
+                        }
+                    }
+                    Err(e) => this.action_error = Some(crate::errors::error_text(&e)),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// The next page of history, appended.
+    fn more_history(&mut self, cx: &mut Context<Self>) {
+        if self.history_more.is_some() || !matches!(self.history, Load::Loaded(_)) {
+            return;
+        }
+        let Some(client) = lidarr_state(cx).read(cx).client.clone() else {
+            return;
+        };
+        let page = self.history_pages + 1;
+        self.history_more = Some(cx.spawn(async move |this, cx| {
+            let result =
+                runtime::spawn_io(
+                    async move { client.history_page(page, lidarr::HISTORY_PAGE).await },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.history_more = None;
+                match result {
+                    Ok((total, more)) => {
+                        if let Load::Loaded((t, items)) = &mut this.history {
+                            *t = total;
+                            append_new(items, more, |h| h.id);
+                            this.history_pages = page;
+                        }
+                    }
+                    Err(e) => this.action_error = Some(crate::errors::error_text(&e)),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     fn wanted_albums(&self) -> &[Album] {
@@ -2233,6 +2441,121 @@ impl LidarrView {
     }
 }
 
+impl LidarrView {
+    fn render_history_row(
+        &self,
+        index: usize,
+        group: &lidarr::HistoryGroup,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let h = &group.first;
+        let album = h.album.as_ref().filter(|a| a.id > 0);
+        let album_id = album.map(|a| a.id);
+        let title = album
+            .map(|a| a.title.clone())
+            .unwrap_or_else(|| h.source_title.clone());
+        let artist = h
+            .artist
+            .as_ref()
+            .map(|a| a.artist_name.clone())
+            .unwrap_or_default();
+        let tip = SharedString::from(h.source_title.clone());
+        h_flex()
+            .id(("lidarr-history", index))
+            .px_2()
+            .py_1p5()
+            .gap_3()
+            .items_center()
+            .rounded_md()
+            .when_some(album_id, |this, id| {
+                this.cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted))
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(LidarrEvent::OpenAlbum(id))))
+            })
+            .when(!h.source_title.is_empty(), |this| {
+                this.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
+            .child(cover_well(
+                album_id.and_then(|id| self.covers.get(id)),
+                ROW_COVER,
+                album_id.is_some_and(|id| self.covers.pending(id)),
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_sm().truncate().child(title))
+                    .child(div().text_xs().text_color(muted).truncate().child(artist)),
+            )
+            .child(h_flex().flex_none().gap_1().text_xs().children(
+                group.steps.iter().enumerate().map(|(i, step)| {
+                    h_flex()
+                        .gap_1()
+                        .when(i > 0, |this| {
+                            this.child(div().text_color(muted).opacity(0.5).child("›"))
+                        })
+                        .child(
+                            div()
+                                .text_color(if step.failure {
+                                    cx.theme().danger
+                                } else {
+                                    muted
+                                })
+                                .child(step.text()),
+                        )
+                }),
+            ))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(112.))
+                    .text_right()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(short_stamp(&h.date)),
+            )
+            .into_any_element()
+    }
+}
+
+/// Append the rows of a further page that aren't listed yet. Pages are
+/// offsets into a list Lidarr may have changed since: a new record at the
+/// top shifts everything down one, and the next page then repeats a row.
+fn append_new<T, K: PartialEq>(list: &mut Vec<T>, more: Vec<T>, key: impl Fn(&T) -> K) {
+    for item in more {
+        if !list.iter().any(|have| key(have) == key(&item)) {
+            list.push(item);
+        }
+    }
+}
+
+/// "50 of 312" while a list has more pages, the plain total once it hasn't.
+fn paged_count(shown: usize, total: u64) -> Option<String> {
+    match total {
+        0 => None,
+        t if (shown as u64) < t => Some(format!("{shown} of {t}")),
+        t => Some(t.to_string()),
+    }
+}
+
+/// The "Show more" button under a paged list.
+fn show_more(
+    id: &'static str,
+    loading: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    h_flex().pt_1().child(
+        Button::new(id)
+            .ghost()
+            .small()
+            .label("Show more")
+            .loading(loading)
+            .on_click(on_click),
+    )
+}
+
 pub(super) fn section_title(title: &str, count: Option<String>, cx: &App) -> impl IntoElement {
     h_flex()
         .gap_2()
@@ -2280,7 +2603,19 @@ impl Render for LidarrView {
             .filter_map(|q| q.album.clone())
             .collect();
         let wanted_albums: Vec<Album> = self.wanted_albums().to_vec();
-        for album in queue_albums.iter().chain(&wanted_albums) {
+        let history_groups = match &self.history {
+            Load::Loaded((_, items)) => lidarr::group_history(items),
+            _ => Vec::new(),
+        };
+        let history_albums: Vec<Album> = history_groups
+            .iter()
+            .filter_map(|g| g.first.album.clone().filter(|a| a.id > 0))
+            .collect();
+        for album in queue_albums
+            .iter()
+            .chain(&wanted_albums)
+            .chain(&history_albums)
+        {
             self.covers.want(
                 &client,
                 album,
@@ -2330,7 +2665,8 @@ impl Render for LidarrView {
             v_flex().gap_0p5().children(queue_rows).into_any_element()
         };
 
-        let (wanted_total, wanted_body): (Option<u64>, gpui::AnyElement) = match &self.wanted {
+        let wanted_loading_more = self.wanted_more.is_some();
+        let (wanted_count, wanted_body): (Option<String>, gpui::AnyElement) = match &self.wanted {
             Load::Loading => (
                 None,
                 div()
@@ -2347,8 +2683,8 @@ impl Render for LidarrView {
                     .child(why.clone())
                     .into_any_element(),
             ),
-            Load::Loaded((total, albums)) if albums.is_empty() => (
-                Some(*total),
+            Load::Loaded((_, albums)) if albums.is_empty() => (
+                None,
                 div()
                     .text_sm()
                     .text_color(muted)
@@ -2356,7 +2692,7 @@ impl Render for LidarrView {
                     .into_any_element(),
             ),
             Load::Loaded((total, albums)) => (
-                Some(*total),
+                paged_count(albums.len(), *total),
                 v_flex()
                     .gap_0p5()
                     .children(albums.iter().enumerate().map(|(i, album)| {
@@ -2370,78 +2706,71 @@ impl Render for LidarrView {
                             cx,
                         )
                     }))
+                    .when((albums.len() as u64) < *total, |this| {
+                        this.child(show_more(
+                            "lidarr-wanted-more",
+                            wanted_loading_more,
+                            cx.listener(|this, _, _, cx| this.more_wanted(cx)),
+                        ))
+                    })
                     .into_any_element(),
             ),
         };
 
-        let history_body: gpui::AnyElement = match &self.history {
-            Load::Loading => div()
-                .text_sm()
-                .text_color(muted)
-                .child("Loading…")
-                .into_any_element(),
-            Load::Failed(why) => div()
-                .text_sm()
-                .text_color(cx.theme().danger)
-                .child(why.clone())
-                .into_any_element(),
-            Load::Loaded(items) if items.is_empty() => div()
-                .text_sm()
-                .text_color(muted)
-                .child("No activity yet.")
-                .into_any_element(),
-            Load::Loaded(items) => v_flex()
-                .gap_0p5()
-                .children(items.iter().map(|h| {
-                    let what = [
-                        h.artist.as_ref().map(|a| a.artist_name.clone()),
-                        h.album.as_ref().map(|a| a.title.clone()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" — ");
-                    let what = if what.is_empty() {
-                        h.source_title.clone()
-                    } else {
-                        what
-                    };
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_3()
-                        .items_center()
-                        .text_sm()
-                        .child(
-                            div()
-                                .w(px(128.))
-                                .flex_none()
-                                .text_xs()
-                                .text_color(if h.is_failure() {
-                                    cx.theme().danger
-                                } else {
-                                    muted
-                                })
-                                .child(h.event_label().to_string()),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(what))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(short_stamp(&h.date)),
-                        )
-                }))
-                .into_any_element(),
+        let history_loading_more = self.history_more.is_some();
+        let (history_count, history_body): (Option<String>, gpui::AnyElement) = match &self.history
+        {
+            Load::Loading => (
+                None,
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("Loading…")
+                    .into_any_element(),
+            ),
+            Load::Failed(why) => (
+                None,
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(why.clone())
+                    .into_any_element(),
+            ),
+            Load::Loaded((_, items)) if items.is_empty() => (
+                None,
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("No activity yet.")
+                    .into_any_element(),
+            ),
+            Load::Loaded((total, items)) => (
+                // Counted in records: that is what Lidarr totals and pages.
+                paged_count(items.len(), *total).map(|n| format!("{n} records")),
+                v_flex()
+                    .gap_0p5()
+                    .children(
+                        history_groups
+                            .iter()
+                            .enumerate()
+                            .map(|(i, g)| self.render_history_row(i, g, cx)),
+                    )
+                    .when((items.len() as u64) < *total, |this| {
+                        this.child(show_more(
+                            "lidarr-history-more",
+                            history_loading_more,
+                            cx.listener(|this, _, _, cx| this.more_history(cx)),
+                        ))
+                    })
+                    .into_any_element(),
+            ),
         };
 
-        v_flex()
-            .id("lidarr-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .p_4()
+        // A list page: on a wide window the rows' far ends would sit a
+        // screen apart, so the column stops at `PAGE_MAX_W`, centred.
+        let column = v_flex()
+            .w_full()
+            .max_w(px(PAGE_MAX_W))
             .gap_5()
             .child(
                 h_flex()
@@ -2499,20 +2828,24 @@ impl Render for LidarrView {
                 v_flex()
                     .flex_none()
                     .gap_2()
-                    .child(section_title(
-                        "Wanted",
-                        wanted_total.filter(|n| *n > 0).map(|n| n.to_string()),
-                        cx,
-                    ))
+                    .child(section_title("Wanted", wanted_count, cx))
                     .child(wanted_body),
             )
             .child(
                 v_flex()
                     .flex_none()
                     .gap_2()
-                    .child(section_title("Recent activity", None, cx))
+                    .child(section_title("Recent activity", history_count, cx))
                     .child(history_body),
-            )
+            );
+        v_flex()
+            .id("lidarr-scroll")
+            .size_full()
+            .items_center()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .p_4()
+            .child(column)
             .into_any_element()
     }
 }
@@ -2520,6 +2853,20 @@ impl Render for LidarrView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn further_pages_skip_rows_already_listed() {
+        let mut list = vec![1, 2, 3];
+        append_new(&mut list, vec![3, 4, 5], |n| *n);
+        assert_eq!(list, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn counts_say_how_much_is_left() {
+        assert_eq!(paged_count(50, 312).as_deref(), Some("50 of 312"));
+        assert_eq!(paged_count(12, 12).as_deref(), Some("12"));
+        assert_eq!(paged_count(0, 0), None);
+    }
 
     #[test]
     fn stamps_drop_seconds_and_zone() {

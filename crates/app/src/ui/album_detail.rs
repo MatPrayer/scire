@@ -52,7 +52,7 @@ pub(crate) const NOTES_PREVIEW_CHARS: usize = 400;
 /// Shared by the two passes that produce one — the canonical fetch and the
 /// provisional cached rendition — so they cannot differ in anything but which
 /// file they are handed.
-fn accent_from_file(path: &Path) -> anyhow::Result<gpui::Hsla> {
+pub(crate) fn accent_from_file(path: &Path) -> anyhow::Result<gpui::Hsla> {
     let bytes = std::fs::read(path)?;
     crate::ui::accent_from_cover_bytes(&bytes)
         .ok_or_else(|| anyhow::anyhow!("cover art did not decode"))

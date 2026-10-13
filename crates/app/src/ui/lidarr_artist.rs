@@ -18,7 +18,9 @@ use gpui_component::{
     v_flex,
 };
 
-use super::lidarr::{Covers, HEADER_COVER, album_activity, cover_well, muted_line, section_title};
+use super::lidarr::{
+    Covers, HEADER_COVER, PAGE_MAX_W, album_activity, cover_well, muted_line, section_title,
+};
 use super::lidarr_add::LidarrHit;
 use crate::assets::{app_icon, icons};
 use crate::services::lidarr::{self, Album, Artist, Lidarr, Lookup};
@@ -33,6 +35,21 @@ const RELEASE_COVER: f32 = 48.;
 /// its metadata server; until then they are asked for again this often.
 const DISCOGRAPHY_RETRY: Duration = Duration::from_secs(3);
 const DISCOGRAPHY_TRIES: u32 = 10;
+/// Rows a discography section shows before "Show all".
+const SECTION_FOLD: usize = 12;
+/// Overview characters shown before "More".
+const OVERVIEW_PREVIEW_CHARS: usize = 400;
+
+/// How many of a section's `len` rows are drawn: all when unfolded, else
+/// `SECTION_FOLD` — unless that would hide only a row or two, which a
+/// "Show all" button would take as much room as.
+fn section_rows(len: usize, unfolded: bool) -> usize {
+    if unfolded || len <= SECTION_FOLD + 2 {
+        len
+    } else {
+        SECTION_FOLD
+    }
+}
 
 pub enum LidarrArtistEvent {
     OpenAlbum(i64),
@@ -59,6 +76,10 @@ pub struct LidarrArtistView {
     imports_seen: u64,
     scroll: ScrollHandle,
     focus_anchor: ScrollAnchor,
+    /// Sections showing every row (`SECTION_FOLD`).
+    unfolded: HashSet<&'static str>,
+    overview_expanded: bool,
+    live_width: crate::ui::LiveWidth,
     /// 0 = search monitored, then release rows in drawn order.
     vi_cursor: Option<usize>,
     vi_scroll_synced: Option<usize>,
@@ -102,6 +123,9 @@ impl LidarrArtistView {
             imports_seen,
             scroll: scroll.clone(),
             focus_anchor: ScrollAnchor::for_handle(scroll),
+            unfolded: HashSet::new(),
+            overview_expanded: false,
+            live_width: crate::ui::LiveWidth::default(),
             vi_cursor: None,
             vi_scroll_synced: None,
             _load: None,
@@ -192,11 +216,15 @@ impl LidarrArtistView {
         }
     }
 
-    /// Release indices in drawn order, for the vi walk.
+    /// Release indices in drawn order (folded sections cut short), for the
+    /// vi walk and the covers.
     fn drawn(&self) -> Vec<usize> {
         lidarr::discography_sections(self.albums(), self.only_missing)
             .into_iter()
-            .flat_map(|(_, ids)| ids)
+            .flat_map(|(label, ids)| {
+                let shown = section_rows(ids.len(), self.unfolded.contains(label));
+                ids.into_iter().take(shown)
+            })
             .collect()
     }
 
@@ -480,7 +508,8 @@ impl Render for LidarrArtistView {
                 .into_any_element();
         };
         let albums: Vec<Album> = self.albums().to_vec();
-        for album in &albums {
+        // Covers for the rows drawn: folded sections don't ask for theirs.
+        for album in self.drawn().into_iter().filter_map(|ix| albums.get(ix)) {
             self.covers.want(
                 &client,
                 album,
@@ -538,10 +567,21 @@ impl Render for LidarrArtistView {
         .collect::<Vec<_>>()
         .join(" · ");
 
+        // Scroll pane minus its `p_4`, whole pixels (see `ui::LiveWidth`),
+        // capped like the column it sits in.
+        let content_w = self
+            .live_width
+            .resolve(f32::from(self.scroll.bounds().size.width), window);
+        let card_w = (content_w - 32.).clamp(0., PAGE_MAX_W).floor();
+
         let search_focused = self.vi_cursor == Some(0);
+        // An explicit width: stretch-sized, the card's height was measured
+        // with the info column narrower than it ends up, and it stood far
+        // taller than its photo.
         let header = h_flex()
             .flex_none()
             .w_full()
+            .when(card_w > 0., |this| this.w(px(card_w)))
             .gap_4()
             .items_start()
             .p_4()
@@ -704,8 +744,12 @@ impl Render for LidarrArtistView {
                     );
                 }
                 for (label, ids) in sections {
+                    let total = ids.len();
+                    let unfolded = self.unfolded.contains(label);
+                    let shown = section_rows(total, unfolded);
                     let rows: Vec<gpui::AnyElement> = ids
                         .iter()
+                        .take(shown)
                         .map(|&ix| {
                             flat += 1;
                             self.render_release(
@@ -717,12 +761,36 @@ impl Render for LidarrArtistView {
                             )
                         })
                         .collect();
+                    let fold = (unfolded || shown < total).then(|| {
+                        h_flex().pt_1().child(
+                            Button::new(gpui::SharedString::from(format!(
+                                "lidarr-section-fold-{label}"
+                            )))
+                            .ghost()
+                            .small()
+                            .label(if unfolded {
+                                "Show fewer".to_string()
+                            } else {
+                                format!("Show all {total}")
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if !this.unfolded.remove(label) {
+                                        this.unfolded.insert(label);
+                                    }
+                                    this.vi_cursor = None;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    });
                     column = column.child(
                         v_flex()
                             .flex_none()
                             .gap_1()
-                            .child(section_title(label, Some(rows.len().to_string()), cx))
-                            .child(v_flex().gap_0p5().children(rows)),
+                            .child(section_title(label, Some(total.to_string()), cx))
+                            .child(v_flex().gap_0p5().children(rows))
+                            .children(fold),
                     );
                 }
                 column.into_any_element()
@@ -730,14 +798,52 @@ impl Render for LidarrArtistView {
         };
 
         let only_missing = self.only_missing;
-        v_flex()
-            .id("lidarr-artist-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .p_4()
+        let overview_expanded = self.overview_expanded;
+        // Under the header, not after the discography (91 releases down),
+        // folded to a preview like a library artist's bio.
+        let about = overview.map(|o| {
+            let o = crate::ui::strip_html(&o);
+            let long = o.chars().count() > OVERVIEW_PREVIEW_CHARS;
+            let text = if long && !overview_expanded {
+                crate::ui::truncate_at_word(&o, OVERVIEW_PREVIEW_CHARS)
+            } else {
+                o
+            };
+            v_flex()
+                .flex_none()
+                .when(card_w > 0., |this| this.w(px(card_w)))
+                .gap_2()
+                .child(div().text_sm().font_medium().child("About"))
+                .child(
+                    div()
+                        .max_w(px(crate::ui::album_detail::ABOUT_PROSE_MAX_W))
+                        .text_sm()
+                        .text_color(muted)
+                        .child(text),
+                )
+                .when(long, |this| {
+                    this.child(
+                        h_flex().child(
+                            Button::new("lidarr-artist-overview-more")
+                                .ghost()
+                                .xsmall()
+                                .label(if overview_expanded { "Less" } else { "More" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.overview_expanded = !this.overview_expanded;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                })
+        });
+        // A list page: on a wide window the rows' far ends would sit a screen
+        // apart, so the column stops at `PAGE_MAX_W`, centred.
+        let column = v_flex()
+            .w_full()
+            .max_w(px(PAGE_MAX_W))
             .gap_4()
             .child(header)
+            .children(about)
             .child(
                 h_flex()
                     .flex_none()
@@ -757,16 +863,28 @@ impl Render for LidarrArtistView {
                     )
                     .child(div().text_sm().text_color(muted).child("Only missing")),
             )
-            .child(body)
-            .when_some(overview, |this, o| {
-                this.child(
-                    v_flex()
-                        .flex_none()
-                        .gap_2()
-                        .child(div().text_sm().font_medium().child("About"))
-                        .child(div().text_sm().text_color(muted).child(o)),
-                )
-            })
+            .child(body);
+        v_flex()
+            .id("lidarr-artist-scroll")
+            .size_full()
+            .items_center()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .p_4()
+            .child(column)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_sections_fold_unless_little_would_hide() {
+        assert_eq!(section_rows(25, false), SECTION_FOLD);
+        assert_eq!(section_rows(25, true), 25);
+        assert_eq!(section_rows(SECTION_FOLD + 2, false), SECTION_FOLD + 2);
+        assert_eq!(section_rows(3, false), 3);
     }
 }
