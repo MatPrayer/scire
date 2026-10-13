@@ -1946,9 +1946,8 @@ impl Render for ArtistDetailView {
             let mut seen = std::collections::HashSet::new();
             a.album
                 .iter()
-                .filter_map(|album| album.genre.as_deref())
-                .map(str::trim)
-                .filter(|g| !g.is_empty() && seen.insert(g.to_lowercase()))
+                .flat_map(|album| album.genre_names())
+                .filter(|g| seen.insert(g.to_lowercase()))
                 .map(str::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -2947,6 +2946,7 @@ mod tests {
             created: None,
             year: None,
             genre: None,
+            genres: Vec::new(),
             starred: None,
             user_rating: None,
             play_count: None,
@@ -3166,6 +3166,7 @@ mod grid_tests {
             created: None,
             year,
             genre: None,
+            genres: Vec::new(),
             starred: None,
             user_rating: None,
             play_count: None,

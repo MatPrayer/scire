@@ -104,6 +104,26 @@ fn cached_album(db: &LibraryDb, album_id: &str) -> Option<AlbumWithSongs> {
     })
 }
 
+/// The album's genres, one chip each: every one the server lists for the
+/// album (`Album::genre_names`), else the tracks' own in order of first
+/// appearance — a page seeded from the cache has no album genre, only each
+/// track's.
+fn album_genres(album: &AlbumWithSongs) -> Vec<String> {
+    let names = album.album.genre_names();
+    if !names.is_empty() {
+        return names.into_iter().map(str::to_string).collect();
+    }
+    let mut seen = std::collections::HashSet::new();
+    album
+        .song
+        .iter()
+        .filter_map(|s| s.genre.as_deref())
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && seen.insert(g.to_lowercase()))
+        .map(str::to_string)
+        .collect()
+}
+
 /// How many tracks the last sync recorded for this album, for the case
 /// `cached_album` refuses: an album row whose tracks never landed still knows
 /// its own `song_count`, and a skeleton list of the right length is the
@@ -1285,15 +1305,7 @@ impl Render for AlbumDetailView {
             let mut chips: Vec<String> = Vec::new();
             let mut has_quality = false;
             if let Some(a) = &self.album {
-                if let Some(genre) = a
-                    .album
-                    .genre
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|g| !g.is_empty())
-                {
-                    chips.push(genre.to_string());
-                }
+                chips.extend(album_genres(a));
                 let discs = a
                     .song
                     .iter()
@@ -2460,7 +2472,7 @@ mod tests {
         assert_eq!(super::ext_links(None, None, &online)[1].1, "rg");
     }
 
-    use super::{album_credits, album_from_row, cached_album};
+    use super::{album_credits, album_from_row, album_genres, cached_album};
     use crate::services::library_db::{AlbumRow, LibraryDb};
     use crate::ui::{album_quality_chips, album_replaygain_line, format_bytes, format_khz};
     use subsonic::{ArtistRef, Song};
@@ -2562,6 +2574,31 @@ mod tests {
         db.upsert_album(&AlbumRow::new("navidrome:album:a1", "navidrome", "Album"))
             .unwrap();
         assert!(cached_album(&db, "a1").is_none());
+    }
+
+    /// The album's own list wins; a seeded page (no album genre) falls back
+    /// to its tracks', deduplicated in first-seen order.
+    #[test]
+    fn genres_come_from_the_album_then_its_tracks() {
+        let songs = vec![
+            song(r#"{"id":"1","title":"a","genre":"Jazz"}"#),
+            song(r#"{"id":"2","title":"b","genre":"Soul"}"#),
+            song(r#"{"id":"3","title":"c","genre":"jazz"}"#),
+        ];
+        let mut a = subsonic::AlbumWithSongs {
+            album: album(None, vec![]),
+            song: songs,
+        };
+        assert_eq!(album_genres(&a), ["Jazz", "Soul"]);
+        a.album.genres = vec![
+            subsonic::ItemGenre {
+                name: "Jazz Fusion".into(),
+            },
+            subsonic::ItemGenre {
+                name: "Funk".into(),
+            },
+        ];
+        assert_eq!(album_genres(&a), ["Jazz Fusion", "Funk"]);
     }
 
     /// Songs carry ~20 fields; building them from JSON keeps the cases readable

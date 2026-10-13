@@ -699,6 +699,7 @@ mod tests {
             created: None,
             year: None,
             genre: None,
+            genres: Vec::new(),
             starred: None,
             user_rating: None,
             play_count: None,

@@ -197,6 +197,39 @@ async fn get_album_parses_every_credited_artist() {
 }
 
 #[tokio::test]
+async fn get_album_parses_every_genre() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getAlbum"))
+        .and(query_param("id", "al-4"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            // Navidrome: `genre` holds only the first; `genres` has them all.
+            r#""album":{"id":"al-4","name":"Kid A","genre":"Electronic",
+                "genres":[{"name":"Electronic"},{"name":"Art Rock"},{"name":"electronic"}],
+                "song":[]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let album = client(&server.uri()).get_album("al-4").await.unwrap();
+    assert_eq!(album.album.genre_names(), ["Electronic", "Art Rock"]);
+}
+
+#[tokio::test]
+async fn get_album_without_genres_array_falls_back_to_genre() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/getAlbum"))
+        .and(query_param("id", "al-5"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_body(
+            r#""album":{"id":"al-5","name":"Blue","genre":"Folk","song":[]}"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let album = client(&server.uri()).get_album("al-5").await.unwrap();
+    assert_eq!(album.album.genre_names(), ["Folk"]);
+}
+
+#[tokio::test]
 async fn get_album_without_artists_array_stays_empty() {
     let server = MockServer::start().await;
     Mock::given(path("/rest/getAlbum"))

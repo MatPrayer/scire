@@ -97,6 +97,10 @@ pub struct Album {
     /// `RELEASETYPE` tags; empty on vanilla servers and untagged libraries.
     #[serde(default)]
     pub release_types: Vec<String>,
+    /// OpenSubsonic genres, every one the album's files carry. `genre` is the
+    /// classic single string, and Navidrome fills it with only the first.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub genres: Vec<ItemGenre>,
 }
 
 /// An OpenSubsonic `ItemDate`: a partial date, any component of which may be
@@ -111,6 +115,22 @@ pub struct ItemDate {
 }
 
 impl Album {
+    /// Every genre to show: OpenSubsonic `genres` when the server sent them,
+    /// else the classic `genre`. Blank and repeated (case-folded) names
+    /// dropped, server order kept.
+    pub fn genre_names(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&str> = match self.genres.is_empty() {
+            false => self.genres.iter().map(|g| g.name.as_str()).collect(),
+            true => self.genre.as_deref().into_iter().collect(),
+        };
+        names
+            .into_iter()
+            .map(str::trim)
+            .filter(|g| !g.is_empty() && seen.insert(g.to_lowercase()))
+            .collect()
+    }
+
     /// Sort key for release order: year, then month, then day.
     ///
     /// Missing components sort *before* a present one within the same year, so

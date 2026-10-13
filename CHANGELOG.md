@@ -4,6 +4,14 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] — 2026-10-13
+
+### Fixed
+
+- Album pages show every genre the album is tagged with, one chip each,
+  instead of only the first (OpenSubsonic `genres`; servers without it keep
+  the single genre). The Genres line on artist pages lists them all too.
+
 ## [1.5.0] — 2026-10-07
 
 ### Added
