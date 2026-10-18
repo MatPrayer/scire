@@ -13,9 +13,10 @@ use crate::PlaybackError;
 const GAMMA: f32 = 0.6;
 
 fn build_decoder(bytes: Vec<u8>) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, PlaybackError> {
+    let len = bytes.len() as u64;
     rodio::Decoder::builder()
         .with_data(Cursor::new(bytes))
-        .with_seekable(true)
+        .with_byte_len(len)
         .build()
         .map_err(|e| PlaybackError(e.to_string()))
 }
