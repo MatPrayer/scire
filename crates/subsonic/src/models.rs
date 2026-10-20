@@ -318,6 +318,29 @@ pub struct SongDetails {
     pub moods: Vec<String>,
 }
 
+impl Song {
+    /// Every genre on the song: OpenSubsonic `genres` when the server sent
+    /// them, else the classic `genre`. Blank and repeated (case-folded) names
+    /// dropped, server order kept — like [`Album::genre_names`].
+    pub fn genre_names(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&str> = match self.details.genres.is_empty() {
+            false => self
+                .details
+                .genres
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect(),
+            true => self.genre.as_deref().into_iter().collect(),
+        };
+        names
+            .into_iter()
+            .map(str::trim)
+            .filter(|g| !g.is_empty() && seen.insert(g.to_lowercase()))
+            .collect()
+    }
+}
+
 impl SongDetails {
     /// Composer credits, with the server's artist id where it has one.
     ///

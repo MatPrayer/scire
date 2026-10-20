@@ -1334,9 +1334,11 @@ impl Render for AlbumDetailView {
             // Chips: genre / added date first (album-level), then the file
             // facts derived from the tracks.
             let mut chips: Vec<String> = Vec::new();
+            // Genres apart from the rest: they are links to the search page.
+            let mut genres: Vec<String> = Vec::new();
             let mut has_quality = false;
             if let Some(a) = &self.album {
-                chips.extend(album_genres(a));
+                genres = album_genres(a);
                 let discs = a
                     .song
                     .iter()
@@ -1366,6 +1368,14 @@ impl Render for AlbumDetailView {
                 .gap_1p5()
                 .flex_wrap()
                 .when(centred, |this| this.justify_center())
+                .children(genres.iter().enumerate().map(|(i, g)| {
+                    crate::ui::advanced_search::genre_chip(
+                        ("album-genre", i),
+                        g,
+                        crate::services::advanced_search::SearchKind::Albums,
+                        cx,
+                    )
+                }))
                 .when(chips_pending, |this| {
                     this.children(
                         CHIP_SAMPLES

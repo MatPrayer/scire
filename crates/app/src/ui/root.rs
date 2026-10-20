@@ -399,6 +399,8 @@ pub struct RootView {
     /// it from the palette carries what was already typed. Taken by
     /// `navigate`, which is also reached with nothing pending.
     pending_search_query: Option<String>,
+    /// Genre and kind the next search page opens on (`open_genre_search`).
+    pending_search_genre: Option<(String, crate::services::advanced_search::SearchKind)>,
     /// New-playlist dialog state.
     new_playlist_open: bool,
     new_pl_name: Entity<InputState>,
@@ -613,6 +615,31 @@ impl RootView {
                 this.open_song_info(song, cx);
             }
         })
+        .detach();
+
+        // Genre chips ask for the search page through this global; observed
+        // with the window, which building the page's query field needs.
+        cx.set_global(crate::ui::advanced_search::GenreSearchRequest::default());
+        cx.observe_global_in::<crate::ui::advanced_search::GenreSearchRequest>(
+            window,
+            |this: &mut Self, window, cx| {
+                // As above: take only when there is something to take.
+                if cx
+                    .global::<crate::ui::advanced_search::GenreSearchRequest>()
+                    .0
+                    .is_none()
+                {
+                    return;
+                }
+                if let Some((genre, kind)) = cx
+                    .global_mut::<crate::ui::advanced_search::GenreSearchRequest>()
+                    .0
+                    .take()
+                {
+                    this.open_genre_search(genre, kind, window, cx);
+                }
+            },
+        )
         .detach();
 
         // -- First-time setup inputs --
@@ -918,6 +945,7 @@ impl RootView {
             geometry_flush: None,
             rail_playlists_open: false,
             pending_search_query: None,
+            pending_search_genre: None,
             new_playlist_open: false,
             new_pl_name,
             new_pl_desc,
@@ -1723,10 +1751,16 @@ impl RootView {
                     AdvancedSearchEvent::OpenLidarr(hit) => this.open_lidarr_hit(hit.clone(), cx),
                 })
                 .detach();
-                // A page whose whole point is a query field starts with the
-                // cursor in it; reaching it from the palette especially, where
-                // the user was already typing.
-                view.update(cx, |v, cx| v.focus_query(window, cx));
+                if let Some((genre, kind)) = self.pending_search_genre.take() {
+                    // Opened by a genre chip: the list is the answer, so the
+                    // query field is left unfocused (vi keys walk the rows).
+                    view.update(cx, |v, cx| v.show_genre(genre, kind, window, cx));
+                } else {
+                    // A page whose whole point is a query field starts with the
+                    // cursor in it; reaching it from the palette especially,
+                    // where the user was already typing.
+                    view.update(cx, |v, cx| v.focus_query(window, cx));
+                }
                 Content::Search(view)
             }
             NavSection::Radio => {
@@ -1806,6 +1840,21 @@ impl RootView {
     /// the *last* search still on screen would ignore what was just typed.
     fn open_advanced_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_search_query = Some(query);
+        self.navigate_push(NavSection::Search, window, cx);
+    }
+
+    /// Open the search page on the `kind` rows tagged `genre` — a genre
+    /// chip's click, through `advanced_search::GenreSearchRequest`. Rebuilt
+    /// like `open_advanced_search`, so Back returns to the chip's page.
+    fn open_genre_search(
+        &mut self,
+        genre: String,
+        kind: crate::services::advanced_search::SearchKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_search_query = None;
+        self.pending_search_genre = Some((genre, kind));
         self.navigate_push(NavSection::Search, window, cx);
     }
 
@@ -2370,6 +2419,14 @@ impl RootView {
             SongInfoAction::OpenAlbum(id) => {
                 self.close_song_info(cx);
                 self.open_any_album(id, cx);
+            }
+            SongInfoAction::OpenGenre(genre) => {
+                self.close_song_info(cx);
+                crate::ui::advanced_search::open_genre(
+                    genre,
+                    crate::services::advanced_search::SearchKind::Albums,
+                    cx,
+                );
             }
             SongInfoAction::ToggleAbout => {
                 if let Some(info) = self.song_info.as_mut() {

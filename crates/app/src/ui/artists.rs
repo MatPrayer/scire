@@ -1951,11 +1951,28 @@ impl Render for ArtistDetailView {
                 .filter(|g| seen.insert(g.to_lowercase()))
                 .map(str::to_string)
                 .collect::<Vec<_>>()
-                .join(", ")
         });
-        let genres_line = genres
-            .filter(|g| !g.is_empty())
-            .map(|g| format!("Genres: {g}"));
+        // One chip per genre, each opening the search page on its albums.
+        let genres_line = genres.filter(|g| !g.is_empty()).map(|g| {
+            h_flex()
+                .flex_wrap()
+                .gap_1p5()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Genres"),
+                )
+                .children(g.iter().enumerate().map(|(i, name)| {
+                    crate::ui::advanced_search::genre_chip(
+                        ("artist-genre", i),
+                        name,
+                        crate::services::advanced_search::SearchKind::Artists,
+                        cx,
+                    )
+                }))
+        });
         // Genres come only with `getArtist` (the cache stores none), so a
         // seeded page still holds their line while it is out.
         let genres_loading = genres_line.is_none() && self.artist_since.is_some();
@@ -2286,14 +2303,7 @@ impl Render for ArtistDetailView {
                                             cx,
                                         )))
                                     })
-                                    .when_some(genres_line, |this, desc| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(desc),
-                                        )
-                                    })
+                                    .when_some(genres_line, |this, line| this.child(line))
                                     .when(genres_loading, |this| {
                                         this.child(div().text_xs().child(skeleton_text(
                                             "ar-genres-sk",

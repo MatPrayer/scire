@@ -89,6 +89,11 @@ pub fn artist_info_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("artist_info"))
 }
 
+/// Genre descriptions for the search page (`services::genre_info`).
+pub fn genre_info_cache_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("genre_info"))
+}
+
 /// Lidarr's answers for artist pages' missing releases (`services::lidarr`).
 pub fn lidarr_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("lidarr"))

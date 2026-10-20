@@ -64,9 +64,21 @@ pub enum SyncMode {
     Incremental,
     /// Drop every cached row and re-import the lot.
     ///
-    /// The escape hatch for the one thing the incremental pass cannot see: an
-    /// album re-tagged without its track count or total duration moving.
+    /// The escape hatch for what the incremental pass cannot see: an album
+    /// re-tagged without its track count, total duration or genres moving.
     Full,
+}
+
+/// An album's genres as one comparable string: case-folded, sorted, `;`-joined.
+/// Empty for an album with none, which is a recorded answer, unlike NULL.
+fn genre_key(album: &subsonic::Album) -> String {
+    let mut genres: Vec<String> = album
+        .genre_names()
+        .into_iter()
+        .map(str::to_lowercase)
+        .collect();
+    genres.sort();
+    genres.join(";")
 }
 
 /// Decide whether a listed album's tracks still need fetching.
@@ -74,10 +86,18 @@ pub enum SyncMode {
 /// `duration` is compared with a tolerance because servers round it and the
 /// value round-trips through an f64 column; an exact compare re-fetched albums
 /// that hadn't changed at all.
+///
+/// Genres are compared too: a re-tag that only changes genres moves neither
+/// count nor duration, and the cached tracks kept the old ones until a full
+/// sync. The listing carries the album's genres, and `genre_key` was recorded
+/// from the same listing when the tracks last landed.
 fn needs_track_fetch(album: &subsonic::Album, cached: Option<&AlbumFingerprint>) -> bool {
     let Some(cached) = cached else { return true };
     let listed_count = album.song_count.unwrap_or(0) as i64;
     if cached.track_rows != listed_count || cached.song_count != listed_count {
+        return true;
+    }
+    if cached.genre_key.as_deref() != Some(genre_key(album).as_str()) {
         return true;
     }
     let listed_duration = album.duration.unwrap_or(0) as f64;
@@ -435,7 +455,11 @@ async fn fetch_album_tracks(
         let _ = db.set_track_artists(&track_id, &song_credits(song, artist_id.as_deref()));
         let _ = db.set_track_composers(&track_id, &composer_credits(song));
         let _ = db.set_track_credits(&track_id, &text_credits(song, artist_names));
+        let genres: Vec<String> = song.genre_names().into_iter().map(String::from).collect();
+        let _ = db.set_track_genres(&track_id, &genres);
     }
+    // Last, so an interrupted fetch leaves the album looking stale.
+    let _ = db.set_album_genre_key(&album_id, &genre_key(album));
 }
 
 /// Every artist an album is credited to, as `(namespaced id, name)`.
@@ -586,6 +610,9 @@ fn remove_navidrome(db: &LibraryDb) -> Result<i64> {
     )?;
     db.execute(
         "DELETE FROM track_credits WHERE track_id IN (SELECT id FROM tracks WHERE source = 'navidrome')",
+    )?;
+    db.execute(
+        "DELETE FROM track_genres WHERE track_id IN (SELECT id FROM tracks WHERE source = 'navidrome')",
     )?;
     db.execute("DELETE FROM tracks WHERE source = 'navidrome'")?;
     db.execute("DELETE FROM albums WHERE source = 'navidrome'")?;
@@ -747,7 +774,58 @@ mod tests {
             song_count,
             duration,
             track_rows,
+            // The listed album has no genres.
+            genre_key: Some(String::new()),
         }
+    }
+
+    fn genre(name: &str) -> subsonic::ItemGenre {
+        subsonic::ItemGenre { name: name.into() }
+    }
+
+    #[test]
+    fn a_retag_that_only_moves_genres_forces_a_refetch() {
+        let mut listed = listed_album(10, 2400);
+        listed.genres = vec![genre("Post-Punk"), genre("Rock")];
+        let mut cached = fingerprint(10, 2400.0, 10);
+        cached.genre_key = Some("electronic".into());
+        assert!(needs_track_fetch(&listed, Some(&cached)));
+        // Same genres in another order or case: nothing moved.
+        cached.genre_key = Some("post-punk;rock".into());
+        assert!(!needs_track_fetch(&listed, Some(&cached)));
+    }
+
+    #[test]
+    fn an_album_whose_genres_were_never_recorded_is_refetched() {
+        // Rows from before schema v12 carry no key; one refetch fills in every
+        // track's genres.
+        let mut cached = fingerprint(10, 2400.0, 10);
+        cached.genre_key = None;
+        assert!(needs_track_fetch(&listed_album(10, 2400), Some(&cached)));
+    }
+
+    #[test]
+    fn the_genre_key_falls_back_to_the_classic_field() {
+        let mut listed = listed_album(1, 1);
+        listed.genre = Some("Jazz".into());
+        assert_eq!(genre_key(&listed), "jazz");
+        listed.genres = vec![genre("Rock"), genre("rock"), genre("Ambient")];
+        assert_eq!(genre_key(&listed), "ambient;rock");
+    }
+
+    #[test]
+    fn rewriting_album_rows_keeps_the_recorded_genre_key() {
+        // Every sync rewrites every album row; losing the key there would
+        // make the whole library stale on each pass.
+        let db = test_db();
+        let row = album_row("a1", None);
+        db.upsert_catalog("navidrome", std::slice::from_ref(&row), &[], &[])
+            .unwrap();
+        db.set_album_genre_key(&row.id, "rock").unwrap();
+        db.upsert_catalog("navidrome", std::slice::from_ref(&row), &[], &[])
+            .unwrap();
+        let fps = db.album_fingerprints("navidrome").unwrap();
+        assert_eq!(fps[&row.id].genre_key.as_deref(), Some("rock"));
     }
 
     #[test]

@@ -4749,8 +4749,10 @@ impl Render for SettingsView {
              with a server are reached by Navidrome; the rest are contacted by \
              Scirè itself, and sent only what their feature says.",
         ];
-        const ALBUM_NOTES: &[&str] =
-            &["Wikipedia and MusicBrainz are sent the album and artist name."];
+        const ALBUM_NOTES: &[&str] = &[
+            "Wikipedia and MusicBrainz are sent the album and artist name. \
+             Wikipedia is also sent the genre the search page is filtered by.",
+        ];
         const ARTIST_NOTES: &[&str] = &[
             "Wikipedia and MusicBrainz are sent the artist's name, and to tell \
              artists of one name apart, the titles of up to two of their albums.",

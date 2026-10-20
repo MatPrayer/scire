@@ -4,6 +4,47 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — 1.7.0
+
+### Added
+
+- Genres are links: the genre chips on server and local album pages and the
+  song details dialog's Genre row open the search page listing that genre's
+  albums; the artist page's genres list that genre's artists.
+- The search page's genre filter works for artists too: an artist has the
+  genres of the albums and tracks credited to them.
+- A search filtered by genre opens with a heading naming the genre and a
+  description of it from Wikipedia (*More* for the full intro, a link to the
+  article). Asked only while *Settings → Connections → Album descriptions →
+  Wikipedia* is on; cached for a month. Rate Your Music has the best genre
+  descriptions but no public API.
+
+### Changed
+
+- The search page is redesigned: a search icon in the query field, kind tabs
+  in a segmented control with the sort beside them, filters a kind can't
+  use hidden instead of greyed, set filters highlighted, every active filter
+  shown as a removable chip with *Clear all*, the result count on a rule
+  above the list, and an empty state that says what to do next.
+- Search results show albums and artists the way their own pages do — album
+  cards (or gallery tiles, following the card style setting) with a play
+  button, round artist cards — with a heading per kind under *All*; tracks
+  stay a list.
+- Genre filters match regardless of case.
+- Every genre on a track is kept, not only the first: the search page's
+  genre list and filter now cover secondary genres (about half the tracks
+  in a multi-genre library). The cache upgrades itself and the next sync
+  refetches each album's tracks once.
+
+### Fixed
+
+- A re-tag that only changed genres was never picked up by the background
+  sync, which looked at track counts and lengths alone; it now compares each
+  album's genres too.
+- Albums, artists and tracks opened or played from the search page used the
+  library cache's internal ids, which the server doesn't recognise; they now
+  use the server's ids, as the command palette does.
+
 ## [1.6.0] — 2026-10-20
 
 ### Added

@@ -37,6 +37,16 @@ const INFO_MIN_W: f32 = 260.;
 /// Horizontal padding the columns lay their cards out within (`p_4` a side).
 const PAGE_PADDING_X: f32 = 32.;
 
+/// The album's genre chip: the first track's that names one.
+fn local_genre(songs: &[subsonic::Song]) -> Option<String> {
+    songs
+        .iter()
+        .filter_map(|song| song.genre.as_deref())
+        .map(str::trim)
+        .find(|genre| !genre.is_empty())
+        .map(str::to_string)
+}
+
 /// `detailed` is `Settings::detailed_album_dates`; a local row carries a year
 /// and no month or day, so it only reaches the "Added" stamp here.
 fn local_album_chips(
@@ -45,14 +55,7 @@ fn local_album_chips(
     detailed: bool,
 ) -> Vec<String> {
     let mut chips = Vec::new();
-    if let Some(genre) = songs
-        .iter()
-        .filter_map(|song| song.genre.as_deref())
-        .map(str::trim)
-        .find(|genre| !genre.is_empty())
-    {
-        chips.push(genre.to_string());
-    }
+    chips.extend(local_genre(songs));
     let discs = songs
         .iter()
         .filter_map(|song| song.disc_number)
@@ -306,6 +309,8 @@ impl Render for LocalAlbumDetailView {
             .collect();
         let detailed_dates = self.session.read(cx).settings.detailed_album_dates;
         let chips = local_album_chips(self.album.as_ref(), &songs, detailed_dates);
+        // The genre leads the chips; it is the one that is a link.
+        let genre = local_genre(&songs);
         let replaygain = album_replaygain_line(&songs);
 
         let header = {
@@ -395,7 +400,16 @@ impl Render for LocalAlbumDetailView {
                             .gap_1p5()
                             .flex_wrap()
                             .when(centred, |this| this.justify_center())
-                            .children(chips.iter().cloned().map(|chip| {
+                            .children(chips.iter().enumerate().map(|(i, chip)| {
+                                if i == 0 && genre.as_deref() == Some(chip.as_str()) {
+                                    return crate::ui::advanced_search::genre_chip(
+                                        "local-album-genre",
+                                        chip,
+                                        crate::services::advanced_search::SearchKind::Albums,
+                                        cx,
+                                    )
+                                    .into_any_element();
+                                }
                                 div()
                                     .px_2()
                                     .py_0p5()
@@ -403,7 +417,8 @@ impl Render for LocalAlbumDetailView {
                                     .bg(cx.theme().muted)
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(chip)
+                                    .child(chip.clone())
+                                    .into_any_element()
                             })),
                     )
                 })

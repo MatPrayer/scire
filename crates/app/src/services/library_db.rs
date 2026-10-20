@@ -273,6 +273,26 @@ DELETE FROM track_composers;
 DELETE FROM tracks WHERE source = 'navidrome';
 ";
 
+/// Every genre on a track, not only the server's primary `genre` — about half
+/// of a library tagged with multi-valued `GENRE` carries more than one, and the
+/// search page's genre filter and list missed all but the first.
+///
+/// `albums.genre_key` records the album's genres as of the last `getAlbum`
+/// that landed (`navidrome_sync::genre_key`), so a sync can notice a re-tag
+/// that moved no track count or duration. NULL means never recorded, which
+/// makes every album stale once — that refetch fills `track_genres`, so
+/// nothing is wiped.
+const SCHEMA_V12: &str = "
+CREATE TABLE IF NOT EXISTS track_genres (
+    track_id TEXT NOT NULL,
+    genre    TEXT NOT NULL,
+    PRIMARY KEY (track_id, genre)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_track_genres_genre ON track_genres(genre COLLATE NOCASE);
+ALTER TABLE albums ADD COLUMN genre_key TEXT;
+";
+
 /// One migration step, applied atomically with the version it records.
 ///
 /// SQLite makes DDL transactional, and the two halves of a step have to travel
@@ -457,6 +477,7 @@ impl LibraryDb {
             (9, SCHEMA_V9),
             (10, SCHEMA_V10),
             (11, SCHEMA_V11),
+            (12, SCHEMA_V12),
         ] {
             if version < target {
                 migration_step(&conn, sql, Some(target))?;
@@ -782,6 +803,10 @@ impl LibraryDb {
             "DELETE FROM track_credits WHERE track_id = ?1",
             rusqlite::params![id],
         )?;
+        conn.execute(
+            "DELETE FROM track_genres WHERE track_id = ?1",
+            rusqlite::params![id],
+        )?;
         conn.execute("DELETE FROM tracks WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
@@ -851,6 +876,37 @@ impl LibraryDb {
                 rusqlite::params![track_id, role.as_str(), artist_id, name],
             )?;
         }
+        Ok(())
+    }
+
+    /// Record every genre on a track, replacing what was there.
+    pub fn set_track_genres(
+        &self,
+        track_id: &str,
+        genres: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM track_genres WHERE track_id = ?1",
+            rusqlite::params![track_id],
+        )?;
+        for genre in genres {
+            conn.execute(
+                "INSERT OR IGNORE INTO track_genres (track_id, genre) VALUES (?1, ?2)",
+                rusqlite::params![track_id, genre],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record the genres an album's tracks were last fetched under — see
+    /// [`SCHEMA_V12`]. Written only once its tracks have landed.
+    pub fn set_album_genre_key(&self, album_id: &str, key: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE albums SET genre_key = ?2 WHERE id = ?1",
+            rusqlite::params![album_id, key],
+        )?;
         Ok(())
     }
 
@@ -978,10 +1034,13 @@ impl LibraryDb {
         }
         {
             let mut stmt = tx.prepare(
+                // `genre_key` belongs to the track fetch, not the listing:
+                // carried over, or a rewrite would mark every album stale.
                 "INSERT OR REPLACE INTO albums
                  (id, source, title, artist, artist_id, year, cover_art, song_count, duration,
-                  created, play_count, starred_at, library_id, release_types)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                  created, play_count, starred_at, library_id, release_types, genre_key)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+                         (SELECT genre_key FROM albums WHERE id = ?1))",
             )?;
             for album in albums {
                 stmt.execute(rusqlite::params![
@@ -1280,7 +1339,7 @@ impl LibraryDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT a.id, a.song_count, a.duration,
-                    (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id)
+                    (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id), a.genre_key
              FROM albums a WHERE a.source = ?1",
         )?;
         let rows = stmt.query_map(rusqlite::params![source], |row| {
@@ -1290,6 +1349,7 @@ impl LibraryDb {
                     song_count: row.get(1)?,
                     duration: row.get(2)?,
                     track_rows: row.get(3)?,
+                    genre_key: row.get(4)?,
                 },
             ))
         })?;
@@ -1325,6 +1385,11 @@ impl LibraryDb {
         )?;
         conn.execute(
             "DELETE FROM track_credits
+             WHERE track_id IN (SELECT id FROM tracks WHERE album_id = ?1)",
+            rusqlite::params![album_id],
+        )?;
+        conn.execute(
+            "DELETE FROM track_genres
              WHERE track_id IN (SELECT id FROM tracks WHERE album_id = ?1)",
             rusqlite::params![album_id],
         )?;
@@ -1840,12 +1905,14 @@ pub(crate) fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackR
 
 /// What a sync compares a listed album against to decide whether its tracks
 /// still need fetching. See `LibraryDb::album_fingerprints`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AlbumFingerprint {
     pub song_count: i64,
     pub duration: f64,
     /// Track rows actually present, which is not always `song_count`.
     pub track_rows: i64,
+    /// Genres as of the last track fetch; `None` when never recorded.
+    pub genre_key: Option<String>,
 }
 
 /// Catalog totals for one source (and optionally one library subset).
@@ -2098,7 +2165,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     #[test]

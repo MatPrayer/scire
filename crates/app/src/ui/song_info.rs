@@ -122,6 +122,8 @@ pub enum SongInfoAction {
     OpenArtist(String),
     /// An album page, by the id `RootView::open_any_album` takes.
     OpenAlbum(String),
+    /// The search page on a genre's albums.
+    OpenGenre(String),
     ToggleAbout,
     RetryGenius,
 }
@@ -140,6 +142,11 @@ pub fn related_key(title: &str, artist: &str) -> String {
 pub struct Section {
     pub title: &'static str,
     pub rows: Vec<(String, String)>,
+}
+
+/// The song's genres: OpenSubsonic's list, else the single `genre`.
+fn song_genres(song: &Song) -> Vec<String> {
+    song.genre_names().into_iter().map(String::from).collect()
 }
 
 /// Everything worth showing about a song, grouped; empty fields and empty
@@ -161,12 +168,11 @@ pub fn song_sections(song: &Song) -> Vec<Section> {
     rows.push("Track", song.track.map(|n| n.to_string()));
     rows.push("Disc", song.disc_number.map(|n| n.to_string()));
     rows.push("Year", song.year.map(|y| y.to_string()));
-    let genres = if !d.genres.is_empty() {
-        Some(join(d.genres.iter().map(|g| g.name.as_str())))
-    } else {
-        song.genre.clone()
-    };
-    rows.push("Genre", genres);
+    let genres = song_genres(song);
+    rows.push(
+        "Genre",
+        (!genres.is_empty()).then(|| join(genres.iter().map(String::as_str))),
+    );
     rows.push("BPM", d.bpm.filter(|b| *b > 0).map(|b| b.to_string()));
     rows.push(
         "Mood",
@@ -724,10 +730,34 @@ pub fn render<V: 'static>(
             {
                 all.push(("File tags".into(), tags.clone()));
             }
+            let genres = song_genres(&info.song);
             for (title, rows) in all {
                 let rows = rows
                     .into_iter()
-                    .map(|(l, v)| kv_row(l, v, &theme).into_any_element())
+                    .map(|(l, v)| {
+                        // The genre row's names open the search page on
+                        // that genre's albums; only the song's own row, not
+                        // a raw GENRE tag under "File tags".
+                        if title == "Track" && l == "Genre" && active {
+                            let chips = h_flex().flex_wrap().gap_1p5().children(
+                                genres.iter().enumerate().map(|(i, g)| {
+                                    crate::ui::advanced_search::genre_tag(
+                                        ("song-genre", i),
+                                        g,
+                                        crate::services::advanced_search::SearchKind::Albums,
+                                        cx,
+                                    )
+                                    .on_click(act(
+                                        &on_action,
+                                        SongInfoAction::OpenGenre(g.clone()),
+                                        cx,
+                                    ))
+                                }),
+                            );
+                            return kv_row(l, chips, &theme).into_any_element();
+                        }
+                        kv_row(l, v, &theme).into_any_element()
+                    })
                     .collect();
                 body = body.child(titled(&title, None, boxed(rows, &theme), &theme));
             }

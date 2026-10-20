@@ -329,7 +329,7 @@ fn adopt(cover: &mut Option<Cover>, other: Option<Cover>) {
 /// results — speaks the bare id the API answers with. Left namespaced, a cached
 /// album is a second copy of one already listed and opening it asks the server
 /// for an id it has never heard of.
-fn strip_ns(id: String, prefix: &str) -> String {
+pub(crate) fn strip_ns(id: String, prefix: &str) -> String {
     id.strip_prefix(prefix).map(str::to_string).unwrap_or(id)
 }
 

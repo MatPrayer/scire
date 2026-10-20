@@ -61,7 +61,8 @@ impl SearchKind {
     }
 
     /// Whether a filter applies at all. An artist row carries a name, a source
-    /// and a library and nothing else, so everything but those three is inert.
+    /// and a library and nothing else, so everything but those three — and a
+    /// genre, asked of their credits — is inert.
     ///
     /// Under `All` a filter one of the three cannot express does not quietly
     /// match everything: that kind is dropped from the results instead
@@ -69,8 +70,10 @@ impl SearchKind {
     pub fn supports_year(self) -> bool {
         !matches!(self, SearchKind::Artists)
     }
+    /// Every kind: an artist's genres are the ones on the albums and tracks
+    /// credited to them, which is how the artist page lists them too.
     pub fn supports_genre(self) -> bool {
-        !matches!(self, SearchKind::Artists)
+        true
     }
     pub fn supports_duration(self) -> bool {
         !matches!(self, SearchKind::Artists)
@@ -236,17 +239,6 @@ impl Filters {
             && self.bitrate_min.is_none()
     }
 
-    /// How many filters are active, for the button's badge.
-    pub fn active_count(&self) -> usize {
-        usize::from(self.genre.is_some())
-            + usize::from(self.year_min.is_some() || self.year_max.is_some())
-            + usize::from(self.duration_min.is_some() || self.duration_max.is_some())
-            + usize::from(self.source != SourceFilter::All)
-            + usize::from(self.starred_only)
-            + usize::from(self.format.is_some())
-            + usize::from(self.bitrate_min.is_some())
-    }
-
     /// Reset the narrowing without touching the kind or the sort — those are
     /// what the user is looking *at*, not what they are excluding.
     pub fn clear(&mut self) {
@@ -268,8 +260,9 @@ impl Filters {
     /// The kinds one run of this query actually searches.
     ///
     /// A single kind is itself. `All` is the three of them, minus any whose
-    /// table cannot express a filter that is set: a genre, a year, a length or
-    /// a format excludes artists, and a star excludes everything but albums.
+    /// table cannot express a filter that is set: a year, a length or a
+    /// format excludes artists (a genre does not — it is asked of what they
+    /// are credited on), and a star excludes everything but albums.
     /// Dropping the kind is the honest reading — the alternative is a filter
     /// that narrows two of the three lists and silently matches all of the
     /// third, i.e. one filter meaning two things in one list, which is the same
@@ -278,8 +271,8 @@ impl Filters {
         if self.kind != SearchKind::All {
             return vec![self.kind];
         }
-        let narrowed = self.genre.is_some()
-            || self.year_min.is_some()
+        // Genre is not here: artists answer it (see `supports_genre`).
+        let narrowed = self.year_min.is_some()
             || self.year_max.is_some()
             || self.duration_min.is_some()
             || self.duration_max.is_some()
@@ -332,24 +325,45 @@ impl Filters {
         }
 
         if kind == SearchKind::Artists {
-            // Nothing below exists on the artist table.
+            // An artist has the genres of what is credited to them: the
+            // albums they are an album artist of (primary or `album_artists`)
+            // and the tracks they are on (primary or `track_artists`). The
+            // artist page lists its genres off its albums, so a chip there
+            // finds the artist it was clicked on.
+            if let Some(genre) = self.genre.as_ref().filter(|g| !g.is_empty()) {
+                sql.push(format!(
+                    "EXISTS (SELECT 1 FROM tracks t WHERE {} AND (
+                        t.artist_id = artists.id
+                        OR t.album_id IN (SELECT al.id FROM albums al
+                                          WHERE al.artist_id = artists.id)
+                        OR t.album_id IN (SELECT aa.album_id FROM album_artists aa
+                                          WHERE aa.artist_id = artists.id)
+                        OR t.id IN (SELECT ta.track_id FROM track_artists ta
+                                    WHERE ta.artist_id = artists.id)))",
+                    track_has_genre("t")
+                ));
+                push_genre(&mut args, genre);
+            }
+            // Nothing else below exists on the artist table.
             return (sql, args);
         }
 
         if let Some(genre) = self.genre.as_ref().filter(|g| !g.is_empty()) {
             match kind {
                 SearchKind::Tracks => {
-                    sql.push("genre = ?".into());
-                    args.push(Box::new(genre.clone()));
+                    sql.push(track_has_genre("tracks"));
+                    push_genre(&mut args, genre);
                 }
                 // Albums carry no genre of their own; it is the tags on their
                 // files, which is also how the album grid's chip reads it.
+                // Case-blind: a genre chip on an album page comes from the
+                // server's album genres, whose casing need not match a tag's.
                 _ => {
-                    sql.push(
-                        "EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND t.genre = ?)"
-                            .into(),
-                    );
-                    args.push(Box::new(genre.clone()));
+                    sql.push(format!(
+                        "EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND {})",
+                        track_has_genre("t")
+                    ));
+                    push_genre(&mut args, genre);
                 }
             }
         }
@@ -486,6 +500,21 @@ impl Filters {
     }
 }
 
+/// The SQL test for "track `t` is tagged with the bound genre": its primary
+/// `genre` column (all a local track records) or any of its `track_genres`.
+/// Binds the genre twice — pair it with [`push_genre`].
+fn track_has_genre(t: &str) -> String {
+    format!(
+        "({t}.genre = ? COLLATE NOCASE OR EXISTS (SELECT 1 FROM track_genres tg \
+         WHERE tg.track_id = {t}.id AND tg.genre = ? COLLATE NOCASE))"
+    )
+}
+
+fn push_genre(args: &mut Vec<Box<dyn ToSql>>, genre: &str) {
+    args.push(Box::new(genre.to_string()));
+    args.push(Box::new(genre.to_string()));
+}
+
 /// A ceiling on what one query may return.
 ///
 /// The page is virtualized, so the cost of a large result is the `Vec` and the
@@ -607,9 +636,14 @@ impl LibraryDb {
         let mut facets = Facets::default();
 
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT genre FROM tracks
-             WHERE genre IS NOT NULL AND genre <> ''
-             ORDER BY genre COLLATE NOCASE",
+            // Every genre, not only the primary ones: a genre that is only
+            // ever a track's second tag is still one to filter by. One spelling
+            // per case-folded name, so "Rock" and "rock" are one entry.
+            "SELECT MIN(genre) FROM (
+                 SELECT genre FROM tracks WHERE genre IS NOT NULL AND genre <> ''
+                 UNION SELECT genre FROM track_genres WHERE genre <> '')
+             GROUP BY genre COLLATE NOCASE
+             ORDER BY 1 COLLATE NOCASE",
         )?;
         facets.genres = stmt
             .query_map([], |r| r.get::<_, String>(0))?
@@ -658,7 +692,10 @@ mod tests {
                 sampling_rate INTEGER, bit_depth INTEGER, channel_count INTEGER,
                 file_size INTEGER, file_created INTEGER, replay_gain_track REAL,
                 replay_gain_album REAL, replay_peak_track REAL, replay_peak_album REAL,
-                play_count INTEGER);",
+                play_count INTEGER, artist_id TEXT);
+             CREATE TABLE track_artists (track_id TEXT, artist_id TEXT);
+             CREATE TABLE album_artists (album_id TEXT, artist_id TEXT);
+             CREATE TABLE track_genres (track_id TEXT, genre TEXT);",
         )
         .unwrap();
         conn
@@ -703,6 +740,34 @@ mod tests {
                     ids(&conn, "anything", &f);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_secondary_genre_finds_its_tracks_and_albums() {
+        // The primary `genre` column holds the first tag alone; the rest are
+        // in `track_genres`, and a filter on any of them must find the row.
+        let conn = db();
+        conn.execute_batch(
+            "INSERT INTO albums (id, source, title) VALUES ('a1','navidrome','Closer');
+             INSERT INTO albums (id, source, title) VALUES ('a2','navidrome','Other');
+             INSERT INTO tracks (id, album_id, genre, title) VALUES ('t1','a1','Rock','Isolation');
+             INSERT INTO tracks (id, album_id, genre, title) VALUES ('t2','a2','Rock','Else');
+             INSERT INTO track_genres VALUES ('t1','Rock'), ('t1','Post-Punk'), ('t2','Rock');",
+        )
+        .unwrap();
+        for kind in [SearchKind::Albums, SearchKind::Tracks] {
+            let f = Filters {
+                kind,
+                genre: Some("post-punk".into()),
+                ..Default::default()
+            };
+            let want = if kind == SearchKind::Albums {
+                "a1"
+            } else {
+                "t1"
+            };
+            assert_eq!(ids(&conn, "", &f), vec![want.to_string()], "{kind:?}");
         }
     }
 
@@ -819,20 +884,27 @@ mod tests {
 
     #[test]
     fn everything_drops_the_kinds_a_filter_cannot_narrow() {
-        // The alternative is a genre that excludes albums and tracks while
+        // The alternative is a year that excludes albums and tracks while
         // every artist in the library comes back beside them — one filter
         // meaning two things in one list.
         let plain = Filters::default();
         assert_eq!(plain.kinds(), SearchKind::EVERY.to_vec());
 
+        let by_year = Filters {
+            year_min: Some(1990),
+            ..Default::default()
+        };
+        assert_eq!(
+            by_year.kinds(),
+            vec![SearchKind::Albums, SearchKind::Tracks]
+        );
+
+        // Artists answer a genre, so it keeps all three.
         let by_genre = Filters {
             genre: Some("Jazz".into()),
             ..Default::default()
         };
-        assert_eq!(
-            by_genre.kinds(),
-            vec![SearchKind::Albums, SearchKind::Tracks]
-        );
+        assert_eq!(by_genre.kinds(), SearchKind::EVERY.to_vec());
 
         // Only the album table records a star.
         let starred = Filters {
@@ -890,6 +962,29 @@ mod tests {
         assert!(f.descending);
         assert_eq!(f.library_ids, vec!["1".to_string()]);
         assert!(f.is_empty());
-        assert_eq!(f.active_count(), 0);
+    }
+
+    #[test]
+    fn an_artist_has_the_genres_of_what_is_credited_to_them() {
+        let conn = db();
+        conn.execute_batch(
+            "INSERT INTO artists (id, name) VALUES ('r1','Primary'),('r2','Guest'),
+                ('r3','Co-billed'),('r4','Elsewhere');
+             INSERT INTO albums (id, title, artist_id) VALUES ('a1','One','r1'),('a2','Two','r4');
+             INSERT INTO album_artists (album_id, artist_id) VALUES ('a1','r3');
+             INSERT INTO tracks (id, album_id, artist_id, genre) VALUES
+                ('t1','a1','r1','Jazz'),('t2','a2','r4','Folk');
+             INSERT INTO track_artists (track_id, artist_id) VALUES ('t1','r2');",
+        )
+        .unwrap();
+        let f = Filters {
+            kind: SearchKind::Artists,
+            genre: Some("jazz".into()),
+            sort: SortBy::Title,
+            ..Default::default()
+        };
+        let mut got = ids(&conn, "", &f);
+        got.sort();
+        assert_eq!(got, ["r1", "r2", "r3"]);
     }
 }
