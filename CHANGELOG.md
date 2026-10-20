@@ -9,14 +9,14 @@ follows [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Featured artists and remixers are read from every place tags put them:
-  the display artist ("Marracash feat. Calcutta", "A • B", "KAF; KAFU"), the
+  the display artist ("A feat. B", "A • B", "A; B"), the
   title ("(feat. X)", "[ft. X]", "feat. X - Title", "(X Remix)", "(Remix by
   X)", "(with X)" for artists in the library) and OpenSubsonic `remixer`
   credits — not only the `artists` array, which lists a guest only when the
   file has a multi-valued `ARTISTS` tag. Band names with "&" or "," stay
   whole when the library knows them.
 - Album track lists (server and local) show the guests and remixers a title
-  doesn't already name, dimmed after it ("feat. Calcutta"); the row's *Go to
+  doesn't already name, dimmed after it ("feat. B"); the row's *Go to
   artist* menu lists them too.
 - Song details open on a new **Credits** tab: everyone on the track grouped
   by role (artist, featuring, remixer, composer, producer, engineers,
