@@ -57,6 +57,22 @@ follows [Semantic Versioning](https://semver.org/).
 - The cache schema moves to v11 (new `track_credits` table): server tracks
   are re-fetched by the next library sync.
 
+### Fixed
+
+- A paused player no longer starts playing by itself when a Bluetooth headset
+  disconnects or the machine goes to sleep: media-key *Play* and *Pause*
+  (MPRIS, AVRCP) now set that state instead of toggling, so a *Pause* sent to
+  an already paused player keeps it paused.
+- Waking from sleep no longer breaks playback. The connection under a remote
+  stream does not survive a suspend, and resuming it stalled, ended the track
+  early and walked the queue into failures. On wake the track is now kept
+  paused at its position and reopened fresh on *Play*; a Bluetooth device
+  playback was waiting for no longer restarts it when it reconnects hours
+  later.
+- A paused track whose reopen failed after an output change (headset
+  connected or gone, network down) no longer skips ahead and starts the next
+  track; it stays paused and reopens on *Play*.
+
 ## [1.5.1] — 2026-10-13
 
 ### Fixed

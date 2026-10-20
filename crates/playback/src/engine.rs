@@ -87,6 +87,52 @@ struct Loaded {
     station: Option<crate::icy::StationInfo>,
 }
 
+/// A paused track whose player was let go — the machine slept under it, or a
+/// reopen on a new route failed — kept so Resume can open it again where it
+/// stopped instead of having nothing to resume.
+struct Parked {
+    track: TrackSource,
+    pos: Option<Duration>,
+    /// The track that was lined up behind it, prepared again on reopen.
+    next: Option<TrackSource>,
+}
+
+/// Wall-clock time beyond monotonic time between two looks that counts as the
+/// machine having been asleep. The monotonic clock stops during suspend on
+/// Linux and macOS, the wall clock does not; a slow `start_track` moves both.
+const SLEEP_GAP: Duration = Duration::from_secs(10);
+
+/// Notices the machine waking up from suspend.
+struct SleepWatch {
+    wall: std::time::SystemTime,
+    mono: std::time::Instant,
+}
+
+impl SleepWatch {
+    fn new() -> Self {
+        Self {
+            wall: std::time::SystemTime::now(),
+            mono: std::time::Instant::now(),
+        }
+    }
+
+    /// Has the machine slept since the last look?
+    fn woke(&mut self) -> bool {
+        let wall = std::time::SystemTime::now();
+        let mono = std::time::Instant::now();
+        let slept = slept_through(wall.duration_since(self.wall).ok(), mono - self.mono);
+        self.wall = wall;
+        self.mono = mono;
+        slept
+    }
+}
+
+/// `wall` is `None` when the wall clock went backwards (set by hand, NTP):
+/// that is no evidence of a sleep.
+fn slept_through(wall: Option<Duration>, mono: Duration) -> bool {
+    wall.is_some_and(|wall| wall > mono + SLEEP_GAP)
+}
+
 pub(crate) fn spawn(
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<Event>,
@@ -172,6 +218,51 @@ async fn control_loop(
     // playback on hold waiting for it to come back.
     let mut route_grace = false;
     let mut playing = false;
+    let mut parked: Option<Parked> = None;
+    let mut sleep = SleepWatch::new();
+
+    // After a suspend nothing the player held can be trusted: the HTTP
+    // connection under the stream is dead (a resumed read stalls out its
+    // timeout, ends the decoder early and the queue walks on, failing), the
+    // output may be on a device that is gone, and the Bluetooth headset a hold
+    // was waiting for coming back hours later is no request for music. Park
+    // the track paused at its position; Resume reopens it fresh.
+    macro_rules! park_if_woke {
+        () => {
+            #[allow(unused_assignments)] // Resume clears both itself, too
+            if sleep.woke() {
+                tracing::info!("woke from sleep: parking playback");
+                lost_device = None;
+                route_grace = false;
+                if current.is_some() {
+                    let pos = seek_target.or_else(|| sink.as_ref().map(|s| s.get_pos()));
+                    cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
+                    seek_announced = false;
+                    let next = queued
+                        .take()
+                        .map(|l| l.track)
+                        .or_else(|| pending.as_ref().map(|p| p.track.clone()));
+                    drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
+                    if let Some(s) = sink.take() {
+                        s.stop();
+                    }
+                    let track = current.take().map(|c| c.track);
+                    parked = track.map(|track| Parked {
+                        // A live stream has no position to come back to.
+                        pos: if track.live { None } else { pos },
+                        track,
+                        next,
+                    });
+                    if let Some(p) = parked.as_ref().and_then(|p| p.pos) {
+                        let _ = event_tx.send(Event::Position(p));
+                    }
+                    playing = false;
+                    let _ = event_tx.send(Event::Paused);
+                }
+                output = None;
+            }
+        };
+    }
 
     loop {
         tokio::select! {
@@ -188,6 +279,10 @@ async fn control_loop(
                         // A new track is an explicit request for audio: whatever
                         // device playback was being held for no longer matters.
                         lost_device = None;
+                        parked = None;
+                        // Spent here, so a sleep that ended just before this
+                        // Play is not taken for one later.
+                        sleep.woke();
                         queued = None;
                         current = None;
                         if let Some(s) = sink.take() {
@@ -268,10 +363,72 @@ async fn control_loop(
                         }
                     }
                     Command::Resume => {
+                        // A Resume can beat the first tick after a wake (a
+                        // headset announcing itself): the player it would
+                        // resume is one the sleep killed.
+                        park_if_woke!();
                         // Resumed on whatever is connected now: the hold for
                         // the vanished device is over.
                         lost_device = None;
-                        if let Some(s) = &sink {
+                        if sink.is_none()
+                            && let Some(Parked { track, pos, next }) = parked.take()
+                        {
+                            cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
+                            let _ = event_tx.send(Event::Buffering);
+                            route_ticks = 0;
+                            route_grace = true;
+                            match start_track(
+                                &mut output,
+                                &target,
+                                &mut direct_error,
+                                track,
+                                volume,
+                                &mut serials,
+                                &end_tx,
+                                &tap,
+                                &event_tx,
+                                pos.is_some(),
+                            )
+                            .await
+                            {
+                                Ok((new_sink, loaded, opened)) => {
+                                    if opened {
+                                        announce(&output, &target, &direct_error, &mut open_device, &event_tx);
+                                    }
+                                    current = Some(loaded);
+                                    let new_sink = Arc::new(new_sink);
+                                    if let Some(p) = pos {
+                                        spawn_seek(
+                                            &new_sink,
+                                            p,
+                                            &mut seek_target,
+                                            &mut seek_gen,
+                                            &mut seek_announced,
+                                            &seek_done_tx,
+                                            &event_tx,
+                                        );
+                                        play_after_seek = true;
+                                    }
+                                    sink = Some(new_sink);
+                                    playing = true;
+                                    let _ = event_tx.send(Event::Playing);
+                                    if let Some(track) = next {
+                                        start_prefetch(
+                                            track,
+                                            &mut prefetch,
+                                            &mut prefetch_gen,
+                                            &mut pending,
+                                            &prep_tx,
+                                            &event_tx,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    playing = false;
+                                    let _ = event_tx.send(Event::Failed(e.to_string()));
+                                }
+                            }
+                        } else if let Some(s) = &sink {
                             // Still seeking into position: the landing starts
                             // it, playing now would sound the old spot.
                             if !play_after_seek {
@@ -289,6 +446,7 @@ async fn control_loop(
                     }
                     Command::Stop => {
                         lost_device = None;
+                        parked = None;
                         drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
                         cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
                         queued = None;
@@ -320,12 +478,13 @@ async fn control_loop(
                             cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
                             // An already-appended next track dies with the old
                             // player; re-prepare it so gapless survives.
-                            let requeue = queued.take().map(|l| l.track);
+                            let mut requeue = queued.take().map(|l| l.track);
                             if let Some(s) = sink.take() {
                                 s.stop();
                             }
                             output = None;
                             if let Some(loaded) = current.take() {
+                                let track = loaded.track.clone();
                                 let _ = event_tx.send(Event::Buffering);
                                 match start_track(
                                     &mut output,
@@ -370,6 +529,14 @@ async fn control_loop(
                                             Event::Paused
                                         });
                                     }
+                                    // Paused, nobody asked for audio: a failure
+                                    // reported now would have the queue skip
+                                    // ahead and start playing. Kept for Resume.
+                                    Err(e) if !resume => {
+                                        tracing::warn!("reopen while paused failed, parked: {e}");
+                                        parked = Some(Parked { track, pos, next: requeue.take() });
+                                        let _ = event_tx.send(Event::Paused);
+                                    }
                                     Err(e) => {
                                         playing = false;
                                         let _ = event_tx.send(Event::Failed(e.to_string()));
@@ -390,7 +557,13 @@ async fn control_loop(
                         }
                     }
                     Command::Seek(pos) => {
-                        if let Some(s) = &sink {
+                        if sink.is_none()
+                            && let Some(p) = &mut parked
+                            && !p.track.live
+                        {
+                            p.pos = Some(pos);
+                            let _ = event_tx.send(Event::Position(pos));
+                        } else if let Some(s) = &sink {
                             spawn_seek(
                                 s,
                                 pos,
@@ -409,7 +582,10 @@ async fn control_loop(
                         }
                     }
                     Command::PrefetchNext(track) => {
-                        if let Some(q) = &queued {
+                        if let Some(p) = &mut parked {
+                            // Nothing to line it up behind until Resume.
+                            p.next = Some(track);
+                        } else if let Some(q) = &queued {
                             // Already appended into rodio's queue, which offers
                             // no way to take it back out. It plays, and the
                             // consumer resyncs from `TrackEnded::started`.
@@ -428,6 +604,9 @@ async fn control_loop(
                         }
                     }
                     Command::ClearPrefetch => {
+                        if let Some(p) = &mut parked {
+                            p.next = None;
+                        }
                         drop_prefetch(&mut prefetch, &mut prefetch_gen, &mut pending);
                     }
                 }
@@ -489,6 +668,9 @@ async fn control_loop(
                 }
             }
             Some(serial) = end_rx.recv() => {
+                // A stream the sleep cut short ends early; that is no
+                // finished track.
+                park_if_woke!();
                 // Ignore signals from sources of a superseded player: only the
                 // track we believe is playing can end.
                 if current.as_ref().is_some_and(|c| c.serial == serial) {
@@ -519,6 +701,7 @@ async fn control_loop(
                 }
             }
             _ = ticker.tick() => {
+                park_if_woke!();
                 // A seek in flight owns the sink: the player reports the
                 // position the seek is leaving until it lands, `empty()` is not
                 // a finished track, and the route check would tear the output
@@ -565,13 +748,14 @@ async fn control_loop(
                     let resume = action == RouteAction::Follow;
                     let pos = sink.as_ref().map(|s| s.get_pos());
                     // The appended next track dies with the old player.
-                    let requeue = queued.take().map(|l| l.track);
+                    let mut requeue = queued.take().map(|l| l.track);
                     if let Some(s) = sink.take() {
                         s.stop();
                     }
                     output = None;
                     playing = false;
                     if let Some(loaded) = current.take() {
+                        let track = loaded.track.clone();
                         match start_track(
                             &mut output,
                             &target,
@@ -611,6 +795,17 @@ async fn control_loop(
                                 } else {
                                     Event::Paused
                                 });
+                            }
+                            // Paused (by hand, or holding for the device that
+                            // went): a failure reported now would have the
+                            // queue skip ahead and start playing. Kept for
+                            // Resume; the hold ends, there is no output left
+                            // to watch the route on.
+                            Err(e) if !resume => {
+                                tracing::warn!("reopen while paused failed, parked: {e}");
+                                lost_device = None;
+                                parked = Some(Parked { track, pos, next: requeue.take() });
+                                let _ = event_tx.send(Event::Paused);
                             }
                             Err(e) => {
                                 let _ = event_tx.send(Event::Failed(e.to_string()));
@@ -1339,6 +1534,20 @@ mod tests {
         // Unplugged while paused, then Play: the user wants audio now, on
         // whatever is connected.
         assert_eq!(route_action(true, true, true), RouteAction::Follow);
+    }
+
+    #[test]
+    fn a_wall_clock_running_ahead_means_the_machine_slept() {
+        let s = Duration::from_secs;
+        assert!(slept_through(Some(s(3600)), Duration::from_millis(500)));
+        // A slow track open moves both clocks together.
+        assert!(!slept_through(Some(s(40)), s(39)));
+        assert!(!slept_through(
+            Some(Duration::from_millis(500)),
+            Duration::from_millis(500)
+        ));
+        // The clock set backwards is no sleep.
+        assert!(!slept_through(None, Duration::from_millis(500)));
     }
 
     #[test]

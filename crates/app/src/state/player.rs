@@ -860,7 +860,21 @@ impl PlayerState {
     fn on_media_key(&mut self, event: souvlaki::MediaControlEvent, cx: &mut Context<Self>) {
         use souvlaki::MediaControlEvent as E;
         match event {
-            E::Play | E::Pause | E::Toggle => self.toggle_play(cx),
+            // Play and Pause say which state they want, and are sent by things
+            // other than the user: a Bluetooth headset going away (or the
+            // machine going to sleep) sends Pause, which toggled a paused
+            // player into playing. Only Toggle toggles.
+            E::Play => {
+                if !self.playing {
+                    self.toggle_play(cx);
+                }
+            }
+            E::Pause => {
+                if self.playing {
+                    self.player.pause();
+                }
+            }
+            E::Toggle => self.toggle_play(cx),
             E::Next => self.next(cx),
             E::Previous => self.previous(cx),
             E::Stop => self.stop(cx),
