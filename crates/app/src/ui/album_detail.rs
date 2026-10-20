@@ -1,6 +1,7 @@
 //! Album page: header (artwork, star, rating) + track list with play,
 //! queue and playlist actions.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -412,6 +413,11 @@ pub struct AlbumDetailView {
     /// The cache's track count for an album it could not seed rows for, so the
     /// skeleton list is as long as the real one.
     expected_tracks: Option<usize>,
+    /// Artist ids for credits the songs spell only as text ("A feat. B"),
+    /// by folded name — resolved against the cache when the songs land, so a
+    /// guest's row menu can open their page.
+    credit_ids: HashMap<String, String>,
+    library_db: Arc<LibraryDb>,
 }
 
 impl EventEmitter<AlbumDetailEvent> for AlbumDetailView {}
@@ -492,6 +498,8 @@ impl AlbumDetailView {
             info_loaded: false,
             info_since: None,
             expected_tracks: None,
+            credit_ids: HashMap::new(),
+            library_db: db.clone(),
         };
         this.seed_from_cache(&db, cx);
         this.load(cx);
@@ -515,6 +523,7 @@ impl AlbumDetailView {
         };
         let cover = seed.album.cover_art.clone();
         self.album = Some(seed);
+        self.refresh_credit_ids();
         if let Some(cover) = cover {
             // Straight off disk when the grid already downloaded this cover,
             // so the header art is there on the first frame — at whatever size
@@ -642,6 +651,7 @@ impl AlbumDetailView {
                             view.fetch_art(cover, cx);
                         }
                         view.album = Some(album);
+                        view.refresh_credit_ids();
                     }
                     Err(e) => view.error = Some(crate::errors::ErrorNote::new(&e)),
                 }
@@ -651,6 +661,27 @@ impl AlbumDetailView {
         })
         .detach();
         self.load_info(cx);
+    }
+
+    /// Look up the cached artist behind every credit the songs name without an
+    /// id. A handful of indexed reads per album, once per load.
+    fn refresh_credit_ids(&mut self) {
+        let Some(album) = &self.album else {
+            return;
+        };
+        let mut ids = HashMap::new();
+        for credit in album.song.iter().flat_map(|song| song.credits()) {
+            let key = subsonic::credits::fold(&credit.name);
+            if credit.id.is_some() || ids.contains_key(&key) {
+                continue;
+            }
+            if let Ok(Some(id)) = self.library_db.artist_id_by_name("navidrome", &credit.name)
+                && let Some(id) = id.strip_prefix("navidrome:artist:")
+            {
+                ids.insert(key, id.to_string());
+            }
+        }
+        self.credit_ids = ids;
     }
 
     /// Album description + external ids. `load` re-runs whenever playback moves
@@ -1621,10 +1652,25 @@ impl Render for AlbumDetailView {
                 let song_info = song.clone();
                 // Right-click context menu data.
                 let menu_song = song.clone();
-                let menu_artists = crate::ui::artist_links(
-                    &song.artists,
-                    song.artist.as_deref(),
-                    song.artist_id.as_deref(),
+                let credits = song.credits_with(|name| {
+                    self.credit_ids.get(&subsonic::credits::fold(name)).cloned()
+                });
+                let mut menu_artists = crate::ui::credit_links(&credits);
+                if menu_artists.is_empty() {
+                    menu_artists = crate::ui::artist_links(
+                        &song.artists,
+                        song.artist.as_deref(),
+                        song.artist_id.as_deref(),
+                    );
+                }
+                let title_cell = crate::ui::track_title_cell(
+                    &song.title,
+                    &credits,
+                    info_prefs
+                        .artist
+                        .then_some(song.artist.as_deref())
+                        .flatten(),
+                    cx,
                 );
                 let menu_view = cx.entity();
                 let menu_song_id = song.id.clone();
@@ -1671,13 +1717,7 @@ impl Render for AlbumDetailView {
                             .text_color(cx.theme().muted_foreground)
                             .child(track_no),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(gpui::relative(crate::ui::TRACK_TITLE_MIN_SHARE))
-                            .truncate()
-                            .child(song.title.clone()),
-                    )
+                    .child(title_cell)
                     .when(!extras.is_empty(), |this| {
                         this.child(crate::ui::extras_column(extras, 320., cx))
                     })

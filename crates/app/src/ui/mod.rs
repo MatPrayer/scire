@@ -20,6 +20,7 @@ pub mod root;
 pub mod search_bar;
 pub mod settings;
 pub mod sidebar;
+pub mod song_credits;
 pub mod song_info;
 pub mod visualizer;
 pub mod waveform_slot;
@@ -246,6 +247,48 @@ const TRACK_EXTRAS_SHARE: f32 = 0.3;
 /// portrait window they alone can leave the title nothing; the credits column
 /// can shrink to zero and gives this up first.
 pub const TRACK_TITLE_MIN_SHARE: f32 = 0.35;
+
+/// A track row's title cell: the title, then — dimmed — the guests and
+/// remixers it doesn't name itself (`subsonic::credits::guest_summary`).
+/// `also_shown` is other row text that already names people (the artist
+/// column when it is on), so nobody is listed twice.
+pub fn track_title_cell(
+    title: &str,
+    credits: &[subsonic::Credit],
+    also_shown: Option<&str>,
+    cx: &App,
+) -> gpui::Div {
+    let named = match also_shown {
+        Some(text) => format!("{title} {text}"),
+        None => title.to_string(),
+    };
+    let guests = subsonic::credits::guest_summary(credits, &named);
+    gpui_component::h_flex()
+        .flex_1()
+        .min_w(gpui::relative(TRACK_TITLE_MIN_SHARE))
+        .gap_1p5()
+        .overflow_hidden()
+        .child(div().min_w_0().truncate().child(title.to_string()))
+        .when_some(guests, |this, guests| {
+            this.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(guests),
+            )
+        })
+}
+
+/// Everyone on a track who has an artist page, for its "Go to artist" menu:
+/// main artists, then guests and remixers, as `(name, id)`.
+pub fn credit_links(credits: &[subsonic::Credit]) -> Vec<(String, String)> {
+    credits
+        .iter()
+        .filter_map(|c| c.id.clone().map(|id| (c.name.clone(), id)))
+        .collect()
+}
 
 /// The muted artist/credits column of a track row, beside a `flex_1` title.
 ///

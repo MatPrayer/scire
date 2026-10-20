@@ -86,10 +86,23 @@ pub mod icons {
     pub const AUDIO_LINES: &str = "icons/audio-lines.svg";
     /// Lidarr: the settings row, the sidebar entry, download buttons.
     pub const DOWNLOAD: &str = "icons/download.svg";
+    // Song details dialog (lucide): file-tag source badge, trending, language,
+    // artist-verified About, recording place.
+    pub const TAG: &str = "icons/tag.svg";
+    pub const FLAME: &str = "icons/flame.svg";
+    pub const LANGUAGES: &str = "icons/languages.svg";
+    pub const BADGE_CHECK: &str = "icons/badge-check.svg";
+    pub const MIC_VOCAL: &str = "icons/mic-vocal.svg";
     // Site marks for the album page's link row, from Simple Icons (CC0).
     pub const BRAND_WIKIPEDIA: &str = "icons/brand-wikipedia.svg";
     pub const BRAND_MUSICBRAINZ: &str = "icons/brand-musicbrainz.svg";
     pub const BRAND_LASTFM: &str = "icons/brand-lastdotfm.svg";
     pub const BRAND_DISCOGS: &str = "icons/brand-discogs.svg";
     pub const BRAND_BANDCAMP: &str = "icons/brand-bandcamp.svg";
+    pub const BRAND_GENIUS: &str = "icons/brand-genius.svg";
+    // Streaming marks for the song details dialog's listen links.
+    pub const BRAND_SPOTIFY: &str = "icons/brand-spotify.svg";
+    pub const BRAND_YOUTUBE: &str = "icons/brand-youtube.svg";
+    pub const BRAND_SOUNDCLOUD: &str = "icons/brand-soundcloud.svg";
+    pub const BRAND_APPLE_MUSIC: &str = "icons/brand-applemusic.svg";
 }

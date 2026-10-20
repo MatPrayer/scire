@@ -244,6 +244,35 @@ const SCHEMA_V10: &str = "
 ALTER TABLE albums ADD COLUMN release_types TEXT;
 ";
 
+/// Every name credited on a track and what they did on it — main artist,
+/// featured guest, remixer — read by `subsonic::credits` from the title, the
+/// display artist and the OpenSubsonic arrays.
+///
+/// `track_artists` holds only what the server's `artists` array lists, and
+/// that array names a guest only when the file carries a multi-valued
+/// `ARTISTS` tag; "Marracash feat. Calcutta" otherwise reaches us as one
+/// string with Marracash's id. `artist_id` is NULL when no id could be found
+/// for the name; `appears_on` then matches the artist's name, like
+/// [`SCHEMA_V9`].
+///
+/// Synced tracks are dropped for the same reason as [`SCHEMA_V6`]: the
+/// contributors only arrive with `getAlbum`.
+const SCHEMA_V11: &str = "
+CREATE TABLE IF NOT EXISTS track_credits (
+    track_id  TEXT NOT NULL,
+    role      TEXT NOT NULL,
+    artist_id TEXT,
+    name      TEXT NOT NULL,
+    PRIMARY KEY (track_id, role, name)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_track_credits_artist ON track_credits(artist_id);
+CREATE INDEX IF NOT EXISTS idx_track_credits_name ON track_credits(name COLLATE NOCASE);
+DELETE FROM track_artists;
+DELETE FROM track_composers;
+DELETE FROM tracks WHERE source = 'navidrome';
+";
+
 /// One migration step, applied atomically with the version it records.
 ///
 /// SQLite makes DDL transactional, and the two halves of a step have to travel
@@ -427,6 +456,7 @@ impl LibraryDb {
             (8, SCHEMA_V8),
             (9, SCHEMA_V9),
             (10, SCHEMA_V10),
+            (11, SCHEMA_V11),
         ] {
             if version < target {
                 migration_step(&conn, sql, Some(target))?;
@@ -748,6 +778,10 @@ impl LibraryDb {
             "DELETE FROM track_composers WHERE track_id = ?1",
             rusqlite::params![id],
         )?;
+        conn.execute(
+            "DELETE FROM track_credits WHERE track_id = ?1",
+            rusqlite::params![id],
+        )?;
         conn.execute("DELETE FROM tracks WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
@@ -796,6 +830,90 @@ impl LibraryDb {
             )?;
         }
         Ok(())
+    }
+
+    /// Record every credit on a track as `(role, artist id if known, name)`,
+    /// replacing what was there.
+    pub fn set_track_credits(
+        &self,
+        track_id: &str,
+        credits: &[(subsonic::CreditRole, Option<String>, String)],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM track_credits WHERE track_id = ?1",
+            rusqlite::params![track_id],
+        )?;
+        for (role, artist_id, name) in credits {
+            conn.execute(
+                "INSERT OR IGNORE INTO track_credits (track_id, role, artist_id, name)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![track_id, role.as_str(), artist_id, name],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The cached artist of `source` called `name` (case-insensitive), if any.
+    pub fn artist_id_by_name(
+        &self,
+        source: &str,
+        name: &str,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM artists WHERE source = ?1 AND name = ?2 COLLATE NOCASE
+             ORDER BY rowid LIMIT 1",
+            rusqlite::params![source, name.trim()],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    /// The album of a cached track called `title` (case-insensitive) whose
+    /// artist line names `artist`, for the details dialog's related songs.
+    pub fn album_for_song(
+        &self,
+        source: &str,
+        title: &str,
+        artist: &str,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let artist = artist
+            .trim()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        conn.query_row(
+            "SELECT album_id FROM tracks
+             WHERE source = ?1 AND title = ?2 COLLATE NOCASE AND album_id IS NOT NULL
+               AND (?3 = '' OR artist LIKE '%' || ?3 || '%' ESCAPE '\\')
+             LIMIT 1",
+            rusqlite::params![source, title.trim(), artist],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    /// Every cached artist of `source` by folded name
+    /// (`subsonic::credits::fold`), so a credit spelled only as text can be
+    /// tied to an artist page. The first id wins when two share a name.
+    pub fn artist_ids_by_name(
+        &self,
+        source: &str,
+    ) -> Result<HashMap<String, String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, name FROM artists WHERE source = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(rusqlite::params![source], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, name) = row?;
+            out.entry(subsonic::credits::fold(&name)).or_insert(id);
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------------
@@ -1059,7 +1177,7 @@ impl LibraryDb {
     }
 
     /// Albums the artist plays on without being their album artist, newest
-    /// first, with how many of their tracks each one holds.
+    /// first, with how many of their tracks each one holds and what they did on them.
     ///
     /// Answered from the cache rather than the server because no Subsonic
     /// endpoint asks this question: `getArtist` returns the albums an artist is
@@ -1078,36 +1196,40 @@ impl LibraryDb {
     /// A track the artist *wrote* counts too (`track_composers`), which is
     /// how covers of their songs on other people's records show up. The
     /// composer id is matched when the server sent one, the artist's name
-    /// otherwise.
+    /// otherwise. So does a guest spot or a remix only the tags' text spells
+    /// out (`track_credits`: "A feat. B", "Song (B Remix)"), matched the same
+    /// way.
     pub fn appears_on(
         &self,
         source: &str,
         artist_id: &str,
-    ) -> Result<Vec<(AlbumRow, i64)>, rusqlite::Error> {
+    ) -> Result<Vec<Appearance>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
+        // `me.name` matches credits the sync found no id for: a guest named
+        // only in a title or display string, a composer from `displayComposer`.
         let mut stmt = conn.prepare(
-            "SELECT a.id, a.source, a.title, a.artist, a.artist_id, a.year, a.cover_art,
+            "WITH me AS (
+                 SELECT ?2 AS id, (SELECT name FROM artists WHERE id = ?2 AND source = ?1) AS name
+             ),
+             hits(track_id, role) AS (
+                 SELECT ta.track_id, 'artist' FROM track_artists ta WHERE ta.artist_id = ?2
+                 UNION
+                 SELECT tc.track_id, tc.role FROM track_credits tc, me
+                 WHERE tc.artist_id = me.id
+                    OR (tc.artist_id IS NULL AND tc.name = me.name COLLATE NOCASE)
+                 UNION
+                 SELECT tc.track_id, 'composer' FROM track_composers tc, me
+                 WHERE tc.artist_id = me.id
+                    OR (tc.artist_id IS NULL AND tc.name = me.name COLLATE NOCASE)
+             )
+             SELECT a.id, a.source, a.title, a.artist, a.artist_id, a.year, a.cover_art,
                     a.song_count, a.duration, a.created, a.play_count, a.starred_at, a.library_id,
                     a.release_types,
-                    COUNT(DISTINCT t.id)
-             FROM albums a
-             JOIN tracks t ON t.album_id = a.id
+                    COUNT(DISTINCT t.id), GROUP_CONCAT(DISTINCT h.role)
+             FROM hits h
+             JOIN tracks t ON t.id = h.track_id
+             JOIN albums a ON a.id = t.album_id
              WHERE a.source = ?1
-               AND (
-                   EXISTS (
-                       SELECT 1 FROM track_artists ta
-                       WHERE ta.track_id = t.id AND ta.artist_id = ?2
-                   )
-                   OR EXISTS (
-                       SELECT 1 FROM track_composers tc
-                       WHERE tc.track_id = t.id
-                         AND (tc.artist_id = ?2
-                              OR (tc.artist_id IS NULL
-                                  AND tc.name = (SELECT name FROM artists
-                                                 WHERE id = ?2 AND source = ?1)
-                                                COLLATE NOCASE))
-                   )
-               )
                AND (a.artist_id IS NULL OR a.artist_id <> ?2)
                AND NOT EXISTS (
                    SELECT 1 FROM album_artists aa
@@ -1117,8 +1239,9 @@ impl LibraryDb {
              ORDER BY a.year DESC, a.title COLLATE NOCASE",
         )?;
         let rows = stmt.query_map(rusqlite::params![source, artist_id], |row| {
-            Ok((
-                AlbumRow {
+            let roles: Option<String> = row.get(15)?;
+            Ok(Appearance {
+                album: AlbumRow {
                     id: row.get(0)?,
                     source: row.get(1)?,
                     title: row.get(2)?,
@@ -1134,8 +1257,9 @@ impl LibraryDb {
                     library_id: row.get(12)?,
                     release_types: decode_release_types(row.get(13)?),
                 },
-                row.get(14)?,
-            ))
+                tracks: row.get(14)?,
+                roles: AppearanceRoles::from_list(roles.as_deref().unwrap_or_default()),
+            })
         })?;
         rows.collect()
     }
@@ -1196,6 +1320,11 @@ impl LibraryDb {
         )?;
         conn.execute(
             "DELETE FROM track_composers
+             WHERE track_id IN (SELECT id FROM tracks WHERE album_id = ?1)",
+            rusqlite::params![album_id],
+        )?;
+        conn.execute(
+            "DELETE FROM track_credits
              WHERE track_id IN (SELECT id FROM tracks WHERE album_id = ?1)",
             rusqlite::params![album_id],
         )?;
@@ -1732,6 +1861,43 @@ pub struct LibraryStats {
     pub size_bytes: i64,
 }
 
+/// One album an artist is on without being its album artist
+/// ([`LibraryDb::appears_on`]).
+#[derive(Debug, Clone)]
+pub struct Appearance {
+    pub album: AlbumRow,
+    /// How many of the album's tracks credit them.
+    pub tracks: i64,
+    pub roles: AppearanceRoles,
+}
+
+/// What an artist did across an album's tracks; several can hold at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppearanceRoles {
+    /// Credited as a performer (the server's `artists`, or a main credit).
+    pub artist: bool,
+    pub featured: bool,
+    pub remixer: bool,
+    pub composer: bool,
+}
+
+impl AppearanceRoles {
+    /// From `GROUP_CONCAT`'s comma-joined role names.
+    fn from_list(list: &str) -> Self {
+        let mut roles = Self::default();
+        for role in list.split(',') {
+            match role {
+                "artist" => roles.artist = true,
+                "featured" => roles.featured = true,
+                "remixer" => roles.remixer = true,
+                "composer" => roles.composer = true,
+                _ => {}
+            }
+        }
+        roles
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AlbumRow {
     pub id: String,
@@ -1932,7 +2098,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]

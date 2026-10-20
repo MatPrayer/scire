@@ -21,7 +21,7 @@ use crate::assets::{app_icon, icons};
 use crate::config::AlbumCardStyle;
 use crate::services::album_info::{self, looks_truncated};
 use crate::services::artist_info::{self, ArtistInfo};
-use crate::services::library_db::{LibraryDb, LibraryStats};
+use crate::services::library_db::{AppearanceRoles, LibraryDb, LibraryStats};
 use crate::services::{artwork, runtime};
 use crate::state::player::PlayerState;
 use crate::state::session::{ConnectionStatus, Session};
@@ -690,8 +690,9 @@ pub struct ArtistDetailView {
     library_db: Arc<LibraryDb>,
     artist_id: String,
     artist: Option<ArtistWithAlbums>,
-    /// Albums the artist only plays on, read from the cache.
-    appears_on: Vec<(Album, i64)>,
+    /// Albums the artist only plays on, read from the cache: the album, how
+    /// many of its tracks credit them, and as what.
+    appears_on: Vec<(Album, i64, AppearanceRoles)>,
     art_paths: HashMap<String, PathBuf>,
     /// In-flight album-cover downloads, cancelled when the view is dropped.
     art_tasks: Vec<gpui::Task<()>>,
@@ -882,7 +883,7 @@ impl ArtistDetailView {
             .artist
             .iter()
             .flat_map(|a| a.album.iter())
-            .chain(self.appears_on.iter().map(|(album, _)| album))
+            .chain(self.appears_on.iter().map(|(album, _, _)| album))
             .map(|album| (album.id.clone(), album.cover_art.clone()))
             .collect();
         for (id, cover) in albums {
@@ -934,13 +935,13 @@ impl ArtistDetailView {
         };
         self.appears_on = rows
             .into_iter()
-            .filter(|(row, _)| in_libraries(row.library_id.as_deref(), &libraries))
-            .map(|(row, tracks)| (album_from_row(row), tracks))
+            .filter(|a| in_libraries(a.album.library_id.as_deref(), &libraries))
+            .map(|a| (album_from_row(a.album), a.tracks, a.roles))
             .collect();
         let art: Vec<_> = self
             .appears_on
             .iter()
-            .map(|(album, _)| (album.id.clone(), album.cover_art.clone()))
+            .map(|(album, _, _)| (album.id.clone(), album.cover_art.clone()))
             .collect();
         for (id, cover) in art {
             self.fetch_art(id, cover, cx);
@@ -1559,7 +1560,7 @@ impl ArtistDetailView {
         let owned: Vec<(Option<String>, String)> = artist
             .album
             .iter()
-            .chain(self.appears_on.iter().map(|(album, _)| album))
+            .chain(self.appears_on.iter().map(|(album, _, _)| album))
             .map(|album| (None, album.name.clone()))
             .collect();
         let mbid = self.info.as_ref().and_then(|i| i.music_brainz_id.clone());
@@ -2051,10 +2052,10 @@ impl Render for ArtistDetailView {
         // above already shows is not one of them.
         let own = own_album_ids(self.artist.as_ref().map(|a| a.album.as_slice()));
         let mut appears_cards: Vec<gpui::AnyElement> = Vec::new();
-        for (album, tracks) in self
+        for (album, tracks, roles) in self
             .appears_on
             .iter()
-            .filter(|(album, _)| !own.contains(&album.id))
+            .filter(|(album, _, _)| !own.contains(&album.id))
         {
             let flat = self.discography_ids.len();
             self.discography_ids.push(album.id.clone());
@@ -2063,7 +2064,7 @@ impl Render for ArtistDetailView {
                 album,
                 flat,
                 focused,
-                Some(appearance_line(album, *tracks)),
+                Some(appearance_line(album, *tracks, *roles)),
                 tile,
                 cx,
             ));
@@ -2403,20 +2404,39 @@ impl Render for ArtistDetailView {
     }
 }
 
-/// What an "Appears on" card says under the cover: whose record it is, and how
-/// much of it is this artist's.
-fn appearance_line(album: &Album, tracks: i64) -> String {
-    let who = album.artist.as_deref().map(str::trim).unwrap_or_default();
-    let count = if tracks == 1 {
+/// What an "Appears on" card says under the cover: whose record it is, what
+/// this artist did on it when that was more than playing ("Featured",
+/// "Remix", "Songwriter"), and how much of it is theirs.
+fn appearance_line(album: &Album, tracks: i64, roles: AppearanceRoles) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(who) = album
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+    {
+        parts.push(who.to_string());
+    }
+    let what: Vec<&str> = [
+        (roles.featured, "Featured"),
+        (roles.remixer, "Remix"),
+        (
+            roles.composer && !roles.artist && !roles.featured,
+            "Songwriter",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(on, label)| on.then_some(label))
+    .collect();
+    if !what.is_empty() {
+        parts.push(what.join(", "));
+    }
+    parts.push(if tracks == 1 {
         "1 track".to_string()
     } else {
         format!("{tracks} tracks")
-    };
-    if who.is_empty() {
-        count
-    } else {
-        format!("{who} · {count}")
-    }
+    });
+    parts.join(" · ")
 }
 
 /// The albums the discography sections already show.
@@ -3327,17 +3347,55 @@ mod detail_tests {
 
     #[test]
     fn an_appearance_names_the_album_artist_and_counts_the_tracks() {
+        let played = AppearanceRoles {
+            artist: true,
+            ..AppearanceRoles::default()
+        };
         assert_eq!(
-            appearance_line(&album("Blue Note", Some("Art Blakey")), 2),
+            appearance_line(&album("Blue Note", Some("Art Blakey")), 2, played),
             "Art Blakey · 2 tracks"
         );
         assert_eq!(
-            appearance_line(&album("Blue Note", Some("Art Blakey")), 1),
+            appearance_line(&album("Blue Note", Some("Art Blakey")), 1, played),
             "Art Blakey · 1 track"
         );
         // A compilation row the sync never got an artist for still says how
         // much of it belongs to this artist.
-        assert_eq!(appearance_line(&album("Blue Note", None), 3), "3 tracks");
+        assert_eq!(
+            appearance_line(&album("Blue Note", None), 3, played),
+            "3 tracks"
+        );
+    }
+
+    #[test]
+    fn an_appearance_says_what_the_artist_did() {
+        let roles = AppearanceRoles {
+            featured: true,
+            remixer: true,
+            ..AppearanceRoles::default()
+        };
+        assert_eq!(
+            appearance_line(&album("Brat", Some("Charli xcx")), 2, roles),
+            "Charli xcx · Featured, Remix · 2 tracks"
+        );
+        // Writing a song they also sing on says nothing new.
+        let roles = AppearanceRoles {
+            artist: true,
+            composer: true,
+            ..AppearanceRoles::default()
+        };
+        assert_eq!(
+            appearance_line(&album("X", Some("Y")), 1, roles),
+            "Y · 1 track"
+        );
+        let roles = AppearanceRoles {
+            composer: true,
+            ..AppearanceRoles::default()
+        };
+        assert_eq!(
+            appearance_line(&album("X", Some("Y")), 1, roles),
+            "Y · Songwriter · 1 track"
+        );
     }
 
     /// An album is "appeared on" when the artist plays on it but is credited to
@@ -3394,9 +3452,10 @@ mod detail_tests {
 
         let found = db.appears_on("navidrome", me).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].0.id, "navidrome:album:guest");
+        assert_eq!(found[0].album.id, "navidrome:album:guest");
         // Only the tracks they are credited on are counted, not the album's.
-        assert_eq!(found[0].1, 2);
+        assert_eq!(found[0].tracks, 2);
+        assert!(found[0].roles.artist && !found[0].roles.featured);
 
         // Their own record with a co-artist: the album row carries the other
         // artist's id and both names joined, so only the album credits can say
@@ -3513,7 +3572,7 @@ mod detail_tests {
             .appears_on("navidrome", me)
             .unwrap()
             .into_iter()
-            .map(|(row, tracks)| (row.id, tracks))
+            .map(|a| (a.album.id, a.tracks))
             .collect();
         found.sort();
         assert_eq!(
@@ -3521,6 +3580,81 @@ mod detail_tests {
             [
                 ("navidrome:album:cash".to_string(), 1),
                 ("navidrome:album:vanilla".to_string(), 1),
+            ]
+        );
+    }
+
+    /// A guest spot or remix spelled only in the tags' text ("A feat. B",
+    /// "Song (B Remix)") is an appearance too: by id when the sync tied the
+    /// name to an artist, by name when it couldn't.
+    #[test]
+    fn appears_on_finds_featured_and_remix_credits() {
+        use subsonic::CreditRole;
+        let db = LibraryDb::open_in_memory().unwrap();
+        let me = "navidrome:artist:me";
+        db.upsert_artist(me, "navidrome", "Calcutta", None, None)
+            .unwrap();
+        for album in [
+            "navidrome:album:feat",
+            "navidrome:album:remix",
+            "navidrome:album:other",
+        ] {
+            let mut row = AlbumRow::new(album, "navidrome", "Record");
+            row.artist_id = Some("navidrome:artist:them".into());
+            db.upsert_album(&row).unwrap();
+        }
+        let track = |id: &str, album: &str, credits: &[(CreditRole, Option<&str>, &str)]| {
+            db.upsert_track(
+                id,
+                "navidrome",
+                "Song",
+                None,
+                Some("navidrome:artist:them"),
+                None,
+                Some(album),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let credits: Vec<_> = credits
+                .iter()
+                .map(|(role, id, name)| (*role, id.map(str::to_string), (*name).to_string()))
+                .collect();
+            db.set_track_credits(id, &credits).unwrap();
+        };
+        track(
+            "navidrome:track:1",
+            "navidrome:album:feat",
+            &[(CreditRole::Featured, None, "calcutta")],
+        );
+        track(
+            "navidrome:track:2",
+            "navidrome:album:remix",
+            &[(CreditRole::Remixer, Some(me), "Calcutta")],
+        );
+        track(
+            "navidrome:track:3",
+            "navidrome:album:other",
+            &[(CreditRole::Featured, None, "Someone Else")],
+        );
+        let mut found = db.appears_on("navidrome", me).unwrap();
+        found.sort_by(|a, b| a.album.id.cmp(&b.album.id));
+        let summary: Vec<_> = found
+            .iter()
+            .map(|a| (a.album.id.as_str(), a.roles.featured, a.roles.remixer))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("navidrome:album:feat", true, false),
+                ("navidrome:album:remix", false, true),
             ]
         );
     }

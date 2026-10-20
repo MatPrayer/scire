@@ -17,7 +17,7 @@ use gpui_component::{
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{DefaultPage, PlayerBarStyle, ThemePref};
 use crate::services::{
@@ -2107,14 +2107,35 @@ impl RootView {
         let client = self.session.read(cx).client.clone();
         let id = song.id.clone();
         let loading = local_path.is_some() || client.is_some();
-        self.song_info = Some(crate::ui::song_info::SongInfo {
-            song,
-            file_tags: None,
-            loading,
-            generation,
-        });
+        let cover = song_info_cover(&song);
+        let missing_cover = match (&cover, local_path.is_some(), &client) {
+            (SongCover::Fetch(id, key), false, Some(client)) => {
+                Some((client.clone(), id.clone(), key.clone()))
+            }
+            _ => None,
+        };
+        let mut info = crate::ui::song_info::SongInfo::new(song, loading, generation);
+        if let SongCover::Cached(path) = cover {
+            info.cover = Some(path);
+        }
+        self.song_info = Some(info);
         self.song_info_open = true;
         cx.notify();
+
+        if let Some((client, cover_id, key)) = missing_cover {
+            cx.spawn(async move |this, cx| {
+                let fetched = artwork::fetch_as(client, cover_id, key, SONG_INFO_COVER_PX).await;
+                let _ = this.update(cx, |this, cx| {
+                    if let (Ok(path), Some(info)) = (fetched, this.song_info.as_mut())
+                        && info.generation == generation
+                    {
+                        info.cover = Some(path);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
 
         if let Some(path) = local_path {
             cx.spawn(async move |this, cx| {
@@ -2135,6 +2156,7 @@ impl RootView {
                 });
             })
             .detach();
+            self.load_song_credits(generation, cx);
         } else if let Some(client) = client {
             cx.spawn(async move |this, cx| {
                 let fresh = runtime::spawn_io(async move {
@@ -2152,10 +2174,225 @@ impl RootView {
                         info.loading = false;
                         cx.notify();
                     }
+                    // Credits are asked of the full record, not a thin copy.
+                    this.load_song_credits(generation, cx);
                 });
             })
             .detach();
+        } else {
+            self.load_song_credits(generation, cx);
         }
+    }
+
+    /// Fill the details dialog's Credits tab: ask Genius (when on), then tie
+    /// every name and related song to the cache's artist and album pages.
+    fn load_song_credits(&mut self, generation: u64, cx: &mut Context<Self>) {
+        use crate::services::genius;
+        use crate::ui::song_info::{GeniusState, related_key};
+
+        let settings = self.session.read(cx).settings.clone();
+        let enabled = settings.genius_credits;
+        let Some(info) = self
+            .song_info
+            .as_mut()
+            .filter(|i| i.generation == generation)
+        else {
+            return;
+        };
+        let song = info.song.clone();
+        info.genius = if enabled {
+            GeniusState::Loading(Instant::now())
+        } else {
+            GeniusState::Off
+        };
+        info.token_rejected = None;
+        info.genius_blocked = false;
+        cx.notify();
+        if enabled {
+            // Grey the placeholder in once it has been waiting a moment.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(crate::ui::PLACEHOLDER_DELAY)
+                    .await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
+
+        let db = self.library_db.clone();
+        cx.spawn(async move |this, cx| {
+            let credits = song.credits();
+            let answer = if enabled {
+                let query = genius::Query {
+                    title: song.title.clone(),
+                    artists: credits
+                        .iter()
+                        .filter(|c| c.role == subsonic::CreditRole::Main)
+                        .map(|c| c.name.clone())
+                        .collect(),
+                };
+                let fetched = runtime::spawn_io(async move {
+                    // The keyring can block; read it off the UI thread.
+                    let token = tokio::task::spawn_blocking(move || {
+                        crate::config::load_genius_token(&settings)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|t| !t.trim().is_empty());
+                    // Without a token nothing is asked.
+                    match token {
+                        Some(token) => genius::fetch(query, &token).await.map(Some),
+                        None => Ok(None),
+                    }
+                })
+                .await;
+                Some(fetched)
+            } else {
+                None
+            };
+
+            // Names and related songs to look up in the cache.
+            let mut names: Vec<String> = credits.iter().map(|c| c.name.clone()).collect();
+            names.extend(song.details.composers().into_iter().map(|(_, n)| n));
+            let mut related: Vec<(String, String)> = Vec::new();
+            if let Some(Ok(Some(genius::Answer {
+                song: Some(found), ..
+            }))) = &answer
+            {
+                names.extend(
+                    found
+                        .credits
+                        .iter()
+                        .flat_map(|(_, people)| people.iter().map(|p| p.name.clone())),
+                );
+                related.extend(
+                    found
+                        .relations
+                        .iter()
+                        .flat_map(|r| r.songs.iter().map(|s| (s.title.clone(), s.artist.clone()))),
+                );
+            }
+            let local = song.local_path.is_some();
+            let lookups = runtime::spawn_blocking_io(move || {
+                let sources: [&str; 2] = if local {
+                    ["local", "navidrome"]
+                } else {
+                    ["navidrome", "local"]
+                };
+                // Pages take server ids bare and local ones namespaced.
+                let page_id = |id: String| -> String {
+                    id.strip_prefix("navidrome:artist:")
+                        .or_else(|| id.strip_prefix("navidrome:album:"))
+                        .map(str::to_string)
+                        .unwrap_or(id)
+                };
+                let mut ids = std::collections::HashMap::new();
+                for name in names {
+                    let key = subsonic::credits::fold(&name);
+                    if ids.contains_key(&key) {
+                        continue;
+                    }
+                    if let Some(id) = sources
+                        .iter()
+                        .find_map(|src| db.artist_id_by_name(src, &name).ok().flatten())
+                    {
+                        ids.insert(key, page_id(id));
+                    }
+                }
+                let mut albums = std::collections::HashMap::new();
+                for (title, artist) in related {
+                    if let Some(id) = sources
+                        .iter()
+                        .find_map(|src| db.album_for_song(src, &title, &artist).ok().flatten())
+                    {
+                        albums.insert(related_key(&title, &artist), page_id(id));
+                    }
+                }
+                Ok((ids, albums))
+            })
+            .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let Some(info) = this
+                    .song_info
+                    .as_mut()
+                    .filter(|i| i.generation == generation)
+                else {
+                    return;
+                };
+                if let Ok((ids, albums)) = lookups {
+                    info.credit_ids = ids;
+                    info.related_albums = albums;
+                }
+                match answer {
+                    None => {}
+                    Some(Ok(None)) => info.genius = GeniusState::NeedsToken,
+                    Some(Ok(Some(a))) => {
+                        info.token_rejected = a.token_rejected;
+                        info.genius_blocked = a.blocked;
+                        info.genius = match a.song {
+                            Some(song) => GeniusState::Found(Box::new(song)),
+                            // A refused token or a bot check has its own line.
+                            None if info.token_rejected.is_some() || a.blocked => GeniusState::Off,
+                            None => GeniusState::Missing,
+                        };
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!("genius lookup failed: {e:#}");
+                        info.genius = GeniusState::Failed(crate::errors::ErrorNote::new(&e));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn song_info_action(
+        &mut self,
+        action: crate::ui::song_info::SongInfoAction,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::song_info::SongInfoAction;
+        match action {
+            SongInfoAction::Close => self.close_song_info(cx),
+            SongInfoAction::Tab(tab) => {
+                if let Some(info) = self.song_info.as_mut() {
+                    info.tab = tab;
+                    cx.notify();
+                }
+            }
+            SongInfoAction::OpenArtist(id) => {
+                self.close_song_info(cx);
+                self.open_any_artist(id, cx);
+            }
+            SongInfoAction::OpenAlbum(id) => {
+                self.close_song_info(cx);
+                self.open_any_album(id, cx);
+            }
+            SongInfoAction::ToggleAbout => {
+                if let Some(info) = self.song_info.as_mut() {
+                    info.about_expanded = !info.about_expanded;
+                    cx.notify();
+                }
+            }
+            SongInfoAction::RetryGenius => {
+                if let Some(generation) = self.song_info.as_ref().map(|i| i.generation) {
+                    self.load_song_credits(generation, cx);
+                }
+            }
+        }
+    }
+
+    /// Flip the details dialog between Credits and Details (Tab, `[`, `]`).
+    fn toggle_song_info_tab(&mut self, cx: &mut Context<Self>) {
+        use crate::ui::song_info::{SongInfoAction, SongInfoTab};
+        let next = match self.song_info.as_ref().map(|i| i.tab) {
+            Some(SongInfoTab::Credits) => SongInfoTab::Details,
+            _ => SongInfoTab::Credits,
+        };
+        self.song_info_action(SongInfoAction::Tab(next), cx);
     }
 
     fn close_song_info(&mut self, cx: &mut Context<Self>) {
@@ -4015,6 +4252,16 @@ impl Render for RootView {
                     cx.stop_propagation();
                     return;
                 }
+                // The details dialog's tabs, in either keyboard mode.
+                if this.song_info_open
+                    && matches!(event.keystroke.key.as_str(), "tab" | "[" | "]")
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                {
+                    this.toggle_song_info_tab(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.vi_enabled {
                     let typing = this.vi_typing(window, cx);
                     this.handle_vi_key(event, window, cx, typing);
@@ -4297,7 +4544,7 @@ impl Render for RootView {
                         info,
                         song_info_t,
                         self.song_info_open,
-                        |this: &mut Self, cx| this.close_song_info(cx),
+                        |this: &mut Self, action, cx| this.song_info_action(action, cx),
                         window,
                         cx,
                     ))
@@ -4378,6 +4625,36 @@ impl Render for RootView {
 /// still start it.
 pub fn player_bar_idle(playing: bool, has_now_playing: bool, queue_empty: bool) -> bool {
     !playing && !has_now_playing && queue_empty
+}
+
+/// The song details dialog's cover edge, in px at 2× for its 64px thumbnail.
+const SONG_INFO_COVER_PX: u32 = 128;
+
+enum SongCover {
+    Cached(std::path::PathBuf),
+    /// Not on disk yet: the server cover id and its cache key.
+    Fetch(String, String),
+    None,
+}
+
+/// Where the song details dialog's cover comes from: the scanner's art for a
+/// local track, else any cached rung of the album's cover, else a download.
+fn song_info_cover(song: &subsonic::Song) -> SongCover {
+    if song.local_path.is_some() {
+        return song
+            .cover_art
+            .as_deref()
+            .and_then(crate::services::local_library::local_art_path)
+            .filter(|p| p.exists())
+            .map_or(SongCover::None, SongCover::Cached);
+    }
+    match artwork::song_cover(song) {
+        Some((id, key)) => match artwork::cached_best(&key, SONG_INFO_COVER_PX) {
+            Some(path) => SongCover::Cached(path),
+            None => SongCover::Fetch(id, key),
+        },
+        None => SongCover::None,
+    }
 }
 
 #[cfg(test)]

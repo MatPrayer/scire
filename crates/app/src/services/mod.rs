@@ -3,6 +3,7 @@ pub mod album_info;
 pub mod art_precache;
 pub mod artist_info;
 pub mod artwork;
+pub mod genius;
 pub mod library_db;
 pub mod lidarr;
 pub mod listenbrainz;

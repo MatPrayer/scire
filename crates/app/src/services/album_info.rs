@@ -597,7 +597,7 @@ pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(
 /// retry the page came up with no description and a second visit found one.
 /// Wikimedia's throttle is a 429. `Retry-After` is honoured in its seconds
 /// form, capped so a page is not held for a minute.
-fn retry_delay(
+pub(crate) fn retry_delay(
     status: reqwest::StatusCode,
     retry_after: Option<&str>,
     attempt: u32,

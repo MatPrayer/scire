@@ -79,6 +79,11 @@ pub fn album_info_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("album_info"))
 }
 
+/// On-disk answers from `services::genius`.
+pub fn genius_cache_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.cache_dir().join("genius"))
+}
+
 /// On-disk answers from `services::artist_info`.
 pub fn artist_info_cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().join("artist_info"))
@@ -338,6 +343,14 @@ pub struct Settings {
     pub server_album_notes: bool,
     /// Show the artist biography the server forwards (`getArtistInfo2`).
     pub server_artist_bios: bool,
+    /// Ask Genius for a song's full credits, samples and description when its
+    /// details open (`services::genius`). Only then, never in the background.
+    #[serde(default = "default_true")]
+    pub genius_credits: bool,
+    /// Plaintext Genius API token fallback for systems without a usable
+    /// keyring. Only written when keyring storage fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genius_token_plaintext: Option<String>,
     /// Look artists up on Wikipedia for the artist page's bio
     /// (`services::artist_info`). On by default, like the album one: the
     /// server's bio is Last.fm's summary, cut off mid-sentence.
@@ -1077,6 +1090,8 @@ impl Default for Settings {
             lidarr_enabled: false,
             lidarr_url: String::new(),
             lidarr_key_plaintext: None,
+            genius_credits: true,
+            genius_token_plaintext: None,
             lidarr_show_missing: false,
             default_shuffle: false,
             default_repeat: RepeatMode::Off,
@@ -1398,6 +1413,28 @@ pub fn load_lidarr_key(settings: &Settings) -> Result<String> {
         .lidarr_key_plaintext
         .clone()
         .context("Lidarr API key not found")
+}
+
+pub fn store_genius_token(token: &str) -> Result<()> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, "genius")?;
+    entry.set_password(token)?;
+    Ok(())
+}
+
+/// The user's Genius API token, if they set one.
+pub fn load_genius_token(settings: &Settings) -> Option<String> {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "genius")
+        && let Ok(token) = entry.get_password()
+    {
+        return Some(token);
+    }
+    settings.genius_token_plaintext.clone()
+}
+
+pub fn delete_genius_token() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "genius") {
+        let _ = entry.delete_credential();
+    }
 }
 
 pub fn delete_lidarr_key() {

@@ -5,12 +5,14 @@
 
 mod auth;
 mod client;
+pub mod credits;
 mod endpoints;
 mod error;
 mod models;
 
 pub use auth::Credentials;
 pub use client::SubsonicClient;
+pub use credits::{Credit, CreditRole, CreditSource};
 pub use endpoints::annotation::Starred;
 pub use endpoints::browsing::{AlbumInfo2, ArtistInfo2};
 pub use endpoints::media::{LyricLine, Lyrics, StreamOptions, StructuredLyrics};

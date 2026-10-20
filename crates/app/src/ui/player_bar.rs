@@ -524,6 +524,9 @@ impl Render for PlayerBar {
             window_w
         };
         let side_width = side_width(bar_width);
+        // The volume block: never wider than the column it sits in, which
+        // shrinks with the window.
+        let meta_w = 240_f32.min(side_width);
         // The floating card is over the page, not beside it: it is shorter,
         // and everything sized off its height comes down with it.
         let bar_h = if floating { float_bar_h() } else { bar_h() };
@@ -934,22 +937,38 @@ impl Render for PlayerBar {
                             }),
                     ),
             )
-            // Volume + queue toggle (+ optional output-device line).
+            // ReplayGain line, volume + queue toggle, output-device line.
             // The three rows share a common left edge; the slider stretches to
             // the right so the block stays anchored to the bar's right side.
             .child(
                 h_flex().w(px(side_width)).flex_none().justify_end().child(
                     v_flex()
-                        // Never wider than the column it sits in, which shrinks
-                        // with the window.
-                        .w(px(240_f32.min(side_width)))
+                        .w(px(meta_w))
                         .gap_1p5()
                         // ReplayGain status chip: highlighted while playing; click
                         // opens a menu to change or disable the mode.
                         .when_some(replay_gain, |this, (label, db)| {
+                            // The icon and tooltip say what this is; the
+                            // line itself only carries the gain and its mode.
+                            // Auto's pick goes on the line, that it was Auto's
+                            // in the tooltip: the column has no room for both.
+                            let auto = label.ends_with(" (auto)");
+                            let base = label.trim_end_matches(" (auto)");
+                            let mut chars = base.chars();
+                            let shown = chars
+                                .next()
+                                .map(|c| c.to_uppercase().chain(chars).collect::<String>())
+                                .unwrap_or_default();
                             let text = match db {
-                                Some(db) => format!("ReplayGain {db:+.1} dB · {label}"),
-                                None => format!("ReplayGain · {label} (no tag)"),
+                                Some(db) => format!("{} dB · {shown}", signed_db(db)),
+                                None => format!("No tag · {shown}"),
+                            };
+                            let mode = if auto { " (Auto mode)" } else { "" };
+                            let tip = match db {
+                                Some(_) => format!("ReplayGain: {base} gain applied{mode}"),
+                                None => {
+                                    format!("ReplayGain: {base} gain{mode}, no tag on this track")
+                                }
                             };
                             let current = self.session.read(cx).settings.replay_gain;
                             let player = self.player.clone();
@@ -958,13 +977,13 @@ impl Render for PlayerBar {
                                 h_flex().w_full().child(
                                     Popover::new("replaygain-menu")
                                         .trigger(
-                                            // Same quiet style as the device picker.
-                                            Button::new("rg-trigger")
-                                                .ghost()
-                                                .xsmall()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .icon(Icon::new(IconName::ChevronDown).xsmall())
-                                                .label(text),
+                                            MetaTrigger::new(
+                                                "rg-trigger",
+                                                icons::AUDIO_LINES,
+                                                text,
+                                                meta_w,
+                                            )
+                                            .tooltip(tip),
                                         )
                                         .content(move |_state, _window, cx| {
                                             let opts = [
@@ -1036,7 +1055,11 @@ impl Render for PlayerBar {
                                                     div()
                                                         .text_xs()
                                                         .text_color(cx.theme().muted_foreground)
-                                                        .child(app_icon(icons::VOLUME_HIGH)),
+                                                        .child(app_icon(if volume < 0.5 {
+                                                            icons::VOLUME_LOW
+                                                        } else {
+                                                            icons::VOLUME_HIGH
+                                                        })),
                                                 )
                                             }
                                         })
@@ -1114,9 +1137,11 @@ impl Render for PlayerBar {
                                 // Click the device name to switch outputs.
                                 h_flex().w_full().child(
                                     Popover::new("output-device")
-                                        .trigger(DeviceTrigger::new(
+                                        .trigger(MetaTrigger::new(
                                             "output-device-trigger",
+                                            icons::HEADPHONES,
                                             device,
+                                            meta_w,
                                         ))
                                         .content(move |_state, _window, cx| {
                                             let opts: Vec<(String, Option<String>)> =
@@ -1193,29 +1218,53 @@ impl Render for PlayerBar {
     }
 }
 
-/// The output-device line under the volume row, and the trigger of the
-/// device picker. A plain element rather than a `Button`: a button's label is
-/// `flex_none`, so a long sink name (Bluetooth and USB ones often are) pushed
-/// the line past the bar instead of ending in an ellipsis. The full name is in
-/// the tooltip.
-#[derive(IntoElement)]
-struct DeviceTrigger {
-    id: &'static str,
-    label: String,
-    selected: bool,
-}
-
-impl DeviceTrigger {
-    fn new(id: &'static str, label: String) -> Self {
-        Self {
-            id,
-            label,
-            selected: false,
-        }
+/// "−10.4", "+2.0", "0.0": a true minus sign, matching the volume buttons.
+fn signed_db(db: f32) -> String {
+    if db <= -0.05 {
+        format!("\u{2212}{:.1}", -db)
+    } else if db >= 0.05 {
+        format!("+{db:.1}")
+    } else {
+        "0.0".into()
     }
 }
 
-impl gpui_component::Selectable for DeviceTrigger {
+/// A status line under the volume row (ReplayGain, output device) that
+/// opens a picker: icon, text, chevron. A plain element rather than a
+/// `Button`: a button's label is `flex_none`, so a long sink name (Bluetooth
+/// and USB ones often are) pushed the line past the bar. The negative left margin cancels the padding so the icon
+/// lines up with the volume icon above.
+#[derive(IntoElement)]
+struct MetaTrigger {
+    id: &'static str,
+    icon: &'static str,
+    label: String,
+    /// Width of the block the line sits in.
+    room: f32,
+    tooltip: Option<String>,
+    selected: bool,
+}
+
+impl MetaTrigger {
+    fn new(id: &'static str, icon: &'static str, label: String, room: f32) -> Self {
+        Self {
+            id,
+            icon,
+            label,
+            room,
+            tooltip: None,
+            selected: false,
+        }
+    }
+
+    /// Defaults to the label, the full text of a truncated name.
+    fn tooltip(mut self, tooltip: String) -> Self {
+        self.tooltip = Some(tooltip);
+        self
+    }
+}
+
+impl gpui_component::Selectable for MetaTrigger {
     fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
@@ -1226,14 +1275,34 @@ impl gpui_component::Selectable for DeviceTrigger {
     }
 }
 
-impl RenderOnce for DeviceTrigger {
-    fn render(self, _: &mut Window, cx: &mut gpui::App) -> impl IntoElement {
-        let tip = self.label.clone();
+impl RenderOnce for MetaTrigger {
+    fn render(self, window: &mut Window, cx: &mut gpui::App) -> impl IntoElement {
+        let tip = self.tooltip.unwrap_or_else(|| self.label.clone());
+        // The text gets an exact width: left to flex shrinking, gpui shapes it
+        // at its natural width and the box then clips it mid-glyph, with no
+        // ellipsis. Room = block + the 6px pulled left − padding, icons, gaps.
+        let font_size = window.rem_size() * 0.75;
+        let style = window.text_style();
+        let run = gpui::TextRun {
+            len: self.label.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let natural = f32::from(
+            window
+                .text_system()
+                .shape_line(self.label.clone().into(), font_size, &[run], None)
+                .width,
+        );
+        let text_w = natural.ceil().min((self.room - 42.).max(0.).floor());
         h_flex()
             .id(self.id)
-            .min_w_0()
-            .max_w_full()
-            .gap_1()
+            .flex_none()
+            .ml(px(-6.))
+            .gap_1p5()
             .px_1p5()
             .py_0p5()
             .rounded_md()
@@ -1242,10 +1311,12 @@ impl RenderOnce for DeviceTrigger {
             .text_color(cx.theme().muted_foreground)
             .hover(|s| s.bg(cx.theme().muted))
             .when(self.selected, |s| s.bg(cx.theme().muted))
-            .child(div().min_w_0().truncate().child(self.label))
+            .child(div().flex_none().child(app_icon(self.icon).xsmall()))
+            .child(div().w(px(text_w)).truncate().child(self.label))
             .child(
                 div()
                     .flex_none()
+                    .opacity(0.7)
                     .child(Icon::new(IconName::ChevronDown).xsmall()),
             )
             .tooltip(move |window, cx| {

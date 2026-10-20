@@ -314,6 +314,10 @@ pub async fn sync_navidrome(
     progress.total.store(stale.len(), Ordering::Relaxed);
     tracing::info!("navidrome sync: {} albums need tracks", stale.len());
 
+    // Names a credit is spelled with only as text ("A feat. B") are tied to
+    // an artist page through every artist the reconcile above just wrote.
+    let artist_names = Arc::new(db.artist_ids_by_name("navidrome").unwrap_or_default());
+
     // Phase 3 — one `getAlbum` per stale album, `ALBUM_FETCH_CONCURRENCY` at a
     // time.
     let mut pending = stale.into_iter();
@@ -324,7 +328,8 @@ pub async fn sync_navidrome(
         {
             let client = client.clone();
             let db = db.clone();
-            tasks.spawn(async move { fetch_album_tracks(&db, &client, &album, now).await });
+            let names = artist_names.clone();
+            tasks.spawn(async move { fetch_album_tracks(&db, &client, &album, &names, now).await });
         }
         if tasks.join_next().await.is_none() {
             break;
@@ -346,6 +351,7 @@ async fn fetch_album_tracks(
     db: &LibraryDb,
     client: &SubsonicClient,
     album: &subsonic::Album,
+    artist_names: &HashMap<String, String>,
     now: i64,
 ) {
     let album_with = match client.get_album(&album.id).await {
@@ -428,6 +434,7 @@ async fn fetch_album_tracks(
         );
         let _ = db.set_track_artists(&track_id, &song_credits(song, artist_id.as_deref()));
         let _ = db.set_track_composers(&track_id, &composer_credits(song));
+        let _ = db.set_track_credits(&track_id, &text_credits(song, artist_names));
     }
 }
 
@@ -477,6 +484,28 @@ fn composer_credits(song: &subsonic::Song) -> Vec<(Option<String>, String)> {
         .into_iter()
         .map(|(id, name)| (id.map(|id| format!("navidrome:artist:{id}")), name))
         .collect()
+}
+
+/// Every credit `subsonic::credits` reads off a song, ids namespaced for the
+/// cache. A name the song carries no id for is looked up among the cached
+/// artists (`artist_names`, by folded name), which is also what keeps a known
+/// band name like "Simon & Garfunkel" from being split.
+fn text_credits(
+    song: &subsonic::Song,
+    artist_names: &HashMap<String, String>,
+) -> Vec<(subsonic::CreditRole, Option<String>, String)> {
+    song.credits_with(|name| {
+        artist_names
+            .get(&subsonic::credits::fold(name))
+            .and_then(|id| id.strip_prefix("navidrome:artist:"))
+            .map(str::to_string)
+    })
+    .into_iter()
+    .map(|c| {
+        let id = c.id.map(|id| format!("navidrome:artist:{id}"));
+        (c.role, id, c.name)
+    })
+    .collect()
 }
 
 /// How often the server scan is polled while it runs.
@@ -554,6 +583,9 @@ fn remove_navidrome(db: &LibraryDb) -> Result<i64> {
     )?;
     db.execute(
         "DELETE FROM track_composers WHERE track_id IN (SELECT id FROM tracks WHERE source = 'navidrome')",
+    )?;
+    db.execute(
+        "DELETE FROM track_credits WHERE track_id IN (SELECT id FROM tracks WHERE source = 'navidrome')",
     )?;
     db.execute("DELETE FROM tracks WHERE source = 'navidrome'")?;
     db.execute("DELETE FROM albums WHERE source = 'navidrome'")?;

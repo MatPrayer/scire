@@ -150,7 +150,8 @@ const COMPACT_SECTIONS: [(&str, u16); 14] = [
     ("Browsing", 18),
     ("Streaming", 5),
     ("Library", 12),
-    ("Connections", 30),
+    // With Song credits' two rows and heading.
+    ("Connections", 33),
     // Counted with Lidarr switched on: the address and key fields under it.
     ("Downloads", 6),
     ("Account", 3),
@@ -273,7 +274,14 @@ fn card_height(weight: u16) -> f32 {
 /// Binary search on "could every run fit under this height", which a left-to-
 /// right greedy answers in one pass; then, under the height the search settled
 /// on, the split whose shortest run is tallest.
-fn split_runs(heights: &[f32], cols: usize) -> Vec<Vec<usize>> {
+///
+/// `room` lets the tallest run grow by up to [`BALANCE_SLACK`] past that
+/// height (never past `room`) when that balances the split better: with the
+/// cap held exactly, a big card a few px too tall to share a column with the
+/// small ones after it was pushed onto its neighbour's, leaving those small
+/// cards alone in a column a third the height of the rest. `None` holds the
+/// cap exactly, which is what measuring a count's tallest run needs.
+fn split_runs(heights: &[f32], cols: usize, room: Option<f32>) -> Vec<Vec<usize>> {
     let runs_under = |cap: f32| -> usize {
         let mut runs = 1;
         let mut used = 0.;
@@ -320,7 +328,10 @@ fn split_runs(heights: &[f32], cols: usize) -> Vec<Vec<usize>> {
     }
     // The cap came out of sums added up another way; a hair of slack keeps
     // rounding from turning the split the search proved possible into none.
-    let cap = hi + 0.01;
+    let cap = match room {
+        Some(room) => (hi * (1. + BALANCE_SLACK)).min(room).max(hi),
+        None => hi,
+    } + 0.01;
     let mut best = vec![vec![None::<(f32, usize)>; n + 1]; cols + 1];
     for i in 0..n {
         let rest = prefix[n] - prefix[i];
@@ -368,9 +379,13 @@ fn columns_width(cols: usize, usable: f32) -> f32 {
         .min(COMPACT_COL_TARGET * cols as f32)
 }
 
+/// How much taller than the shortest possible the tallest column may get
+/// when that balances the columns — see [`split_runs`].
+const BALANCE_SLACK: f32 = 0.03;
+
 /// The tallest of the runs a `cols`-way split produces.
 fn tallest_run(heights: &[f32], cols: usize) -> f32 {
-    split_runs(heights, cols)
+    split_runs(heights, cols, None)
         .iter()
         .map(|run| run.iter().map(|&i| heights[i]).sum::<f32>())
         .fold(0., f32::max)
@@ -433,7 +448,7 @@ fn compact_grid(weights: &[u16], body: f32, height: f32) -> Vec<GridColumn> {
     };
     let spread = columns_width(cols, body - 2. * SECTION_BODY_PAD);
 
-    let runs = split_runs(&heights, cols);
+    let runs = split_runs(&heights, cols, Some(height));
     let loads: Vec<f32> = runs
         .iter()
         .map(|run| run.iter().map(|&i| heights[i]).sum())
@@ -497,6 +512,7 @@ enum SettingsSwitch {
     ServerArtistBios,
     ArtistInfoWikipedia,
     ArtistInfoMusicBrainz,
+    GeniusCredits,
     LyricsLibrary,
     LyricsOnline,
     LyricsOnlineFirst,
@@ -620,16 +636,23 @@ enum OnlineCache {
     AlbumInfo,
     ArtistInfo,
     Lyrics,
+    Genius,
 }
 
 impl OnlineCache {
-    const ALL: [Self; 3] = [Self::AlbumInfo, Self::ArtistInfo, Self::Lyrics];
+    const ALL: [Self; 4] = [
+        Self::AlbumInfo,
+        Self::ArtistInfo,
+        Self::Lyrics,
+        Self::Genius,
+    ];
 
     fn dir(self) -> anyhow::Result<std::path::PathBuf> {
         match self {
             Self::AlbumInfo => crate::config::album_info_cache_dir(),
             Self::ArtistInfo => crate::config::artist_info_cache_dir(),
             Self::Lyrics => crate::config::lyrics_cache_dir(),
+            Self::Genius => crate::config::genius_cache_dir(),
         }
     }
 }
@@ -821,6 +844,7 @@ enum SettingsAction {
     LbInput,
     LidarrUrl,
     LidarrKey,
+    GeniusToken,
 }
 
 /// A quick-nav jump in flight: the scroll offsets it runs between, the section
@@ -844,6 +868,8 @@ pub struct SettingsView {
     lb_input: Entity<InputState>,
     lidarr_url_input: Entity<InputState>,
     lidarr_key_input: Entity<InputState>,
+    /// Genius API token (keyring); empty uses the public web API.
+    genius_input: Entity<InputState>,
     library_db: Arc<LibraryDb>,
     /// The three maintenance jobs' statuses. Owned by the root view rather
     /// than by this one, which is rebuilt on every visit — see
@@ -878,6 +904,7 @@ pub struct SettingsView {
     album_info_cached: Option<usize>,
     artist_info_cached: Option<usize>,
     lyrics_cached: Option<usize>,
+    genius_cached: Option<usize>,
     /// Where the server forwards scrobbles, asked once per page visit.
     forwarding: Forwarding,
     /// Audio card: the output devices on offer, `None` while being listed.
@@ -982,6 +1009,23 @@ impl SettingsView {
             })
             .detach();
         }
+        let genius_token =
+            crate::config::load_genius_token(&session.read(cx).settings).unwrap_or_default();
+        let genius_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Genius client access token")
+                .default_value(genius_token)
+                .masked(true)
+        });
+        cx.subscribe(
+            &genius_input,
+            |this: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.save_genius_token(cx);
+                }
+            },
+        )
+        .detach();
         // Connection status line; the state notifies only on change.
         cx.observe(&crate::state::lidarr::lidarr(cx), |_, _, cx| cx.notify())
             .detach();
@@ -993,6 +1037,7 @@ impl SettingsView {
             lb_input,
             lidarr_url_input,
             lidarr_key_input,
+            genius_input,
             library_db,
             jobs,
             scroll: scroll.clone(),
@@ -1009,6 +1054,7 @@ impl SettingsView {
             album_info_cached: None,
             artist_info_cached: None,
             lyrics_cached: None,
+            genius_cached: None,
             forwarding: Forwarding::Unasked,
             devices: None,
             open_device,
@@ -1496,6 +1542,30 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Stores the Genius token in the keyring (settings file only when the
+    /// keyring fails); an empty field removes it.
+    fn save_genius_token(&mut self, cx: &mut Context<Self>) {
+        let token = self.genius_input.read(cx).value().trim().to_string();
+        let fallback = if token.is_empty() {
+            crate::config::delete_genius_token();
+            None
+        } else if let Err(error) = crate::config::store_genius_token(&token) {
+            tracing::warn!("keyring unavailable ({error:#}); storing Genius token in settings");
+            Some(token.clone())
+        } else {
+            None
+        };
+        let changed = self.session.update(cx, |session, _| {
+            let changed = session.settings.genius_token_plaintext != fallback;
+            session.settings.genius_token_plaintext = fallback;
+            changed
+        });
+        if changed {
+            self.persist(cx);
+        }
+        cx.notify();
+    }
+
     fn save_lb_token(&mut self, cx: &mut Context<Self>) {
         let token = self.lb_input.read(cx).value().trim().to_string();
         let fallback = if token.is_empty() {
@@ -1866,6 +1936,7 @@ impl SettingsView {
             SettingsSwitch::ServerArtistBios => s.server_artist_bios,
             SettingsSwitch::ArtistInfoWikipedia => s.artist_info_wikipedia,
             SettingsSwitch::ArtistInfoMusicBrainz => s.artist_info_musicbrainz,
+            SettingsSwitch::GeniusCredits => s.genius_credits,
             SettingsSwitch::LyricsLibrary => s.lyrics_provider.uses_library(),
             SettingsSwitch::LyricsOnline => s.lyrics_provider.uses_online(),
             SettingsSwitch::LyricsOnlineFirst => s.lyrics_provider == LyricsProvider::OnlineFirst,
@@ -1957,6 +2028,7 @@ impl SettingsView {
             SettingsSwitch::ArtistInfoMusicBrainz => {
                 self.set_flag(cx, |s| s.artist_info_musicbrainz = value)
             }
+            SettingsSwitch::GeniusCredits => self.set_flag(cx, |s| s.genius_credits = value),
             SettingsSwitch::LyricsLibrary => {
                 let current = self.session.read(cx).settings.lyrics_provider;
                 if let Some(next) = current.with_library(value) {
@@ -2090,8 +2162,9 @@ impl SettingsView {
                 }))
             })
             .await;
-            if let Ok([album_info, artist_info, lyrics]) = counts {
+            if let Ok([album_info, artist_info, lyrics, genius]) = counts {
                 let _ = this.update(cx, |this, cx| {
+                    this.genius_cached = Some(genius);
                     this.album_info_cached = Some(album_info);
                     this.artist_info_cached = Some(artist_info);
                     this.lyrics_cached = Some(lyrics);
@@ -2309,6 +2382,11 @@ impl SettingsView {
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window)
+            || self
+                .genius_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
     }
 
     /// Cycle sections with `[`/`]`: jump the vi cursor to the next/prev
@@ -2481,6 +2559,10 @@ impl SettingsView {
                     .update(cx, |s, cx| s.focus(window, cx));
                 cx.notify();
             }
+            SettingsAction::GeniusToken => {
+                self.genius_input.update(cx, |s, cx| s.focus(window, cx));
+                cx.notify();
+            }
         }
     }
 
@@ -2496,6 +2578,8 @@ impl SettingsView {
         } else if matches!(selected, Some(SettingsAction::LidarrKey)) {
             self.lidarr_key_input
                 .update(cx, |s, cx| s.focus(window, cx));
+        } else if matches!(selected, Some(SettingsAction::GeniusToken)) {
+            self.genius_input.update(cx, |s, cx| s.focus(window, cx));
         } else {
             self.dir_input.update(cx, |s, cx| s.focus(window, cx));
         }
@@ -2690,6 +2774,7 @@ impl SettingsView {
             OnlineCache::AlbumInfo => "clear-album-info-cache",
             OnlineCache::ArtistInfo => "clear-artist-info-cache",
             OnlineCache::Lyrics => "clear-lyrics-cache",
+            OnlineCache::Genius => "clear-genius-cache",
         };
         h_flex()
             .w_full()
@@ -4681,6 +4766,12 @@ impl Render for SettingsView {
              sidebar with the download queue. Scirè talks to Lidarr itself; \
              the API key is under Settings → General in Lidarr's interface.",
         ];
+        const CREDITS_NOTES: &[&str] = &[
+            "Genius is sent the track's title and artist when its details open, \
+             for producers, writers, engineers, samples and the song's \
+             description. Needs a free client access token from \
+             genius.com/api-clients; without one nothing is sent.",
+        ];
         const SCROBBLE_NOTES: &[&str] = &[
             "Server tracks are scrobbled to Navidrome, which forwards them to the \
              accounts linked under Personal in its own interface.",
@@ -4688,6 +4779,69 @@ impl Render for SettingsView {
              itself: artist, title, album and length. Needs a free API token \
              from your ListenBrainz profile.",
         ];
+        // Song credits, kept to two rows: the token field carries the cache
+        // button rather than a cache row of its own — Connections is the
+        // tallest card, and one more row loses the grid on a maximized 1440p
+        // window.
+        let genius_on = self.session.read(cx).settings.genius_credits;
+        let genius_has_token = !self.genius_input.read(cx).value().trim().is_empty();
+        let genius_switch = self.vi_toggle(
+            SettingsSwitch::GeniusCredits,
+            "genius-credits",
+            genius_on,
+            false,
+            cx,
+        );
+        let genius_cached = self.genius_cached;
+        let genius_field = genius_on.then(|| {
+            // The flex sizing goes outside `vi_control`: its frame is a plain
+            // div, and a field inside it shrinks to nothing.
+            let input = div().flex_1().min_w_0().child(self.vi_control(
+                SettingsAction::GeniusToken,
+                div().w_full().child(Input::new(&self.genius_input).small()),
+                cx,
+            ));
+            let clear = self.vi_control(
+                SettingsAction::Button(SettingsButton::ClearCache(OnlineCache::Genius)),
+                Button::new("clear-genius-cache")
+                    .outline()
+                    .small()
+                    .label("Clear cache")
+                    .tooltip(
+                        genius_cached.map_or_else(|| "Counting…".to_string(), cache_entries_label),
+                    )
+                    .disabled(genius_cached == Some(0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_online_cache(OnlineCache::Genius, cx);
+                    })),
+                cx,
+            );
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_center()
+                .child(input)
+                .child(clear)
+                .into_any_element()
+        });
+        let genius_list = self.service_list(
+            vec![Service {
+                mark: app_icon(icons::BRAND_GENIUS),
+                name: "Genius",
+                route: Route::Direct,
+                detail: if genius_has_token {
+                    "api.genius.com · with your token"
+                } else {
+                    "api.genius.com · paste a token below"
+                },
+                status: (genius_on && !genius_has_token).then(|| ("No token", cx.theme().warning)),
+                switch: Some(genius_switch),
+                lit: genius_on,
+                extra: genius_field,
+            }],
+            cx,
+        );
+
         let connections_section = self
             .section_with_notes("Connections", INTRO, cx)
             .child(self.note(INTRO[0], cx))
@@ -4710,7 +4864,11 @@ impl Render for SettingsView {
             .child(self.subheading_with_notes("Artist bios", ARTIST_NOTES, cx))
             .child(bio_list)
             .child(self.note(ARTIST_NOTES[0], cx))
-            .child(artist_cache);
+            .child(artist_cache)
+            .child(crate::ui::divider())
+            .child(self.subheading_with_notes("Song credits", CREDITS_NOTES, cx))
+            .child(genius_list)
+            .child(self.note(CREDITS_NOTES[0], cx));
 
         // Lidarr: its own card rather than a fifth group under Connections. It
         // is a server of yours with its own address and key, not a feature's
@@ -5188,8 +5346,9 @@ mod tests {
     /// A content area tall enough for a roomy compact grid.
     const TALL: f32 = 1800.;
     /// Short, but tall enough for four columns — the tallest being
-    /// Connections with Downloads, Account and About under it.
-    const SHORT: f32 = 1450.;
+    /// Connections with Downloads, Account and About under it (~1525px since
+    /// Connections gained Song credits).
+    const SHORT: f32 = 1550.;
 
     #[test]
     fn the_grid_places_every_section_in_page_order() {
@@ -5256,11 +5415,34 @@ mod tests {
     fn split_runs_balances_under_the_cap() {
         // A greedy fill would cut [4, 1] + [1]; both keep the tallest at 5,
         // and [4] + [1, 1] leaves the short column less short.
-        assert_eq!(split_runs(&[4., 1., 1.], 2), vec![vec![0], vec![1, 2]]);
+        assert_eq!(
+            split_runs(&[4., 1., 1.], 2, None),
+            vec![vec![0], vec![1, 2]]
+        );
         // Every run non-empty even where fewer would fit under the cap.
         assert_eq!(
-            split_runs(&[1., 1., 1.], 3),
+            split_runs(&[1., 1., 1.], 3, None),
             vec![vec![0], vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn a_little_extra_height_buys_a_balanced_split() {
+        // Held to the shortest cap (10), the 9 cannot share with the 1s after
+        // it and joins the 2; with 3% slack it takes them and the columns even
+        // out. Never past the room, though.
+        let heights = [8., 2., 9., 0.6, 0.6];
+        assert_eq!(
+            split_runs(&heights, 3, None),
+            vec![vec![0, 1], vec![2], vec![3, 4]]
+        );
+        assert_eq!(
+            split_runs(&heights, 3, Some(100.)),
+            vec![vec![0], vec![1], vec![2, 3, 4]]
+        );
+        assert_eq!(
+            split_runs(&heights, 3, Some(10.)),
+            vec![vec![0, 1], vec![2], vec![3, 4]]
         );
     }
 
@@ -5450,7 +5632,7 @@ mod tests {
         // consecutive cards, no run empty, however the cap lands.
         let heights: Vec<f32> = weights().iter().copied().map(card_height).collect();
         for cols in 1..=heights.len() {
-            let runs = split_runs(&heights, cols);
+            let runs = split_runs(&heights, cols, None);
             assert_eq!(runs.len(), cols, "{cols} columns produced {}", runs.len());
             let mut next = 0;
             for run in &runs {

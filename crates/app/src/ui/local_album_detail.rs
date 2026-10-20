@@ -522,13 +522,15 @@ impl Render for LocalAlbumDetailView {
                             .text_color(cx.theme().muted_foreground)
                             .child(track_no),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(gpui::relative(crate::ui::TRACK_TITLE_MIN_SHARE))
-                            .truncate()
-                            .child(track.title.clone()),
-                    )
+                    .child(crate::ui::track_title_cell(
+                        &track.title,
+                        &song.credits(),
+                        info_prefs
+                            .artist
+                            .then_some(song.artist.as_deref())
+                            .flatten(),
+                        cx,
+                    ))
                     .when(!extras.is_empty(), |this| {
                         this.child(crate::ui::extras_column(extras, 320., cx))
                     })

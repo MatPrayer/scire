@@ -4,6 +4,59 @@ All notable changes to Scirè are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-10-20
+
+### Added
+
+- Featured artists and remixers are read from every place tags put them:
+  the display artist ("Marracash feat. Calcutta", "A • B", "KAF; KAFU"), the
+  title ("(feat. X)", "[ft. X]", "feat. X - Title", "(X Remix)", "(Remix by
+  X)", "(with X)" for artists in the library) and OpenSubsonic `remixer`
+  credits — not only the `artists` array, which lists a guest only when the
+  file has a multi-valued `ARTISTS` tag. Band names with "&" or "," stay
+  whole when the library knows them.
+- Album track lists (server and local) show the guests and remixers a title
+  doesn't already name, dimmed after it ("feat. Calcutta"); the row's *Go to
+  artist* menu lists them too.
+- Song details open on a new **Credits** tab: everyone on the track grouped
+  by role (artist, featuring, remixer, composer, producer, engineers,
+  instruments, label …), each name a chip marked with where it came from
+  (*server*, *tags*, *Genius*). A name with an artist page in the library
+  opens it; a Genius-only name opens its Genius page. The old fields moved to
+  a **Details** tab (Tab, `[` or `]` switch between them).
+- **Genius** credits on the Credits tab: producers, writers, mixing and
+  mastering engineers and other performances, samples / sampled in / covers /
+  remixes (opening the album when the library has the song), and the song's
+  Genius description with *More*. Asked only when the dialog opens, and only
+  with a free Genius API token (Settings → Connections → Song credits, kept in
+  the keyring); without one the dialog says a token is needed. Answers are
+  cached (30 days, misses 7).
+- The Credits tab also shows what Genius knows about the song: release date,
+  recording place, language and view count (with a *Hot* flame when
+  trending), genre tags, listen links in the dialog's header (Spotify, Apple
+  Music, YouTube or the music video, SoundCloud), translations among the relations, and
+  whether the artist verified the description.
+- The song details dialog is redesigned: the cover and an artist · album ·
+  year line head it, a segmented Credits / Details switch, credits and
+  fields in bordered lists, source marks as icons with a legend, relations as
+  song rows with an *In library* badge.
+- *Appears on* finds albums an artist is featured on or remixed for even when
+  only the text names them, and each card says what they did ("Featured",
+  "Remix", "Songwriter").
+
+### Changed
+
+- The player bar's ReplayGain and output-device lines share one style: an
+  icon lined up with the volume icon, the text, a chevron. ReplayGain reads
+  "−10.4 dB · Album" (Auto mode and the full wording in the tooltip), a long
+  device name ends in "…" instead of being cut mid-letter, and the volume
+  icon follows the level.
+- The compact settings grid may make its tallest column up to 3% taller
+  when that balances the columns, instead of leaving a few small cards alone
+  in a short last column.
+- The cache schema moves to v11 (new `track_credits` table): server tracks
+  are re-fetched by the next library sync.
+
 ## [1.5.1] — 2026-10-13
 
 ### Fixed
