@@ -174,6 +174,16 @@ mod tests {
         assert!(peaks_from_bytes(vec![1, 2, 3, 4], 10).is_err());
     }
 
+    /// rodio's symphonia decoder panics (`unreachable!`) on an m4a marked
+    /// seekable without a byte length; under `panic = "abort"` that took the
+    /// whole app down whenever a local m4a became the current track.
+    #[test]
+    fn m4a_decodes_without_panicking() {
+        let bytes = include_bytes!("../tests/fixtures/alac.m4a").to_vec();
+        let peaks = peaks_from_bytes(bytes, 64).expect("m4a decodes");
+        assert_eq!(peaks.len(), 64);
+    }
+
     #[test]
     fn strip_id3_handles_bogus_zero_size() {
         // ID3v2.4 header with a declared size of 0 (as some transcoders emit),

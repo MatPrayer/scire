@@ -72,6 +72,10 @@ follows [Semantic Versioning](https://semver.org/).
 - A paused track whose reopen failed after an output change (headset
   connected or gone, network down) no longer skips ahead and starts the next
   track; it stays paused and reopens on *Play*.
+- Making a local `.m4a` the current track with the waveform seek bar on no
+  longer crashes the app (and crashes it again on every launch while that
+  track is restored). The waveform decoder now knows the file's length, which
+  rodio needs before it will read an m4a (#1, thanks Mirko Lana).
 
 ## [1.5.1] — 2026-10-13
 
