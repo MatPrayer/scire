@@ -61,6 +61,9 @@ follows [Semantic Versioning](https://semver.org/).
   which slides in from the window's edge.
 - Turning the fullscreen visualizer on or off cross-fades between the scene
   and the cover layout instead of swapping them in one frame.
+- Folding the sidebar (Ctrl/Cmd+B) slides it between the full sidebar and
+  the icon rail, the two cross-fading, instead of snapping; the page beside
+  it widens and narrows along.
 
 ## [1.6.0] — 2026-10-20
 

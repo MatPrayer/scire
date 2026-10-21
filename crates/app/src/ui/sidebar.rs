@@ -148,6 +148,7 @@ pub struct LidarrBadge {
     pub online: bool,
 }
 
+#[derive(Clone)]
 pub struct SidebarModel {
     pub active: Option<NavSection>,
     /// `Some` while the Lidarr integration is on: the row shows.
@@ -295,6 +296,76 @@ fn playlist_row(
                 Icon::new(IconName::User)
                     .xsmall()
                     .text_color(cx.theme().muted_foreground),
+            )
+        })
+}
+
+/// Width of the sidebar, folded or not. Folded: wide enough for the icon
+/// rows' hover/active pill and nothing else.
+pub fn width(collapsed: bool) -> f32 {
+    crate::ui::scaled(if collapsed { 52. } else { 210. })
+}
+
+/// The sidebar's slot at `openness` (0 folded … 1 unfolded) of a fold:
+/// the rail fades out over the full sidebar as the slot widens, and back in
+/// as it narrows, so neither the width nor the content changes in one step.
+/// The full sidebar keeps its own width throughout and is clipped by the
+/// slot rather than reflowed by it.
+pub fn render_sidebar_slot(
+    model: SidebarModel,
+    openness: f32,
+    on_action: impl Fn(SidebarAction, &mut Window, &mut App) + Clone + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let (rail, full) = (width(true), width(false));
+    div()
+        .relative()
+        .flex_none()
+        .h_full()
+        .w(px(rail + (full - rail) * openness))
+        // Clipped only mid-fold: at rest it would cut off focus glows.
+        .when(openness > 0. && openness < 1., |this| {
+            this.overflow_hidden()
+        })
+        .border_r_1()
+        .border_color(hsla(0., 0., 0.5, 0.15))
+        .bg(cx.theme().sidebar)
+        .when(openness > 0., |this| {
+            this.child(
+                div()
+                    .id("sidebar-full")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h_full()
+                    .opacity(openness)
+                    .child(render_sidebar(
+                        SidebarModel {
+                            collapsed: false,
+                            ..model.clone()
+                        },
+                        on_action.clone(),
+                        cx,
+                    )),
+            )
+        })
+        .when(openness < 1., |this| {
+            this.child(
+                div()
+                    .id("sidebar-rail")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h_full()
+                    .opacity(1. - openness)
+                    .child(render_sidebar(
+                        SidebarModel {
+                            collapsed: true,
+                            ..model
+                        },
+                        on_action,
+                        cx,
+                    )),
             )
         })
 }
@@ -651,18 +722,16 @@ pub fn render_sidebar(
         None => albums.into_any_element(),
     };
 
+    // Fill and edge belong to the slot `RootView` stands this in: while the
+    // sidebar folds, the rail and the full sidebar are drawn over each other
+    // in it, and an edge of their own would show the rail's mid-slot.
     v_flex()
-        // Collapsed: wide enough for the icon rows' hover/active pill and
-        // nothing else.
-        .w(px(crate::ui::scaled(if collapsed { 52. } else { 210. })))
+        .w(px(width(collapsed)))
         .h_full()
         .when(collapsed, |s| s.px_1())
         .when(!collapsed, |s| s.px_2())
         .py_2()
         .gap_0p5()
-        .border_r_1()
-        .border_color(hsla(0., 0., 0.5, 0.15))
-        .bg(cx.theme().sidebar)
         .when_some(rail_fold, |this, fold| {
             this.child(h_flex().w_full().justify_center().child(fold))
         })

@@ -56,7 +56,7 @@ use crate::ui::recent::RecentView;
 use crate::ui::search_bar::{SearchBar, SearchBarEvent};
 use crate::ui::settings::SettingsView;
 use crate::ui::sidebar::{
-    NavSection, SidebarAction, SidebarFocus, SidebarModel, render_sidebar, sidebar_targets,
+    NavSection, SidebarAction, SidebarFocus, SidebarModel, render_sidebar_slot, sidebar_targets,
 };
 
 /// How often a running refresh resamples its workers' progress counters.
@@ -308,6 +308,12 @@ pub struct RootView {
     /// Open/close travel of the queue panel, driven from `show_queue` in
     /// `render` so the two cannot drift apart.
     queue_reveal: crate::ui::Reveal,
+    /// Fold travel of the sidebar, open = unfolded. Driven from
+    /// `sidebar_collapsed` in `render`.
+    sidebar_reveal: crate::ui::Reveal,
+    /// The fold was still travelling last frame: its landing owes the grids
+    /// one more frame to pick up the final width (`settle_reflow`).
+    sidebar_travelling: bool,
     /// Open/close travel of the bottom player bar, behind
     /// `Settings::hide_idle_player_bar`. Driven from the same idle test the bar
     /// is drawn off, so the two cannot drift apart.
@@ -904,6 +910,12 @@ impl RootView {
             in_history_restore: false,
             show_queue: false,
             queue_reveal: crate::ui::Reveal::new(220, 150),
+            sidebar_reveal: if sidebar_collapsed {
+                crate::ui::Reveal::new(220, 170)
+            } else {
+                crate::ui::Reveal::opened(220, 170)
+            },
+            sidebar_travelling: false,
             player_bar_reveal: crate::ui::Reveal::new(220, 160),
             player_bar_primed: false,
             // A dialog is read the moment it lands, so it is given a little
@@ -1004,6 +1016,10 @@ impl RootView {
         let was = self.sidebar_collapsed;
         if portrait {
             self.sidebar_collapsed = true;
+            // Launched portrait: folded from the first frame, not folding.
+            if first_frame {
+                self.sidebar_reveal = crate::ui::Reveal::new(220, 170);
+            }
         } else if !first_frame {
             self.sidebar_collapsed = self.session.read(cx).settings.sidebar_collapsed;
         }
@@ -4237,6 +4253,20 @@ impl Render for RootView {
             window.request_animation_frame();
         }
 
+        // Sidebar fold: the slot's width and the rail/full cross-fade ride one
+        // clock. The grids learn the content width a frame late
+        // (`ui::LiveWidth`), so the landing asks for one frame more.
+        self.sidebar_reveal
+            .set(!self.sidebar_collapsed, reduced_motion);
+        let sidebar_t = self.sidebar_reveal.openness(reduced_motion);
+        let sidebar_travelling = self.sidebar_reveal.settling(reduced_motion);
+        if sidebar_travelling {
+            window.request_animation_frame();
+        } else if self.sidebar_travelling {
+            settle_reflow(window, cx);
+        }
+        self.sidebar_travelling = sidebar_travelling;
+
         // Queue panel: the travel is state, not a `with_animation` wrapper, so
         // it plays in both directions — an element dropped from the tree on
         // close animates nothing. gpui redraws on demand, so a travel in
@@ -4404,8 +4434,9 @@ impl Render for RootView {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(render_sidebar(
+                    .child(render_sidebar_slot(
                         sidebar_model,
+                        sidebar_t,
                         move |action, window, cx| {
                             this.update(cx, |root, cx| match action {
                                 SidebarAction::Select(section) => {
