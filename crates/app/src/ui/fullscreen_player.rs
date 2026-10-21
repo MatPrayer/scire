@@ -324,6 +324,10 @@ fn queue_visible_rows(max_h: f32, len: usize) -> usize {
 /// player and is stacked above it instead.
 const TUNING_SIDE_MIN_W: f32 = 1000.;
 
+/// The content row's flex gap (`gap_8`), which the side panel's slot takes in
+/// and gives back as it opens and closes.
+const PANEL_FLEX_GAP: f32 = 32.;
+
 /// Content geometry of the overlay for one window size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Layout {
@@ -351,6 +355,48 @@ struct Layout {
 }
 
 impl Layout {
+    /// `from` eased toward `to`, `t` of the way (0..=1): sizes interpolate so
+    /// the content travels between the two. Where the two disagree on shape
+    /// (stacked, density, volume column) nothing in between exists, so the
+    /// nearer one's shape is kept — the switch lands mid-travel, the same
+    /// point in both directions. Coming from no panel, the panel's own fields
+    /// are `to`'s: the panel's slot shrinks or grows by `t` separately.
+    fn blend(from: &Layout, to: &Layout, t: f32) -> Layout {
+        let t = t.clamp(0., 1.);
+        let same_shape =
+            from.stacked == to.stacked && from.density == to.density && from.volume == to.volume;
+        let base = if same_shape || t >= 0.5 { *to } else { *from };
+        if !same_shape {
+            return Layout {
+                panel: to.panel,
+                panel_beside: to.panel_beside,
+                panel_max_h: to.panel_max_h,
+                ..base
+            };
+        }
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        // Between two panels (a Queue <-> Lyrics swap) the panel's own room
+        // travels too. From no panel it is `to`'s: the slot grows by `t`.
+        let two_panels = from.panel > 0. && to.panel > 0. && from.panel_beside == to.panel_beside;
+        let (panel, panel_max_h) = if two_panels {
+            (
+                lerp(from.panel, to.panel),
+                lerp(from.panel_max_h, to.panel_max_h),
+            )
+        } else {
+            (to.panel, to.panel_max_h)
+        };
+        Layout {
+            panel,
+            panel_max_h,
+            art: lerp(from.art, to.art),
+            card: lerp(from.card, to.card),
+            pad_top: lerp(from.pad_top, to.pad_top),
+            pad_bottom: lerp(from.pad_bottom, to.pad_bottom),
+            ..base
+        }
+    }
+
     fn resolve(
         width: f32,
         height: f32,
@@ -634,10 +680,38 @@ impl Layout {
 
 /// Entrance duration. Long enough for the zoom to read, short enough that the
 /// overlay never feels like it is loading.
-const ENTER: Duration = Duration::from_millis(340);
+const ENTER_MS: u64 = 340;
 /// Exit is deliberately faster than the entrance — dismissals should feel
 /// immediate. `begin_close` waits this out (plus a frame) before unmounting.
-const EXIT: Duration = Duration::from_millis(220);
+const EXIT_MS: u64 = 220;
+/// How far the overlay is inset at the closed end of its travel, and how far
+/// below its resting place it sits. Shared by both directions so the exit
+/// drops back along the path the entrance rose on.
+const ZOOM_INSET: f32 = 34.;
+const ZOOM_SHIFT: f32 = 46.;
+
+/// Entrance and exit spans, collapsed under reduced motion like every other
+/// transition (`ui::transition`).
+fn overlay_spans(reduced_motion: bool) -> (Duration, Duration) {
+    (
+        crate::ui::transition(reduced_motion, ENTER_MS),
+        crate::ui::transition(reduced_motion, EXIT_MS),
+    )
+}
+
+/// The instant a travel of `span` would have started to be `done` (0..=1) of
+/// the way through now — so a reversal picks up where the other direction
+/// had got to instead of replaying from its far end.
+fn started_ago(span: Duration, done: f32) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(span.mul_f32(done.clamp(0., 1.)))
+        .unwrap_or(now)
+}
+
+/// Fraction of a travel of `span` that started at `since`, clamped.
+fn travelled(since: Instant, span: Duration) -> f32 {
+    (since.elapsed().as_secs_f32() / span.as_secs_f32()).clamp(0., 1.)
+}
 
 /// Decelerating curve — fast start, soft landing.
 fn out_cubic(t: f32) -> f32 {
@@ -1307,8 +1381,16 @@ pub struct FullscreenPlayer {
     panel_drawn: Option<SidePanel>,
     /// Open/close travel of the side panel, driven from `panel` in `render`.
     panel_reveal: crate::ui::Reveal,
+    /// Room the layout makes for the side panel, 0 none … 1 all of it. Apart
+    /// from `panel_reveal` because a Queue <-> Lyrics swap fades the panel out
+    /// and back in while the room it stands in stays put.
+    panel_room: crate::ui::Reveal,
     /// Open/close travel of the tuning card over the mini player.
     viz_tuning_reveal: crate::ui::Reveal,
+    /// Cross-fade between the cover layout and a running scene: the
+    /// visualizer and the mini player arrive as the cover, card and backdrop
+    /// leave, and the other way round.
+    viz_reveal: crate::ui::Reveal,
     /// Start of the entrance, reset on every open.
     opened_at: Instant,
     /// Set when the exit starts; `Some` also means "closing", i.e. the overlay
@@ -1460,7 +1542,9 @@ impl FullscreenPlayer {
             viz_tuning_open: false,
             panel_drawn: None,
             panel_reveal: crate::ui::Reveal::new(220, 150),
+            panel_room: crate::ui::Reveal::new(220, 150),
             viz_tuning_reveal: crate::ui::Reveal::new(170, 120),
+            viz_reveal: crate::ui::Reveal::new(260, 180),
             opened_at: Instant::now(),
             closing_at: None,
         }
@@ -1521,15 +1605,22 @@ impl FullscreenPlayer {
         if self.closing_at.is_some() {
             return;
         }
-        self.closing_at = Some(Instant::now());
+        let (enter, exit) = overlay_spans(self.session.read(cx).settings.reduced_motion);
+        // Closed mid-entrance, the exit starts from as far open as the
+        // entrance got rather than snapping fully open first.
+        let entered = travelled(self.opened_at, enter);
+        let closing_at = started_ago(exit, 1. - entered);
+        self.closing_at = Some(closing_at);
         cx.notify();
+        let remaining = exit.mul_f32(entered);
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(EXIT + Duration::from_millis(16))
+                .timer(remaining + Duration::from_millis(16))
                 .await;
             let _ = this.update(cx, |this, cx| {
-                // Skip if a quick reopen already cancelled the close.
-                if this.closing_at.is_some() {
+                // Skip if a quick reopen cancelled this close — including one
+                // followed by a fresh close, whose own timer owns the unmount.
+                if this.closing_at == Some(closing_at) {
                     this.closing_at = None;
                     cx.emit(FullscreenEvent::Close);
                 }
@@ -1540,8 +1631,22 @@ impl FullscreenPlayer {
 
     /// Reset state so a fresh open plays the entrance (not a stale exit).
     pub fn reset_for_open(&mut self, cx: &mut Context<Self>) {
-        self.closing_at = None;
-        self.opened_at = Instant::now();
+        // A scene still running from last time is simply there when the
+        // overlay opens; only toggling it while open cross-fades.
+        self.viz_reveal = if self.session.read(cx).settings.visualizer.is_on() {
+            crate::ui::Reveal::opened(260, 180)
+        } else {
+            crate::ui::Reveal::new(260, 180)
+        };
+        // Reopened mid-exit, the entrance resumes from as far closed as the
+        // exit got rather than blanking out and rising from nothing.
+        self.opened_at = match self.closing_at.take() {
+            Some(closing_at) => {
+                let (enter, exit) = overlay_spans(self.session.read(cx).settings.reduced_motion);
+                started_ago(enter, 1. - travelled(closing_at, exit))
+            }
+            None => Instant::now(),
+        };
         // A track is usually already loaded when the overlay opens. The art
         // observer only fires on song *changes*, and a paused player never
         // notifies at all, so without this the cover stays blank until the
@@ -3321,7 +3426,13 @@ impl Render for FullscreenPlayer {
         // Keep a thin one — enough to seat the text over moving geometry.
         let viz_mode = self.session.read(cx).settings.visualizer;
         let direct_output = self.player.read(cx).output_direct.is_some();
-        let scrim = if viz_mode.is_on() { 0.15 } else { scrim };
+        let reduced_motion = self.session.read(cx).settings.reduced_motion;
+        self.viz_reveal.set(viz_mode.is_on(), reduced_motion);
+        let viz_t = self.viz_reveal.openness(reduced_motion);
+        if self.viz_reveal.settling(reduced_motion) {
+            window.request_animation_frame();
+        }
+        let scrim = scrim + (0.15 - scrim) * viz_t;
         let mini_title = title.clone();
         // Built up front: the mini player's closures hold `cx` borrowed.
         let mini_artist_el = self.artist_line("fs-mini-artist", artist.clone(), &artists, cx);
@@ -3340,7 +3451,6 @@ impl Render for FullscreenPlayer {
         // `panel` by the exit — and it is what the layout is sized from, or
         // the cover would grow into the panel's room while the panel is still
         // in it.
-        let reduced_motion = self.session.read(cx).settings.reduced_motion;
         // Switching Queue <-> Lyrics is a swap, not a re-open: the outgoing
         // panel leaves first and the arriving one then plays its own entrance.
         // Replacing the contents where they stand instead cuts the outgoing
@@ -3363,30 +3473,48 @@ impl Render for FullscreenPlayer {
             .visible(reduced_motion)
             .then_some(self.panel_drawn)
             .flatten();
-        if self.panel_reveal.settling(reduced_motion) {
+        // The room travels with the panel, so the cover and card ease aside
+        // as it arrives and back as it leaves. Sized from the drawn panel, the
+        // layout used to jump aside before the entrance and back after the
+        // exit, the one mirroring nothing of the other.
+        self.panel_room.set(self.panel.is_some(), reduced_motion);
+        let room = self.panel_room.openness(reduced_motion);
+        if self.panel_reveal.settling(reduced_motion) || self.panel_room.settling(reduced_motion) {
             window.request_animation_frame();
         }
 
-        let layout = Layout::resolve(
-            vw,
-            vh,
-            drawn_panel,
-            show_volume && !is_radio,
-            self.session.read(cx).settings.fullscreen_cover,
-        );
+        let want_volume = show_volume && !is_radio;
+        let cover_size = self.session.read(cx).settings.fullscreen_cover;
+        let bare = Layout::resolve(vw, vh, None, want_volume, cover_size);
+        let target = Layout::resolve(vw, vh, self.panel, want_volume, cover_size);
+        // Mid-swap the outgoing panel's room eases into the incoming one's as
+        // the outgoing panel fades, so the cover never steps when the lyrics
+        // panel (wider) replaces the queue or the other way round.
+        let roomy = match (drawn_panel, self.panel) {
+            (Some(d), Some(p)) if d != p => Layout::blend(
+                &Layout::resolve(vw, vh, Some(d), want_volume, cover_size),
+                &target,
+                1. - panel_open,
+            ),
+            _ => Layout::resolve(vw, vh, drawn_panel.or(self.panel), want_volume, cover_size),
+        };
+        let layout = Layout::blend(&bare, &roomy, room);
+        // Where the travel is headed: the cover's copy is cut for that size,
+        // not remade for every frame of the way there.
+        let settled = target;
         // Follow the playing track in the queue panel, now that the room the
         // panel gets — and so how many rows it holds — is known.
         self.sync_queue_scroll(layout.panel_max_h, cx);
         // The cover can grow past the rung first fetched (`roomy_art_cap`);
         // drawn upscaled it is visibly softer than the album page's lightbox.
-        self.sync_art_size(layout.art, window, cx);
+        self.sync_art_size(settled.art, window, cx);
         let art_path = self.art_path.clone().filter(|_| !is_radio);
         let main_art = art_path
             .clone()
-            .filter(|_| !viz_mode.is_on() && layout.art > 0.)
-            .map(|path| self.sharp_art.path(&path, layout.art, window, cx));
+            .filter(|_| viz_t < 1. && layout.art > 0.)
+            .map(|path| self.sharp_art.path(&path, settled.art, window, cx));
         let thumb_art = art_path
-            .filter(|_| viz_mode.is_on())
+            .filter(|_| viz_t > 0.)
             .map(|path| self.sharp_thumb.path(&path, 56., window, cx));
         // And the line being sung in the lyrics panel, which the position tick
         // brings us back here for twice a second.
@@ -3402,7 +3530,8 @@ impl Render for FullscreenPlayer {
         // frame until it lands; gpui only redraws on demand.
         let closing = self.closing_at.is_some();
         let elapsed = self.closing_at.unwrap_or(self.opened_at).elapsed();
-        let span = if closing { EXIT } else { ENTER };
+        let (enter, exit) = overlay_spans(reduced_motion);
+        let span = if closing { exit } else { enter };
         let raw = elapsed.as_secs_f32() / span.as_secs_f32();
         if raw < 1.0 {
             window.request_animation_frame();
@@ -3438,7 +3567,7 @@ impl Render for FullscreenPlayer {
             // Opacity holds through the first half so the drop is actually
             // seen — fade it out early and the exit degenerates into a
             // cross-fade, which is what the travel distance is for.
-            (1.0 - t * t, motion * 26., motion * 64.)
+            (1.0 - t * t, motion * ZOOM_INSET, motion * ZOOM_SHIFT)
         } else {
             // Opacity lands at ~60% of the timeline so the overlay is solid
             // while the geometry is still easing. `out_back` overshoots, so
@@ -3446,8 +3575,8 @@ impl Render for FullscreenPlayer {
             let motion = out_back(t);
             (
                 out_cubic(phase(t, 0.0, 0.6)),
-                (1.0 - motion) * 34.,
-                (1.0 - motion) * 46.,
+                (1.0 - motion) * ZOOM_INSET,
+                (1.0 - motion) * ZOOM_SHIFT,
             )
         };
         // Positive top / negative bottom offsets the whole overlay downward:
@@ -3491,7 +3620,7 @@ impl Render for FullscreenPlayer {
             .visible(reduced_motion)
             .then(|| self.viz_tuning_card(viz_mode, cx).into_any_element());
 
-        let mini_player = viz_mode.is_on().then(|| {
+        let mini_player = (viz_t > 0.).then(|| {
             let mode_btn = |mode: VisualizerMode, current: VisualizerMode| {
                 let id = match mode {
                     VisualizerMode::Off => "mini-viz-off",
@@ -3520,7 +3649,9 @@ impl Render for FullscreenPlayer {
 
             div()
                 .absolute()
-                .bottom(px(36.))
+                // Rises into place as the scene fades in, sinks as it fades out.
+                .bottom(px(36. - 24. * (1. - viz_t)))
+                .opacity(viz_t)
                 .left_0()
                 .right_0()
                 .flex()
@@ -3780,10 +3911,20 @@ impl Render for FullscreenPlayer {
             // Visualizer takes over the backdrop when running: it needs the
             // whole window to read as 3D, and the scrim + content still sit
             // on top of it.
-            .child(if viz_mode.is_on() {
-                self.visualizer.render(cx.theme().primary)
-            } else {
-                self.render_background(bg_mode, vw, vh, cx)
+            // Both are drawn while the one cross-fades into the other.
+            .when(viz_t < 1., |this| {
+                this.child(self.render_background(bg_mode, vw, vh, cx))
+            })
+            .when(viz_t > 0., |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .opacity(viz_t)
+                        .child(self.visualizer.render(cx.theme().primary)),
+                )
             })
             // Readability scrim.
             .child(
@@ -3824,7 +3965,7 @@ impl Render for FullscreenPlayer {
             // than it is wide, the same pieces stacked in one column.
             // Stood down while a scene runs — the visualizer wants the whole
             // window, and the mini player carries the controls instead.
-            .when(!viz_mode.is_on(), |root| {
+            .when(viz_t < 1., |root| {
                 root.child({
                     let art_size = layout.art;
                     let scrolls = layout.overruns(vh);
@@ -4237,7 +4378,7 @@ impl Render for FullscreenPlayer {
                     // `h_full`: a full-height wrapper pinned a short queue to the
                     // top of the window instead of centring it on the card.
                     let panel_el = drawn_panel.map(|panel| {
-                        div()
+                        let inner = div()
                             .flex_none()
                             .opacity(panel_open)
                             .ml(px(28. * (1. - panel_open)))
@@ -4248,7 +4389,24 @@ impl Render for FullscreenPlayer {
                                 SidePanel::Lyrics => {
                                     self.render_lyrics_panel(layout.panel, layout.panel_max_h, cx)
                                 }
+                            });
+                        // The slot grows with `room`, taking the flex gap in
+                        // with it (the negative margin), so the content beside
+                        // it moves over continuously. Clipped only in transit:
+                        // at rest the clip would cut off the panel's shadow.
+                        let in_row = !layout.stacked || layout.panel_beside;
+                        div()
+                            .flex_none()
+                            .when(room < 1., |this| {
+                                let gap_left = -PANEL_FLEX_GAP * (1. - room);
+                                let this = this.overflow_hidden();
+                                if in_row {
+                                    this.w(px(layout.panel * room)).ml(px(gap_left))
+                                } else {
+                                    this.max_h(px(layout.panel_max_h * room)).mt(px(gap_left))
+                                }
                             })
+                            .child(inner)
                     });
 
                     // A portrait window wide enough for both puts the card and
@@ -4367,7 +4525,7 @@ impl Render for FullscreenPlayer {
                             }
                         })
                         .child(content)
-                        .opacity(content_fade)
+                        .opacity(content_fade * (1. - viz_t))
                         .top(px(content_rise))
                 })
             })
@@ -4750,6 +4908,47 @@ mod tests {
             want_volume,
             FullscreenCoverSize::default(),
         )
+    }
+
+    #[test]
+    fn a_panel_blend_lands_on_both_ends_and_travels_between() {
+        let bare = resolve(1600., 900., false, false);
+        let roomy = resolve(1600., 900., true, false);
+        assert_eq!(Layout::blend(&bare, &roomy, 0.).art, bare.art);
+        assert_eq!(Layout::blend(&bare, &roomy, 1.), roomy);
+        let mid = Layout::blend(&bare, &roomy, 0.5);
+        let (lo, hi) = (bare.art.min(roomy.art), bare.art.max(roomy.art));
+        assert!(mid.art >= lo && mid.art <= hi);
+        // The slot is sized off the panel's own width all the way.
+        assert_eq!(mid.panel, roomy.panel);
+    }
+
+    #[test]
+    fn a_panel_swap_eases_the_panel_width_across() {
+        let queue = resolve(1600., 900., true, false);
+        let lyrics = Layout::resolve(
+            1600.,
+            900.,
+            Some(SidePanel::Lyrics),
+            false,
+            FullscreenCoverSize::default(),
+        );
+        let mid = Layout::blend(&queue, &lyrics, 0.5);
+        let (lo, hi) = (queue.panel.min(lyrics.panel), queue.panel.max(lyrics.panel));
+        assert!(mid.panel >= lo && mid.panel <= hi);
+        assert_eq!(Layout::blend(&queue, &lyrics, 0.).panel, queue.panel);
+        assert_eq!(Layout::blend(&queue, &lyrics, 1.).panel, lyrics.panel);
+    }
+
+    #[test]
+    fn a_shape_change_switches_at_the_same_point_both_ways() {
+        let from = resolve(1600., 900., false, false);
+        let to = Layout {
+            stacked: !from.stacked,
+            ..from
+        };
+        assert_eq!(Layout::blend(&from, &to, 0.49).stacked, from.stacked);
+        assert_eq!(Layout::blend(&from, &to, 0.5).stacked, to.stacked);
     }
 
     fn rgba(r: f32, g: f32, b: f32) -> gpui::Rgba {

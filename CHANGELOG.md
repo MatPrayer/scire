@@ -48,6 +48,19 @@ follows [Semantic Versioning](https://semver.org/).
   shrank, worst on a high-DPI display: every frame drew the moving lines at a
   font size never drawn before, so every glyph was rasterized again. Sizes
   now step on a fine fixed grid and are reused from line to line.
+- The fullscreen player's open and close now follow the same path: it rose
+  in from one offset and dropped out to another. Closing it mid-entrance (or
+  reopening it mid-exit) turns around where it stands instead of jumping to
+  the far end first, and *Reduce motion* now applies to it.
+- Opening or closing the fullscreen Queue or Lyrics panel moved the cover
+  and card aside in one jump before the panel slid in, and back in one jump
+  after it left; they now ease aside and back with the panel. Switching
+  between Queue and Lyrics eases the width across instead of stepping.
+- The docked queue panel pushed the page aside at once on opening and let it
+  back only after closing; the page now narrows and widens with the panel,
+  which slides in from the window's edge.
+- Turning the fullscreen visualizer on or off cross-fades between the scene
+  and the cover layout instead of swapping them in one frame.
 
 ## [1.6.0] — 2026-10-20
 

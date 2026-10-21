@@ -2917,6 +2917,9 @@ mod tests {
         assert!(!r.visible(false));
         r.set(true, false);
         assert!(r.visible(false));
+        // Leave from fully open with a long exit: closing straight after
+        // opening travels from ~0, a 1ms span a slow runner outlives.
+        let mut r = Reveal::opened(200, 60_000);
         r.set(false, false);
         // Closed as far as the flag driving it is concerned, but still drawn —
         // that is the whole point of the type.

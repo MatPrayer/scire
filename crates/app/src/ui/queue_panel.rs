@@ -52,6 +52,10 @@ pub enum QueuePanelEvent {
     Close,
 }
 
+/// Width of the panel. The docked slot it stands in grows to this as the
+/// panel opens (`RootView::render`).
+pub const PANEL_W: f32 = 300.;
+
 pub struct QueuePanel {
     player: Entity<PlayerState>,
     /// Read for `player_bar_style` alone: the panel is opened from the bar and
@@ -276,7 +280,7 @@ impl Render for QueuePanel {
         let translucent = settings.player_bar_translucent;
 
         v_flex()
-            .w(px(300.))
+            .w(px(PANEL_W))
             .h_full()
             .map(|this| {
                 if floating {

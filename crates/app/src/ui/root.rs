@@ -4527,13 +4527,32 @@ impl Render for RootView {
                         // rather than stretching them, so without a definite
                         // height here the panel's own `h_full()` resolves
                         // against nothing and its track list collapses.
+                        //
+                        // The slot grows with the travel rather than standing
+                        // at full width from the first frame: the page beside
+                        // it narrows as the panel arrives and widens as it
+                        // leaves, instead of jumping at the start of one and
+                        // the end of the other. Pinned to the slot's right
+                        // edge, the panel slides in from the window's edge;
+                        // clipped only in transit.
                         this.child(
                             div()
                                 .h_full()
                                 .flex()
-                                .opacity(queue_open)
-                                .ml(px(20. * (1. - queue_open)))
-                                .child(self.queue_panel.clone()),
+                                .flex_none()
+                                .justify_end()
+                                .when(queue_open < 1., |this| {
+                                    this.w(px(crate::ui::queue_panel::PANEL_W * queue_open))
+                                        .overflow_hidden()
+                                })
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .flex()
+                                        .flex_none()
+                                        .opacity(queue_open)
+                                        .child(self.queue_panel.clone()),
+                                ),
                         )
                     }),
             )
