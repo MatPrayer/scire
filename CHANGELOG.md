@@ -44,6 +44,10 @@ follows [Semantic Versioning](https://semver.org/).
 - Albums, artists and tracks opened or played from the search page used the
   library cache's internal ids, which the server doesn't recognise; they now
   use the server's ids, as the command palette does.
+- The fullscreen player's lyrics could drop frames while a line grew or
+  shrank, worst on a high-DPI display: every frame drew the moving lines at a
+  font size never drawn before, so every glyph was rasterized again. Sizes
+  now step on a fine fixed grid and are reused from line to line.
 
 ## [1.6.0] — 2026-10-20
 

@@ -1037,6 +1037,25 @@ fn lyric_wrap(size_rem: f32) -> f32 {
     size_rem / LYRIC_REM_ACTIVE
 }
 
+/// Step the handover's type size moves in, in rems: an eighth of a pixel at
+/// the default 16px rem.
+///
+/// gpui caches a rasterized glyph under its exact font size, and never evicts
+/// one. Eased continuously, the two lines in the handover land on a size no
+/// frame has drawn before, every frame — so every glyph in them is rasterized
+/// again and parked in the atlas for good, and the overlay drops frames
+/// exactly while the lines move (worst on a high-DPI output, where each glyph
+/// has more pixels). On a fixed grid the sizes repeat across handovers, so
+/// after the first few lines every glyph is a cache hit. The step is far below
+/// what a growing line can be seen to jump by.
+const LYRIC_SIZE_STEP_REM: f32 = 1. / 128.;
+
+/// Type size `t` of the way from `from` to `to` rems, on [`LYRIC_SIZE_STEP_REM`].
+fn lyric_size(from: f32, to: f32, t: f32) -> f32 {
+    let size = from + (to - from) * t;
+    (size / LYRIC_SIZE_STEP_REM).round() * LYRIC_SIZE_STEP_REM
+}
+
 /// A lyric line's colour part-way through the handover, `t` of the way from
 /// `rest` to `lit`.
 ///
@@ -2571,7 +2590,7 @@ impl FullscreenPlayer {
                                     ElementId::Name(format!("fs-lyric-in-{ix}").into()),
                                     anim(LYRIC_GROW_MS),
                                     move |el, t| {
-                                        let size = LYRIC_REM + (LYRIC_REM_ACTIVE - LYRIC_REM) * t;
+                                        let size = lyric_size(LYRIC_REM, LYRIC_REM_ACTIVE, t);
                                         el.text_size(rems(size))
                                             .w(relative(lyric_wrap(size)))
                                             // Into the accent over the same curve as
@@ -2589,8 +2608,7 @@ impl FullscreenPlayer {
                                     ElementId::Name(format!("fs-lyric-out-{ix}").into()),
                                     anim(LYRIC_GROW_MS),
                                     move |el, t| {
-                                        let size =
-                                            LYRIC_REM_ACTIVE + (LYRIC_REM - LYRIC_REM_ACTIVE) * t;
+                                        let size = lyric_size(LYRIC_REM_ACTIVE, LYRIC_REM, t);
                                         el.text_size(rems(size))
                                             .w(relative(lyric_wrap(size)))
                                             // And back out of it, so the two lines
@@ -4361,11 +4379,11 @@ impl Render for FullscreenPlayer {
 mod tests {
     use super::{
         ART_LEAD, ART_MAX, ART_MAX_STACKED, ART_MIN, BLOB_BLEED, CARD_MAX, CARD_MIN, CardDensity,
-        EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, Layout, LyricRow, LyricsSource,
-        PANEL_LYRICS_MAX, PANEL_MAX, PANEL_MIN, SidePanel, VOLUME_W, active_line, best_lyrics,
-        blob_base, blob_field, hash01, interlude_dots, line_emphasis, lyric_color, lyric_rows,
-        lyric_seek_target, lyric_wrap, lyrics_switch_target, plain_lyrics, queue_chrome_h,
-        queue_row_h, queue_visible_rows, settled, takes_over,
+        EDGE, GAP, LYRIC_DIM, LYRIC_REM, LYRIC_REM_ACTIVE, LYRIC_SIZE_STEP_REM, Layout, LyricRow,
+        LyricsSource, PANEL_LYRICS_MAX, PANEL_MAX, PANEL_MIN, SidePanel, VOLUME_W, active_line,
+        best_lyrics, blob_base, blob_field, hash01, interlude_dots, line_emphasis, lyric_color,
+        lyric_rows, lyric_seek_target, lyric_size, lyric_wrap, lyrics_switch_target, plain_lyrics,
+        queue_chrome_h, queue_row_h, queue_visible_rows, settled, takes_over,
     };
     use crate::config::{FullscreenCoverSize, LyricsProvider};
     use std::time::Duration;
@@ -5080,6 +5098,29 @@ mod tests {
                 "size {size} wraps at a different width ratio ({ratio})"
             );
         }
+    }
+
+    /// The handover's sizes come from a fixed set, so the glyphs rasterized
+    /// for one line's grow are the ones every later grow draws with — and the
+    /// two ends are exactly the resting sizes, so a line that has arrived is
+    /// the same size as one that never moved.
+    #[test]
+    fn handover_type_sizes_repeat_between_lines() {
+        assert_eq!(lyric_size(LYRIC_REM, LYRIC_REM_ACTIVE, 0.), LYRIC_REM);
+        assert_eq!(
+            lyric_size(LYRIC_REM, LYRIC_REM_ACTIVE, 1.),
+            LYRIC_REM_ACTIVE
+        );
+        assert_eq!(lyric_size(LYRIC_REM_ACTIVE, LYRIC_REM, 1.), LYRIC_REM);
+        let mut sizes = std::collections::BTreeSet::new();
+        for frame in 0..=1000 {
+            let t = gpui::ease_in_out(frame as f32 / 1000.);
+            let size = lyric_size(LYRIC_REM, LYRIC_REM_ACTIVE, t);
+            assert!((LYRIC_REM..=LYRIC_REM_ACTIVE).contains(&size));
+            sizes.insert(size.to_bits());
+        }
+        let steps = ((LYRIC_REM_ACTIVE - LYRIC_REM) / LYRIC_SIZE_STEP_REM).round() as usize;
+        assert_eq!(sizes.len(), steps + 1);
     }
 
     /// Lyrics are prose set large; the queue is one-line rows. Sharing a width
