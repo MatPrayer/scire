@@ -604,6 +604,12 @@ pub struct AdvancedSearchView {
     lidarr_art: HashMap<String, PathBuf>,
     lidarr_generation: u64,
     lidarr_scroll: gpui::ScrollHandle,
+    /// Generation of a search that re-asks the same question (`revisit` after
+    /// the cache moved): its rows keep the top row on screen in `sync_lines`
+    /// instead of starting from the top.
+    hold_scroll: Option<u64>,
+    /// Set by `apply` from `hold_scroll` for the rows it just installed.
+    keep_top: bool,
 }
 
 impl AdvancedSearchView {
@@ -679,6 +685,8 @@ impl AdvancedSearchView {
             lidarr_art: HashMap::new(),
             lidarr_generation: 0,
             lidarr_scroll: gpui::ScrollHandle::new(),
+            hold_scroll: None,
+            keep_top: false,
         };
         this.load_facets(cx);
         this.run_search(cx);
@@ -705,6 +713,42 @@ impl AdvancedSearchView {
         self.art_range = None;
         self.vi_cursor = None;
         self.refilter(cx);
+    }
+
+    /// Replace the query, keeping the filters — the palette handing over what
+    /// was typed there to a page `RootView` kept from an earlier visit.
+    pub fn set_query(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lidarr_mode {
+            self.set_lidarr_mode(false, cx);
+        }
+        if query == self.query {
+            return;
+        }
+        self.input
+            .update(cx, |input, cx| input.set_value(query.clone(), window, cx));
+        self.query = query;
+        self.art_range = None;
+        self.vi_cursor = None;
+        self.refilter(cx);
+    }
+
+    /// Coming back to a kept page: re-ask when the sidebar's library selection
+    /// moved meanwhile, or the cache was rewritten under the rows (`stale`).
+    /// Otherwise the rows, scroll and cursor are left exactly as they were.
+    pub fn revisit(&mut self, stale: bool, cx: &mut Context<Self>) {
+        let library_ids = self.session.read(cx).settings.library_ids.clone();
+        let moved = library_ids != self.filters.library_ids;
+        if !moved && !stale {
+            return;
+        }
+        self.filters.library_ids = library_ids;
+        if stale {
+            self.load_facets(cx);
+        }
+        self.refilter(cx);
+        // `refilter` bumped the generation synchronously: hold only for its
+        // answer, not for a later one the user asks by typing.
+        self.hold_scroll = (!moved).then_some(self.generation);
     }
 
     /// Focus the query field — what opening the page from the sidebar or from
@@ -1062,6 +1106,7 @@ impl AdvancedSearchView {
         self.summary = summarize(&results, self.filters.kind).into();
         self.rows = to_rows(&results, self.filters.kind);
         self.rows_version += 1;
+        self.keep_top = self.hold_scroll.take() == Some(self.generation);
         self.rows_genre = self.filters.genre.clone();
         self.results = results;
         // A new result set is a new window, whatever the scroll offset says.
@@ -1238,7 +1283,7 @@ impl AdvancedSearchView {
         if shape == self.lines_shape {
             return;
         }
-        let new_rows = shape.0 != self.lines_shape.0;
+        let new_rows = shape.0 != self.lines_shape.0 && !std::mem::take(&mut self.keep_top);
         let anchor = self.list.logical_scroll_top();
         // The row the top line starts with, so a reflow keeps it on screen.
         let top_row = self.lines.get(anchor.item_ix).and_then(|l| match l {

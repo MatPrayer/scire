@@ -369,6 +369,12 @@ pub struct RootView {
     /// scroll position; they're dropped only when the data behind them changes
     /// (connect/disconnect, library selection) — see `invalidate_catalog_views`.
     albums_view: Option<Entity<AlbumsView>>,
+    /// The search page, kept so the sidebar row and Back/Forward come back to
+    /// the last search rather than an empty page. Not dropped with the catalog
+    /// views — `search_stale` makes the next visit re-ask instead, keeping the
+    /// query, filters and scroll.
+    search_view: Option<Entity<AdvancedSearchView>>,
+    search_stale: bool,
     artists_view: Option<Entity<ArtistsView>>,
     recent_view: Option<Entity<RecentView>>,
     /// Whether initial local/navidrome sync has been triggered.
@@ -934,6 +940,8 @@ impl RootView {
             library_db,
             jobs: cx.new(|_| MaintenanceJobs::default()),
             albums_view: None,
+            search_view: None,
+            search_stale: false,
             artists_view: None,
             recent_view: None,
             scan_started: false,
@@ -1599,6 +1607,7 @@ impl RootView {
         self.albums_view = None;
         self.artists_view = None;
         self.recent_view = None;
+        self.search_stale = true;
     }
 
     /// Whether the page showing is one of the listings `invalidate_catalog_views`
@@ -1748,6 +1757,27 @@ impl RootView {
                 // `navigate` is also how the sidebar row and `:search` reach
                 // this page, and those arrive with nothing typed.
                 let query = self.pending_search_query.take().unwrap_or_default();
+                if let Some(view) = self.search_view.clone() {
+                    let stale = std::mem::take(&mut self.search_stale);
+                    view.update(cx, |v, cx| {
+                        if let Some((genre, kind)) = self.pending_search_genre.take() {
+                            v.show_genre(genre, kind, window, cx);
+                            return;
+                        }
+                        v.revisit(stale, cx);
+                        // Something typed in the palette is a new question;
+                        // nothing typed (sidebar, `:search`, an empty palette)
+                        // comes back to the last one.
+                        if !query.is_empty() {
+                            v.set_query(query, window, cx);
+                            v.focus_query(window, cx);
+                        }
+                    });
+                    self.content = Some(Content::Search(view));
+                    cx.notify();
+                    return;
+                }
+                self.search_stale = false;
                 let view = cx.new(|cx| {
                     AdvancedSearchView::new(
                         self.session.clone(),
@@ -1777,6 +1807,7 @@ impl RootView {
                     // where the user was already typing.
                     view.update(cx, |v, cx| v.focus_query(window, cx));
                 }
+                self.search_view = Some(view.clone());
                 Content::Search(view)
             }
             NavSection::Radio => {
@@ -1851,17 +1882,16 @@ impl RootView {
 
     /// Open the full-page search, carrying whatever was typed in the palette.
     ///
-    /// The page is rebuilt each time rather than retained: it holds a query,
-    /// a filter set and a result list, and reopening it from the palette with
-    /// the *last* search still on screen would ignore what was just typed.
+    /// The page is kept across visits (`search_view`); a non-empty query
+    /// replaces the one it shows, filters stay.
     fn open_advanced_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_search_query = Some(query);
         self.navigate_push(NavSection::Search, window, cx);
     }
 
     /// Open the search page on the `kind` rows tagged `genre` — a genre
-    /// chip's click, through `advanced_search::GenreSearchRequest`. Rebuilt
-    /// like `open_advanced_search`, so Back returns to the chip's page.
+    /// chip's click, through `advanced_search::GenreSearchRequest`. Pushed like
+    /// `open_advanced_search`, so Back returns to the chip's page.
     fn open_genre_search(
         &mut self,
         genre: String,

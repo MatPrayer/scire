@@ -64,6 +64,10 @@ follows [Semantic Versioning](https://semver.org/).
 - Folding the sidebar (Ctrl/Cmd+B) slides it between the full sidebar and
   the icon rail, the two cross-fading, instead of snapping; the page beside
   it widens and narrows along.
+- The search page came back empty every time it was left: from the sidebar
+  or with Back/Forward it now shows the last search — query, filters, kind,
+  sort and scroll — re-asked if the library changed meanwhile. Text typed in
+  the command palette still replaces the query.
 
 ## [1.6.0] — 2026-10-20
 
