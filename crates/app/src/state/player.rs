@@ -24,6 +24,19 @@ const ART_SIZE: u32 = 300;
 /// the queue would only repeat the same failed request per track.
 const MAX_FAILED_STREAK: usize = 5;
 
+/// How long a station must play uninterrupted before a later drop starts the
+/// reconnect attempts over.
+const RADIO_STABLE: Duration = Duration::from_secs(30);
+
+/// Wait before reconnect attempt `attempt` (0-based) to a dropped station, or
+/// `None` once the attempts are spent.
+fn radio_reconnect_delay(attempt: u32) -> Option<Duration> {
+    const DELAYS: [u64; 5] = [1, 3, 5, 10, 20];
+    DELAYS
+        .get(attempt as usize)
+        .map(|&secs| Duration::from_secs(secs))
+}
+
 /// A playback failure worth telling the user about.
 ///
 /// The player has no window to put a toast in, so it emits these and the root
@@ -163,6 +176,16 @@ pub struct PlayerState {
     radio_stream_title: Option<String>,
     /// What the station said about itself when the stream opened.
     radio_station: Option<playback::icy::StationInfo>,
+    /// The station's stream URL, kept to reconnect when the stream drops.
+    radio_url: Option<String>,
+    /// Reconnects tried since the stream last played steadily for
+    /// `RADIO_STABLE`. Indexes `radio_reconnect_delay`.
+    radio_reconnects: u32,
+    /// Bumped whenever radio starts or ends, so a reconnect timer that fires
+    /// after the user moved on does nothing.
+    radio_generation: u64,
+    /// A reconnect timer is running: the station is silent but coming back.
+    radio_reconnect_pending: bool,
     media_controls: Option<MediaControls>,
     /// Most-recently-played tracks (newest first, max 50). Persisted to disk.
     pub recently_played: Vec<Song>,
@@ -291,6 +314,10 @@ impl PlayerState {
             radio_title: None,
             radio_stream_title: None,
             radio_station: None,
+            radio_url: None,
+            radio_reconnects: 0,
+            radio_generation: 0,
+            radio_reconnect_pending: false,
             media_controls,
             recently_played: load_recent(),
             current_art_path: None,
@@ -453,6 +480,70 @@ impl PlayerState {
         self.radio_title = None;
         self.radio_stream_title = None;
         self.radio_station = None;
+        self.radio_url = None;
+        self.radio_reconnects = 0;
+        self.radio_generation += 1;
+        self.radio_reconnect_pending = false;
+    }
+
+    /// Call off a reconnect still waiting on its timer, leaving the station
+    /// stopped. Returns whether one was pending.
+    fn cancel_radio_reconnect(&mut self) -> bool {
+        if !self.radio_reconnect_pending {
+            return false;
+        }
+        self.radio_reconnect_pending = false;
+        self.radio_generation += 1;
+        self.radio_reconnects = 0;
+        self.buffering = false;
+        true
+    }
+
+    /// A live stream that was playing ended or failed: open it again after a
+    /// short wait instead of leaving the station silent. Returns false once
+    /// the attempts are spent (or nothing is there to reconnect to), and the
+    /// caller reports the failure as usual.
+    fn reconnect_radio(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(delay) = radio_reconnect_delay(self.radio_reconnects) else {
+            return false;
+        };
+        if self.radio_url.is_none() {
+            return false;
+        }
+        self.radio_reconnects += 1;
+        self.radio_reconnect_pending = true;
+        self.buffering = true;
+        let generation = self.radio_generation;
+        tracing::info!(
+            "radio stream dropped; reconnecting in {}s (attempt {})",
+            delay.as_secs(),
+            self.radio_reconnects
+        );
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.radio_generation != generation {
+                    return;
+                }
+                state.radio_reconnect_pending = false;
+                let Some(url) = state.radio_url.clone() else {
+                    return;
+                };
+                state.engine_has_track = true;
+                state.radio_stream_title = None;
+                state.player.play(TrackSource {
+                    url,
+                    duration_hint: None,
+                    path: None,
+                    id: None,
+                    live: true,
+                    start_at: None,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        true
     }
 
     /// Codec / bitrate / genre the station advertises, as one line.
@@ -478,13 +569,18 @@ impl PlayerState {
         self.engine_has_track = true;
         self.scrobble.clear();
         self.player.clear_prefetch();
+        // A reconnect still pending for the previous station must not fire.
+        self.clear_radio();
         self.radio_title = Some(name);
-        self.radio_stream_title = None;
-        self.radio_station = None;
+        self.radio_url = Some(stream_url.clone());
+        // The cleared queue's saved position must not fire if it comes back.
+        self.pending_resume = None;
         self.set_position(Duration::ZERO);
         self.duration = None;
         self.failed_streak = 0;
         self.buffering = true;
+        // Radio plays at unity, not the last track's ReplayGain.
+        self.recompute_gain();
         self.player.play(TrackSource {
             url: stream_url,
             duration_hint: None,
@@ -631,6 +727,19 @@ impl PlayerState {
     }
 
     pub fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        // Radio with nothing in the engine: either a reconnect is waiting
+        // (pressing pause means stop waiting) or the station gave up (pressing
+        // play means tune in again). Resume would be a no-op either way.
+        if self.is_radio() && !self.engine_has_track {
+            if self.cancel_radio_reconnect() {
+                cx.notify();
+            } else if let (Some(name), Some(url)) =
+                (self.radio_title.clone(), self.radio_url.clone())
+            {
+                self.play_radio(name, url, cx);
+            }
+            return;
+        }
         if self.playing {
             self.player.pause();
         } else if !self.engine_has_track && !self.is_radio() && self.current_song().is_some() {
@@ -865,13 +974,16 @@ impl PlayerState {
             // machine going to sleep) sends Pause, which toggled a paused
             // player into playing. Only Toggle toggles.
             E::Play => {
-                if !self.playing {
+                // A pending reconnect is already on its way back to playing.
+                if !self.playing && !self.radio_reconnect_pending {
                     self.toggle_play(cx);
                 }
             }
             E::Pause => {
                 if self.playing {
                     self.player.pause();
+                } else if self.cancel_radio_reconnect() {
+                    cx.notify();
                 }
             }
             E::Toggle => self.toggle_play(cx),
@@ -1272,6 +1384,11 @@ impl PlayerState {
         match event {
             Event::Position(pos) => {
                 self.set_position(pos);
+                // Playing steadily again: a later drop gets the full set of
+                // reconnect attempts.
+                if self.is_radio() && pos >= RADIO_STABLE {
+                    self.radio_reconnects = 0;
+                }
                 let action = self.scrobble.on_position(pos, self.duration);
                 self.fire_scrobble(action, cx);
                 // Saved as playback goes rather than only on quit: a crash or a
@@ -1363,8 +1480,21 @@ impl PlayerState {
                         });
                     }
                 } else {
+                    let was_playing = self.playing;
                     self.playing = false;
                     self.engine_has_track = false;
+                    // An endless stream that ended lost its connection.
+                    if self.is_radio() {
+                        if !(was_playing && self.reconnect_radio(cx)) {
+                            self.buffering = false;
+                            cx.emit(PlayerNotice::Failed(format!(
+                                "{} stopped — the station closed the stream",
+                                self.radio_title.as_deref().unwrap_or("Radio")
+                            )));
+                        }
+                        cx.notify();
+                        return;
+                    }
                     if let Some(pos) = self.queue.next_pos() {
                         self.queue.advance_to(pos);
                         self.start_current(cx);
@@ -1375,6 +1505,19 @@ impl PlayerState {
                 }
             }
             Event::Failed(msg) => {
+                // A reconnect that failed to open is retried in turn; a station
+                // that never opened at all is broken, not dropped, and fails
+                // straight away.
+                if self.is_radio()
+                    && (self.radio_reconnects > 0 || self.position > Duration::ZERO)
+                    && self.reconnect_radio(cx)
+                {
+                    tracing::warn!("radio reconnect failed: {msg}");
+                    self.playing = false;
+                    self.engine_has_track = false;
+                    cx.notify();
+                    return;
+                }
                 self.playing = false;
                 self.buffering = false;
                 self.engine_has_track = false;
@@ -1704,7 +1847,8 @@ mod tests {
 
     use super::{
         FALLBACK_BITRATE, FALLBACK_FORMAT, ReplayGainMode, ResumeState, RgTuning, SMOOTH_MAX,
-        read_resume_at, replaygain_linear, resume_for, smoothed, stream_opts_for, write_resume_at,
+        radio_reconnect_delay, read_resume_at, replaygain_linear, resume_for, smoothed,
+        stream_opts_for, write_resume_at,
     };
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
@@ -2004,5 +2148,15 @@ mod tests {
         };
         let opts = stream_opts_for(&base, &flac(Some(32)), true);
         assert_eq!(opts.format.as_deref(), Some(FALLBACK_FORMAT));
+    }
+
+    #[test]
+    fn radio_reconnects_back_off_then_give_up() {
+        let delays: Vec<_> = (0..)
+            .map_while(radio_reconnect_delay)
+            .map(|d| d.as_secs())
+            .collect();
+        assert_eq!(delays, [1, 3, 5, 10, 20]);
+        assert!(delays.windows(2).all(|w| w[0] < w[1]));
     }
 }

@@ -76,6 +76,8 @@ pub mod icons {
     pub const VOLUME_HIGH: &str = "icons/volume-2.svg";
     pub const MUSIC: &str = "icons/music.svg";
     pub const RADIO: &str = "icons/radio.svg";
+    /// Edit a radio station.
+    pub const PENCIL: &str = "icons/pencil.svg";
     pub const STAR_FILLED: &str = "icons/star-filled.svg";
     pub const REFRESH: &str = "icons/refresh-cw.svg";
     /// Outline star from the gpui-component bundle (same artwork, no fill).

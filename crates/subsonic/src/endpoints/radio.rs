@@ -35,6 +35,23 @@ impl SubsonicClient {
         self.get_empty("createInternetRadioStation", &params).await
     }
 
+    /// Rewrite a station's name, stream URL and homepage. The homepage is
+    /// cleared when `homepage_url` is `None`.
+    pub async fn update_internet_radio_station(
+        &self,
+        id: &str,
+        stream_url: &str,
+        name: &str,
+        homepage_url: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut params: Vec<(&str, &str)> =
+            vec![("id", id), ("streamUrl", stream_url), ("name", name)];
+        if let Some(hp) = homepage_url {
+            params.push(("homepageUrl", hp));
+        }
+        self.get_empty("updateInternetRadioStation", &params).await
+    }
+
     pub async fn delete_internet_radio_station(&self, id: &str) -> Result<(), Error> {
         self.get_empty("deleteInternetRadioStation", &[("id", id)])
             .await

@@ -32,6 +32,8 @@ impl RadioState {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             self.stations.clear();
+            self.error = None;
+            cx.notify();
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -44,7 +46,10 @@ impl RadioState {
             .await;
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(stations) => state.stations = stations,
+                    Ok(stations) => {
+                        state.stations = stations;
+                        state.error = None;
+                    }
                     Err(e) => state.error = Some(crate::errors::error_text(&e)),
                 }
                 cx.notify();
@@ -53,41 +58,59 @@ impl RadioState {
         .detach();
     }
 
-    pub fn create(&mut self, name: String, stream_url: String, cx: &mut Context<Self>) {
-        let Some(client) = self.client(cx) else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let result = runtime::spawn_io(async move {
-                client
-                    .create_internet_radio_station(&stream_url, &name, None)
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await;
-            let _ = this.update(cx, |state, cx| match result {
-                Ok(()) => state.reload(cx),
-                Err(e) => {
-                    state.error = Some(crate::errors::error_text(&e));
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+    pub fn create(
+        &mut self,
+        name: String,
+        stream_url: String,
+        homepage_url: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mutate(cx, move |client| async move {
+            client
+                .create_internet_radio_station(&stream_url, &name, homepage_url.as_deref())
+                .await
+        });
+    }
+
+    pub fn update(
+        &mut self,
+        id: String,
+        name: String,
+        stream_url: String,
+        homepage_url: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mutate(cx, move |client| async move {
+            client
+                .update_internet_radio_station(&id, &stream_url, &name, homepage_url.as_deref())
+                .await
+        });
     }
 
     pub fn delete(&mut self, id: String, cx: &mut Context<Self>) {
+        self.mutate(cx, move |client| async move {
+            client.delete_internet_radio_station(&id).await
+        });
+    }
+
+    /// Run one station edit on the IO runtime, then reload the list (or show
+    /// why it failed). The previous failure is cleared as the new edit starts,
+    /// so it does not sit on screen while this one is in flight.
+    fn mutate<F, Fut>(&mut self, cx: &mut Context<Self>, op: F)
+    where
+        F: FnOnce(SubsonicClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), subsonic::Error>> + Send + 'static,
+    {
         let Some(client) = self.client(cx) else {
             return;
         };
+        if self.error.take().is_some() {
+            cx.notify();
+        }
         cx.spawn(async move |this, cx| {
-            let result = runtime::spawn_io(async move {
-                client
-                    .delete_internet_radio_station(&id)
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await;
+            let result =
+                runtime::spawn_io(async move { op(client).await.map_err(anyhow::Error::from) })
+                    .await;
             let _ = this.update(cx, |state, cx| match result {
                 Ok(()) => state.reload(cx),
                 Err(e) => {

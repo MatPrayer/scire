@@ -57,6 +57,52 @@ async fn create_radio_station_sends_params() {
 }
 
 #[tokio::test]
+async fn create_radio_station_sends_homepage() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/createInternetRadioStation"))
+        .and(query_param("streamUrl", "https://example.com/stream"))
+        .and(query_param("name", "My Station"))
+        .and(query_param("homepageUrl", "https://example.com"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_empty()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server.uri())
+        .create_internet_radio_station(
+            "https://example.com/stream",
+            "My Station",
+            Some("https://example.com"),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn update_radio_station_sends_params() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/updateInternetRadioStation"))
+        .and(query_param("id", "3"))
+        .and(query_param("streamUrl", "https://example.com/new"))
+        .and(query_param("name", "Renamed"))
+        .and(query_param("homepageUrl", "https://example.com"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_empty()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server.uri())
+        .update_internet_radio_station(
+            "3",
+            "https://example.com/new",
+            "Renamed",
+            Some("https://example.com"),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn delete_radio_station() {
     let server = MockServer::start().await;
     Mock::given(path("/rest/deleteInternetRadioStation"))

@@ -18,6 +18,11 @@ follows [Semantic Versioning](https://semver.org/).
   article). Asked only while *Settings → Connections → Album descriptions →
   Wikipedia* is on; cached for a month. Rate Your Music has the best genre
   descriptions but no public API.
+- A radio station that drops its stream reconnects by itself, waiting a
+  little longer before each of five tries; pausing while it waits calls it
+  off, and pressing play after it gives up tunes in again.
+- Radio stations can be edited (pencil button on the row: name, stream URL,
+  homepage) and carry a homepage, opened from a globe button on the row.
 
 ### Changed
 
@@ -72,6 +77,14 @@ follows [Semantic Versioning](https://semver.org/).
   remix and songwriting credits, so most showed no role; every card now
   leads with every role held ("Performer", "Featured", "Remix",
   "Songwriter").
+- Radio played at the ReplayGain level of the track before it — boosted or
+  cut by that track's gain — instead of unity.
+- Switching the output device or following a route change during radio no
+  longer tries to seek the live stream back to where it was, which stalled
+  it until the seek failed; it reopens on the air.
+- The radio page's error line stayed after the next add, delete or reload
+  succeeded; it now clears when a new one starts. The add form checks the
+  stream URL (http:// or https://) before sending it to the server.
 
 ## [1.6.0] — 2026-10-20
 

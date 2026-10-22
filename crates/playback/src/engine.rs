@@ -474,7 +474,11 @@ async fn control_loop(
                             // A seek still on its way is where playback is
                             // going, so that is the position to reopen at —
                             // the player itself still reports the old one.
-                            let pos = seek_target.or_else(|| sink.as_ref().map(|s| s.get_pos()));
+                            // A live stream has no position to go back to: it
+                            // reopens on whatever the station is airing now.
+                            let pos = seek_target
+                                .or_else(|| sink.as_ref().map(|s| s.get_pos()))
+                                .filter(|_| !current.as_ref().is_some_and(|c| c.track.live));
                             cancel_seek(&mut seek_target, &mut seek_gen, &mut play_after_seek);
                             // An already-appended next track dies with the old
                             // player; re-prepare it so gapless survives.
@@ -746,7 +750,11 @@ async fn control_loop(
                         lost_device = open_device.clone();
                     }
                     let resume = action == RouteAction::Follow;
-                    let pos = sink.as_ref().map(|s| s.get_pos());
+                    // Live: reopen on the air, not at a seek it can't do.
+                    let pos = sink
+                        .as_ref()
+                        .map(|s| s.get_pos())
+                        .filter(|_| !current.as_ref().is_some_and(|c| c.track.live));
                     // The appended next track dies with the old player.
                     let mut requeue = queued.take().map(|l| l.track);
                     if let Some(s) = sink.take() {
