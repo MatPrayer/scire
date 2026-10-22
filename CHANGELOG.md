@@ -68,6 +68,10 @@ follows [Semantic Versioning](https://semver.org/).
   or with Back/Forward it now shows the last search — query, filters, kind,
   sort and scroll — re-asked if the library changed meanwhile. Text typed in
   the command palette still replaces the query.
+- An artist's *Appears on* cards said what the artist did only for featured,
+  remix and songwriting credits, so most showed no role; every card now
+  leads with every role held ("Performer", "Featured", "Remix",
+  "Songwriter").
 
 ## [1.6.0] — 2026-10-20
 

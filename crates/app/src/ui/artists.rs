@@ -2414,11 +2414,24 @@ impl Render for ArtistDetailView {
     }
 }
 
-/// What an "Appears on" card says under the cover: whose record it is, what
-/// this artist did on it when that was more than playing ("Featured",
-/// "Remix", "Songwriter"), and how much of it is theirs.
+/// What an "Appears on" card says under the cover: what this artist did on
+/// the record ("Performer", "Featured", "Remix", "Songwriter"), whose record it
+/// is, and how much of it is theirs. The role leads — it is what this section
+/// is about, and the gallery tile's one-line subtitle truncates the tail.
 fn appearance_line(album: &Album, tracks: i64, roles: AppearanceRoles) -> String {
     let mut parts: Vec<String> = Vec::new();
+    let what: Vec<&str> = [
+        (roles.artist, "Performer"),
+        (roles.featured, "Featured"),
+        (roles.remixer, "Remix"),
+        (roles.composer, "Songwriter"),
+    ]
+    .into_iter()
+    .filter_map(|(on, label)| on.then_some(label))
+    .collect();
+    if !what.is_empty() {
+        parts.push(what.join(", "));
+    }
     if let Some(who) = album
         .artist
         .as_deref()
@@ -2426,20 +2439,6 @@ fn appearance_line(album: &Album, tracks: i64, roles: AppearanceRoles) -> String
         .filter(|w| !w.is_empty())
     {
         parts.push(who.to_string());
-    }
-    let what: Vec<&str> = [
-        (roles.featured, "Featured"),
-        (roles.remixer, "Remix"),
-        (
-            roles.composer && !roles.artist && !roles.featured,
-            "Songwriter",
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(on, label)| on.then_some(label))
-    .collect();
-    if !what.is_empty() {
-        parts.push(what.join(", "));
     }
     parts.push(if tracks == 1 {
         "1 track".to_string()
@@ -3363,22 +3362,22 @@ mod detail_tests {
         };
         assert_eq!(
             appearance_line(&album("Blue Note", Some("Art Blakey")), 2, played),
-            "Art Blakey · 2 tracks"
+            "Performer · Art Blakey · 2 tracks"
         );
         assert_eq!(
             appearance_line(&album("Blue Note", Some("Art Blakey")), 1, played),
-            "Art Blakey · 1 track"
+            "Performer · Art Blakey · 1 track"
         );
         // A compilation row the sync never got an artist for still says how
         // much of it belongs to this artist.
         assert_eq!(
             appearance_line(&album("Blue Note", None), 3, played),
-            "3 tracks"
+            "Performer · 3 tracks"
         );
     }
 
     #[test]
-    fn an_appearance_says_what_the_artist_did() {
+    fn an_appearance_names_every_role_the_artist_had() {
         let roles = AppearanceRoles {
             featured: true,
             remixer: true,
@@ -3386,9 +3385,9 @@ mod detail_tests {
         };
         assert_eq!(
             appearance_line(&album("Brat", Some("Charli xcx")), 2, roles),
-            "Charli xcx · Featured, Remix · 2 tracks"
+            "Featured, Remix · Charli xcx · 2 tracks"
         );
-        // Writing a song they also sing on says nothing new.
+        // Every role is named, writing a song they also sing on included.
         let roles = AppearanceRoles {
             artist: true,
             composer: true,
@@ -3396,7 +3395,7 @@ mod detail_tests {
         };
         assert_eq!(
             appearance_line(&album("X", Some("Y")), 1, roles),
-            "Y · 1 track"
+            "Performer, Songwriter · Y · 1 track"
         );
         let roles = AppearanceRoles {
             composer: true,
@@ -3404,7 +3403,7 @@ mod detail_tests {
         };
         assert_eq!(
             appearance_line(&album("X", Some("Y")), 1, roles),
-            "Y · Songwriter · 1 track"
+            "Songwriter · Y · 1 track"
         );
     }
 
