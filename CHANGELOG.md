@@ -85,6 +85,15 @@ follows [Semantic Versioning](https://semver.org/).
 - The radio page's error line stayed after the next add, delete or reload
   succeeded; it now clears when a new one starts. The add form checks the
   stream URL (http:// or https://) before sending it to the server.
+- Resuming a track mid-way (*Resume playback*) could spin for up to a minute,
+  or never start, worst near the end of a FLAC: the seek ran after the track
+  reached the output, while the next track's prefetch competed for the
+  server's bandwidth. The track is now positioned before it starts, with a
+  10s limit after which it plays from the top; the next track is fetched
+  only once the resumed one plays; pausing mid-load clears the spinner.
+- A library track's download no longer runs ahead of playback at full speed
+  (capped at 1 MiB/s), so it can't fill a home server's uplink and leave
+  seeks queued behind it.
 - The album grid could show a run of albums twice after a sync, most visibly
   on a large or freshly imported library. The grid paints the cached albums
   first and swaps in the server's pages as they arrive, but the cache sorts
