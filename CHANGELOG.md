@@ -26,9 +26,27 @@ follows [Semantic Versioning](https://semver.org/).
 - The waveform seek bar can be dragged (*Settings → Player bar → Drag the
   waveform*, shown while the waveform bar is on): the played region follows
   the pointer and the seek happens on release.
+- A Playlists page (click the sidebar's *Playlists* heading, *All playlists*
+  in the folded rail, or `:pl`) shows every playlist as a card with its
+  cover, newest change first or A–Z, with a *New playlist* card up front.
+- Playlist tracks can be reordered: drag a row, or *Move up / down / to top /
+  to bottom* from its menu. A sorted view can be kept with *Save as playlist
+  order*.
+- Playlists can be duplicated, made public or private, and given a
+  description after they're made (*Edit details*).
+- A playlist's tracks can be filtered by title, artist or album and sorted
+  by title, artist, album or length; Play and Shuffle play what's shown.
+- vi commands `:pl rename <name>`, `:pl dup`, `:pl public`, `:pl private`
+  and `:pl delete` act on the open playlist.
 
 ### Changed
 
+- The playlist page is redesigned like an album page: cover, description,
+  owner (on someone else's playlist), track count, total time and last
+  change in the header; rows with cover thumbnails, artist and album (both
+  links), and a menu with play next, add to queue, song details and go to
+  album or artist. Edit controls are hidden on playlists you don't own, and
+  Delete asks for a second click.
 - The search page is redesigned: a search icon in the query field, kind tabs
   in a segmented control with the sort beside them, filters a kind can't
   use hidden instead of greyed, set filters highlighted, every active filter

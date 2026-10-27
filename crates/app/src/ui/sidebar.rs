@@ -10,7 +10,9 @@ use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::popover::Popover;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+};
 
 /// What a row does *after* its action has been dispatched.
 ///
@@ -59,6 +61,8 @@ pub enum NavSection {
     LocalMusic,
     /// Download queue and wanted list; only while the Lidarr integration is on.
     Lidarr,
+    /// Every playlist as a card; reached from the "Playlists" heading.
+    Playlists,
     Settings,
 }
 
@@ -506,11 +510,13 @@ pub fn render_sidebar(
         }
     }
 
-    // Collapsible "Playlists" header: label + chevron (click to fold) on the
-    // left, a "+" new-playlist button on the right.
+    // "Playlists" header: the label opens the playlists page, the chevron
+    // beside it folds the list, and a "+" on the right makes a new one.
     let playlists_header = {
         let on_toggle = on_action.clone();
+        let on_open = on_action.clone();
         let on_new = on_action.clone();
+        let page_active = model.active == Some(NavSection::Playlists);
         h_flex()
             .px_3()
             .pt_3()
@@ -519,23 +525,45 @@ pub fn render_sidebar(
             .justify_between()
             .child(
                 h_flex()
-                    .id("pl-header")
-                    .gap_1()
+                    .gap_0p5()
                     .items_center()
-                    .cursor_pointer()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .on_click(move |_, window, cx| {
-                        on_toggle(SidebarAction::TogglePlaylistSection, window, cx)
+                    .text_color(if page_active {
+                        cx.theme().foreground
+                    } else {
+                        cx.theme().muted_foreground
                     })
-                    .child("Playlists")
                     .child(
-                        Icon::new(if model.playlists_collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .xsmall(),
+                        div()
+                            .id("pl-header")
+                            .px_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(page_active, |s| s.font_semibold())
+                            .hover(|s| s.underline())
+                            .on_click(move |_, window, cx| {
+                                on_open(SidebarAction::Select(NavSection::Playlists), window, cx)
+                            })
+                            .child("Playlists"),
+                    )
+                    .child(
+                        div()
+                            .id("pl-fold")
+                            .p_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().muted))
+                            .on_click(move |_, window, cx| {
+                                on_toggle(SidebarAction::TogglePlaylistSection, window, cx)
+                            })
+                            .child(
+                                Icon::new(if model.playlists_collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .xsmall(),
+                            ),
                     ),
             )
             .child(
@@ -654,6 +682,8 @@ pub fn render_sidebar(
                 });
                 let on_new = on_action.clone();
                 let after_new = dismiss.clone();
+                let on_all = on_action.clone();
+                let after_all = dismiss.clone();
                 let mut menu = v_flex()
                     .id("rail-pl-menu")
                     .gap_0p5()
@@ -678,6 +708,25 @@ pub fn render_sidebar(
                             })
                             .child(Icon::new(IconName::Plus).xsmall())
                             .child("New playlist"),
+                    )
+                    .child(
+                        h_flex()
+                            .id("rail-pl-all")
+                            .px_3()
+                            .py_1()
+                            .gap_1p5()
+                            .items_center()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .hover(|s| s.bg(cx.theme().muted))
+                            .on_click(move |_, window, cx| {
+                                on_all(SidebarAction::Select(NavSection::Playlists), window, cx);
+                                after_all(window, cx);
+                            })
+                            .child(Icon::new(IconName::LayoutDashboard).xsmall())
+                            .child("All playlists"),
                     );
                 if playlists.is_empty() {
                     menu = menu.child(

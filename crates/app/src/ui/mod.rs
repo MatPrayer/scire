@@ -13,6 +13,7 @@ pub mod local_artist_detail;
 pub mod local_music;
 pub mod player_bar;
 pub mod playlist_detail;
+pub mod playlists;
 pub mod queue_panel;
 pub mod radio;
 pub mod recent;

@@ -22,6 +22,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// would abort a large one on a slow link. A server that has stopped sending
 /// mid-body still fails here.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Parameter bytes past which a request is sent as a POST form rather than a
+/// query string. Common proxy and server limits on a request line start
+/// around 8 KiB; the auth and envelope params ride along in the query.
+const FORM_POST_OVER: usize = 4096;
 
 /// Async Subsonic API client.
 ///
@@ -116,16 +120,22 @@ impl SubsonicClient {
         Ok(url)
     }
 
-    /// Issue a GET request and unwrap the `subsonic-response` envelope.
+    /// Issue a request and unwrap the `subsonic-response` envelope.
     pub(crate) async fn get<T: DeserializeOwned>(
         &self,
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> Result<T, Error> {
-        let url = self.build_url(endpoint, params)?;
-        let resp = self
-            .http
-            .get(url)
+        // A long parameter list (a playlist's worth of song ids) would make a
+        // URL past what servers and proxies accept, so it goes as a form body
+        // instead (OpenSubsonic `formPost`); the auth stays in the query.
+        let query_len: usize = params.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+        let request = if query_len > FORM_POST_OVER {
+            self.http.post(self.build_url(endpoint, &[])?).form(params)
+        } else {
+            self.http.get(self.build_url(endpoint, params)?)
+        };
+        let resp = request
             .send()
             .await
             .map_err(http_error)?

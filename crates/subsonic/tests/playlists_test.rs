@@ -1,5 +1,5 @@
 use subsonic::{Credentials, SubsonicClient};
-use wiremock::matchers::{path, query_param};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn client(base: &str) -> SubsonicClient {
@@ -123,6 +123,84 @@ async fn delete_playlist_hits_endpoint() {
         .await;
 
     client(&server.uri()).delete_playlist("pl-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn set_playlist_public_sends_flag() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/updatePlaylist"))
+        .and(query_param("playlistId", "pl-1"))
+        .and(query_param("public", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_empty()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server.uri())
+        .set_playlist_public("pl-1", true)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn replace_playlist_songs_overwrites_in_order() {
+    let server = MockServer::start().await;
+    Mock::given(path("/rest/createPlaylist"))
+        .and(query_param("playlistId", "pl-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_empty()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server.uri())
+        .replace_playlist_songs("pl-1", &["s-3", "s-1", "s-2"])
+        .await
+        .unwrap();
+
+    let reqs = server.received_requests().await.unwrap();
+    let ids: Vec<_> = reqs[0]
+        .url
+        .query_pairs()
+        .filter(|(k, _)| k == "songId")
+        .map(|(_, v)| v.to_string())
+        .collect();
+    assert_eq!(ids, vec!["s-3", "s-1", "s-2"]);
+    // No name: the server keeps the playlist's own.
+    assert!(!reqs[0].url.query_pairs().any(|(k, _)| k == "name"));
+}
+
+#[tokio::test]
+async fn a_long_song_list_goes_as_a_form_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/createPlaylist"))
+        .and(query_param("u", "joe"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ok_empty()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ids: Vec<String> = (0..500).map(|i| format!("song-id-{i:05}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    client(&server.uri())
+        .replace_playlist_songs("pl-1", &refs)
+        .await
+        .unwrap();
+
+    let reqs = server.received_requests().await.unwrap();
+    assert!(!reqs[0].url.query_pairs().any(|(k, _)| k == "songId"));
+    // Plain ASCII ids: nothing in the body needs percent-decoding.
+    let body: Vec<(String, String)> = String::from_utf8(reqs[0].body.clone())
+        .unwrap()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert!(body.contains(&("playlistId".into(), "pl-1".into())));
+    let sent: Vec<_> = body.iter().filter(|(k, _)| k == "songId").collect();
+    assert_eq!(sent.len(), 500);
+    assert_eq!(sent[0].1, "song-id-00000");
+    assert_eq!(sent[499].1, "song-id-00499");
 }
 
 #[tokio::test]

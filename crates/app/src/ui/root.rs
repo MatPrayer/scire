@@ -29,7 +29,7 @@ use crate::services::{
 use crate::state::lidarr::ImportedAlbum;
 use crate::state::maintenance::MaintenanceJobs;
 use crate::state::player::{PlayerNotice, PlayerState};
-use crate::state::playlists::PlaylistsState;
+use crate::state::playlists::{PlaylistsEvent, PlaylistsState};
 use crate::state::queue::RepeatMode;
 use crate::state::radio::RadioState;
 use crate::state::session::{ConnectionStatus, Session};
@@ -50,6 +50,7 @@ use crate::ui::player_bar::{
     PlayerBar, PlayerBarEvent, bar_h, float_bottom, float_margin, float_max_w, float_panel_bottom,
 };
 use crate::ui::playlist_detail::{PlaylistDetailEvent, PlaylistDetailView};
+use crate::ui::playlists::{PlaylistsView, PlaylistsViewEvent};
 use crate::ui::queue_panel::{QueuePanel, QueuePanelEvent};
 use crate::ui::radio::RadioView;
 use crate::ui::recent::RecentView;
@@ -217,6 +218,7 @@ enum Content {
     LocalAlbumDetail(Entity<LocalAlbumDetailView>),
     LocalArtistDetail(Entity<LocalArtistDetailView>),
     Playlist(Entity<PlaylistDetailView>),
+    Playlists(Entity<PlaylistsView>),
     Radio(Entity<RadioView>),
     Settings(Entity<SettingsView>),
     Recent(Entity<RecentView>),
@@ -235,6 +237,7 @@ fn command_section(name: &str) -> Option<NavSection> {
         "favorites" | "favourites" | "favorite" | "favourite" => Some(NavSection::Favorites),
         "recent" => Some(NavSection::Recent),
         "radio" => Some(NavSection::Radio),
+        "playlists" => Some(NavSection::Playlists),
         "local" | "localmusic" | "local-music" => Some(NavSection::LocalMusic),
         "lidarr" | "downloads" => Some(NavSection::Lidarr),
         "settings" | "config" => Some(NavSection::Settings),
@@ -686,6 +689,17 @@ impl RootView {
             window,
             |this: &mut Self, _, notice: &PlayerNotice, window, cx| {
                 this.raise_player_notice(notice, window, cx);
+            },
+        )
+        .detach();
+
+        // A duplicated playlist opens once the server has made it.
+        cx.subscribe_in(
+            &playlists,
+            window,
+            |this: &mut Self, _, event: &PlaylistsEvent, window, cx| {
+                let PlaylistsEvent::Duplicated(id) = event;
+                this.open_playlist(id.clone(), window, cx);
             },
         )
         .detach();
@@ -1810,6 +1824,23 @@ impl RootView {
                 self.search_view = Some(view.clone());
                 Content::Search(view)
             }
+            NavSection::Playlists => {
+                let Some(window) = window else {
+                    return; // its events open pages that build text fields
+                };
+                let view = cx
+                    .new(|cx| PlaylistsView::new(self.session.clone(), self.playlists.clone(), cx));
+                cx.subscribe_in(
+                    &view,
+                    window,
+                    |this: &mut Self, _, event, window, cx| match event {
+                        PlaylistsViewEvent::Open(id) => this.open_playlist(id.clone(), window, cx),
+                        PlaylistsViewEvent::New => this.open_new_playlist(window, cx),
+                    },
+                )
+                .detach();
+                Content::Playlists(view)
+            }
             NavSection::Radio => {
                 let Some(window) = window else {
                     return; // radio's add-station form needs a window
@@ -2155,10 +2186,17 @@ impl RootView {
                 cx,
             )
         });
-        cx.subscribe(&view, |this: &mut Self, _, event, cx| {
-            let PlaylistDetailEvent::Deleted = event;
-            this.navigate(NavSection::Albums, None, cx);
-        })
+        cx.subscribe_in(
+            &view,
+            window,
+            |this: &mut Self, _, event, window, cx| match event {
+                PlaylistDetailEvent::Deleted => {
+                    this.navigate(NavSection::Playlists, Some(window), cx)
+                }
+                PlaylistDetailEvent::OpenAlbum(id) => this.open_any_album(id.clone(), cx),
+                PlaylistDetailEvent::OpenArtist(id) => this.open_any_artist(id.clone(), cx),
+            },
+        )
         .detach();
         self.content = Some(Content::Playlist(view));
         cx.notify();
@@ -2606,6 +2644,7 @@ impl RootView {
                 v.update(cx, |v, cx| v.vi_move(delta, window, cx))
             }
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
+            Some(Content::Playlists(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_move(delta, window, cx)),
@@ -2630,6 +2669,7 @@ impl RootView {
             Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::LocalArtistDetail(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
+            Some(Content::Playlists(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_activate(window, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_activate(window, cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_activate(cx)),
@@ -2684,6 +2724,7 @@ impl RootView {
         match &self.content {
             Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
+            Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_insert(window, cx)),
             _ => {}
         }
@@ -2694,6 +2735,7 @@ impl RootView {
         match &self.content {
             Some(Content::Albums(v)) => v.update(cx, |v, cx| v.vi_tab(delta, cx)),
             Some(Content::Search(v)) => v.update(cx, |v, cx| v.vi_tab(delta, cx)),
+            Some(Content::Playlists(v)) => v.update(cx, |v, cx| v.vi_tab(delta, cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_tab(delta, window, cx)),
             _ => {}
         }
@@ -2716,6 +2758,7 @@ impl RootView {
             Some(Content::LocalAlbumDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::LocalArtistDetail(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Playlist(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
+            Some(Content::Playlists(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Radio(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Settings(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
             Some(Content::Recent(v)) => v.update(cx, |v, cx| v.vi_clear(cx)),
@@ -3272,7 +3315,8 @@ impl RootView {
                     cx,
                 ),
             },
-            "albums" | "artists" | "favorites" | "recent" | "radio" | "local" | "settings" => {
+            "albums" | "artists" | "favorites" | "recent" | "radio" | "local" | "settings"
+            | "playlists" => {
                 if let Some(section) = command_section(&cmd) {
                     self.navigate_push(section, window, cx);
                 }
@@ -3330,7 +3374,46 @@ impl RootView {
                         cx,
                     );
                 }
-                _ => self.set_vi_status("Usage: :pl add <name> | :pl list".into(), cx),
+                Some("rename") if args.len() >= 2 => {
+                    let name = args[1..].join(" ");
+                    match &self.content {
+                        Some(Content::Playlist(v)) => {
+                            v.update(cx, |v, cx| v.rename(name.clone(), cx));
+                            self.set_vi_status(format!("Renamed to \"{name}\""), cx);
+                        }
+                        _ => self.set_vi_status("Open a playlist first".into(), cx),
+                    }
+                }
+                Some("dup" | "duplicate") => match &self.content {
+                    Some(Content::Playlist(v)) => {
+                        v.update(cx, |v, cx| v.vi_duplicate(cx));
+                        self.set_vi_status("Duplicating playlist…".into(), cx);
+                    }
+                    _ => self.set_vi_status("Open a playlist first".into(), cx),
+                },
+                Some(which @ ("public" | "private")) => match &self.content {
+                    Some(Content::Playlist(v)) => {
+                        let public = which == "public";
+                        v.update(cx, |v, cx| v.set_public(public, cx));
+                        self.set_vi_status(format!("Playlist is now {which}"), cx);
+                    }
+                    _ => self.set_vi_status("Open a playlist first".into(), cx),
+                },
+                Some("delete") => match &self.content {
+                    Some(Content::Playlist(v)) => {
+                        let id = v.read(cx).playlist_id().to_string();
+                        self.playlists.update(cx, |p, cx| p.delete(id, cx));
+                        self.set_vi_status("Playlist deleted".into(), cx);
+                        self.navigate(NavSection::Playlists, Some(window), cx);
+                    }
+                    _ => self.set_vi_status("Open a playlist first".into(), cx),
+                },
+                None => self.navigate_push(NavSection::Playlists, window, cx),
+                _ => self.set_vi_status(
+                    "Usage: :pl [add <name> | list | rename <name> | dup | public | private | delete]"
+                        .into(),
+                    cx,
+                ),
             },
             _ => {
                 self.set_vi_status(format!("Unknown command: {cmd} - try :help"), cx);
@@ -3769,6 +3852,10 @@ impl RootView {
                                             (":newpl <name>", "Create playlist"),
                                             (":pl add <name>", "Add current song to playlist"),
                                             (":pl list", "List playlists"),
+                                            (":pl", "Open the playlists page"),
+                                            (":pl rename <name>", "Rename the open playlist"),
+                                            (":pl dup / delete", "Duplicate / delete it"),
+                                            (":pl public / private", "Share it or not"),
                                         ],
                                     ))
                                     .child(section(
@@ -4171,6 +4258,7 @@ impl Render for RootView {
             Some(Content::LocalArtistDetail(v)) => v.clone().into_any_element(),
             Some(Content::Favorites(v)) => v.clone().into_any_element(),
             Some(Content::Playlist(v)) => v.clone().into_any_element(),
+            Some(Content::Playlists(v)) => v.clone().into_any_element(),
             Some(Content::Radio(v)) => v.clone().into_any_element(),
             Some(Content::Settings(v)) => v.clone().into_any_element(),
             Some(Content::Recent(v)) => v.clone().into_any_element(),

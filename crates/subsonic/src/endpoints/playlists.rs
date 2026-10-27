@@ -77,6 +77,34 @@ impl SubsonicClient {
         self.get_empty("updatePlaylist", &params).await
     }
 
+    /// Make a playlist visible to every user of the server, or only its owner.
+    pub async fn set_playlist_public(&self, playlist_id: &str, public: bool) -> Result<(), Error> {
+        let public = if public { "true" } else { "false" };
+        self.get_empty(
+            "updatePlaylist",
+            &[("playlistId", playlist_id), ("public", public)],
+        )
+        .await
+    }
+
+    /// Replace a playlist's songs with `song_ids`, in that order.
+    ///
+    /// `updatePlaylist` can only append and remove by index, so a reorder
+    /// through it is two lists that must agree with what the server holds.
+    /// `createPlaylist` with a `playlistId` overwrites the whole list in one
+    /// call instead (Subsonic 1.14+), keeping the name, comment and owner.
+    pub async fn replace_playlist_songs(
+        &self,
+        playlist_id: &str,
+        song_ids: &[&str],
+    ) -> Result<(), Error> {
+        let mut params: Vec<(&str, &str)> = vec![("playlistId", playlist_id)];
+        for id in song_ids {
+            params.push(("songId", id));
+        }
+        self.get_empty("createPlaylist", &params).await
+    }
+
     pub async fn delete_playlist(&self, id: &str) -> Result<(), Error> {
         self.get_empty("deletePlaylist", &[("id", id)]).await
     }
