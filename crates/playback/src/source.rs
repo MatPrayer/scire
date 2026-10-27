@@ -61,6 +61,13 @@ const PREFETCH_FILE: u64 = 256 * 1024;
 /// *duration*, not a size: 256KB of a 128kbps stream is sixteen seconds of
 /// dead air before playback may begin. 32KB is a couple of seconds.
 const PREFETCH_LIVE: u64 = 32 * 1024;
+/// Speed cap for the part of a track downloading ahead of playback. Unpaced,
+/// one track (or the prefetched next one) fills a home server's uplink, and a
+/// seek's ranged requests queue behind it: measured 0.2s to first byte on an
+/// idle link, 1–5s beside a full-speed download, and a FLAC seek near the end
+/// takes several in a row. 1 MiB/s is several times a hi-res FLAC's bitrate,
+/// and whenever the decoder waits on bytes the download runs unpaced.
+const RATE_LIMIT_FILE: u64 = 1024 * 1024;
 /// Cap on fetching a playlist before giving up and trying the URL as a stream.
 const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on establishing the connection for a stream. reqwest has no default, so
@@ -149,10 +156,12 @@ pub(crate) async fn open(
         .map(|ct| format!("{}/{}", ct.r#type, ct.subtype).to_ascii_lowercase());
 
     let content_length = stream.content_length();
-    let settings = Settings::default().prefetch_bytes(match content_length {
-        Some(_) => PREFETCH_FILE,
-        None => PREFETCH_LIVE,
-    });
+    let settings = Settings::default()
+        .prefetch_bytes(match content_length {
+            Some(_) => PREFETCH_FILE,
+            None => PREFETCH_LIVE,
+        })
+        .rate_limit(content_length.map(|_| RATE_LIMIT_FILE));
 
     // ICY details, present only on live streams. `icy-metaint` is the server
     // agreeing to interleave now-playing titles; without it there is nothing to
@@ -286,6 +295,67 @@ pub(crate) async fn open_local(path: &Path) -> Result<Opened, PlaybackError> {
             .and_then(|e| e.to_str())
             .map(|e| Hint::Extension(e.to_ascii_lowercase())),
     })
+}
+
+/// Wraps a decoder that was already seeked, off the audio thread, before it
+/// was appended (see `engine::seek_ahead`).
+///
+/// rodio's player still has to be told where the track stands — its position
+/// counter only moves on a seek it carries out — but carrying one out runs
+/// the decoder's seek again on the audio thread, over the network. The first
+/// seek to the very position already reached is answered here instead.
+pub(crate) struct Preseeked<S> {
+    inner: S,
+    at: Option<Duration>,
+}
+
+impl<S> Preseeked<S> {
+    pub(crate) fn new(inner: S, at: Option<Duration>) -> Self {
+        Self { inner, at }
+    }
+}
+
+impl<S: Source> Iterator for Preseeked<S> {
+    type Item = Sample;
+
+    #[inline]
+    fn next(&mut self) -> Option<Sample> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<S: Source> Source for Preseeked<S> {
+    #[inline]
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+
+    #[inline]
+    fn channels(&self) -> ChannelCount {
+        self.inner.channels()
+    }
+
+    #[inline]
+    fn sample_rate(&self) -> SampleRate {
+        self.inner.sample_rate()
+    }
+
+    #[inline]
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        if self.at.take() == Some(pos) {
+            return Ok(());
+        }
+        self.inner.try_seek(pos)
+    }
 }
 
 /// Wraps a decoder so the engine learns the exact sample at which it runs out.

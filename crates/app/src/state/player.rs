@@ -1333,6 +1333,12 @@ impl PlayerState {
     /// Point the engine's prefetch slot at whatever plays after the current
     /// track (honoring repeat), or clear it.
     fn refresh_prefetch(&mut self, cx: &mut Context<Self>) {
+        // A restored track is still seeking to where it left off: a whole next
+        // track downloading beside it starves the seek's range requests (seen
+        // stretching a 3s resume to 16s). `Playing` asks again once it lands.
+        if self.resume_loading() {
+            return;
+        }
         let next = self.queue.next_pos().and_then(|pos| {
             let song = self.queue.iter_ordered().nth(pos).map(|(_, s)| s)?;
             let duration = song.duration.map(|s| Duration::from_secs(s as u64));
@@ -1356,6 +1362,16 @@ impl PlayerState {
         }
         self.prewarm_next_art(cx);
         self.prewarm_next_waveform(cx);
+    }
+
+    /// The engine has the current track and is still opening it at a restored
+    /// position (`pending_resume` is spent on its `Playing`).
+    fn resume_loading(&self) -> bool {
+        self.engine_has_track
+            && self
+                .pending_resume
+                .as_ref()
+                .is_some_and(|(id, _)| self.current_song().is_some_and(|s| &s.id == id))
     }
 
     /// Queue position the engine actually moved into on a gapless hand-over.
@@ -1414,13 +1430,11 @@ impl PlayerState {
                     self.next_failure_reported = None;
                 }
                 // The restored position went to the engine with the track
-                // (`TrackSource::start_at`); once it has opened, it is spent.
-                if self
-                    .pending_resume
-                    .as_ref()
-                    .is_some_and(|(id, _)| self.current_song().is_some_and(|s| &s.id == id))
-                {
+                // (`TrackSource::start_at`); once it has opened, it is spent,
+                // and the prefetch held back while it loaded can go out.
+                if self.resume_loading() {
                     self.pending_resume = None;
+                    self.refresh_prefetch(cx);
                 }
                 if let Some(c) = &mut self.media_controls {
                     let _ = c.set_playback(MediaPlayback::Playing {
@@ -1430,6 +1444,9 @@ impl PlayerState {
             }
             Event::Paused => {
                 self.playing = false;
+                // A pause can land mid-load (pressed while a seek was still out);
+                // the spinner must not outlive it.
+                self.buffering = false;
                 // Pausing is the likeliest thing to precede a quit; don't wait
                 // for the throttle window to come round.
                 self.persist_resume(true);

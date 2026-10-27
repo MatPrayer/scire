@@ -53,6 +53,7 @@ pub struct Settings<S> {
     pub(crate) batch_write_size: usize,
     pub(crate) retry_timeout: Duration,
     pub(crate) cancel_on_drop: bool,
+    pub(crate) rate_limit: Option<u64>,
     #[educe(Debug = false, PartialEq = false)]
     pub(crate) on_progress: Option<ProgressFn<S>>,
     #[educe(Debug = false, PartialEq = false)]
@@ -66,6 +67,7 @@ impl<S> Default for Settings<S> {
             batch_write_size: 4096,
             retry_timeout: Duration::from_secs(5),
             cancel_on_drop: true,
+            rate_limit: None,
             on_progress: None,
             on_reconnect: None,
         }
@@ -124,6 +126,24 @@ impl<S> Settings<S> {
     pub fn cancel_on_drop(self, cancel_on_drop: bool) -> Self {
         Self {
             cancel_on_drop,
+            ..self
+        }
+    }
+
+    /// LOCAL PATCH (Scire): cap the background download at `bytes_per_sec`.
+    ///
+    /// Only the download running ahead of the reader is paced: the prefetch
+    /// window after the start or a seek runs at full speed, and so does any
+    /// stretch where a reader is waiting on bytes not downloaded yet. What it
+    /// stops is one stream filling a slow uplink with the rest of a file nobody
+    /// is reading yet, which queues every other request — a seek's ranged
+    /// re-request among them — behind it.
+    ///
+    /// The default is `None`, no limit.
+    #[must_use]
+    pub fn rate_limit(self, bytes_per_sec: Option<u64>) -> Self {
+        Self {
+            rate_limit: bytes_per_sec.filter(|r| *r > 0),
             ..self
         }
     }

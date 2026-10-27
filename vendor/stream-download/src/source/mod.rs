@@ -131,6 +131,9 @@ pub(crate) struct Source<S: SourceStream, W: StorageWriter> {
     prefetch_start_position: u64,
     remaining_bytes: Option<Bytes>,
     cancellation_token: CancellationToken,
+    rate_limit: Option<u64>,
+    paced_since: Instant,
+    paced_bytes: u64,
 }
 
 impl<S, W> Source<S, W>
@@ -166,6 +169,9 @@ where
             prefetch_start_position: 0,
             remaining_bytes: None,
             cancellation_token,
+            rate_limit: settings.rate_limit,
+            paced_since: Instant::now(),
+            paced_bytes: 0,
         }
     }
 
@@ -200,13 +206,27 @@ where
         loop {
             // Some streams may get stuck if the connection has a hiccup while waiting for the next
             // chunk. Forcing the client to abort and retry may help in these cases.
-            let next_chunk = timeout(self.retry_timeout, stream.next());
+            let pause = self.pace();
+            let retry_timeout = self.retry_timeout;
+            let chunks = &mut *stream;
+            // A pause reads nothing: once it ends the loop comes round and
+            // asks again, so seeks and cancellation are heard meanwhile.
+            let next_chunk = async move {
+                match pause {
+                    Some(pause) => {
+                        tokio::time::sleep(pause).await;
+                        None
+                    }
+                    None => Some(timeout(retry_timeout, chunks.next()).await),
+                }
+            };
             tokio::select! {
                 position = self.seek_rx.recv() => {
                     // seek_tx can't be dropped here since we keep a reference in this struct
                     self.handle_seek(stream, position.expect("seek_tx dropped")).await?;
                 },
                 bytes = next_chunk => {
+                    let Some(bytes) = bytes else { continue };
                     let Ok(bytes) = bytes else {
                         self.handle_reconnect(stream).await?;
                         continue;
@@ -231,6 +251,34 @@ where
         }
         self.report_download_complete(stream, download_start)?;
         Ok(StreamOutcome::Completed)
+    }
+
+    /// How long to hold off reading the next chunk to stay under the rate
+    /// limit, if at all.
+    ///
+    /// LOCAL PATCH (Scire): see [`Settings::rate_limit`]. Pacing restarts from
+    /// zero whenever it doesn't apply, and when the network has fallen more
+    /// than `MAX_CREDIT` behind the limit — so neither a stretch at full speed
+    /// leaves a debt nor a stall a burst of credit. A pause is capped at
+    /// `MAX_PACE` so a reader that starts waiting meanwhile is answered at
+    /// full speed soon after.
+    fn pace(&mut self) -> Option<Duration> {
+        const MAX_PACE: Duration = Duration::from_millis(100);
+        const MAX_CREDIT: Duration = Duration::from_secs(1);
+        let rate = self.rate_limit?;
+        let due = Duration::from_secs_f64(self.paced_bytes as f64 / rate as f64);
+        let elapsed = self.paced_since.elapsed();
+        if !self.prefetch_complete
+            || self.requested_position.get().is_some()
+            || elapsed > due + MAX_CREDIT
+        {
+            self.paced_since = Instant::now();
+            self.paced_bytes = 0;
+            return None;
+        }
+        due.checked_sub(elapsed)
+            .filter(|d| !d.is_zero())
+            .map(|d| d.min(MAX_PACE))
     }
 
     async fn handle_seek(&mut self, stream: &mut S, position: u64) -> io::Result<()> {
@@ -423,6 +471,9 @@ where
             }
         };
         let bytes_len = bytes.len();
+        if self.rate_limit.is_some() {
+            self.paced_bytes += bytes_len as u64;
+        }
         let new_position = self.write(bytes).await?;
         self.report_downloading_progress(stream, new_position, download_start, bytes_len)?;
 

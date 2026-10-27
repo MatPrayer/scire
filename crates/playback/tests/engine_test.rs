@@ -439,6 +439,77 @@ async fn start_at_begins_at_the_restored_position() {
     );
 }
 
+/// A restored position the server will not deliver in time: every ranged
+/// request stalls past the engine's start-seek deadline. The track must start
+/// from the top instead of holding the player on "buffering" — measured at a
+/// minute and more against a real server stalling range requests.
+///
+/// Not `#[tokio::test]`: the abandoned seek is still blocked on its stream when
+/// the body ends, and dropping a runtime waits for its blocking tasks — while
+/// the download feeding that one is already gone with the runtime.
+#[test]
+fn a_restored_position_out_of_reach_starts_from_the_top() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(restored_position_out_of_reach());
+    rt.shutdown_background();
+}
+
+async fn restored_position_out_of_reach() {
+    if no_audio_output() {
+        return;
+    }
+    let url = slow_range_server(
+        wav_bytes_secs(300),
+        512 * 1024,
+        Duration::from_secs(15),
+        "audio/wav",
+    );
+
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    let asked_at = std::time::Instant::now();
+    player.play(TrackSource {
+        url,
+        duration_hint: Some(Duration::from_secs(300)),
+        path: None,
+        id: Some("stalled-resume".into()),
+        live: false,
+        start_at: Some(Duration::from_secs(250)),
+    });
+
+    let deadline = tokio::time::sleep(Duration::from_secs(25));
+    tokio::pin!(deadline);
+    let mut playing = false;
+    let mut position = None;
+    while position.is_none() {
+        tokio::select! {
+            event = events.recv() => {
+                match event.expect("event channel closed early") {
+                    Event::Playing => playing = true,
+                    Event::Position(p) if playing => position = Some(p),
+                    Event::Failed(msg) => panic!("playback failed: {msg}"),
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => panic!("still loading after {:?}", asked_at.elapsed()),
+        }
+    }
+    let position = position.expect("loop ends on a position");
+    assert!(
+        position < Duration::from_secs(5),
+        "played from {position:?}, not from the top"
+    );
+    assert!(
+        asked_at.elapsed() < Duration::from_secs(15),
+        "took {:?}: waited the stalled seek out",
+        asked_at.elapsed()
+    );
+}
+
 /// An HTTP server that trickles the body after the first `fast_bytes` and
 /// delays every ranged request by `range_delay`. That is what a seek costs
 /// against a real server — the bytes are not downloaded yet, so the decoder has
@@ -755,6 +826,92 @@ fn raw_server(
         }
     });
     (format!("http://{addr}/rest/stream"), rx)
+}
+
+/// The rest of a track downloads behind playback at a capped speed. Unpaced,
+/// a track fills a home server's uplink and every other request — a seek's
+/// ranged re-requests, the next track's prefetch — queues behind it: measured
+/// 0.2s to first byte on an idle link against 1–5s beside a full download.
+///
+/// A ~24MB file over loopback arrives whole in well under a second unpaced;
+/// paced at 1 MiB/s, four seconds after it starts most of it must still be
+/// unsent (allowing for the prefetch window and the socket buffers between).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_track_downloads_ahead_of_playback_at_a_capped_speed() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if no_audio_output() {
+        return;
+    }
+    let body = wav_bytes_secs(1536);
+    let total = body.len();
+    let sent = Arc::new(AtomicUsize::new(0));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let counter = sent.clone();
+    std::thread::spawn(move || {
+        let Some(Ok(mut stream)) = listener.incoming().next() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            if line.trim_end().is_empty() {
+                break;
+            }
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n\
+             Accept-Ranges: bytes\r\nContent-Length: {total}\r\n\r\n"
+        );
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        for chunk in body.chunks(64 * 1024) {
+            if stream.write_all(chunk).is_err() {
+                return;
+            }
+            counter.fetch_add(chunk.len(), Ordering::Relaxed);
+        }
+    });
+
+    let (player, mut events) = Player::new();
+    player.set_volume(0.0);
+    player.play(TrackSource {
+        url: format!("http://{addr}/rest/stream"),
+        duration_hint: Some(Duration::from_secs(1536)),
+        path: None,
+        id: Some("paced-song".into()),
+        live: false,
+        start_at: None,
+    });
+
+    let deadline = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            event = events.recv() => match event.expect("event channel closed early") {
+                Event::Playing => break,
+                Event::Failed(msg) => panic!("playback failed: {msg}"),
+                _ => {}
+            },
+            _ = &mut deadline => panic!("track never started"),
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let after = sent.load(Ordering::Relaxed);
+    player.stop();
+
+    assert!(
+        after < total * 2 / 3,
+        "{after} of {total} bytes sent within four seconds: the download is not paced"
+    );
 }
 
 /// An m4a keeps its index (`moov`) after the audio unless it was written with

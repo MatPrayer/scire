@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use crate::direct::{self, DirectFormat, OpenError, Want};
 #[cfg(target_os = "linux")]
 use crate::pulse;
-use crate::source::{self, EndSignal, Hint, Opened, SourceReader};
+use crate::source::{self, EndSignal, Hint, Opened, Preseeked, SourceReader};
 use crate::spectrum::{SpectrumTap, Tap};
 use crate::{Command, Event, MAX_VOLUME, PlaybackError, TrackSource};
 
@@ -74,6 +74,8 @@ struct Prepared {
     decoded_duration: Option<Duration>,
     /// Set when the source turned out to be a live radio stream.
     station: Option<crate::icy::StationInfo>,
+    /// Where `seek_ahead` already moved the decoder to.
+    preseeked: Option<Duration>,
 }
 
 /// A track that has been appended to the player's queue: either playing now or
@@ -312,11 +314,12 @@ async fn control_loop(
                             &end_tx,
                             &tap,
                             &event_tx,
-                            start_at.is_some(),
+                            false,
+                            start_at,
                         )
                         .await
                         {
-                            Ok((new_sink, loaded, opened)) => {
+                            Ok((new_sink, loaded, opened, preseeked)) => {
                                 if opened {
                                     announce(&output, &target, &direct_error, &mut open_device, &event_tx);
                                 }
@@ -329,8 +332,9 @@ async fn control_loop(
                                 current = Some(loaded);
                                 let new_sink = Arc::new(new_sink);
                                 // Opened paused: the seek landing starts it, so
-                                // the track is first heard at `start_at`.
-                                if let Some(p) = start_at {
+                                // the track is first heard at `start_at`. The
+                                // decoder is already there, so it lands at once.
+                                if let Some(p) = preseeked {
                                     spawn_seek(
                                         &new_sink,
                                         p,
@@ -387,17 +391,18 @@ async fn control_loop(
                                 &end_tx,
                                 &tap,
                                 &event_tx,
-                                pos.is_some(),
+                                false,
+                                pos,
                             )
                             .await
                             {
-                                Ok((new_sink, loaded, opened)) => {
+                                Ok((new_sink, loaded, opened, preseeked)) => {
                                     if opened {
                                         announce(&output, &target, &direct_error, &mut open_device, &event_tx);
                                     }
                                     current = Some(loaded);
                                     let new_sink = Arc::new(new_sink);
-                                    if let Some(p) = pos {
+                                    if let Some(p) = preseeked {
                                         spawn_seek(
                                             &new_sink,
                                             p,
@@ -504,10 +509,11 @@ async fn control_loop(
                                     // track starts at zero, and resuming before the seek
                                     // lands would replay its opening seconds.
                                     !resume || pos.is_some(),
+                                    None,
                                 )
                                 .await
                                 {
-                                    Ok((new_sink, loaded, _)) => {
+                                    Ok((new_sink, loaded, _, _)) => {
                                         current = Some(loaded);
                                         let new_sink = Arc::new(new_sink);
                                         // The reopened track starts at zero, so
@@ -778,10 +784,11 @@ async fn control_loop(
                             // track starts at zero, and resuming before the seek
                             // lands would replay its opening seconds.
                             !resume || pos.is_some(),
+                            None,
                         )
                         .await
                         {
-                            Ok((new_sink, loaded, _)) => {
+                            Ok((new_sink, loaded, _, _)) => {
                                 current = Some(loaded);
                                 let new_sink = Arc::new(new_sink);
                                 if let Some(p) = pos {
@@ -1101,7 +1108,10 @@ fn append(
     // and wrapping it inside `EndSignal` keeps the end-of-track detection on
     // the outermost source where the player pulls from.
     sink.append(EndSignal::new(
-        Tap::new(prepared.decoder, tap.clone()),
+        Tap::new(
+            Preseeked::new(prepared.decoder, prepared.preseeked),
+            tap.clone(),
+        ),
         serial,
         end_tx.clone(),
     ));
@@ -1206,6 +1216,7 @@ async fn build(track: TrackSource, opened: Opened) -> Result<Prepared, PlaybackE
         decoder,
         decoded_duration,
         station,
+        preseeked: None,
     })
 }
 
@@ -1274,8 +1285,27 @@ async fn start_track(
     tap: &Arc<SpectrumTap>,
     event_tx: &mpsc::UnboundedSender<Event>,
     paused: bool,
-) -> Result<(rodio::Player, Loaded, bool), PlaybackError> {
-    let prepared = prepare(track, event_tx).await?;
+    start_at: Option<Duration>,
+) -> Result<(rodio::Player, Loaded, bool, Option<Duration>), PlaybackError> {
+    let retry = start_at.map(|_| track.clone());
+    let mut prepared = prepare(track, event_tx).await?;
+    if let (Some(pos), Some(track)) = (start_at, retry) {
+        prepared = match seek_ahead(prepared, pos).await {
+            Some(p) => p,
+            // The seek is still out on the blocking pool with the decoder it
+            // took; a fresh one from the top beats a spinner with no end.
+            None => {
+                tracing::warn!(
+                    "seek to {pos:?} still running after {START_SEEK_DEADLINE:?}; starting from the top"
+                );
+                prepare(track, event_tx).await?
+            }
+        };
+    }
+    let preseeked = prepared.preseeked;
+    // Paused until the player's own seek to the same spot has landed (at once:
+    // `Preseeked` answers it), so the track is first heard where it was left.
+    let paused = paused || preseeked.is_some();
 
     let mut opened = false;
     if let Some(id) = &target.direct {
@@ -1334,7 +1364,38 @@ async fn start_track(
     if !paused {
         player.play();
     }
-    Ok((player, loaded, opened))
+    Ok((player, loaded, opened, preseeked))
+}
+
+/// How long a restored position may take to reach before the track is started
+/// from the top instead. Seeking far into a file over HTTP is a run of ranged
+/// requests, and a server stalling one of them held the player on "buffering"
+/// for a minute and more.
+const START_SEEK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Move a prepared decoder to `pos` before it is appended, on the blocking pool.
+///
+/// A seek carried out by the player runs on the audio thread, inside the mixer:
+/// a stalled range request there cannot be given up on, and holds every sound
+/// on that output with it. Here it can — `None` once `START_SEEK_DEADLINE`
+/// passes (the decoder stays with the abandoned seek). A seek that fails keeps
+/// the decoder wherever it was left, as a failed seek on the player does.
+async fn seek_ahead(mut prepared: Prepared, pos: Duration) -> Option<Prepared> {
+    let seek = tokio::task::spawn_blocking(move || {
+        let result = rodio::Source::try_seek(&mut prepared.decoder, pos);
+        (prepared, result)
+    });
+    match tokio::time::timeout(START_SEEK_DEADLINE, seek).await {
+        Ok(Ok((mut prepared, Ok(())))) => {
+            prepared.preseeked = Some(pos);
+            Some(prepared)
+        }
+        Ok(Ok((prepared, Err(e)))) => {
+            tracing::warn!("seek to {pos:?} failed: {e}");
+            Some(prepared)
+        }
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 /// Open card `id` for `want`, retrying while it is busy for up to `patience`.
