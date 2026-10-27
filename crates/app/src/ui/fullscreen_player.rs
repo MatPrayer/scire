@@ -2958,6 +2958,11 @@ impl FullscreenPlayer {
             }
             return;
         }
+        // Paint whatever rung is already cached (the grid's or player bar's
+        // copy, usually) while the wanted one loads — offline too. `SharpArt`
+        // holds it until the sharper file is decoded.
+        self.art_path = artwork::cached_best(&key, self.art_want);
+        cx.notify();
         let Some(client) = self.client(cx) else {
             return;
         };

@@ -127,7 +127,9 @@ follows [Semantic Versioning](https://semver.org/).
 - The fullscreen player's cover flashed blank when a sharper copy replaced
   it (a bigger window asking for a larger size): the new image was drawn
   before it was decoded. The old one now stays until the new one is ready;
-  album page covers and their enlarged view likewise when resized.
+  album page covers and their enlarged view likewise when resized. While
+  the sharp copy downloads, the fullscreen player shows a smaller one
+  already in the cache instead of an empty square.
 
 ## [1.6.0] — 2026-10-20
 
