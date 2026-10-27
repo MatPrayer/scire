@@ -2828,9 +2828,10 @@ fn tagged_section(types: &[String]) -> ReleaseSection {
 }
 
 /// What an untagged title says outright: a bracketed "(Live)", "[Live at
-/// Wembley]", "(DJ Mix)", "(Mixed by …)", or a title that opens "Live at",
-/// "Live in", "Live from". A bare trailing "Live" is not enough — "Long Live",
-/// "Love Live" are studio records.
+/// Wembley]", "(DJ Mix)", "(Mixed by …)"; "Live at", "Live @", "Live from"
+/// anywhere, a title opening "Live in"; set-rip words ("B2B", "DJ set",
+/// "Boiler Room", "Essential Mix") file a DJ mix. A bare trailing "Live" is
+/// not enough — "Long Live", "Love Live" are studio records.
 fn titled_section(name: &str) -> Option<ReleaseSection> {
     let lower = name.trim().to_lowercase();
     let bracketed = lower
@@ -2849,10 +2850,30 @@ fn titled_section(name: &str) -> Option<ReleaseSection> {
             return Some(ReleaseSection::Live);
         }
     }
-    ["live at ", "live in ", "live from "]
+    // Words, keeping `@` as one: set rips are titled "Artist LIVE @ Festival".
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '@')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |phrase: &[&str]| words.windows(phrase.len()).any(|w| w == phrase);
+    if [
+        &["b2b"][..],
+        &["dj", "set"],
+        &["boiler", "room"],
+        &["essential", "mix"],
+    ]
+    .iter()
+    .any(|p| has(p))
+    {
+        return Some(ReleaseSection::DjMixes);
+    }
+    // "Live in" only opens a title: "Artist Live in Paris" is rare, "We Live
+    // in Fear" is not.
+    let live = [&["live", "@"][..], &["live", "at"], &["live", "from"]]
         .iter()
-        .any(|p| lower.starts_with(p))
-        .then_some(ReleaseSection::Live)
+        .any(|p| has(p))
+        || words.starts_with(&["live", "in"]);
+    live.then_some(ReleaseSection::Live)
 }
 
 /// A title *ending* in "EP" or "Single" as a word of its own — "Title - EP",
@@ -3107,12 +3128,23 @@ mod tests {
             filed("Global Underground (Mixed by Sasha)"),
             ReleaseSection::DjMixes
         );
+        assert_eq!(
+            filed("SKRILLEX LIVE @ ULTRA MUSIC FESTIVAL 2015"),
+            ReleaseSection::Live
+        );
+        assert_eq!(filed("Artist Live at Red Rocks"), ReleaseSection::Live);
+        assert_eq!(
+            filed("SKRILLEX B2B ISOXO @ NITEHARTS FESTIVAL 2025 ¦ San Diego, CA"),
+            ReleaseSection::DjMixes
+        );
+        assert_eq!(filed("Boiler Room London DJ Set"), ReleaseSection::DjMixes);
         for name in [
             "Long Live",
             "Love Live",
             "Lively",
             "Live Forever",
             "Delivered (Deluxe)",
+            "We Live in Fear",
         ] {
             assert_eq!(filed(name), ReleaseSection::Albums, "{name}");
         }

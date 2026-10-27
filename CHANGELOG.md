@@ -46,6 +46,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Untagged live sets were filed under an artist's Albums when the title said
+  so only mid-title ("Artist LIVE @ Festival"); "Live @", "Live at" and
+  "Live from" anywhere now file them under Live albums, and set-rip words
+  ("B2B", "DJ set", "Boiler Room", "Essential Mix") under DJ mixes.
 - A re-tag that only changed genres was never picked up by the background
   sync, which looked at track counts and lengths alone; it now compares each
   album's genres too.
