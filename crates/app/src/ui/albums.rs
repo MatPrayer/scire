@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -204,10 +204,17 @@ pub(crate) fn album_from_row(row: AlbumRow) -> Album {
 /// Merge a freshly-fetched page into a tab's display list.
 ///
 /// Normally an append. While the tab still holds placeholders seeded from the
-/// last sync, the page *overwrites* them from the front instead: the row count
-/// stays put, so the scrollbar doesn't jump under the user while live pages
-/// stream in. Once the server's list ends, any cached tail (albums deleted
-/// server-side since the sync) is dropped.
+/// last sync, the page *replaces* them instead: the row count stays put, so the
+/// scrollbar doesn't jump under the user while live pages stream in. Once the
+/// server's list ends, any cached tail (albums deleted server-side since the
+/// sync) is dropped.
+///
+/// Replacement goes by id, not position: the cache's order only approximates
+/// the server's (Navidrome folds accents and skips leading articles, SQLite's
+/// `NOCASE` does neither), so the cached rows at the write cursor may be other
+/// albums than the page — overwriting by position left the page's own albums
+/// further down the tail, drawn twice. Only page albums the cache doesn't hold
+/// (new since the sync) displace rows from the front of the tail.
 ///
 /// `state.exhausted` must already be set for this page.
 fn apply_live_page(state: &mut TabState, page: &[Album]) {
@@ -216,9 +223,17 @@ fn apply_live_page(state: &mut TabState, page: &[Album]) {
         state.albums.extend_from_slice(page);
         return;
     }
-    let start = state.live_len;
-    let end = (start + page.len()).min(state.albums.len());
-    state.albums.splice(start..end, page.iter().cloned());
+    let tail = state.albums.split_off(state.live_len);
+    let page_ids: HashSet<&str> = page.iter().map(|a| a.id.as_str()).collect();
+    let held = tail.len();
+    let mut tail: Vec<Album> = tail
+        .into_iter()
+        .filter(|a| !page_ids.contains(a.id.as_str()))
+        .collect();
+    let unmatched = page.len().saturating_sub(held - tail.len());
+    tail.drain(..unmatched.min(tail.len()));
+    state.albums.extend_from_slice(page);
+    state.albums.extend(tail);
     state.live_len += page.len();
     if state.exhausted {
         state.albums.truncate(state.live_len);
@@ -2398,6 +2413,18 @@ mod tests {
         assert_eq!(ids(&state), ["l0", "l1", "c2", "c3", "c4", "c5"]);
         apply_live_page(&mut state, &[album("l2"), album("l3")]);
         assert_eq!(ids(&state), ["l0", "l1", "l2", "l3", "c4", "c5"]);
+        assert!(state.cached);
+    }
+
+    #[test]
+    fn live_pages_replace_their_own_cached_rows_when_orders_differ() {
+        // Cache sorted "c2" earlier than the server does (an accented or
+        // article-led title): the page's albums sit further down the tail.
+        let mut state = seeded(6);
+        apply_live_page(&mut state, &[album("c0"), album("c1"), album("c3")]);
+        assert_eq!(ids(&state), ["c0", "c1", "c3", "c2", "c4", "c5"]);
+        apply_live_page(&mut state, &[album("c4"), album("c2")]);
+        assert_eq!(ids(&state), ["c0", "c1", "c3", "c4", "c2", "c5"]);
         assert!(state.cached);
     }
 

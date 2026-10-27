@@ -85,6 +85,11 @@ follows [Semantic Versioning](https://semver.org/).
 - The radio page's error line stayed after the next add, delete or reload
   succeeded; it now clears when a new one starts. The add form checks the
   stream URL (http:// or https://) before sending it to the server.
+- The album grid could show a run of albums twice after a sync, most visibly
+  on a large or freshly imported library. The grid paints the cached albums
+  first and swaps in the server's pages as they arrive, but the cache sorts
+  titles differently from Navidrome (which folds accents and skips leading
+  articles), and the swap went by position; it now goes by album.
 
 ## [1.6.0] — 2026-10-20
 
