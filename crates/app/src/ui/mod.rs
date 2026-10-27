@@ -702,22 +702,32 @@ pub fn lightbox_art_px(window: &Window) -> f32 {
 /// Art for a slot much smaller than the file: swaps in a CPU-downscaled copy
 /// at the slot's device-pixel size once it is ready (`artwork::display_copy`
 /// says why). Draws the source meanwhile, and when no copy is worth making.
+///
+/// A path gpui hasn't decoded yet draws nothing until it has, so a new source
+/// or edge (a larger rung landing, a resize) would blank the slot for a frame
+/// or two — twice, once for the source and again for its copy. Until the path
+/// it wants is decoded, the last one that was keeps being drawn; [`Self::forget`]
+/// drops it when the slot moves on to different art.
 #[derive(Default)]
 pub struct SharpArt {
     /// Source and edge the copy (or the job in flight) is for.
     want: Option<(PathBuf, u32)>,
     /// Filled by the job; shared because it lands outside the view's borrow.
+    /// `None` while the job runs, then the copy — or the source, when no copy
+    /// is worth making.
     copy: Rc<std::cell::RefCell<Option<PathBuf>>>,
+    /// Last path handed out that gpui had decoded.
+    shown: Option<PathBuf>,
 }
 
 impl SharpArt {
     /// Path to draw `source` with in a slot `logical_px` wide. Call from
-    /// `render`; notifies the view when the copy lands.
+    /// `render`; notifies the view when the copy lands and when it is decoded.
     pub fn path<V: 'static>(
         &mut self,
         source: &std::path::Path,
         logical_px: f32,
-        window: &Window,
+        window: &mut Window,
         cx: &mut gpui::Context<V>,
     ) -> PathBuf {
         // As gpui paints it: layout rounds the logical size, the sprite's
@@ -736,20 +746,43 @@ impl SharpArt {
                 let cell = self.copy.clone();
                 let source = source.to_path_buf();
                 cx.spawn(async move |this, cx| {
-                    let Some(copy) = crate::services::artwork::display_copy(&source, edge).await
-                    else {
-                        return;
-                    };
+                    let copy = crate::services::artwork::display_copy(&source, edge)
+                        .await
+                        .unwrap_or(source);
                     *cell.borrow_mut() = Some(copy);
                     let _ = this.update(cx, |_, cx| cx.notify());
                 })
                 .detach();
             }
         }
-        self.copy
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| source.to_path_buf())
+        let ready = self.copy.borrow().clone();
+        let candidate = match (ready, &self.shown) {
+            (Some(path), _) => path,
+            // Copy still being made: keep what is on screen rather than
+            // decoding the full-size source for the few frames it takes.
+            (None, Some(shown)) => return shown.clone(),
+            (None, None) => source.to_path_buf(),
+        };
+        if self.shown.as_ref() == Some(&candidate) {
+            return candidate;
+        }
+        // Starts the decode if it hasn't begun; notifies the view when done.
+        let resource = gpui::Resource::Path(candidate.as_path().into());
+        match window.use_asset::<gpui::ImgResourceLoader>(&resource, cx) {
+            Some(Ok(_)) => {
+                self.shown = Some(candidate.clone());
+                candidate
+            }
+            // Not decoded yet: hold the previous image while it is.
+            None if let Some(shown) = &self.shown => shown.clone(),
+            // Nothing to hold, or the file is broken: let `img` handle it.
+            _ => candidate,
+        }
+    }
+
+    /// The slot now shows other art: stop holding the previous image.
+    pub fn forget(&mut self) {
+        self.shown = None;
     }
 }
 

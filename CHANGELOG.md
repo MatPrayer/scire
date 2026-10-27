@@ -99,6 +99,10 @@ follows [Semantic Versioning](https://semver.org/).
   first and swaps in the server's pages as they arrive, but the cache sorts
   titles differently from Navidrome (which folds accents and skips leading
   articles), and the swap went by position; it now goes by album.
+- The fullscreen player's cover flashed blank when a sharper copy replaced
+  it (a bigger window asking for a larger size): the new image was drawn
+  before it was decoded. The old one now stays until the new one is ready;
+  album page covers and their enlarged view likewise when resized.
 
 ## [1.6.0] — 2026-10-20
 

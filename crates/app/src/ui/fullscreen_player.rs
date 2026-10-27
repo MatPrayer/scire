@@ -1478,6 +1478,8 @@ impl FullscreenPlayer {
                 this.last_art_key = key;
                 this.art_rung = 0;
                 this.art_path = None;
+                this.sharp_art.forget();
+                this.sharp_thumb.forget();
                 this.bg_art_path = None;
                 this.gradient_palette = None;
                 if let Some((cover_id, key)) = cover {
