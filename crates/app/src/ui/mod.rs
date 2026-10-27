@@ -1613,18 +1613,34 @@ pub fn seek_hover_wrap(
 
 /// Continuous filled waveform seek bar: a symmetric amplitude envelope built
 /// as a single polygon per region (played / remaining) painted on a canvas.
-/// Click seeks the player to the fraction under the cursor.
+/// Click seeks the player to the fraction under the cursor. With `drag`, a
+/// press instead grabs the played edge: it follows the pointer (anywhere in
+/// the window) and the one seek happens on release — a remote seek can take
+/// seconds, so one per mouse move would queue them up.
+///
+/// `id` keys the drag state; every bar on screen at once needs its own.
+#[allow(clippy::too_many_arguments)]
 pub fn waveform_seek_bar(
+    id: &'static str,
     peaks: &[f32],
     fraction: f32,
     height: f32,
     played_color: gpui::Hsla,
     rest_color: gpui::Hsla,
+    drag: bool,
     player: gpui::Entity<crate::state::player::PlayerState>,
 ) -> gpui::AnyElement {
-    use gpui::{MouseButton, div, prelude::*, px};
-    use std::cell::Cell;
+    use gpui::{MouseButton, MouseMoveEvent, MouseUpEvent, div, prelude::*, px};
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+
+    /// Where a held press has dragged the played edge, if one is held.
+    type Grab = gpui::Entity<Option<f32>>;
+
+    fn fraction_at(bounds: gpui::Bounds<gpui::Pixels>, x: gpui::Pixels) -> Option<f32> {
+        let w = f32::from(bounds.size.width);
+        (w > 0.).then(|| ((f32::from(x) - f32::from(bounds.origin.x)) / w).clamp(0., 1.))
+    }
 
     let peaks: Rc<Vec<f32>> = Rc::new(peaks.to_vec());
     // Canvas bounds captured at paint time so the click handler can map the
@@ -1632,6 +1648,20 @@ pub fn waveform_seek_bar(
     let bounds_cell: Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>> = Rc::new(Cell::new(None));
     let bounds_for_paint = bounds_cell.clone();
     let bounds_for_click = bounds_cell.clone();
+    // The drag state lives in element state (it must outlive this frame's
+    // element); the canvas fetches it, the press handler reads it from here.
+    let grab_cell: Rc<RefCell<Option<Grab>>> = Rc::new(RefCell::new(None));
+    let grab_for_paint = grab_cell.clone();
+    let grab_for_click = grab_cell;
+    let seek_player = player;
+    let seek = move |target: f32, cx: &mut gpui::App| {
+        seek_player.update(cx, |player, _| {
+            if let Some(total) = player.duration {
+                player.seek(seek_position(total, target));
+            }
+        });
+    };
+    let seek_on_release = seek.clone();
 
     // Build the envelope polygon for buckets [from, to): across the top edge,
     // then back along the mirrored bottom edge.
@@ -1678,31 +1708,75 @@ pub fn waveform_seek_bar(
         .on_mouse_down(
             MouseButton::Left,
             move |event: &gpui::MouseDownEvent, _, cx| {
-                let Some(bounds) = bounds_for_click.get() else {
+                let Some(target) = bounds_for_click
+                    .get()
+                    .and_then(|b| fraction_at(b, event.position.x))
+                else {
                     return;
                 };
-                let w = f32::from(bounds.size.width);
-                if w <= 0. {
-                    return;
+                match grab_for_click.borrow().as_ref() {
+                    Some(grab) => grab.update(cx, |held, cx| {
+                        *held = Some(target);
+                        cx.notify();
+                    }),
+                    None => seek(target, cx),
                 }
-                let x = f32::from(event.position.x) - f32::from(bounds.origin.x);
-                let target = (x / w).clamp(0., 1.);
-                player.update(cx, |player, _| {
-                    if let Some(total) = player.duration {
-                        player.seek(seek_position(total, target));
-                    }
-                });
             },
         )
         .child(
             gpui::canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
+                move |_, window, cx| {
+                    drag.then(|| window.use_keyed_state(id, cx, |_, _| None::<f32>))
+                },
+                move |bounds, grab: Option<Grab>, window, cx| {
                     bounds_for_paint.set(Some(bounds));
+                    *grab_for_paint.borrow_mut() = grab.clone();
+                    let held = grab.as_ref().and_then(|g| *g.read(cx));
+                    if let Some(grab) = grab {
+                        // Window-wide, so the drag survives the pointer
+                        // leaving the bar. A move with the button up means
+                        // the release happened outside the window.
+                        let on_move = grab.clone();
+                        let seek_on_move = seek_on_release.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if !phase.bubble() || on_move.read(cx).is_none() {
+                                return;
+                            }
+                            if event.dragging() {
+                                if let Some(target) = fraction_at(bounds, event.position.x) {
+                                    on_move.update(cx, |held, cx| {
+                                        if *held != Some(target) {
+                                            *held = Some(target);
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            } else if let Some(target) = on_move.update(cx, |held, cx| {
+                                cx.notify();
+                                held.take()
+                            }) {
+                                seek_on_move(target, cx);
+                            }
+                        });
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if !phase.bubble() || event.button != MouseButton::Left {
+                                return;
+                            }
+                            let Some(held) = grab.update(cx, |held, cx| {
+                                cx.notify();
+                                held.take()
+                            }) else {
+                                return;
+                            };
+                            let target = fraction_at(bounds, event.position.x).unwrap_or(held);
+                            seek_on_release(target, cx);
+                        });
+                    }
                     let n = peaks.len();
                     if n == 0 {
                         return;
                     }
+                    let fraction = held.unwrap_or(fraction);
                     let split = ((fraction.clamp(0., 1.) * n as f32).round() as usize).min(n);
                     if let Some(path) = envelope(&peaks, split, n, bounds) {
                         window.paint_path(path, rest_color);

@@ -3378,6 +3378,7 @@ impl Render for FullscreenPlayer {
             _ => 0.,
         };
         let waveform_enabled = self.session.read(cx).settings.waveform_seekbar;
+        let waveform_drag = self.session.read(cx).settings.waveform_drag;
         let show_volume = self.session.read(cx).settings.fullscreen_volume;
         let detailed_volume = self.session.read(cx).settings.detailed_volume;
         // The handle's own position, not the amplitude: the slider is tapered,
@@ -3818,6 +3819,7 @@ impl Render for FullscreenPlayer {
                                                 ) {
                                                     (true, Some(peaks)) => {
                                                         crate::ui::waveform_seek_bar(
+                                                            "fs-mini-waveform",
                                                             &peaks,
                                                             seek_fraction,
                                                             22.,
@@ -3825,6 +3827,7 @@ impl Render for FullscreenPlayer {
                                                             cx.theme()
                                                                 .muted_foreground
                                                                 .opacity(0.35),
+                                                            waveform_drag,
                                                             self.player.clone(),
                                                         )
                                                     }
@@ -4166,11 +4169,13 @@ impl Render for FullscreenPlayer {
                                             match (waveform_enabled, self.waveform.peaks.clone()) {
                                                 (true, Some(peaks)) => {
                                                     crate::ui::waveform_seek_bar(
+                                                        "fs-waveform",
                                                         &peaks,
                                                         seek_fraction,
                                                         34.,
                                                         cx.theme().primary,
                                                         cx.theme().muted_foreground.opacity(0.35),
+                                                        waveform_drag,
                                                         self.player.clone(),
                                                     )
                                                 }

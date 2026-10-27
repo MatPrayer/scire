@@ -23,6 +23,9 @@ follows [Semantic Versioning](https://semver.org/).
   off, and pressing play after it gives up tunes in again.
 - Radio stations can be edited (pencil button on the row: name, stream URL,
   homepage) and carry a homepage, opened from a globe button on the row.
+- The waveform seek bar can be dragged (*Settings → Player bar → Drag the
+  waveform*, shown while the waveform bar is on): the played region follows
+  the pointer and the seek happens on release.
 
 ### Changed
 

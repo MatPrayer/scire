@@ -502,6 +502,7 @@ impl Render for PlayerBar {
         }
 
         let waveform_enabled = self.session.read(cx).settings.waveform_seekbar;
+        let waveform_drag = self.session.read(cx).settings.waveform_drag;
 
         let time_now = format_duration(position);
         let time_total = duration
@@ -899,11 +900,13 @@ impl Render for PlayerBar {
                                     let bar = match (waveform_enabled, self.waveform.peaks.clone())
                                     {
                                         (true, Some(peaks)) => crate::ui::waveform_seek_bar(
+                                            "bar-waveform",
                                             &peaks,
                                             seek_fraction,
                                             wave_h,
                                             cx.theme().primary,
                                             cx.theme().muted_foreground.opacity(0.35),
+                                            waveform_drag,
                                             self.player.clone(),
                                         ),
                                         _ => div()

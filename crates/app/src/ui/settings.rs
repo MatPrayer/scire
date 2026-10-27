@@ -526,6 +526,7 @@ enum SettingsSwitch {
     ResumePlayback,
     DefaultShuffle,
     WaveformSeekbar,
+    WaveformDrag,
     StreamInfoBar,
     DetailedVolume,
     ShowQueueButton,
@@ -1720,6 +1721,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn set_waveform_drag(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |s, _| s.settings.waveform_drag = enabled);
+        self.persist(cx);
+        cx.notify();
+    }
+
     fn set_stream_info(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.session
             .update(cx, |s, _| s.settings.stream_info_bar = enabled);
@@ -1950,6 +1958,7 @@ impl SettingsView {
             SettingsSwitch::ResumePlayback => s.resume_playback,
             SettingsSwitch::DefaultShuffle => s.default_shuffle,
             SettingsSwitch::WaveformSeekbar => s.waveform_seekbar,
+            SettingsSwitch::WaveformDrag => s.waveform_drag,
             SettingsSwitch::StreamInfoBar => s.stream_info_bar,
             SettingsSwitch::DetailedVolume => s.detailed_volume,
             SettingsSwitch::ShowQueueButton => s.show_queue_button,
@@ -1980,6 +1989,8 @@ impl SettingsView {
             // The docked bar is opaque either way — there is no card to see
             // through.
             SettingsSwitch::PlayerBarTranslucent => s.player_bar_style != PlayerBarStyle::Floating,
+            // The slider drags already; only the waveform needs the choice.
+            SettingsSwitch::WaveformDrag => !s.waveform_seekbar,
             // Only the side-panel layout has two columns to swap.
             SettingsSwitch::AlbumPanelRight => !s.album_layout.wants_side_panel(),
             SettingsSwitch::SelectionGlowAlbumColor => {
@@ -2057,6 +2068,7 @@ impl SettingsView {
             SettingsSwitch::ResumePlayback => self.set_resume_playback(value, cx),
             SettingsSwitch::DefaultShuffle => self.set_default_shuffle(value, cx),
             SettingsSwitch::WaveformSeekbar => self.set_waveform(value, cx),
+            SettingsSwitch::WaveformDrag => self.set_waveform_drag(value, cx),
             SettingsSwitch::StreamInfoBar => self.set_stream_info(value, cx),
             SettingsSwitch::DetailedVolume => self.set_detailed_volume(value, cx),
             SettingsSwitch::ShowQueueButton => self.set_show_queue_button(value, cx),
@@ -3067,6 +3079,8 @@ impl Render for SettingsView {
         let hide_idle_player_bar = self.session.read(cx).settings.hide_idle_player_bar;
         let player_bar_style = self.session.read(cx).settings.player_bar_style;
         let player_bar_tint = self.session.read(cx).settings.player_bar_tint;
+        let waveform_drag = self.session.read(cx).settings.waveform_drag;
+        let waveform_drag_disabled = self.switch_disabled(SettingsSwitch::WaveformDrag, cx);
         let tint_disabled = self.switch_disabled(SettingsSwitch::PlayerBarTint, cx);
         let player_bar_translucent = self.session.read(cx).settings.player_bar_translucent;
         let translucent_disabled = self.switch_disabled(SettingsSwitch::PlayerBarTranslucent, cx);
@@ -3691,6 +3705,15 @@ impl Render for SettingsView {
                 false,
                 "Waveform progress bar",
                 None,
+                cx,
+            ),
+            self.switch_row(
+                SettingsSwitch::WaveformDrag,
+                "waveform-drag",
+                waveform_drag,
+                waveform_drag_disabled,
+                "Drag the waveform",
+                Some("Seeks on release"),
                 cx,
             ),
             self.switch_row(

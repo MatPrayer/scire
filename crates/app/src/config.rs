@@ -245,6 +245,9 @@ pub struct Settings {
     /// Render the seek bar as the track's waveform (downloads remote tracks a
     /// second time or reads local tracks to decode them).
     pub waveform_seekbar: bool,
+    /// Let the waveform seek bar be dragged: the played region follows the
+    /// pointer and the seek happens on release. Off, a press seeks at once.
+    pub waveform_drag: bool,
     /// Show format/bitrate/sample-rate of the current track in the player bar.
     pub stream_info_bar: bool,
     /// Show a precise percentage readout next to the volume slider.
@@ -1117,6 +1120,7 @@ impl Default for Settings {
                 ..Default::default()
             },
             waveform_seekbar: false,
+            waveform_drag: false,
             stream_info_bar: false,
             detailed_volume: false,
             show_queue_button: true,
