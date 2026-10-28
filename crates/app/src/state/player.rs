@@ -28,11 +28,16 @@ const MAX_FAILED_STREAK: usize = 5;
 /// reconnect attempts over.
 const RADIO_STABLE: Duration = Duration::from_secs(30);
 
+/// Waits before each reconnect attempt to a dropped station, in seconds.
+const RADIO_RECONNECT_DELAYS: [u64; 5] = [1, 3, 5, 10, 20];
+
+/// How many times a dropped station is reopened before it is given up.
+pub const RADIO_RECONNECT_ATTEMPTS: u32 = RADIO_RECONNECT_DELAYS.len() as u32;
+
 /// Wait before reconnect attempt `attempt` (0-based) to a dropped station, or
 /// `None` once the attempts are spent.
 fn radio_reconnect_delay(attempt: u32) -> Option<Duration> {
-    const DELAYS: [u64; 5] = [1, 3, 5, 10, 20];
-    DELAYS
+    RADIO_RECONNECT_DELAYS
         .get(attempt as usize)
         .map(|&secs| Duration::from_secs(secs))
 }
@@ -451,9 +456,17 @@ impl PlayerState {
         self.radio_title.is_some()
     }
 
-    /// The station's name as bookmarked, while radio is playing.
-    pub fn radio_station_name(&self) -> Option<&str> {
-        self.radio_title.as_deref()
+    /// The live station's stream URL — what identifies it among bookmarks
+    /// (two stations may share a name, never a stream).
+    pub fn radio_stream_url(&self) -> Option<&str> {
+        self.radio_url.as_deref()
+    }
+
+    /// Which reconnect attempt the dropped station is on, while one is
+    /// waiting or opening; `None` while it plays (or isn't radio).
+    pub fn radio_reconnect_attempt(&self) -> Option<u32> {
+        (self.is_radio() && self.buffering && self.radio_reconnects > 0)
+            .then_some(self.radio_reconnects)
     }
 
     /// The station's current track, split into `(artist, title)`.

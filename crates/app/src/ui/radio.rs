@@ -1,16 +1,20 @@
 //! Internet radio: station list, play, add, edit, delete.
 
+use std::time::Duration;
+
 use gpui::{
-    App, Context, Entity, Focusable as _, IntoElement, Render, Window, div, prelude::*, px,
+    Animation, AnimationExt as _, App, Context, Entity, Focusable as _, IntoElement, Render,
+    Window, div, prelude::*, pulsating_between, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    StyledExt as _, h_flex, v_flex,
 };
 
 use crate::assets::{app_icon, icons};
-use crate::state::player::PlayerState;
+use crate::state::player::{PlayerState, RADIO_RECONNECT_ATTEMPTS};
 use crate::state::radio::RadioState;
 use crate::state::session::Session;
 use crate::ui::with_focus_cursor;
@@ -58,28 +62,91 @@ fn validate_station(name: &str, url: &str, homepage: &str) -> Result<StationForm
     })
 }
 
-/// What the radio page draws out of the player: the live station's name, and
-/// the track it announced.
-///
-/// Match on the station, not on `now_playing()`: once the station announces a
-/// track, that title is the track's, not the station's.
-fn player_signature(
-    player: &Entity<PlayerState>,
-    cx: &gpui::App,
-) -> (Option<String>, Option<String>) {
-    let p = player.read(cx);
-    let station = p.radio_station_name().map(str::to_string);
-    let track = p.radio_now_playing().map(|(artist, title)| match artist {
-        Some(artist) => format!("{artist} — {title}"),
-        None => title,
-    });
-    (station, track)
+/// How long a first press on a station's Delete stays armed.
+const DELETE_ARM: Duration = Duration::from_secs(4);
+
+/// What the radio page draws out of the player: which station is live, what
+/// it says is on, and how the stream is doing. Everything else the player
+/// reports — position above all — changes nothing here.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Live {
+    /// Stream URL of the live station. Rows match on it, not on the name:
+    /// two bookmarks may share a name, and the announced track title is not
+    /// the station's.
+    url: Option<String>,
+    track: Option<String>,
+    playing: bool,
+    buffering: bool,
+    reconnect: Option<u32>,
+}
+
+impl Live {
+    fn read(player: &Entity<PlayerState>, cx: &App) -> Self {
+        let p = player.read(cx);
+        Self {
+            url: p.radio_stream_url().map(str::to_string),
+            track: p.radio_now_playing().map(|(artist, title)| match artist {
+                Some(artist) => format!("{artist} — {title}"),
+                None => title,
+            }),
+            playing: p.playing,
+            buffering: p.buffering,
+            reconnect: p.radio_reconnect_attempt(),
+        }
+    }
+}
+
+/// How a station row reads while it is the live one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RowStatus {
+    Connecting,
+    Reconnecting(u32),
+    OnAir,
+    Paused,
+}
+
+/// The row's status, or `None` when `stream_url` is not the live station.
+fn row_status(live: &Live, stream_url: &str) -> Option<RowStatus> {
+    if live.url.as_deref() != Some(stream_url) {
+        return None;
+    }
+    Some(match live.reconnect {
+        Some(attempt) => RowStatus::Reconnecting(attempt),
+        None if live.buffering => RowStatus::Connecting,
+        None if live.playing => RowStatus::OnAir,
+        None => RowStatus::Paused,
+    })
+}
+
+/// The row's second line: the stream's state while it isn't simply on air,
+/// else what the station announced, else its URL.
+fn row_detail(status: Option<RowStatus>, track: Option<&str>, stream_url: &str) -> String {
+    match status {
+        Some(RowStatus::Connecting) => "Connecting…".into(),
+        Some(RowStatus::Reconnecting(attempt)) => {
+            format!("Signal lost — reconnecting ({attempt}/{RADIO_RECONNECT_ATTEMPTS})…")
+        }
+        Some(RowStatus::Paused) => {
+            track.map_or_else(|| "Paused".into(), |t| format!("Paused · {t}"))
+        }
+        Some(RowStatus::OnAir) => track.unwrap_or(stream_url).to_string(),
+        None => stream_url.to_string(),
+    }
+}
+
+/// "1 station" / "4 stations".
+fn station_count_label(n: usize) -> String {
+    if n == 1 {
+        "1 station".into()
+    } else {
+        format!("{n} stations")
+    }
 }
 
 pub struct RadioView {
     radio: Entity<RadioState>,
     player: Entity<PlayerState>,
-    /// Read for one thing: whether the vi cursor glows.
+    /// Read for the vi cursor's glow and whether a server is connected.
     session: Entity<Session>,
     name_input: Entity<InputState>,
     url_input: Entity<InputState>,
@@ -88,10 +155,15 @@ pub struct RadioView {
     editing: Option<String>,
     /// Why the form was not sent, shown under it until the next submit.
     form_error: Option<&'static str>,
-    /// The two things this view draws out of the player: which station is
-    /// live, and what it says is on. Everything else the player reports —
-    /// position above all — changes nothing here.
-    playing: (Option<String>, Option<String>),
+    /// The form went to the server and hasn't been answered. What was typed
+    /// stays until the server takes it, so a failed save loses nothing.
+    saving: bool,
+    /// Station whose Delete was pressed once; a second press deletes. The
+    /// counter keeps an older arm's timer from disarming a newer one.
+    delete_armed: Option<String>,
+    delete_arm_generation: u64,
+    /// Kept in step by the player observer rather than re-read in `render`.
+    live: Live,
     /// Station row / form input index under the vi-mode cursor. Flattened:
     /// station rows 0..n, then name, url and homepage inputs, the Add/Save
     /// button, and Cancel while editing.
@@ -107,21 +179,41 @@ impl RadioView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&radio, |_, _, cx| cx.notify()).detach();
+        // Going offline hides the form: a cursor on one of its targets
+        // would sit on nothing while Enter still fired.
+        cx.observe(&session, |this: &mut Self, _, cx| {
+            let count = this.station_count(cx) + this.form_targets(cx);
+            if this.vi_cursor.is_some_and(|i| i >= count) {
+                this.vi_cursor = None;
+            }
+            cx.notify();
+        })
+        .detach();
         // PlayerState notifies on every event, position ticks included; only a
-        // change to the live station or its announced track shows up here.
+        // change to what `Live` holds shows up here.
         cx.observe(&player, |this: &mut Self, player, cx| {
-            let now = player_signature(&player, cx);
-            if now != this.playing {
-                this.playing = now;
+            let now = Live::read(&player, cx);
+            if now != this.live {
+                this.live = now;
                 cx.notify();
             }
         })
         .detach();
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Station name"));
-        let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("Stream URL"));
+        let url_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Stream URL (https://…)"));
         let homepage_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Homepage (optional)"));
-        let playing = player_signature(&player, cx);
+        // Enter in any field sends the form, as the Add/Save button does.
+        for input in [&name_input, &url_input, &homepage_input] {
+            cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit(window, cx);
+                }
+            })
+            .detach();
+        }
+        let live = Live::read(&player, cx);
         Self {
             radio,
             player,
@@ -131,13 +223,20 @@ impl RadioView {
             homepage_input,
             editing: None,
             form_error: None,
-            playing,
+            saving: false,
+            delete_armed: None,
+            delete_arm_generation: 0,
+            live,
             vi_cursor: None,
         }
     }
 
-    /// Send the form: add a station, or save the one being edited.
+    /// Send the form: add a station, or save the one being edited. The form
+    /// empties only once the server has taken it.
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
         let field =
             |input: &Entity<InputState>, cx: &App| input.read(cx).value().trim().to_string();
         let (name, url, homepage) = (
@@ -153,12 +252,28 @@ impl RadioView {
                 return;
             }
         };
-        let editing = self.editing.take();
-        self.radio.update(cx, |r, cx| match editing {
+        self.form_error = None;
+        self.saving = true;
+        let editing = self.editing.clone();
+        let sent = editing.clone();
+        let task = self.radio.update(cx, |r, cx| match sent {
             Some(id) => r.update(id, form.name, form.stream_url, form.homepage_url, cx),
             None => r.create(form.name, form.stream_url, form.homepage_url, cx),
         });
-        self.reset_form(window, cx);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let saved = task.await;
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.saving = false;
+                // Only the form that was sent: Edit on another station while
+                // this was out has put something else in the fields.
+                if saved && view.editing == editing {
+                    view.reset_form(window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Load station `i` into the form for editing.
@@ -189,17 +304,61 @@ impl RadioView {
         cx.notify();
     }
 
-    fn delete_station(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        // Saving an edit to a station that is gone would fail on the server.
-        if self.editing.as_deref() == Some(id.as_str()) {
-            self.reset_form(window, cx);
+    /// First press arms, second deletes; the arm lapses after `DELETE_ARM`.
+    fn press_delete(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.delete_armed.as_deref() == Some(id.as_str()) {
+            self.delete_armed = None;
+            // Saving an edit to a station that is gone would fail on the server.
+            if self.editing.as_deref() == Some(id.as_str()) {
+                self.reset_form(window, cx);
+            }
+            self.radio.update(cx, |r, cx| r.delete(id, cx)).detach();
+            cx.notify();
+            return;
         }
-        self.radio.update(cx, |r, cx| r.delete(id, cx));
+        self.delete_armed = Some(id);
+        self.delete_arm_generation += 1;
+        let generation = self.delete_arm_generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DELETE_ARM).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.delete_arm_generation == generation {
+                    view.delete_armed = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A click (or Enter) on station `i`: tune in, or — on the station
+    /// already live — pause/resume it instead of starting it over.
+    fn press_station(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some((name, url)) = self
+            .radio
+            .read(cx)
+            .stations
+            .get(i)
+            .map(|s| (s.name.clone(), s.stream_url.clone()))
+        else {
+            return;
+        };
+        self.player.update(cx, |p, cx| {
+            if p.radio_stream_url() == Some(url.as_str()) {
+                p.toggle_play(cx);
+            } else {
+                p.play_radio(name, url, cx);
+            }
+        });
     }
 
     /// Form targets after the station rows: three inputs, the submit button,
-    /// and Cancel while editing.
-    fn form_targets(&self) -> usize {
+    /// and Cancel while editing. None while offline, where the form isn't drawn.
+    fn form_targets(&self, cx: &App) -> usize {
+        if self.session.read(cx).client.is_none() {
+            return 0;
+        }
         4 + usize::from(self.editing.is_some())
     }
 
@@ -215,9 +374,12 @@ impl RadioView {
     }
 
     pub fn vi_move(&mut self, delta: isize, _window: &mut Window, cx: &mut Context<Self>) {
-        // The form targets always follow the station rows, so there is
-        // always something to land on even with no stations.
-        let count = self.station_count(cx) + self.form_targets();
+        // The form targets follow the station rows, so with a server there
+        // is always something to land on even with no stations.
+        let count = self.station_count(cx) + self.form_targets(cx);
+        if count == 0 {
+            return;
+        }
         let cur = self.vi_cursor.unwrap_or(0);
         let next = if delta > 0 {
             (cur + delta as usize).min(count - 1)
@@ -228,20 +390,15 @@ impl RadioView {
         cx.notify();
     }
 
-    /// Enter on the focused station/form target: play the station, focus the
-    /// pinned input, or run `add_station`.
+    /// Enter on the focused station/form target: play (or pause) the station,
+    /// focus the pinned input, or send the form.
     pub fn vi_activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let n = self.station_count(cx);
         let Some(i) = self.vi_cursor else {
             return;
         };
         if i < n {
-            let (name, url) = {
-                let r = self.radio.read(cx);
-                let s = &r.stations[i];
-                (s.name.clone(), s.stream_url.clone())
-            };
-            self.player.update(cx, |p, cx| p.play_radio(name, url, cx));
+            self.press_station(i, cx);
         } else if i == n {
             self.name_input.update(cx, |s, cx| s.focus(window, cx));
             cx.notify();
@@ -269,16 +426,33 @@ impl RadioView {
             cx.notify();
         }
     }
+
+    /// What stands in for the list when it has no rows.
+    fn empty_note(&self, cx: &App) -> Option<&'static str> {
+        let r = self.radio.read(cx);
+        if !r.stations.is_empty() || r.error.is_some() {
+            return None;
+        }
+        Some(if self.session.read(cx).client.is_none() {
+            "Connect to a server to see its radio stations."
+        } else if r.loading {
+            "Loading stations…"
+        } else {
+            "No stations yet. Add one below by its stream URL — stations are \
+             saved on your server, so every client connected to it sees them."
+        })
+    }
 }
 
 impl Render for RadioView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Kept in step by the player observer rather than re-read here.
-        let (playing_station, playing_track) = self.playing.clone();
+        let live = self.live.clone();
         let (stations, error) = {
             let r = self.radio.read(cx);
             (r.stations.clone(), r.error.clone())
         };
+        let empty_note = self.empty_note(cx);
+        let connected = self.session.read(cx).client.is_some();
 
         let editing = self.editing.is_some();
         let glow = self.session.read(cx).settings.selection_glow_vi;
@@ -286,23 +460,57 @@ impl Render for RadioView {
         // The form targets sit after the station rows in the same flat vi
         // index space `vi_move`/`vi_activate` walk.
         let station_count = stations.len();
+        let editing_name = self
+            .editing
+            .as_deref()
+            .and_then(|id| stations.iter().find(|s| s.id == id))
+            .map(|s| s.name.clone());
         let rows: Vec<_> = stations
             .into_iter()
             .enumerate()
             .map(|(i, station)| {
-                let is_playing = playing_station.as_deref() == Some(station.name.as_str());
-                let now_playing = is_playing.then(|| playing_track.clone()).flatten();
-                let name = station.name.clone();
-                let url = station.stream_url.clone();
+                let status = row_status(&live, &station.stream_url);
+                let detail = row_detail(status, live.track.as_deref(), &station.stream_url);
                 let id = station.id.clone();
                 let homepage = station.home_page_url.clone().filter(|u| is_web_url(u));
                 let being_edited = self.editing.as_deref() == Some(station.id.as_str());
+                let armed = self.delete_armed.as_deref() == Some(station.id.as_str());
                 let focused = self.vi_cursor == Some(i);
+                let accent = cx.theme().primary;
+                let muted = cx.theme().muted_foreground;
+                let lead = match status {
+                    Some(RowStatus::OnAir) => {
+                        crate::ui::live_badge("radio-row-live", accent, None, cx)
+                    }
+                    Some(RowStatus::Paused) => div()
+                        .flex_none()
+                        .text_color(muted)
+                        .child(app_icon(icons::PAUSE).small())
+                        .into_any_element(),
+                    Some(RowStatus::Connecting | RowStatus::Reconnecting(_)) => div()
+                        .flex_none()
+                        .text_color(accent)
+                        .child(app_icon(icons::RADIO).small())
+                        .with_animation(
+                            ("radio-row-wait", i),
+                            Animation::new(Duration::from_millis(900))
+                                .repeat()
+                                .with_easing(pulsating_between(0.35, 1.0)),
+                            |el, t| el.opacity(t),
+                        )
+                        .into_any_element(),
+                    None => div()
+                        .flex_none()
+                        .text_color(muted)
+                        .child(app_icon(icons::RADIO).small())
+                        .into_any_element(),
+                };
                 let row = h_flex()
                     .id(("radio", i))
                     .px_2()
                     .py_1p5()
-                    .gap_2()
+                    .gap_3()
+                    .items_center()
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|s| {
@@ -313,35 +521,21 @@ impl Render for RadioView {
                             s
                         }
                     })
-                    .when(is_playing, |s| s.text_color(cx.theme().primary))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let (name, url) = (name.clone(), url.clone());
-                        this.player.update(cx, |p, cx| p.play_radio(name, url, cx));
-                    }))
-                    .when(is_playing, |this| {
-                        this.child(crate::ui::live_badge(
-                            "radio-row-live",
-                            cx.theme().primary,
-                            None,
-                            cx,
-                        ))
-                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.press_station(i, cx)))
+                    .child(lead)
+                    // Name over its detail line, so a long announced title
+                    // gets the row's width rather than a narrow slot.
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .child(station.name.clone()),
-                    )
-                    // The station's own now-playing line is worth more than its
-                    // URL, so it takes that slot while the station is on.
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .max_w(px(280.))
-                            .truncate()
-                            .child(now_playing.unwrap_or_else(|| station.stream_url.clone())),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .when(status.is_some(), |d| d.text_color(accent))
+                                    .child(station.name.clone()),
+                            )
+                            .child(div().text_xs().text_color(muted).truncate().child(detail)),
                     )
                     .when_some(homepage, |row, url| {
                         row.child(
@@ -370,105 +564,217 @@ impl Render for RadioView {
                     )
                     .child(
                         Button::new(("radio-del", i))
-                            .ghost()
                             .xsmall()
-                            .icon(Icon::new(IconName::Close))
-                            .tooltip("Delete station")
+                            .map(|b| {
+                                if armed {
+                                    b.danger().label("Delete?").tooltip("Press again to delete")
+                                } else {
+                                    b.ghost()
+                                        .icon(Icon::new(IconName::Close))
+                                        .tooltip("Delete station")
+                                }
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.delete_station(id.clone(), window, cx);
+                                this.press_delete(id.clone(), window, cx);
                             })),
                     );
                 with_focus_cursor(format!("vi-radio-{i}"), row, focused, glow, None, cx)
             })
             .collect();
 
+        let radio = self.radio.clone();
         v_flex()
             .id("radio-scroll")
             .size_full()
             .overflow_y_scroll()
             .p_4()
             .gap_3()
-            .child(div().text_lg().child("Internet Radio"))
-            .when_some(error, |this, e| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(e))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_baseline()
+                    .child(div().text_lg().child("Internet Radio"))
+                    .when(station_count > 0, |h| {
+                        h.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(station_count_label(station_count)),
+                        )
+                    }),
+            )
+            .when_some(error, |this, note| {
+                this.child(crate::ui::error_banner(
+                    &note,
+                    move |_, _, cx| radio.update(cx, |r, cx| r.reload(cx)),
+                    cx,
+                ))
+            })
+            .when_some(empty_note, |this, note| {
+                this.child(
+                    div()
+                        .px_2()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(note),
+                )
             })
             .child(v_flex().gap_0p5().children(rows))
             // Add/edit form. Each control is a vi target in its own right,
             // so each carries the cursor ring — without it j/k past the last
             // station leaves nothing highlighted while Enter still fires.
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .flex_wrap()
-                    .mt_2()
-                    .child(with_focus_cursor(
-                        "vi-radio-name",
-                        div().w(px(200.)).child(Input::new(&self.name_input)),
-                        self.vi_cursor == Some(station_count),
-                        glow,
-                        None,
-                        cx,
-                    ))
-                    .child(with_focus_cursor(
-                        "vi-radio-url",
-                        div().w(px(320.)).child(Input::new(&self.url_input)),
-                        self.vi_cursor == Some(station_count + 1),
-                        glow,
-                        None,
-                        cx,
-                    ))
-                    .child(with_focus_cursor(
-                        "vi-radio-homepage",
-                        div().w(px(240.)).child(Input::new(&self.homepage_input)),
-                        self.vi_cursor == Some(station_count + 2),
-                        glow,
-                        None,
-                        cx,
-                    ))
-                    .child(with_focus_cursor(
-                        "vi-radio-add",
-                        div().child(
-                            Button::new("radio-add")
-                                .primary()
-                                .label(if editing { "Save" } else { "Add" })
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.submit(window, cx)),
-                                ),
-                        ),
-                        self.vi_cursor == Some(station_count + 3),
-                        glow,
-                        None,
-                        cx,
-                    ))
-                    .when(editing, |row| {
-                        row.child(with_focus_cursor(
-                            "vi-radio-cancel",
-                            div().child(
-                                Button::new("radio-cancel")
-                                    .ghost()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.reset_form(window, cx)
-                                    })),
-                            ),
-                            self.vi_cursor == Some(station_count + 4),
-                            glow,
-                            None,
-                            cx,
-                        ))
-                    }),
-            )
-            .when_some(self.form_error, |this, why| {
-                this.child(div().text_color(cx.theme().danger).text_sm().child(why))
+            .when(connected, |this| {
+                this.child(
+                    v_flex()
+                        .mt_2()
+                        .pt_3()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_medium()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(match &editing_name {
+                                    Some(name) => format!("Edit “{name}”"),
+                                    None => "Add a station".into(),
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .flex_wrap()
+                                .child(with_focus_cursor(
+                                    "vi-radio-name",
+                                    div().w(px(200.)).child(Input::new(&self.name_input)),
+                                    self.vi_cursor == Some(station_count),
+                                    glow,
+                                    None,
+                                    cx,
+                                ))
+                                .child(with_focus_cursor(
+                                    "vi-radio-url",
+                                    div().w(px(320.)).child(Input::new(&self.url_input)),
+                                    self.vi_cursor == Some(station_count + 1),
+                                    glow,
+                                    None,
+                                    cx,
+                                ))
+                                .child(with_focus_cursor(
+                                    "vi-radio-homepage",
+                                    div().w(px(240.)).child(Input::new(&self.homepage_input)),
+                                    self.vi_cursor == Some(station_count + 2),
+                                    glow,
+                                    None,
+                                    cx,
+                                ))
+                                .child(with_focus_cursor(
+                                    "vi-radio-add",
+                                    div().child(
+                                        Button::new("radio-add")
+                                            .primary()
+                                            .label(if editing { "Save" } else { "Add" })
+                                            .loading(self.saving)
+                                            .disabled(self.saving)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.submit(window, cx)
+                                            })),
+                                    ),
+                                    self.vi_cursor == Some(station_count + 3),
+                                    glow,
+                                    None,
+                                    cx,
+                                ))
+                                .when(editing, |row| {
+                                    row.child(with_focus_cursor(
+                                        "vi-radio-cancel",
+                                        div().child(
+                                            Button::new("radio-cancel")
+                                                .ghost()
+                                                .label("Cancel")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.reset_form(window, cx)
+                                                })),
+                                        ),
+                                        self.vi_cursor == Some(station_count + 4),
+                                        glow,
+                                        None,
+                                        cx,
+                                    ))
+                                }),
+                        )
+                        .when_some(self.form_error, |this, why| {
+                            this.child(div().text_color(cx.theme().danger).text_sm().child(why))
+                        }),
+                )
             })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StationForm, is_web_url, validate_station};
+    use super::{
+        Live, RowStatus, StationForm, is_web_url, row_detail, row_status, station_count_label,
+        validate_station,
+    };
+
+    fn live(url: &str) -> Live {
+        Live {
+            url: Some(url.into()),
+            playing: true,
+            ..Live::default()
+        }
+    }
+
+    #[test]
+    fn only_the_live_stream_gets_a_status() {
+        let on = live("https://a.b/s");
+        assert_eq!(row_status(&on, "https://a.b/s"), Some(RowStatus::OnAir));
+        assert_eq!(row_status(&on, "https://a.b/other"), None);
+        assert_eq!(row_status(&Live::default(), "https://a.b/s"), None);
+    }
+
+    #[test]
+    fn reconnecting_outranks_buffering_and_pause() {
+        let mut l = live("u");
+        l.buffering = true;
+        assert_eq!(row_status(&l, "u"), Some(RowStatus::Connecting));
+        l.reconnect = Some(2);
+        l.playing = false;
+        assert_eq!(row_status(&l, "u"), Some(RowStatus::Reconnecting(2)));
+        let mut paused = live("u");
+        paused.playing = false;
+        assert_eq!(row_status(&paused, "u"), Some(RowStatus::Paused));
+    }
+
+    #[test]
+    fn row_detail_prefers_state_then_track_then_url() {
+        assert_eq!(row_detail(None, Some("A — B"), "u"), "u");
+        assert_eq!(
+            row_detail(Some(RowStatus::OnAir), Some("A — B"), "u"),
+            "A — B"
+        );
+        assert_eq!(row_detail(Some(RowStatus::OnAir), None, "u"), "u");
+        assert_eq!(row_detail(Some(RowStatus::Paused), None, "u"), "Paused");
+        assert_eq!(
+            row_detail(Some(RowStatus::Paused), Some("A — B"), "u"),
+            "Paused · A — B"
+        );
+        assert_eq!(
+            row_detail(Some(RowStatus::Connecting), Some("x"), "u"),
+            "Connecting…"
+        );
+        assert!(row_detail(Some(RowStatus::Reconnecting(1)), None, "u").contains("(1/5)"));
+    }
+
+    #[test]
+    fn station_counts_read_naturally() {
+        assert_eq!(station_count_label(1), "1 station");
+        assert_eq!(station_count_label(3), "3 stations");
+    }
 
     #[test]
     fn web_urls_need_a_scheme_and_a_host() {

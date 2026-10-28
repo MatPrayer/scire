@@ -38,6 +38,11 @@ follows [Semantic Versioning](https://semver.org/).
   by title, artist, album or length; Play and Shuffle play what's shown.
 - vi commands `:pl rename <name>`, `:pl dup`, `:pl public`, `:pl private`
   and `:pl delete` act on the open playlist.
+- The radio page's rows say how the live station is doing: *Connecting…*,
+  *Signal lost — reconnecting (n/5)…* with the icon pulsing, the LIVE badge
+  with the announced track, or *Paused*. The page shows how many stations
+  there are, says when it is loading, offline or has no stations yet, and a
+  failed request offers Retry.
 
 ### Changed
 
@@ -57,6 +62,12 @@ follows [Semantic Versioning](https://semver.org/).
   button, round artist cards — with a heading per kind under *All*; tracks
   stay a list.
 - Genre filters match regardless of case.
+- Clicking the station already playing on the radio page pauses or resumes
+  it instead of starting it over. Delete asks for a second click. The form
+  is headed *Add a station* or *Edit "Name"*, sends on Enter, and keeps
+  what was typed until the server has saved it, so a failed save loses
+  nothing. Each row shows the station's name above its announced track,
+  which gets the row's full width.
 - Every genre on a track is kept, not only the first: the search page's
   genre list and filter now cover secondary genres (about half the tracks
   in a multi-genre library). The cache upgrades itself and the next sync
@@ -107,6 +118,8 @@ follows [Semantic Versioning](https://semver.org/).
 - Switching the output device or following a route change during radio no
   longer tries to seek the live stream back to where it was, which stalled
   it until the seek failed; it reopens on the air.
+- Two radio stations with the same name both showed as playing; the page
+  now goes by stream URL.
 - The radio page's error line stayed after the next add, delete or reload
   succeeded; it now clears when a new one starts. The add form checks the
   stream URL (http:// or https://) before sending it to the server.
